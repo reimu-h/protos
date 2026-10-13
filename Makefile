@@ -3,15 +3,33 @@ CXX := g++
 LD := ld
 BUILD_DIR := build
 
-ASFLAGS := --64
-CXXFLAGS := -m64 -masm=intel -std=c++20 -O2 -Wall -Wextra -Werror \
-            -ffreestanding -nostdlib -fno-builtin \
-            -fno-exceptions -fcheck-new -fno-rtti -mno-red-zone \
-            -mgeneral-regs-only -fno-stack-protector -fno-pie \
-            -I$(BUILD_DIR)/include
-LDFLAGS := -m elf_x86_64 -z max-page-size=0x1000 --no-warn-rwx-segments -T linker.ld
+# Treat compiler warnings as errors (the default, and what CI enforces). Pass
+# WERROR=0 if a newer compiler than the ones CI uses reports new warnings.
+WERROR ?= 1
+WERROR_FLAG := $(if $(filter 1,$(WERROR)),-Werror)
 
-TEST_COMMON_CXXFLAGS := -std=c++20 -Wall -Wextra -Werror -MMD -MP
+# Link the boot self-tests (memory_tests.cpp, stress_test.cpp) into the kernel
+# and run them from kernel_main. With SELFTEST=0 the kernel initializes and then
+# idles. `make run-boot-test`/`make test` require SELFTEST=1.
+SELFTEST ?= 1
+
+ASFLAGS := --64
+# The kernel is freestanding but uses a few header-only parts of libstdc++
+# (<atomic>, <memory>, <new>, <type_traits>, <utility>). Their freestanding
+# subset is too small, so $(FREESTANDING_CXX_CONFIG) below wraps the host
+# <bits/c++config.h> and forces _GLIBCXX_HOSTED=1. This needs a native x86-64
+# GCC with libstdc++ headers (or the Docker image); bare x86_64-elf cross
+# compilers and clang/libc++ are not supported. The runtime support those
+# headers need is provided by heap.cpp (operator new/delete) and
+# cxx_runtime.cpp (mem* functions, __cxa_* hooks).
+CXXFLAGS := -m64 -masm=intel -std=c++20 -O2 -Wall -Wextra $(WERROR_FLAG) \
+            -ffreestanding -nostdlib -fno-builtin \
+            -fno-exceptions -fno-rtti -mno-red-zone \
+            -mgeneral-regs-only -fno-stack-protector -fno-pie \
+            -DPROTOS_SELFTEST=$(if $(filter 1,$(SELFTEST)),1,0) \
+            -I$(BUILD_DIR)/include
+
+TEST_COMMON_CXXFLAGS := -std=c++20 -Wall -Wextra $(WERROR_FLAG) -MMD -MP
 TEST_COMMON_LDFLAGS := -lgmock_main -lgmock -lgtest -pthread
 
 TEST_BUILD_MODES := debug opt
@@ -33,6 +51,7 @@ TEST_SAN_ENV_ubsan := UBSAN_OPTIONS=print_stacktrace=1:halt_on_error=1
 TEST_SAN_ENV_lsan := LSAN_OPTIONS=print_suppressions=0
 TEST_SAN_ENV_tsan := TSAN_OPTIONS=halt_on_error=1
 
+# stress_test.cpp is kernel code (the stress workload), not a unit test.
 HOST_TEST_SRCS := $(filter-out stress_test.cpp,$(sort $(wildcard *_test.cpp)))
 HOST_TESTS := $(patsubst %.cpp,%,$(HOST_TEST_SRCS))
 TASK_LAYER_SRCS := \
@@ -47,16 +66,29 @@ TASK_LAYER_HDRS := \
     join_lifecycle_scheduler.h \
     preemptive_scheduler.h
 
+# Host tests that link idt.cpp also need the stand-ins for its kernel-only
+# symbols (boot.S's ISR stub table, the CR2 register).
+IDT_TEST_SRCS := idt.cpp idt_host_fakes.cpp
+
+TEST_EXTRA_SRCS_cxx_runtime_test := cxx_runtime.cpp
 TEST_EXTRA_SRCS_heap_test := heap.cpp
-TEST_EXTRA_SRCS_idt_test := idt.cpp
-TEST_EXTRA_SRCS_pmm_test := pmm.cpp multiboot.cpp
-TEST_EXTRA_SRCS_smp_test := smp.cpp idt.cpp
-TEST_EXTRA_SRCS_core_runqueue_scheduler_test := core_runqueue_scheduler.cpp
-TEST_EXTRA_SRCS_work_stealing_scheduler_test := work_stealing_scheduler.cpp core_runqueue_scheduler.cpp
-TEST_EXTRA_SRCS_join_lifecycle_scheduler_test := join_lifecycle_scheduler.cpp
-TEST_EXTRA_SRCS_preemptive_scheduler_test := preemptive_scheduler.cpp
-TEST_EXTRA_SRCS_task_test := $(TASK_LAYER_SRCS) task.cpp idt.cpp
-TEST_EXTRA_SRCS_stress_test_test := stress_test.cpp $(TASK_LAYER_SRCS) task.cpp idt.cpp
+TEST_EXTRA_SRCS_idt_test := $(IDT_TEST_SRCS)
+TEST_EXTRA_SRCS_multiboot_test := multiboot.cpp
+TEST_EXTRA_SRCS_pmm_test := pmm.cpp
+TEST_EXTRA_SRCS_smp_test := smp.cpp $(IDT_TEST_SRCS)
+TEST_EXTRA_SRCS_vga_test := vga.cpp
+# Host fakes for the scheduler tests (see scheduler_test_support.h). Tests that
+# link the real idt.cpp and task.cpp must not link the IDT/task fakes.
+SCHED_TEST_FAKES := scheduler_test_fakes.cpp
+SCHED_TEST_IDT_TASK_FAKES := scheduler_test_idt_task_fakes.cpp
+TEST_EXTRA_SRCS_core_runqueue_scheduler_test := core_runqueue_scheduler.cpp $(SCHED_TEST_FAKES) $(SCHED_TEST_IDT_TASK_FAKES)
+TEST_EXTRA_SRCS_work_stealing_scheduler_test := work_stealing_scheduler.cpp core_runqueue_scheduler.cpp $(SCHED_TEST_FAKES) $(SCHED_TEST_IDT_TASK_FAKES)
+TEST_EXTRA_SRCS_join_lifecycle_scheduler_test := join_lifecycle_scheduler.cpp $(SCHED_TEST_FAKES) $(SCHED_TEST_IDT_TASK_FAKES)
+TEST_EXTRA_SRCS_preemptive_scheduler_test := preemptive_scheduler.cpp $(SCHED_TEST_FAKES) $(SCHED_TEST_IDT_TASK_FAKES)
+TEST_EXTRA_SRCS_task_test := $(TASK_LAYER_SRCS) task.cpp $(IDT_TEST_SRCS) $(SCHED_TEST_FAKES)
+TEST_EXTRA_SRCS_stress_test_test := stress_test.cpp $(TASK_LAYER_SRCS) task.cpp $(IDT_TEST_SRCS) $(SCHED_TEST_FAKES)
+
+SELFTEST_SRCS := memory_tests.cpp stress_test.cpp
 
 CXX_SRCS := \
     uart.cpp \
@@ -66,11 +98,11 @@ CXX_SRCS := \
     paging.cpp \
     pmm.cpp \
     heap.cpp \
+    cxx_runtime.cpp \
     smp.cpp \
     $(TASK_LAYER_SRCS) \
     task.cpp \
-    memory_tests.cpp \
-    stress_test.cpp \
+    $(if $(filter 1,$(SELFTEST)),$(SELFTEST_SRCS)) \
     kernel.cpp
 
 CXX_HDRS := \
@@ -83,6 +115,7 @@ CXX_HDRS := \
     paging.h \
     pmm.h \
     heap.h \
+    cxx_runtime.h \
     smp.h \
     task.h \
     $(TASK_LAYER_HDRS) \
@@ -93,6 +126,13 @@ CXX_HDRS := \
 CXX_OBJS := $(patsubst %.cpp,$(BUILD_DIR)/%.o,$(CXX_SRCS))
 OBJS := $(BUILD_DIR)/boot.o $(CXX_OBJS)
 FREESTANDING_CXX_CONFIG := $(BUILD_DIR)/include/bits/c++config.h
+# Records the kernel build configuration so that changing flags (e.g. WERROR or
+# SELFTEST) rebuilds the kernel.
+KERNEL_CONFIG_STAMP := $(BUILD_DIR)/.kernel-config
+KERNEL_CONFIG := $(CXX) $(CXXFLAGS) | $(AS) $(ASFLAGS) | $(OBJS)
+
+KERNEL_ISO := $(BUILD_DIR)/kernel.iso
+KERNEL_MB1_ISO := $(BUILD_DIR)/kernel-mb1.iso
 
 DOCKER ?= docker
 DOCKER_IMAGE ?= x86-64-kernel-build
@@ -101,46 +141,89 @@ HOST_UID ?= $(shell id -u)
 HOST_GID ?= $(shell id -g)
 DOCKER_STAMP := $(BUILD_DIR)/.docker.stamp
 
+NPROC := $(shell nproc 2>/dev/null || getconf _NPROCESSORS_ONLN 2>/dev/null || echo 1)
+# --output-sync (-O) needs GNU make 4.0 or newer.
+OUTPUT_SYNC := $(if $(filter-out 0.% 1.% 2.% 3.%,$(MAKE_VERSION)),-Otarget)
+
+# Decide whether to build on the host or in the Docker image. Only the tools the
+# requested goals need are checked: unit tests need GoogleTest but no GRUB,
+# kernel builds need GRUB/xorriso/mtools but no GoogleTest, and boot tests also
+# need QEMU. Set USE_DOCKER=0/1 to override.
 IN_DOCKER := $(wildcard /.dockerenv /run/.containerenv)
-HOST_REQUIRED_BINS := $(AS) $(CXX) $(LD) grub-mkrescue xorriso mtools qemu-system-x86_64
-MISSING_HOST_BINS := $(strip $(foreach bin,$(HOST_REQUIRED_BINS),$(if $(shell command -v $(bin) 2>/dev/null),,$(bin))))
+HOST_GRUB_MKRESCUE := $(firstword $(foreach bin,grub-mkrescue grub2-mkrescue,$(if $(shell command -v $(bin) 2>/dev/null),$(bin))))
+missing_bins = $(strip $(foreach bin,$(1),$(if $(shell command -v $(bin) 2>/dev/null),,$(bin))))
 HAVE_HOST_GTEST := $(and $(wildcard /usr/include/gtest/gtest.h),$(wildcard /usr/include/gmock/gmock.h))
+
+GOALS := $(or $(MAKECMDGOALS),all)
+UNIT_TEST_ONLY_GOALS := unit-test test-host test-% \
+    $(foreach b,$(TEST_BUILD_MODES),$(foreach s,$(TEST_SAN_MODES),run-%-$(b)-$(s) $(BUILD_DIR)/%_$(b)_$(s)))
+NEED_GTEST := $(filter test $(UNIT_TEST_ONLY_GOALS),$(GOALS))
+NEED_QEMU := $(filter test run run-boot-test,$(GOALS))
+NEED_KERNEL_TOOLS := $(filter-out clean docker-build docker-test $(UNIT_TEST_ONLY_GOALS),$(GOALS))
 
 ifneq ($(IN_DOCKER),)
 USE_DOCKER := 0
-else ifeq ($(MISSING_HOST_BINS),)
-  ifneq ($(HAVE_HOST_GTEST),)
-    USE_DOCKER ?= 0
-  else
-    USE_DOCKER ?= 1
-  endif
 else
-  USE_DOCKER ?= 1
+MISSING_HOST_DEPS := $(call missing_bins,$(CXX) \
+    $(if $(NEED_KERNEL_TOOLS),$(AS) $(LD) xorriso mformat) \
+    $(if $(NEED_QEMU),qemu-system-x86_64)) \
+    $(if $(NEED_KERNEL_TOOLS),$(if $(HOST_GRUB_MKRESCUE),,grub-mkrescue)) \
+    $(if $(NEED_GTEST),$(if $(HAVE_HOST_GTEST),,gtest/gmock-headers))
+ifeq ($(strip $(MISSING_HOST_DEPS)),)
+USE_DOCKER ?= 0
+else
+ifeq ($(origin USE_DOCKER),undefined)
+$(info Building in Docker; missing on the host: $(strip $(MISSING_HOST_DEPS)). Set USE_DOCKER=0 to force a host build.)
+endif
+USE_DOCKER ?= 1
+endif
 endif
 
 ifeq ($(USE_DOCKER),1)
-DOCKER_RUN := $(DOCKER) run --rm --platform=$(DOCKER_PLATFORM) \
-              --user $(HOST_UID):$(HOST_GID) \
-              -e HOME=/tmp \
-              -v "$(CURDIR):/workspace" \
-              -w /workspace \
-              $(DOCKER_IMAGE)
+GRUB_MKRESCUE := grub-mkrescue
+# The Docker image ships binutils 2.40.
+LD_NO_WARN_RWX := --no-warn-rwx-segments
+else
+GRUB_MKRESCUE := $(or $(HOST_GRUB_MKRESCUE),grub-mkrescue)
+# --no-warn-rwx-segments exists since binutils 2.39.
+LD_NO_WARN_RWX := $(if $(shell $(LD) --help 2>/dev/null | grep -e --no-warn-rwx-segments),--no-warn-rwx-segments)
+endif
+LDFLAGS := -m elf_x86_64 -z max-page-size=0x1000 $(LD_NO_WARN_RWX) -T linker.ld
+
+# Settings forwarded to the make that runs inside the Docker container
+# (including -k, so that `make -k ... USE_DOCKER=1` keeps going there too).
+INNER_MAKE := make --no-print-directory WERROR=$(WERROR) SELFTEST=$(SELFTEST) \
+              $(if $(findstring k,$(firstword -$(MAKEFLAGS))),-k)
+# Boot-test settings forwarded into the container (see test_boot.sh).
+BOOT_TEST_ENV_VARS := BIOS_TIMEOUT_SECS UEFI_TIMEOUT_SECS MIN_STRESS_PASSES OVMF OVMF_VARS REQUIRE_UEFI
+
+ifeq ($(USE_DOCKER),1)
+DOCKER_RUN_ARGS := --rm --platform=$(DOCKER_PLATFORM) \
+                   --user $(HOST_UID):$(HOST_GID) \
+                   -e HOME=/tmp $(foreach var,$(BOOT_TEST_ENV_VARS),-e $(var)) \
+                   -v "$(CURDIR):/workspace" \
+                   -w /workspace
+DOCKER_RUN := $(DOCKER) run $(DOCKER_RUN_ARGS) $(DOCKER_IMAGE)
+DOCKER_RUN_INTERACTIVE := $(DOCKER) run -it $(DOCKER_RUN_ARGS) $(DOCKER_IMAGE)
 DOCKER_DEPS := $(DOCKER_STAMP)
 else
 DOCKER_RUN :=
+DOCKER_RUN_INTERACTIVE :=
 DOCKER_DEPS :=
 ifeq ($(filter -j% --jobserver%,$(MAKEFLAGS)),)
-MAKEFLAGS += -j$(shell nproc) -Otarget
+MAKEFLAGS += -j$(NPROC) $(OUTPUT_SYNC)
 endif
 endif
 
-.PHONY: all clean test unit-test test-host docker-build docker-test test-rbtree test-spinlock test-heap test-idt test-pmm test-smp test-core-runqueue-scheduler test-work-stealing-scheduler test-join-lifecycle-scheduler test-preemptive-scheduler test-task test-stress_test test-stress run-boot-test
+QEMU_RUN_FLAGS ?= -smp 4 -m 256M -serial mon:stdio
+
+.PHONY: all clean test unit-test test-host docker-build docker-test run run-boot-test FORCE test-rbtree test-spinlock test-heap test-idt test-pmm test-smp test-core-runqueue-scheduler test-work-stealing-scheduler test-join-lifecycle-scheduler test-preemptive-scheduler test-task test-stress_test test-stress
 
 ifeq ($(USE_DOCKER),1)
 all: $(DOCKER_STAMP)
-	$(DOCKER_RUN) sh -c 'make --no-print-directory -j$$(nproc) -Otarget $(BUILD_DIR)/kernel.bin $(BUILD_DIR)/kernel.iso'
+	$(DOCKER_RUN) sh -c '$(INNER_MAKE) -j$$(nproc) -Otarget $(KERNEL_ISO) $(KERNEL_MB1_ISO)'
 else
-all: $(BUILD_DIR)/kernel.bin $(BUILD_DIR)/kernel.iso
+all: $(KERNEL_ISO) $(KERNEL_MB1_ISO)
 endif
 
 $(BUILD_DIR):
@@ -156,22 +239,37 @@ $(FREESTANDING_CXX_CONFIG): Makefile | $(BUILD_DIR)
 	mkdir -p $(dir $@)
 	printf '#ifndef PROTOS_BITS_CXXCONFIG_H_\n#define PROTOS_BITS_CXXCONFIG_H_\n#pragma GCC system_header\n#include_next <bits/c++config.h>\n#undef _GLIBCXX_HOSTED\n#define _GLIBCXX_HOSTED 1\n#endif\n' > $@
 
-$(BUILD_DIR)/boot.o: boot.S $(DOCKER_DEPS) | $(BUILD_DIR)
+FORCE:
+
+$(KERNEL_CONFIG_STAMP): FORCE | $(BUILD_DIR)
+	@echo '$(KERNEL_CONFIG)' | cmp -s - $@ || echo '$(KERNEL_CONFIG)' > $@
+
+$(BUILD_DIR)/boot.o: boot.S $(KERNEL_CONFIG_STAMP) $(DOCKER_DEPS) | $(BUILD_DIR)
 	$(DOCKER_RUN) $(AS) $(ASFLAGS) $< -o $@
 
-$(BUILD_DIR)/%.o: %.cpp $(CXX_HDRS) $(FREESTANDING_CXX_CONFIG) $(DOCKER_DEPS) | $(BUILD_DIR)
+$(BUILD_DIR)/%.o: %.cpp $(CXX_HDRS) $(FREESTANDING_CXX_CONFIG) $(KERNEL_CONFIG_STAMP) $(DOCKER_DEPS) | $(BUILD_DIR)
 	$(DOCKER_RUN) $(CXX) $(CXXFLAGS) -c $< -o $@
 
-$(BUILD_DIR)/kernel.bin: $(OBJS) linker.ld $(DOCKER_DEPS) | $(BUILD_DIR)
+$(BUILD_DIR)/kernel.bin: $(OBJS) linker.ld $(KERNEL_CONFIG_STAMP) $(DOCKER_DEPS) | $(BUILD_DIR)
 	$(DOCKER_RUN) $(LD) $(LDFLAGS) $(OBJS) -o $@
 
-$(BUILD_DIR)/kernel.iso: $(BUILD_DIR)/kernel.bin Makefile $(DOCKER_DEPS) | $(BUILD_DIR)
-	rm -rf $(BUILD_DIR)/isodir
-	mkdir -p $(BUILD_DIR)/isodir/boot/grub
-	cp $(BUILD_DIR)/kernel.bin $(BUILD_DIR)/isodir/boot/kernel.bin
-	printf 'set timeout=0\nset default=0\n\nmenuentry "x86-64 Kernel" {\n    if [ "$${grub_platform}" = "efi" ]; then\n        insmod all_video\n    fi\n    multiboot2 /boot/kernel.bin\n    if [ "$${grub_platform}" = "pc" ]; then\n        set gfxpayload=text\n    fi\n    boot\n}\n' > $(BUILD_DIR)/isodir/boot/grub/grub.cfg
-	$(DOCKER_RUN) grub-mkrescue -o $@ $(BUILD_DIR)/isodir
-	rm -rf $(BUILD_DIR)/isodir
+# $(call MAKE_ISO,iso_path,multiboot_command)
+# Builds a GRUB rescue ISO (bootable via legacy BIOS and UEFI) that loads
+# kernel.bin with the given GRUB multiboot command (multiboot2 or multiboot).
+define MAKE_ISO
+	rm -rf $(1).dir
+	mkdir -p $(1).dir/boot/grub
+	cp $(BUILD_DIR)/kernel.bin $(1).dir/boot/kernel.bin
+	printf 'set timeout=0\nset default=0\n\nmenuentry "x86-64 Kernel" {\n    if [ "$${grub_platform}" = "efi" ]; then\n        insmod all_video\n    fi\n    $(2) /boot/kernel.bin\n    if [ "$${grub_platform}" = "pc" ]; then\n        set gfxpayload=text\n    fi\n    boot\n}\n' > $(1).dir/boot/grub/grub.cfg
+	$(DOCKER_RUN) $(GRUB_MKRESCUE) -o $(1) $(1).dir
+	rm -rf $(1).dir
+endef
+
+$(KERNEL_ISO): $(BUILD_DIR)/kernel.bin Makefile $(DOCKER_DEPS) | $(BUILD_DIR)
+	$(call MAKE_ISO,$@,multiboot2)
+
+$(KERNEL_MB1_ISO): $(BUILD_DIR)/kernel.bin Makefile $(DOCKER_DEPS) | $(BUILD_DIR)
+	$(call MAKE_ISO,$@,multiboot)
 
 # $(call DEFINE_HOST_TEST_VARIANT,test_name,build_mode,san_mode)
 define DEFINE_HOST_TEST_VARIANT
@@ -195,7 +293,7 @@ $(foreach b,$(TEST_BUILD_MODES),$(foreach s,$(TEST_SAN_MODES),$(eval $(call DEFI
 .PHONY: test-$(1)
 ifeq ($(USE_DOCKER),1)
 test-$(1): $(DOCKER_STAMP)
-	$$(DOCKER_RUN) sh -c 'make --no-print-directory -j$$$$(nproc) -Otarget $$(HOST_TEST_RUNS_$(1))'
+	$$(DOCKER_RUN) sh -c '$$(INNER_MAKE) -j$$$$(nproc) -Otarget $$(HOST_TEST_RUNS_$(1))'
 else
 test-$(1): $$(HOST_TEST_RUNS_$(1))
 endif
@@ -219,21 +317,32 @@ test-stress: test-stress_test_test
 
 ifeq ($(USE_DOCKER),1)
 unit-test: $(DOCKER_STAMP)
-	$(DOCKER_RUN) sh -c 'make --no-print-directory -j$$(nproc) -Otarget $(HOST_TEST_ALL_RUNS)'
+	$(DOCKER_RUN) sh -c '$(INNER_MAKE) -j$$(nproc) -Otarget $(HOST_TEST_ALL_RUNS)'
 else
 unit-test: $(HOST_TEST_ALL_RUNS)
 endif
 
 test-host: unit-test
 
-run-boot-test: $(BUILD_DIR)/kernel.iso $(DOCKER_DEPS)
-	$(DOCKER_RUN) ./test_boot.sh $(BUILD_DIR)/kernel.iso
+run-boot-test: $(KERNEL_ISO) $(KERNEL_MB1_ISO) $(DOCKER_DEPS)
+	$(if $(filter 1,$(SELFTEST)),,$(error run-boot-test needs the self-tests; do not set SELFTEST=0))
+	$(DOCKER_RUN) ./test_boot.sh $(KERNEL_ISO) $(KERNEL_MB1_ISO)
 
+# Boots the kernel interactively; the serial console is attached to the
+# terminal (press Ctrl-A X to quit QEMU).
+run: $(KERNEL_ISO) $(DOCKER_DEPS)
+	$(DOCKER_RUN_INTERACTIVE) qemu-system-x86_64 $(QEMU_RUN_FLAGS) \
+		$(if $(filter 1,$(USE_DOCKER)),-display none) -cdrom $(KERNEL_ISO)
+
+# The QEMU boot test is timing-sensitive, so it runs only after the unit tests
+# have finished instead of competing with them for CPUs.
 ifeq ($(USE_DOCKER),1)
 test: $(DOCKER_STAMP)
-	$(DOCKER_RUN) sh -c 'make --no-print-directory -j$$(nproc) -Otarget $(HOST_TEST_ALL_RUNS) run-boot-test'
+	$(DOCKER_RUN) sh -c '$(INNER_MAKE) -j$$(nproc) -Otarget $(HOST_TEST_ALL_RUNS) $(KERNEL_ISO) $(KERNEL_MB1_ISO) && $(INNER_MAKE) run-boot-test'
 else
-test: unit-test run-boot-test
+test:
+	$(MAKE) --no-print-directory $(HOST_TEST_ALL_RUNS) $(KERNEL_ISO) $(KERNEL_MB1_ISO)
+	$(MAKE) --no-print-directory run-boot-test
 endif
 
 docker-build:
@@ -246,4 +355,3 @@ clean:
 	rm -rf $(BUILD_DIR)
 
 -include $(wildcard $(BUILD_DIR)/*.d)
-

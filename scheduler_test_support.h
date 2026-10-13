@@ -1,6 +1,25 @@
 #ifndef PROTOS_SCHEDULER_TEST_SUPPORT_H_
 #define PROTOS_SCHEDULER_TEST_SUPPORT_H_
 
+// Shared fixtures for the scheduler unit tests (core_runqueue_scheduler_test,
+// work_stealing_scheduler_test, join_lifecycle_scheduler_test,
+// preemptive_scheduler_test, task_test and stress_test_test).
+//
+// The scheduler code calls into other kernel modules. These tests replace the
+// modules with host fakes whose state lives in `g_env`. The fakes are plain
+// (non-inline, non-weak) definitions in two source files, and the Makefile
+// links each test with the ones it needs (`TEST_EXTRA_SRCS_<test>`):
+// - scheduler_test_fakes.cpp fakes the PMM, heap, SMP, UART and VGA functions
+//   that the scheduler code and these tests call. Every test that includes
+//   this header links it; none of them links pmm.cpp, heap.cpp, smp.cpp,
+//   uart.cpp or vga.cpp.
+// - scheduler_test_idt_task_fakes.cpp fakes the parts of idt.h and task.h
+//   that SetupEnv() and the scheduler layers use. Only tests that link
+//   neither idt.cpp nor task.cpp use it; task_test and stress_test_test link
+//   the real modules instead.
+// A test that links both a fake and the real module fails to link with a
+// duplicate symbol error rather than silently using one of them.
+
 #include <gmock/gmock.h>
 #include <gtest/gtest.h>
 
@@ -29,13 +48,18 @@ constexpr int64_t kInitialFakeFreeFrames = 16384;
 constexpr int64_t kInitialFakeHeapBytes = 4 * 1024 * 1024;
 constexpr uintptr_t kFakeStackBase = 0x200000;
 
+// State of the fakes. SetupEnv() resets it.
 struct FakeSchedulerEnv {
   int cpu_count = 1;
+  // Returned by the fake IdtIsInitialized(), so it only matters in tests that
+  // link scheduler_test_idt_task_fakes.cpp.
   bool idt_initialized = true;
+  // Make the fake PmmAllocFrames() and KmallocAligned() fail.
   bool fail_pmm_alloc = false;
   bool fail_kmalloc = false;
   std::unique_ptr<CpuLocal[]> cpu_locals;
   std::unique_ptr<CpuInfo[]> cpu_infos;
+  // Makes the fake SmpGetCpuLocal(i) return nullptr while set.
   std::unique_ptr<bool[]> null_cpu_local;
 
   std::atomic<int64_t> allocated_frames{0};
@@ -46,8 +70,7 @@ struct FakeSchedulerEnv {
   std::unique_ptr<std::atomic<int64_t>[]> ipi_sent_count;
   std::unique_ptr<std::atomic<uint8_t>[]> last_ipi_vector;
 
-  std::shared_ptr<TaskScheduler> active_scheduler;
-
+  // Output of the fake UART and VGA functions, guarded by `log_mutex`.
   std::mutex log_mutex;
   std::string uart_log;
   std::string vga_log;
@@ -57,36 +80,17 @@ struct FakeSchedulerEnv {
 
 inline FakeSchedulerEnv g_env;
 
-struct HeapAllocHeader {
-  int64_t payload_size = 0;
-  void* raw_base = nullptr;
-  uint64_t magic = 0;
-};
-constexpr uint64_t kHeapHeaderMagic = 0xC0DEC0DE12345678ULL;
-
-[[gnu::weak, gnu::noinline, gnu::noipa]] void TaskResetForTest() {}
-[[gnu::weak, gnu::noinline, gnu::noipa]] void IdtResetForTest() {}
-[[gnu::weak, gnu::noinline, gnu::noipa]] void ResetRdrandHookForTest() {}
-
-[[gnu::weak, gnu::noinline, gnu::noipa]] bool IdtIsInitialized() {
-  return g_env.idt_initialized;
-}
-
-[[gnu::weak, gnu::noinline, gnu::noipa]] const std::shared_ptr<TaskScheduler>&
-GetTaskScheduler() {
-  return g_env.active_scheduler;
-}
-
+// Destroys the scheduler of a previous TaskInit() (if any), resets the fakes
+// and the IDT, and simulates `num_cpus` online CPUs. On return CPU 0 is bound
+// to the calling thread, its simulated interrupts are enabled and the IDT is
+// initialized, so the test may call TaskInit() or create scheduler layers.
 inline void SetupEnv(const int num_cpus = 1) {
   CHECK(num_cpus >= 1);
   TaskResetForTest();
   IdtResetForTest();
   ResetCpuLocalForTest();
-  ResetRdrandHookForTest();
   SetInterruptsEnabledForTest(true);
 
-  g_env.active_scheduler.reset();
-  g_env.idt_initialized = true;
   g_env.fail_pmm_alloc = false;
   g_env.fail_kmalloc = false;
   g_env.cpu_count = num_cpus;
@@ -132,6 +136,7 @@ inline void SetupEnv(const int num_cpus = 1) {
     info.stack_top = stack_top;
   }
 
+  IdtInit();
   BindCpuLocal(&g_env.cpu_locals[0]);
 }
 
@@ -149,6 +154,7 @@ class MockTaskScheduler : public TaskScheduler {
               (override));
   MOCK_METHOD(void, Yield, (), (override));
   MOCK_METHOD(void, Join, (Task*), (override));
+  MOCK_METHOD(void, Detach, (Task*), (override));
   MOCK_METHOD(int, ReapZombies, (), (override));
   MOCK_METHOD(bool, PollIdleCpu, (int), (override));
   MOCK_METHOD(int, RunqueueLoad, (int), (const, override));
@@ -159,231 +165,6 @@ class MockTaskScheduler : public TaskScheduler {
   MOCK_METHOD(void, OnWakeupIpi, (InterruptFrame*), (override));
   MOCK_METHOD(Task*, CurrentTask, (), (const, override));
 };
-
-[[gnu::used]] inline uintptr_t PmmAllocFrames(const int64_t count) {
-  DCHECK(count > 0);
-  if (g_env.fail_pmm_alloc) {
-    return 0;
-  }
-  const int64_t bytes = count * kPageSize;
-  void* const mem = std::aligned_alloc(static_cast<size_t>(kPageSize),
-                                       static_cast<size_t>(bytes));
-  if (mem == nullptr) {
-    return 0;
-  }
-  g_env.allocated_frames.fetch_add(count, std::memory_order_acq_rel);
-  return reinterpret_cast<uintptr_t>(mem);
-}
-
-[[gnu::used]] inline uintptr_t PmmAllocFrame() { return PmmAllocFrames(1); }
-
-[[gnu::used]] inline void PmmFreeFrames(const uintptr_t base_addr,
-                                        const int64_t count) {
-  DCHECK(base_addr != 0);
-  DCHECK((base_addr & (kPageSize - 1)) == 0);
-  DCHECK(count > 0);
-  std::free(reinterpret_cast<void*>(base_addr));
-  const int64_t prev =
-      g_env.allocated_frames.fetch_sub(count, std::memory_order_acq_rel);
-  DCHECK(prev >= count);
-}
-
-[[gnu::used]] inline void PmmFreeFrame(const uintptr_t frame_addr) {
-  PmmFreeFrames(frame_addr, 1);
-}
-
-[[gnu::used]] inline int64_t PmmFreeFrameCount() {
-  return kInitialFakeFreeFrames -
-         g_env.allocated_frames.load(std::memory_order_acquire);
-}
-
-[[gnu::used]] inline void* KmallocAligned(const int64_t size,
-                                          const int64_t alignment) {
-  if (g_env.fail_kmalloc || size < 0 || alignment < 1 ||
-      (alignment & (alignment - 1)) != 0 || alignment > kPageSize) {
-    return nullptr;
-  }
-  const int64_t payload = (size > 0) ? size : kHeapAlignment;
-  const int64_t align =
-      (alignment > kHeapAlignment) ? alignment : kHeapAlignment;
-  const int64_t header_size = static_cast<int64_t>(sizeof(HeapAllocHeader));
-  const int64_t header_offset = (header_size + align - 1) & ~(align - 1);
-  const int64_t total_bytes =
-      (header_offset + payload + align - 1) & ~(align - 1);
-
-  void* const raw = std::aligned_alloc(static_cast<size_t>(align),
-                                       static_cast<size_t>(total_bytes));
-  if (raw == nullptr) {
-    return nullptr;
-  }
-  uint8_t* const user_ptr = static_cast<uint8_t*>(raw) + header_offset;
-  HeapAllocHeader* const hdr =
-      reinterpret_cast<HeapAllocHeader*>(user_ptr - sizeof(HeapAllocHeader));
-  hdr->payload_size = payload;
-  hdr->raw_base = raw;
-  hdr->magic = kHeapHeaderMagic;
-
-  g_env.allocated_heap_bytes.fetch_add(payload, std::memory_order_acq_rel);
-  g_env.allocated_heap_blocks.fetch_add(1, std::memory_order_acq_rel);
-  return user_ptr;
-}
-
-[[gnu::used]] inline void* Kmalloc(const int64_t size) {
-  return KmallocAligned(size, kHeapAlignment);
-}
-
-[[gnu::used]] inline void Kfree(void* const ptr) {
-  if (ptr == nullptr) {
-    return;
-  }
-  uint8_t* const user_ptr = static_cast<uint8_t*>(ptr);
-  HeapAllocHeader* const hdr =
-      reinterpret_cast<HeapAllocHeader*>(user_ptr - sizeof(HeapAllocHeader));
-  DCHECK(hdr->magic == kHeapHeaderMagic);
-  const int64_t payload = hdr->payload_size;
-  void* const raw = hdr->raw_base;
-  hdr->magic = 0;
-  std::free(raw);
-
-  const int64_t prev_bytes =
-      g_env.allocated_heap_bytes.fetch_sub(payload, std::memory_order_acq_rel);
-  const int64_t prev_blocks =
-      g_env.allocated_heap_blocks.fetch_sub(1, std::memory_order_acq_rel);
-  DCHECK(prev_bytes >= payload);
-  DCHECK(prev_blocks >= 1);
-}
-
-[[gnu::used]] inline int64_t HeapTotalFreeBytes() {
-  return kInitialFakeHeapBytes -
-         g_env.allocated_heap_bytes.load(std::memory_order_acquire);
-}
-
-[[gnu::used]] inline int SmpCpuCount() { return g_env.cpu_count; }
-
-[[gnu::used]] inline int SmpOnlineCpuCount() {
-  int online = 0;
-  for (int i = 0; i < g_env.cpu_count; ++i) {
-    if (g_env.cpu_locals[i].online) {
-      ++online;
-    }
-  }
-  return online;
-}
-
-[[gnu::used]] inline const CpuInfo* SmpGetCpuInfo(const int index) {
-  DCHECK(index >= 0 && index < g_env.cpu_count);
-  return &g_env.cpu_infos[index];
-}
-
-[[gnu::used]] inline CpuLocal* SmpGetCpuLocal(const int cpu_index) {
-  DCHECK(cpu_index >= 0 && cpu_index < g_env.cpu_count);
-  if (g_env.null_cpu_local != nullptr && g_env.null_cpu_local[cpu_index]) {
-    return nullptr;
-  }
-  return &g_env.cpu_locals[cpu_index];
-}
-
-[[gnu::used]] inline void SmpSendLocalApicEoi() {
-  g_env.eoi_count.fetch_add(1, std::memory_order_acq_rel);
-}
-
-[[gnu::used]] inline void SmpSendIpi(const int target_cpu_index,
-                                     const uint8_t vector) {
-  DCHECK(target_cpu_index >= 0 && target_cpu_index < g_env.cpu_count);
-  DCHECK(vector >= static_cast<uint8_t>(kCpuExceptionCount));
-  g_env.ipi_sent_count[target_cpu_index].fetch_add(1,
-                                                   std::memory_order_acq_rel);
-  g_env.last_ipi_vector[target_cpu_index].store(vector,
-                                                std::memory_order_release);
-}
-
-[[gnu::used]] inline void UartWrite(const char* const str) {
-  if (str != nullptr) {
-    const std::lock_guard<std::mutex> lock(g_env.log_mutex);
-    g_env.uart_log.append(str);
-  }
-}
-
-[[gnu::used]] inline void UartWriteHex(const uint64_t value) {
-  char buf[32];
-  std::snprintf(buf,          //
-                sizeof(buf),  //
-                "0x%llX",     //
-                static_cast<unsigned long long>(value));
-  const std::lock_guard<std::mutex> lock(g_env.log_mutex);
-  g_env.uart_log.append(buf);
-}
-
-[[gnu::used]] inline void UartWriteDec(const uint64_t value) {
-  char buf[32];
-  std::snprintf(buf,          //
-                sizeof(buf),  //
-                "%llu",       //
-                static_cast<unsigned long long>(value));
-  const std::lock_guard<std::mutex> lock(g_env.log_mutex);
-  g_env.uart_log.append(buf);
-}
-
-[[gnu::used]] inline void VgaWrite(const char* const str) {
-  if (str != nullptr) {
-    const std::lock_guard<std::mutex> lock(g_env.log_mutex);
-    g_env.vga_log.append(str);
-  }
-}
-
-[[gnu::used]] inline void VgaWriteHex(const uint64_t value) {
-  char buf[32];
-  std::snprintf(buf,          //
-                sizeof(buf),  //
-                "0x%llX",     //
-                static_cast<unsigned long long>(value));
-  const std::lock_guard<std::mutex> lock(g_env.log_mutex);
-  g_env.vga_log.append(buf);
-}
-
-[[gnu::used]] inline void VgaWriteDec(const uint64_t value) {
-  char buf[32];
-  std::snprintf(buf,          //
-                sizeof(buf),  //
-                "%llu",       //
-                static_cast<unsigned long long>(value));
-  const std::lock_guard<std::mutex> lock(g_env.log_mutex);
-  g_env.vga_log.append(buf);
-}
-
-[[gnu::used]] inline void UartPanicWrite(const char* const str) {
-  if (str != nullptr) {
-    const std::lock_guard<std::mutex> lock(g_env.log_mutex);
-    g_env.uart_panic_log.append(str);
-  }
-}
-
-[[gnu::used]] inline void UartPanicWriteDec(const uint64_t value) {
-  char buf[32];
-  std::snprintf(buf,          //
-                sizeof(buf),  //
-                "%llu",       //
-                static_cast<unsigned long long>(value));
-  const std::lock_guard<std::mutex> lock(g_env.log_mutex);
-  g_env.uart_panic_log.append(buf);
-}
-
-[[gnu::used]] inline void VgaPanicWrite(const char* const str) {
-  if (str != nullptr) {
-    const std::lock_guard<std::mutex> lock(g_env.log_mutex);
-    g_env.vga_panic_log.append(str);
-  }
-}
-
-[[gnu::used]] inline void VgaPanicWriteDec(const uint64_t value) {
-  char buf[32];
-  std::snprintf(buf,          //
-                sizeof(buf),  //
-                "%llu",       //
-                static_cast<unsigned long long>(value));
-  const std::lock_guard<std::mutex> lock(g_env.log_mutex);
-  g_env.vga_panic_log.append(buf);
-}
 
 }  // namespace protos
 

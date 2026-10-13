@@ -5,6 +5,7 @@
 #include <memory>
 #include <new>
 
+#include "check.h"
 #include "heap.h"
 #include "idt.h"
 #include "multiboot.h"
@@ -13,6 +14,7 @@
 #include "rbtree.h"
 #include "smp.h"
 #include "spinlock.h"
+#include "stress_test.h"
 #include "task.h"
 #include "uart.h"
 #include "vga.h"
@@ -119,133 +121,203 @@ class XorDevice final : public PolymorphicBase {
   uint64_t extra_padding_[2];
 };
 
-static void ConsoleWrite(const char* const str) {
-  UartWrite(str);
-  VgaWrite(str);
-}
-
+// Prints the "[TEST] <name>: PASS|FAIL" line of a boot test over UART only.
+// The suite runs after the boot log has filled about half of the 25-row VGA
+// text screen, and each VGA line it added would bring the greeting on row 0
+// (which test_boot.sh checks) closer to scrolling off. The VGA console only
+// gets the one-line summary of RunBootVerificationSuite().
 static void LogTestResult(const char* const test_name, const bool passed) {
-  ConsoleWrite("[TEST] ");
-  ConsoleWrite(test_name);
-  if (passed) {
-    ConsoleWrite(": PASS\n");
-  } else {
-    ConsoleWrite(": FAIL\n");
-  }
+  UartWrite("[TEST] ");
+  UartWrite(test_name);
+  UartWrite(passed ? ": PASS\n" : ": FAIL\n");
 }
 
-// Verifies that PMM physical frame allocation returns valid, page-aligned,
-// identity-mapped usable RAM frames and that the identity map covers all
-// discovered usable physical RAM. Outputs the allocated frame addresses so the
-// subsequent free-and-reuse test can release them.
-static bool TestPmmAllocAndBounds(uintptr_t* const out_first_frame,
-                                  uintptr_t* const out_second_frame,
-                                  uintptr_t* const out_multi_frames) {
-  // Verify that usable physical RAM extends beyond the initial 64 MiB
-  // bootstrap mapping and that PmmInit extended the identity map all the way
-  // up to the highest usable physical page.
+// Logs `expr` with its location over UART if `ok` is false; returns `ok`.
+static bool CheckExpectation(const bool ok,           //
+                             const char* const expr,  //
+                             const char* const file,  //
+                             const int line) {
+  if (!ok) {
+    UartWrite("[TEST] expectation failed: ");
+    UartWrite(expr);
+    UartWrite(" at ");
+    UartWrite(file);
+    UartWrite(":");
+    UartWriteDec(static_cast<uint64_t>(line));
+    UartWrite("\n");
+  }
+  return ok;
+}
+
+// Evaluates to `cond`, after logging it with its location if it is false.
+#define SELFTEST_OK(cond) \
+  CheckExpectation(static_cast<bool>(cond), #cond, __FILE__, __LINE__)
+
+// Makes the enclosing boot test return false, after logging `cond` with its
+// location, if `cond` is false.
+#define SELFTEST_EXPECT(cond) \
+  do {                        \
+    if (!SELFTEST_OK(cond)) { \
+      return false;           \
+    }                         \
+  } while (false)
+
+// Fixed-capacity text line, so that a line printed by one CPU goes out in a
+// single write instead of interleaving with the output of other CPUs.
+class LineBuffer {
+ public:
+  LineBuffer() { buf_[0] = '\0'; }
+
+  LineBuffer& Append(const char* str) {
+    while (*str != '\0' && len_ + 1 < kCapacity) {
+      buf_[len_++] = *str++;
+    }
+    buf_[len_] = '\0';
+    return *this;
+  }
+
+  LineBuffer& AppendDec(uint64_t value) {
+    char digits[20];
+    int count = 0;
+    do {
+      digits[count++] = static_cast<char>('0' + value % 10);
+      value /= 10;
+    } while (value != 0);
+    while (count > 0 && len_ + 1 < kCapacity) {
+      buf_[len_++] = digits[--count];
+    }
+    buf_[len_] = '\0';
+    return *this;
+  }
+
+  const char* c_str() const { return buf_; }
+
+ private:
+  static constexpr int kCapacity = 96;
+  char buf_[kCapacity];
+  int len_ = 0;
+};
+
+// Frames that TestPmmAllocAndBounds() allocates and TestPmmFreeAndReuse()
+// frees again.
+struct PmmTestFrames {
+  int64_t free_before_allocs = 0;
+  uintptr_t first = 0;
+  uintptr_t second = 0;
+  uintptr_t run = 0;  // kPmmTestRunFrames contiguous frames.
+};
+constexpr int64_t kPmmTestRunFrames = 4;
+PmmTestFrames g_pmm_test_frames;
+
+static bool TestPmmMemoryMapInit() {
+  SELFTEST_EXPECT(PmmTotalUsableFrameCount() > 0);
+  SELFTEST_EXPECT(PmmFreeFrameCount() > 0);
+  SELFTEST_EXPECT(PmmFreeFrameCount() <= PmmTotalUsableFrameCount());
+  SELFTEST_EXPECT(PmmMaxPhysicalAddress() > kLowerMemoryLimit);
+  return true;
+}
+
+// Checks that the `count` frames at `frame` are page-aligned, identity-mapped
+// (also through PagingEnsureIdentityMappedRange, which must accept ranges that
+// 2 MiB huge pages already cover), usable RAM.
+static bool IsMappedUsableFrameRun(const uintptr_t frame, const int64_t count) {
+  const uintptr_t last_page =
+      frame + static_cast<uintptr_t>((count - 1) * kPageSize);
+  SELFTEST_EXPECT((frame & (kPageSize - 1)) == 0);
+  SELFTEST_EXPECT(PagingIsIdentityMapped(frame));
+  SELFTEST_EXPECT(PagingIsIdentityMapped(last_page));
+  SELFTEST_EXPECT(PagingEnsureIdentityMappedRange(frame, count * kPageSize));
+  SELFTEST_EXPECT(PmmRangeIsValidUsableRam(frame, count * kPageSize));
+  return true;
+}
+
+// Verifies that the identity map covers all usable RAM and that PMM
+// allocation returns distinct, page-aligned, identity-mapped usable frames
+// that hold data. Leaves the frames in g_pmm_test_frames.
+static bool TestPmmAllocAndBounds() {
+  // PmmInit extends the 64 MiB identity map of boot.S up to the highest usable
+  // page. That page may be in use, so it is only read.
   const uintptr_t max_phys = PmmMaxPhysicalAddress();
-  if (max_phys <= kBootstrapIdentityMapSize ||
-      PagingIdentityMappedLimit() < max_phys ||
-      !PagingIsIdentityMapped(max_phys - kPageSize) ||
-      !PmmRangeIsValidUsableRam(max_phys - kPageSize, kPageSize)) {
-    return false;
+  const uintptr_t top_page = max_phys - kPageSize;
+  if (max_phys <= kBootstrapIdentityMapSize) {
+    UartWrite(
+        "[TEST] pmm_alloc_and_bounds: identity map extension check skipped "
+        "(all usable RAM is below 64 MiB)\n");
   }
+  SELFTEST_EXPECT(PagingIdentityMappedLimit() >= max_phys);
+  SELFTEST_EXPECT(PagingIsIdentityMapped(top_page));
+  SELFTEST_EXPECT(PmmRangeIsValidUsableRam(top_page, kPageSize));
+  (void)*reinterpret_cast<const volatile uint64_t*>(top_page);
 
-  // Allocate two single 4 KiB frames and one contiguous run of four 4 KiB
-  // frames, recording their addresses for the caller to free in the next test.
-  const uintptr_t frame1 = PmmAllocFrame();
-  const uintptr_t frame2 = PmmAllocFrame();
-  const uintptr_t multi = PmmAllocFrames(4);
+  PmmTestFrames& frames = g_pmm_test_frames;
+  frames.free_before_allocs = PmmFreeFrameCount();
+  frames.first = PmmAllocFrame();
+  frames.second = PmmAllocFrame();
+  frames.run = PmmAllocFrames(kPmmTestRunFrames);
+  SELFTEST_EXPECT(frames.first != 0);
+  SELFTEST_EXPECT(frames.second != 0);
+  SELFTEST_EXPECT(frames.run != 0);
+  SELFTEST_EXPECT(frames.first != frames.second);
+  SELFTEST_EXPECT(frames.first != frames.run);
+  SELFTEST_EXPECT(frames.second != frames.run);
+  SELFTEST_EXPECT(IsMappedUsableFrameRun(frames.first, 1));
+  SELFTEST_EXPECT(IsMappedUsableFrameRun(frames.second, 1));
+  SELFTEST_EXPECT(IsMappedUsableFrameRun(frames.run, kPmmTestRunFrames));
 
-  *out_first_frame = frame1;
-  *out_second_frame = frame2;
-  *out_multi_frames = multi;
-
-  // Ensure all allocations succeeded (non-zero physical address).
-  if (frame1 == 0 || frame2 == 0 || multi == 0) {
-    return false;
-  }
-  // Ensure each allocation returned a distinct starting physical address.
-  if (frame1 == frame2 || frame1 == multi || frame2 == multi) {
-    return false;
-  }
-  // Ensure all returned physical addresses are 4 KiB page-aligned.
-  if ((frame1 & (kPageSize - 1)) != 0 || (frame2 & (kPageSize - 1)) != 0 ||
-      (multi & (kPageSize - 1)) != 0) {
-    return false;
-  }
-  // Verify that all allocated frames are identity-mapped in the active page
-  // tables, that PagingEnsureIdentityMappedRange succeeds on ranges already
-  // covered by 2 MiB huge pages (kPageEntryHugePage), and that they lie
-  // strictly within usable RAM (above 1 MiB and not overlapping the kernel
-  // image, PMM bitmap, or Multiboot structures).
-  if (!PagingIsIdentityMapped(frame1) || !PagingIsIdentityMapped(frame2) ||
-      !PagingIsIdentityMapped(multi) ||
-      !PagingEnsureIdentityMappedRange(frame1, kPageSize) ||
-      !PagingEnsureIdentityMappedRange(multi, 4 * kPageSize) ||
-      !PmmRangeIsValidUsableRam(frame1, kPageSize) ||
-      !PmmRangeIsValidUsableRam(frame2, kPageSize) ||
-      !PmmRangeIsValidUsableRam(multi, 4 * kPageSize)) {
-    return false;
-  }
-
-  // Write distinct 64-bit test patterns to the allocated frames (including the
-  // last frame of the 4-frame contiguous block) as well as the highest usable
-  // physical page (restoring its prior value afterward), and verify that they
-  // read back identically.
-  volatile uint64_t* const p1 = reinterpret_cast<volatile uint64_t*>(frame1);
-  volatile uint64_t* const p2 = reinterpret_cast<volatile uint64_t*>(frame2);
-  volatile uint64_t* const pm =
-      reinterpret_cast<volatile uint64_t*>(multi + 3 * kPageSize);
-  volatile uint64_t* const p_top =
-      reinterpret_cast<volatile uint64_t*>(max_phys - kPageSize);
-  const uint64_t saved_top = *p_top;
-  *p1 = 0xCAFEBABE11112222;
-  *p2 = 0xDEADBEEF33334444;
-  *pm = 0x0123456789ABCDEF;
-  *p_top = 0xFEDCBA9876543210;
-
-  const bool patterns_ok =
-      *p1 == 0xCAFEBABE11112222 && *p2 == 0xDEADBEEF33334444 &&
-      *pm == 0x0123456789ABCDEF && *p_top == 0xFEDCBA9876543210;
-  *p_top = saved_top;
-  return patterns_ok;
+  volatile uint64_t* const first_word =
+      reinterpret_cast<volatile uint64_t*>(frames.first);
+  volatile uint64_t* const second_word =
+      reinterpret_cast<volatile uint64_t*>(frames.second);
+  volatile uint64_t* const run_last_page_word =
+      reinterpret_cast<volatile uint64_t*>(frames.run +
+                                           (kPmmTestRunFrames - 1) * kPageSize);
+  *first_word = 0xCAFEBABE11112222;
+  *second_word = 0xDEADBEEF33334444;
+  *run_last_page_word = 0x0123456789ABCDEF;
+  SELFTEST_EXPECT(*first_word == 0xCAFEBABE11112222);
+  SELFTEST_EXPECT(*second_word == 0xDEADBEEF33334444);
+  SELFTEST_EXPECT(*run_last_page_word == 0x0123456789ABCDEF);
+  return true;
 }
 
-static bool TestPmmFreeAndReuse(const int64_t free_before_allocs,  //
-                                const uintptr_t frame1,            //
-                                const uintptr_t frame2,            //
-                                const uintptr_t multi_frames) {
+// Frees the frames of TestPmmAllocAndBounds() (whatever it got) and checks the
+// free-frame accounting, that the freed frames are handed out again first, and
+// that a request larger than all of RAM fails.
+static bool TestPmmFreeAndReuse() {
+  const PmmTestFrames frames = g_pmm_test_frames;
+  g_pmm_test_frames = PmmTestFrames{};
   const int64_t free_with_allocs = PmmFreeFrameCount();
-  const int64_t total_usable = PmmTotalUsableFrameCount();
-  if (total_usable == 0 || free_with_allocs + 6 != free_before_allocs ||
-      free_before_allocs > total_usable) {
-    return false;
+  if (frames.first != 0) {
+    PmmFreeFrame(frames.first);
   }
-
-  PmmFreeFrame(frame1);
-  PmmFreeFrame(frame2);
-  PmmFreeFrames(multi_frames, 4);
-
-  if (PmmFreeFrameCount() != free_before_allocs) {
-    return false;
+  if (frames.second != 0) {
+    PmmFreeFrame(frames.second);
   }
-
-  const uintptr_t reused_frame1 = PmmAllocFrame();
-  const uintptr_t reused_frame2 = PmmAllocFrame();
-  const bool reused_match =
-      (reused_frame1 == frame1) && (reused_frame2 == frame2);
-
-  PmmFreeFrame(reused_frame1);
-  PmmFreeFrame(reused_frame2);
-
-  const uintptr_t oom_frame = PmmAllocFrames(PmmMaxFrameCount() + 1);
-  if (oom_frame != 0) {
-    return false;
+  if (frames.run != 0) {
+    PmmFreeFrames(frames.run, kPmmTestRunFrames);
   }
+  SELFTEST_EXPECT(frames.first != 0);
+  SELFTEST_EXPECT(frames.second != 0);
+  SELFTEST_EXPECT(frames.run != 0);
+  SELFTEST_EXPECT(frames.free_before_allocs <= PmmTotalUsableFrameCount());
+  SELFTEST_EXPECT(free_with_allocs + 2 + kPmmTestRunFrames ==
+                  frames.free_before_allocs);
+  SELFTEST_EXPECT(PmmFreeFrameCount() == frames.free_before_allocs);
 
-  return reused_match && (PmmFreeFrameCount() == free_before_allocs);
+  const uintptr_t reused_first = PmmAllocFrame();
+  const uintptr_t reused_second = PmmAllocFrame();
+  if (reused_first != 0) {
+    PmmFreeFrame(reused_first);
+  }
+  if (reused_second != 0) {
+    PmmFreeFrame(reused_second);
+  }
+  SELFTEST_EXPECT(reused_first == frames.first);
+  SELFTEST_EXPECT(reused_second == frames.second);
+
+  SELFTEST_EXPECT(PmmAllocFrames(PmmMaxFrameCount() + 1) == 0);
+  SELFTEST_EXPECT(PmmFreeFrameCount() == frames.free_before_allocs);
+  return true;
 }
 
 struct alignas(64) CacheLineAlignedWidget {
@@ -296,6 +368,7 @@ struct alignas(256) PageSubblockAlignedWidget {
 
 static bool TestHeapVariedSizesAndAlignment() {
   const int64_t free_before = HeapTotalFreeBytes();
+  SELFTEST_EXPECT(free_before > 0);
   constexpr int64_t kSizes[] = {1,   7,    15,   16,    31,   64,
                                 256, 1024, 4096, 16384, 65536};
   constexpr int kNumSizes = sizeof(kSizes) / sizeof(kSizes[0]);
@@ -310,13 +383,12 @@ static bool TestHeapVariedSizesAndAlignment() {
 
     const uintptr_t k_addr = reinterpret_cast<uintptr_t>(kmalloc_ptrs[i]);
     const uintptr_t n_addr = reinterpret_cast<uintptr_t>(new_ptrs[i]);
-    if (kmalloc_ptrs[i] == nullptr || new_ptrs[i] == nullptr ||
-        (k_addr & (kHeapAlignment - 1)) != 0 ||
-        (n_addr & (kHeapAlignment - 1)) != 0 ||
-        !PmmRangeIsValidUsableRam(k_addr, req_size) ||
-        !PmmRangeIsValidUsableRam(n_addr, req_size)) {
-      return false;
-    }
+    SELFTEST_EXPECT(kmalloc_ptrs[i] != nullptr);
+    SELFTEST_EXPECT(new_ptrs[i] != nullptr);
+    SELFTEST_EXPECT((k_addr & (kHeapAlignment - 1)) == 0);
+    SELFTEST_EXPECT((n_addr & (kHeapAlignment - 1)) == 0);
+    SELFTEST_EXPECT(PmmRangeIsValidUsableRam(k_addr, req_size));
+    SELFTEST_EXPECT(PmmRangeIsValidUsableRam(n_addr, req_size));
   }
 
   for (int i = 0; i < kNumSizes; ++i) {
@@ -337,11 +409,9 @@ static bool TestHeapVariedSizesAndAlignment() {
     const int64_t req_size = 48 + i * 16;
     aligned_ptrs[i] = static_cast<uint8_t*>(KmallocAligned(req_size, align));
     const uintptr_t addr = reinterpret_cast<uintptr_t>(aligned_ptrs[i]);
-    if (aligned_ptrs[i] == nullptr ||
-        (addr & static_cast<uintptr_t>(eff_align - 1)) != 0 ||
-        !PmmRangeIsValidUsableRam(addr, req_size)) {
-      return false;
-    }
+    SELFTEST_EXPECT(aligned_ptrs[i] != nullptr);
+    SELFTEST_EXPECT((addr & static_cast<uintptr_t>(eff_align - 1)) == 0);
+    SELFTEST_EXPECT(PmmRangeIsValidUsableRam(addr, req_size));
     for (int64_t b = 0; b < req_size; ++b) {
       aligned_ptrs[i][b] = static_cast<uint8_t>((i * 31 + b) & 0xFF);
     }
@@ -349,14 +419,14 @@ static bool TestHeapVariedSizesAndAlignment() {
   for (int i = 0; i < kNumAlignments; ++i) {
     const int64_t req_size = 48 + i * 16;
     for (int64_t b = 0; b < req_size; ++b) {
-      if (aligned_ptrs[i][b] != static_cast<uint8_t>((i * 31 + b) & 0xFF)) {
-        return false;
-      }
+      SELFTEST_EXPECT(aligned_ptrs[i][b] ==
+                      static_cast<uint8_t>((i * 31 + b) & 0xFF));
     }
     Kfree(aligned_ptrs[i]);
   }
 
-  return HeapTotalFreeBytes() == free_before;
+  SELFTEST_EXPECT(HeapTotalFreeBytes() == free_before);
+  return true;
 }
 
 static bool TestHeapPatternIsolation() {
@@ -366,9 +436,7 @@ static bool TestHeapPatternIsolation() {
   uint8_t* buffers[kCount];
   for (int i = 0; i < kCount; ++i) {
     buffers[i] = static_cast<uint8_t*>(Kmalloc(kSizes[i]));
-    if (buffers[i] == nullptr) {
-      return false;
-    }
+    SELFTEST_EXPECT(buffers[i] != nullptr);
     for (int64_t b = 0; b < kSizes[i]; ++b) {
       const uint8_t pattern = ((i + 1) * 41 + b * 17) ^ 0xA5;
       buffers[i][b] = pattern;
@@ -381,15 +449,11 @@ static bool TestHeapPatternIsolation() {
     for (int j = i + 1; j < kCount; ++j) {
       const uintptr_t start_j = reinterpret_cast<uintptr_t>(buffers[j]);
       const uintptr_t end_j = start_j + kSizes[j];
-      if (start_i < end_j && end_i > start_j) {
-        return false;
-      }
+      SELFTEST_EXPECT(start_i >= end_j || end_i <= start_j);
     }
     for (int64_t b = 0; b < kSizes[i]; ++b) {
       const uint8_t expected = ((i + 1) * 41 + b * 17) ^ 0xA5;
-      if (buffers[i][b] != expected) {
-        return false;
-      }
+      SELFTEST_EXPECT(buffers[i][b] == expected);
     }
   }
 
@@ -409,31 +473,25 @@ static bool TestCppNewDeleteLifecycle() {
   {
     const std::unique_ptr<TestWidget> single =
         std::make_unique<TestWidget>(0x13572468);
-    if (single == nullptr || !single->IsValid() || single->id() != 0x13572468 ||
-        g_widget_ctor_count != 1 || g_widget_dtor_count != 0) {
-      return false;
-    }
+    SELFTEST_EXPECT(single != nullptr);
+    SELFTEST_EXPECT(single->IsValid());
+    SELFTEST_EXPECT(single->id() == 0x13572468);
+    SELFTEST_EXPECT(g_widget_ctor_count == 1);
+    SELFTEST_EXPECT(g_widget_dtor_count == 0);
   }
-  if (g_widget_dtor_count != 1) {
-    return false;
-  }
+  SELFTEST_EXPECT(g_widget_dtor_count == 1);
 
   constexpr int kArrayLen = 12;
   {
     const std::unique_ptr<TestWidget[]> array =
         std::make_unique<TestWidget[]>(kArrayLen);
-    if (array == nullptr || g_widget_ctor_count != (1 + kArrayLen)) {
-      return false;
-    }
+    SELFTEST_EXPECT(array != nullptr);
+    SELFTEST_EXPECT(g_widget_ctor_count == 1 + kArrayLen);
     for (int i = 0; i < kArrayLen; ++i) {
-      if (!array[i].IsValid()) {
-        return false;
-      }
+      SELFTEST_EXPECT(array[i].IsValid());
     }
   }
-  if (g_widget_dtor_count != (1 + kArrayLen)) {
-    return false;
-  }
+  SELFTEST_EXPECT(g_widget_dtor_count == 1 + kArrayLen);
 
   // Verify over-aligned C++17 `operator new(size_t, std::align_val_t)` and
   // `operator new[](size_t, std::align_val_t)` with `alignas(64)` and
@@ -447,25 +505,25 @@ static bool TestCppNewDeleteLifecycle() {
     constexpr int kAlignedArrayLen = 4;
     const std::unique_ptr<CacheLineAlignedWidget[]> aligned64_arr =
         std::make_unique<CacheLineAlignedWidget[]>(kAlignedArrayLen);
-    if (aligned64 == nullptr || aligned256 == nullptr ||
-        aligned64_arr == nullptr ||
-        (reinterpret_cast<uintptr_t>(aligned64.get()) & 63u) != 0 ||
-        (reinterpret_cast<uintptr_t>(aligned256.get()) & 255u) != 0 ||
-        (reinterpret_cast<uintptr_t>(aligned64_arr.get()) & 63u) != 0 ||
-        !aligned64->IsValid() || !aligned256->IsValid() ||
-        g_widget_ctor_count != base_ctor_count + 2 + kAlignedArrayLen) {
-      return false;
-    }
+    SELFTEST_EXPECT(aligned64 != nullptr);
+    SELFTEST_EXPECT(aligned256 != nullptr);
+    SELFTEST_EXPECT(aligned64_arr != nullptr);
+    SELFTEST_EXPECT((reinterpret_cast<uintptr_t>(aligned64.get()) & 63u) == 0);
+    SELFTEST_EXPECT((reinterpret_cast<uintptr_t>(aligned256.get()) & 255u) ==
+                    0);
+    SELFTEST_EXPECT((reinterpret_cast<uintptr_t>(aligned64_arr.get()) & 63u) ==
+                    0);
+    SELFTEST_EXPECT(aligned64->IsValid());
+    SELFTEST_EXPECT(aligned256->IsValid());
+    SELFTEST_EXPECT(g_widget_ctor_count ==
+                    base_ctor_count + 2 + kAlignedArrayLen);
     for (int i = 0; i < kAlignedArrayLen; ++i) {
-      if (!aligned64_arr[i].IsValid() ||
-          (reinterpret_cast<uintptr_t>(&aligned64_arr[i]) & 63u) != 0) {
-        return false;
-      }
+      SELFTEST_EXPECT(aligned64_arr[i].IsValid());
+      SELFTEST_EXPECT((reinterpret_cast<uintptr_t>(&aligned64_arr[i]) & 63u) ==
+                      0);
     }
   }
-  if (g_widget_dtor_count != g_widget_ctor_count) {
-    return false;
-  }
+  SELFTEST_EXPECT(g_widget_dtor_count == g_widget_ctor_count);
 
   // Verify dynamic allocation, pure-virtual and overridden vtable dispatch, and
   // polymorphic deletion through smart pointers (`std::unique_ptr` and
@@ -475,28 +533,24 @@ static bool TestCppNewDeleteLifecycle() {
         std::make_unique<AddDevice>(10, 25);
     const std::shared_ptr<PolymorphicBase> dev1 =
         std::make_shared<XorDevice>(7, 0x0F000F00);
-    if (dev0 == nullptr || dev1 == nullptr ||
-        HeapTotalFreeBytes() >= free_before) {
-      return false;
-    }
+    SELFTEST_EXPECT(dev0 != nullptr);
+    SELFTEST_EXPECT(dev1 != nullptr);
+    SELFTEST_EXPECT(HeapTotalFreeBytes() < free_before);
     std::shared_ptr<PolymorphicBase> dev1_alias = dev1;
-    if (dev1.use_count() != 2 || dev0->Compute(100) != 135 ||
-        dev0->Tag() != 10 ||
-        dev1_alias->Compute(0x00FF00FF) != (0x0FFF0FFF + 7) ||
-        dev1_alias->Tag() != (7 ^ 0x0F000F00)) {
-      return false;
-    }
+    SELFTEST_EXPECT(dev1.use_count() == 2);
+    SELFTEST_EXPECT(dev0->Compute(100) == 135);
+    SELFTEST_EXPECT(dev0->Tag() == 10);
+    SELFTEST_EXPECT(dev1_alias->Compute(0x00FF00FF) == (0x0FFF0FFF + 7));
+    SELFTEST_EXPECT(dev1_alias->Tag() == (7 ^ 0x0F000F00));
     dev1_alias.reset();
-    if (dev1.use_count() != 1 || g_poly_derived_dtor_count != 0) {
-      return false;
-    }
+    SELFTEST_EXPECT(dev1.use_count() == 1);
+    SELFTEST_EXPECT(g_poly_derived_dtor_count == 0);
   }
-  if (g_poly_derived_dtor_count != 2 || g_poly_base_dtor_count != 2) {
-    return false;
-  }
+  SELFTEST_EXPECT(g_poly_derived_dtor_count == 2);
+  SELFTEST_EXPECT(g_poly_base_dtor_count == 2);
 
-  const int64_t free_after = HeapTotalFreeBytes();
-  return free_after == free_before;
+  SELFTEST_EXPECT(HeapTotalFreeBytes() == free_before);
+  return true;
 }
 
 static bool TestHeapStressReuse() {
@@ -512,9 +566,7 @@ static bool TestHeapStressReuse() {
     for (int c = 0; c < kNumChunks; ++c) {
       const int64_t sz = kChunkSizes[c];
       chunks[c] = static_cast<uint8_t*>(Kmalloc(sz));
-      if (chunks[c] == nullptr) {
-        return false;
-      }
+      SELFTEST_EXPECT(chunks[c] != nullptr);
       const uint8_t tag = (iter + c) & 0xFF;
       chunks[c][0] = tag;
       chunks[c][sz / 2] = tag ^ 0x55;
@@ -524,10 +576,9 @@ static bool TestHeapStressReuse() {
     for (int c = 0; c < kNumChunks; ++c) {
       const int64_t sz = kChunkSizes[c];
       const uint8_t tag = (iter + c) & 0xFF;
-      if (chunks[c][0] != tag || chunks[c][sz / 2] != (tag ^ 0x55) ||
-          chunks[c][sz - 1] != (tag ^ 0xAA)) {
-        return false;
-      }
+      SELFTEST_EXPECT(chunks[c][0] == tag);
+      SELFTEST_EXPECT(chunks[c][sz / 2] == (tag ^ 0x55));
+      SELFTEST_EXPECT(chunks[c][sz - 1] == (tag ^ 0xAA));
     }
 
     if ((iter & 1) == 0) {
@@ -541,11 +592,12 @@ static bool TestHeapStressReuse() {
     }
   }
 
-  if (HeapTotalFreeBytes() != free_before ||
-      PmmFreeFrameCount() != pmm_before) {
-    return false;
-  }
+  SELFTEST_EXPECT(HeapTotalFreeBytes() == free_before);
+  SELFTEST_EXPECT(PmmFreeFrameCount() == pmm_before);
 
+  // Two 768 KiB chunks don't fit the initial 1 MiB arena, so the first
+  // iteration expands the heap (permanently); later iterations must reuse
+  // that memory without growing the heap any further.
   constexpr int64_t kLargeChunkSize = 768 * 1024;
   constexpr int kLargeIterations = 16;
   int64_t free_after_first_expand = 0;
@@ -554,9 +606,8 @@ static bool TestHeapStressReuse() {
   for (int iter = 0; iter < kLargeIterations; ++iter) {
     uint8_t* const big1 = static_cast<uint8_t*>(Kmalloc(kLargeChunkSize));
     uint8_t* const big2 = static_cast<uint8_t*>(Kmalloc(kLargeChunkSize));
-    if (big1 == nullptr || big2 == nullptr) {
-      return false;
-    }
+    SELFTEST_EXPECT(big1 != nullptr);
+    SELFTEST_EXPECT(big2 != nullptr);
     const uint8_t s1 = (iter + 0x11) & 0xFF;
     const uint8_t s2 = (iter + 0x77) & 0xFF;
     big1[0] = s1;
@@ -564,10 +615,10 @@ static bool TestHeapStressReuse() {
     big2[0] = s2;
     big2[kLargeChunkSize - 1] = s2 ^ 0xFF;
 
-    if (big1[0] != s1 || big1[kLargeChunkSize - 1] != (s1 ^ 0xFF) ||
-        big2[0] != s2 || big2[kLargeChunkSize - 1] != (s2 ^ 0xFF)) {
-      return false;
-    }
+    SELFTEST_EXPECT(big1[0] == s1);
+    SELFTEST_EXPECT(big1[kLargeChunkSize - 1] == (s1 ^ 0xFF));
+    SELFTEST_EXPECT(big2[0] == s2);
+    SELFTEST_EXPECT(big2[kLargeChunkSize - 1] == (s2 ^ 0xFF));
 
     Kfree(big1);
     Kfree(big2);
@@ -575,13 +626,14 @@ static bool TestHeapStressReuse() {
     if (iter == 0) {
       free_after_first_expand = HeapTotalFreeBytes();
       pmm_after_first_expand = PmmFreeFrameCount();
-    } else if (HeapTotalFreeBytes() != free_after_first_expand ||
-               PmmFreeFrameCount() != pmm_after_first_expand) {
-      return false;
+    } else {
+      SELFTEST_EXPECT(HeapTotalFreeBytes() == free_after_first_expand);
+      SELFTEST_EXPECT(PmmFreeFrameCount() == pmm_after_first_expand);
     }
   }
 
-  return free_after_first_expand >= free_before;
+  SELFTEST_EXPECT(free_after_first_expand >= free_before);
+  return true;
 }
 
 struct KernelRbAugNode {
@@ -595,28 +647,20 @@ struct KernelRbAugNode {
 };
 
 struct KernelRbAugTraits {
-  static RbNode* GetNode(KernelRbAugNode& item) { return &item.hook; }
-  static const RbNode* GetNode(const KernelRbAugNode& item) {
-    return &item.hook;
-  }
   static uintptr_t GetKey(const KernelRbAugNode& item) {
     return reinterpret_cast<uintptr_t>(&item);
   }
-  static bool UpdateAugment(KernelRbAugNode& item,
+  static void UpdateAugment(KernelRbAugNode* const item,
                             const KernelRbAugNode* const left,
                             const KernelRbAugNode* const right) {
-    int64_t max_val = item.span;
+    int64_t max_val = item->span;
     if (left != nullptr && left->max_subtree_span > max_val) {
       max_val = left->max_subtree_span;
     }
     if (right != nullptr && right->max_subtree_span > max_val) {
       max_val = right->max_subtree_span;
     }
-    if (item.max_subtree_span == max_val) {
-      return false;
-    }
-    item.max_subtree_span = max_val;
-    return true;
+    item->max_subtree_span = max_val;
   }
 };
 
@@ -628,6 +672,8 @@ static bool TestRbTreeEdgeCases() {
     KernelRbAugNode uninserted{32};
   } group;
 
+  // Keys are node addresses, so n0 < n1 < n2: the tree is n1 with children n0
+  // (left) and n2 (right).
   RbTree<KernelRbAugNode, &KernelRbAugNode::hook, KernelRbAugTraits> tree;
   tree.Insert(group.n0);
   tree.Insert(group.n1);
@@ -635,10 +681,10 @@ static bool TestRbTreeEdgeCases() {
 
   // Erasing an uninserted node must not corrupt root() or existing nodes.
   tree.Erase(group.uninserted);
-  if (tree.root() == nullptr) {
-    return false;
-  }
+  SELFTEST_EXPECT(tree.root() != nullptr);
 
+  // The first node with span >= 12 is n2: the search has to skip n0's subtree
+  // (max_subtree_span 4) and the root n1 (span 8) and descend to the right.
   const auto& const_tree = tree;
   bool saw_foreign_address = false;
   const KernelRbAugNode* const match16 = const_tree.FindFirstAugmented(
@@ -654,12 +700,12 @@ static bool TestRbTreeEdgeCases() {
         }
         return node.span >= 12;
       });
-  if (saw_foreign_address || match16 != &group.n2) {
-    return false;
-  }
+  SELFTEST_EXPECT(!saw_foreign_address);
+  SELFTEST_EXPECT(match16 == &group.n2);
 
-  // Erasing n1 twice must leave n0 and n2 intact, and right-subtree augmented
-  // search from root n0 (span=4, max_subtree_span=16) must return &group.n2.
+  // Erasing n1 twice must leave n0 and n2 intact. n2 replaces n1 as the root
+  // (with n0 as its left child), and the search must still find it there with
+  // the augmented values updated by the erase.
   tree.Erase(group.n1);
   tree.Erase(group.n1);
   const KernelRbAugNode* const match_after_erase =
@@ -676,13 +722,13 @@ static bool TestRbTreeEdgeCases() {
             }
             return node.span >= 12;
           });
-  if (saw_foreign_address || match_after_erase != &group.n2) {
-    return false;
-  }
+  SELFTEST_EXPECT(!saw_foreign_address);
+  SELFTEST_EXPECT(match_after_erase == &group.n2);
 
   tree.Erase(group.n0);
   tree.Erase(group.n2);
-  return tree.root() == nullptr;
+  SELFTEST_EXPECT(tree.root() == nullptr);
+  return true;
 }
 
 static void ResetTestMemoryMap(MultibootMemoryMap* const map) {
@@ -704,47 +750,47 @@ static void ResetTestMemoryMap(MultibootMemoryMap* const map) {
 
 static bool TestMultibootMmapEdgeCases() {
   const std::unique_ptr<MultibootMemoryMap> map(
-      static_cast<MultibootMemoryMap*>(operator new(
-          sizeof(MultibootMemoryMap))));
-  if (map == nullptr) {
-    return false;
-  }
+      static_cast<MultibootMemoryMap*>(operator new(sizeof(MultibootMemoryMap),
+                                                    std::nothrow)));
+  SELFTEST_EXPECT(map != nullptr);
   ResetTestMemoryMap(map.get());
 
   constexpr uint64_t kHugeLen = static_cast<uint64_t>(INT64_MAX) + 4096ULL;
-  if (!MultibootRecordMmapEntry(map.get(),  //
-                                0x100000,   //
-                                kHugeLen,   //
-                                kMemoryTypeAvailable) ||
-      map->usable_ram_bytes != INT64_MAX || map->total_ram_bytes != INT64_MAX) {
-    return false;
-  }
-  if (!MultibootRecordMmapEntry(map.get(), 0x200000, kHugeLen, 2) ||
-      map->reserved_ram_bytes != INT64_MAX ||
-      map->total_ram_bytes != INT64_MAX) {
-    return false;
-  }
+  SELFTEST_EXPECT(MultibootRecordMmapEntry(map.get(),  //
+                                           0x100000,   //
+                                           kHugeLen,   //
+                                           kMemoryTypeAvailable));
+  SELFTEST_EXPECT(map->usable_ram_bytes == INT64_MAX);
+  SELFTEST_EXPECT(map->total_ram_bytes == INT64_MAX);
+  // Type 3 (ACPI reclaimable) is reserved RAM; type 2 is reserved address
+  // space that does not count as RAM at all.
+  SELFTEST_EXPECT(MultibootRecordMmapEntry(map.get(), 0x200000, kHugeLen, 3));
+  SELFTEST_EXPECT(map->reserved_ram_bytes == INT64_MAX);
+  SELFTEST_EXPECT(map->total_ram_bytes == INT64_MAX);
+  ResetTestMemoryMap(map.get());
+  SELFTEST_EXPECT(
+      MultibootRecordMmapEntry(map.get(), 0xFD00000000, 3ULL << 32, 2));
+  SELFTEST_EXPECT(map->total_ram_bytes == 0);
+  SELFTEST_EXPECT(map->reserved_ram_bytes == 0);
+  SELFTEST_EXPECT(map->usable_ram_bytes == 0);
 
   ResetTestMemoryMap(map.get());
-  if (!MultibootRecordMmapEntry(map.get(),  //
-                                0x200000,   //
-                                kPageSize,  //
-                                kMemoryTypeAvailable) ||
-      !MultibootRecordMmapEntry(map.get(),  //
-                                0x202000,   //
-                                kPageSize,  //
-                                kMemoryTypeAvailable) ||
-      map->region_count != 2) {
-    return false;
-  }
-  if (!MultibootRecordMmapEntry(map.get(),  //
-                                0x201000,   //
-                                kPageSize,  //
-                                kMemoryTypeAvailable) ||
-      map->region_count != 1 || map->regions[0].base != 0x200000 ||
-      map->regions[0].length != 3 * kPageSize) {
-    return false;
-  }
+  SELFTEST_EXPECT(MultibootRecordMmapEntry(map.get(),  //
+                                           0x200000,   //
+                                           kPageSize,  //
+                                           kMemoryTypeAvailable));
+  SELFTEST_EXPECT(MultibootRecordMmapEntry(map.get(),  //
+                                           0x202000,   //
+                                           kPageSize,  //
+                                           kMemoryTypeAvailable));
+  SELFTEST_EXPECT(map->region_count == 2);
+  SELFTEST_EXPECT(MultibootRecordMmapEntry(map.get(),  //
+                                           0x201000,   //
+                                           kPageSize,  //
+                                           kMemoryTypeAvailable));
+  SELFTEST_EXPECT(map->region_count == 1);
+  SELFTEST_EXPECT(map->regions[0].base == 0x200000);
+  SELFTEST_EXPECT(map->regions[0].length == 3 * kPageSize);
 
   struct [[gnu::packed]] SyntheticMb2FbBuffer {
     uint32_t total_size;
@@ -791,45 +837,47 @@ static bool TestMultibootMmapEdgeCases() {
 
   const uintptr_t fb_buf_addr = reinterpret_cast<uintptr_t>(&fb_buf);
   constexpr uint32_t kOverInt32Max = static_cast<uint32_t>(INT32_MAX) + 1u;
-  if (!MultibootParseMemoryMapFromBuffer(kMultiboot2Magic,              //
-                                         fb_buf_addr,                   //
-                                         kMaxCanonicalIdentityAddress,  //
-                                         map.get()) ||
-      map->fb_addr != 0) {
-    return false;
-  }
+  const auto parse_fb_buf = [&]() {
+    return MultibootParseMemoryMapQuiet(kMultiboot2Magic,              //
+                                        fb_buf_addr,                   //
+                                        kMaxCanonicalIdentityAddress,  //
+                                        map.get());
+  };
+  SELFTEST_EXPECT(parse_fb_buf());
+  SELFTEST_EXPECT(map->fb_addr == 0);
   fb_buf.fb_pitch = kOverInt32Max;
-  if (!MultibootParseMemoryMapFromBuffer(kMultiboot2Magic,              //
-                                         fb_buf_addr,                   //
-                                         kMaxCanonicalIdentityAddress,  //
-                                         map.get()) ||
-      map->fb_addr != 0) {
-    return false;
-  }
+  SELFTEST_EXPECT(parse_fb_buf());
+  SELFTEST_EXPECT(map->fb_addr == 0);
   fb_buf.fb_pitch = 640 * 4;
   fb_buf.fb_width = 0;
-  if (!MultibootParseMemoryMapFromBuffer(kMultiboot2Magic,              //
-                                         fb_buf_addr,                   //
-                                         kMaxCanonicalIdentityAddress,  //
-                                         map.get()) ||
-      map->fb_addr != 0) {
-    return false;
-  }
+  SELFTEST_EXPECT(parse_fb_buf());
+  SELFTEST_EXPECT(map->fb_addr == 0);
 
-  // Verify VgaInitFramebuffer rejects pitch < width * (bpp / 8) and zero
-  // dimensions without overwriting the active console or writing to the buffer.
-  const uintptr_t scratch_fb = PmmAllocFrame();
-  if (scratch_fb == 0) {
-    return false;
-  }
+  // VgaInitFramebuffer must reject a pitch below width * (bpp / 8) and a zero
+  // width without writing to the buffer. The buffer is as large as the
+  // framebuffer it describes, and it is leaked instead of freed if
+  // VgaInitFramebuffer accepts it, because the console then draws into it.
+  constexpr int kFbWidth = 640;
+  constexpr int kFbHeight = 400;
+  constexpr int kFbPitch = kFbWidth * 4;
+  constexpr int64_t kFbFrames =
+      (static_cast<int64_t>(kFbPitch) * kFbHeight + kPageSize - 1) / kPageSize;
+  constexpr uint64_t kCanary = 0xDEADBEEFCAFEBABEULL;
+  const uintptr_t scratch_fb = PmmAllocFrames(kFbFrames);
+  SELFTEST_EXPECT(scratch_fb != 0);
   volatile uint64_t* const scratch_words =
       reinterpret_cast<volatile uint64_t*>(scratch_fb);
-  scratch_words[0] = 0xDEADBEEFCAFEBABEULL;
-  VgaInitFramebuffer(scratch_fb, 640 * 4 - 4, 640, 400, 32);
-  VgaInitFramebuffer(scratch_fb, 640 * 4, 0, 400, 32);
-  const bool scratch_untouched = (scratch_words[0] == 0xDEADBEEFCAFEBABEULL);
-  PmmFreeFrame(scratch_fb);
-  return scratch_untouched;
+  const int64_t last_word = kFbFrames * kPageSize / 8 - 1;
+  scratch_words[0] = kCanary;
+  scratch_words[last_word] = kCanary;
+  SELFTEST_EXPECT(
+      !VgaInitFramebuffer(scratch_fb, kFbPitch - 4, kFbWidth, kFbHeight, 32));
+  SELFTEST_EXPECT(!VgaInitFramebuffer(scratch_fb, kFbPitch, 0, kFbHeight, 32));
+  const bool scratch_untouched =
+      scratch_words[0] == kCanary && scratch_words[last_word] == kCanary;
+  PmmFreeFrames(scratch_fb, kFbFrames);
+  SELFTEST_EXPECT(scratch_untouched);
+  return true;
 }
 
 static bool TestEdgeCasesAndOom() {
@@ -842,56 +890,127 @@ static bool TestEdgeCasesAndOom() {
   delete[] null_array;
 
   void* const zero_alloc = Kmalloc(0);
-  if (zero_alloc == nullptr ||
-      (reinterpret_cast<uintptr_t>(zero_alloc) & (kHeapAlignment - 1)) != 0) {
-    return false;
-  }
+  SELFTEST_EXPECT(zero_alloc != nullptr);
+  SELFTEST_EXPECT(
+      (reinterpret_cast<uintptr_t>(zero_alloc) & (kHeapAlignment - 1)) == 0);
   Kfree(zero_alloc);
 
+  // Requests the heap cannot satisfy make `Kmalloc`, `KmallocAligned` and the
+  // `std::nothrow` forms of `operator new` return nullptr. (The throwing forms
+  // would panic instead.)
   const uintptr_t max_phys = PmmMaxPhysicalAddress();
   void* const oom1 = Kmalloc(INT64_MAX);
   void* const oom2 = Kmalloc(max_phys);
-  void* oom3 = operator new(max_phys);
+  void* oom3 = operator new(max_phys, std::nothrow);
   asm volatile("" : "+r"(oom3));
+  void* oom4 = operator new[](max_phys, std::nothrow);
+  asm volatile("" : "+r"(oom4));
   void* const bad_align1 = KmallocAligned(64, 0);
   void* const bad_align2 = KmallocAligned(64, 24);
   void* const bad_align3 = KmallocAligned(64, kPageSize * 2);
-  void* bad_align4 = operator new(64,
-                                  static_cast<std::align_val_t>(kPageSize * 2));
+  void* bad_align4 = operator new(
+      64, static_cast<std::align_val_t>(kPageSize * 2), std::nothrow);
   asm volatile("" : "+r"(bad_align4));
-  if (oom1 != nullptr || oom2 != nullptr || oom3 != nullptr ||
-      bad_align1 != nullptr || bad_align2 != nullptr || bad_align3 != nullptr ||
-      bad_align4 != nullptr) {
-    return false;
-  }
+  SELFTEST_EXPECT(oom1 == nullptr);
+  SELFTEST_EXPECT(oom2 == nullptr);
+  SELFTEST_EXPECT(oom3 == nullptr);
+  SELFTEST_EXPECT(oom4 == nullptr);
+  SELFTEST_EXPECT(bad_align1 == nullptr);
+  SELFTEST_EXPECT(bad_align2 == nullptr);
+  SELFTEST_EXPECT(bad_align3 == nullptr);
+  SELFTEST_EXPECT(bad_align4 == nullptr);
+
+  // Satisfiable `std::nothrow` requests behave like the throwing forms.
+  int* const nothrow_int = new (std::nothrow) int(42);
+  CacheLineAlignedWidget* const nothrow_aligned =
+      new (std::nothrow) CacheLineAlignedWidget(0x5EED);
+  SELFTEST_EXPECT(nothrow_int != nullptr && *nothrow_int == 42);
+  SELFTEST_EXPECT(nothrow_aligned != nullptr && nothrow_aligned->IsValid());
+  SELFTEST_EXPECT((reinterpret_cast<uintptr_t>(nothrow_aligned) & 63u) == 0);
+  delete nothrow_int;
+  delete nothrow_aligned;
 
   void* const recovery = Kmalloc(128);
-  if (recovery == nullptr) {
-    return false;
-  }
+  SELFTEST_EXPECT(recovery != nullptr);
   Kfree(recovery);
 
-#ifdef NDEBUG
-  if (PmmAllocFrames(0) != 0 || PmmAllocFrames(-1) != 0) {
-    return false;
-  }
-#endif
+  SELFTEST_EXPECT(HeapTotalFreeBytes() == free_before);
+  return true;
+}
 
-  // Verify PagingMarkPageUncacheable rejects physical page 0 (both base 0 and
-  // non-zero offsets such as 0x400 and kPageSize - 1) and non-canonical
-  // addresses without splitting huge pages or allocating page tables.
-  if (PagingMarkPageUncacheable(0) || PagingMarkPageUncacheable(0x400) ||
-      PagingMarkPageUncacheable(kPageSize - 1) ||
-      PagingMarkPageUncacheable(kMaxCanonicalIdentityAddress)) {
-    return false;
+// Verifies that PagingMarkPageUncacheable rejects physical page 0 (at offsets
+// 0, 0x400, and kPageSize - 1) and non-canonical addresses without allocating
+// page tables.
+static bool TestPagingEdgeCases() {
+  const int64_t pmm_free_before = PmmFreeFrameCount();
+  SELFTEST_EXPECT(!PagingMarkPageUncacheable(0));
+  SELFTEST_EXPECT(!PagingMarkPageUncacheable(0x400));
+  SELFTEST_EXPECT(!PagingMarkPageUncacheable(kPageSize - 1));
+  SELFTEST_EXPECT(!PagingMarkPageUncacheable(kMaxCanonicalIdentityAddress));
+  SELFTEST_EXPECT(PmmFreeFrameCount() == pmm_free_before);
+  return true;
+}
+
+// Exhausts physical memory for real, unlike edge_cases_and_oom, whose oversized
+// requests the PMM and heap reject up front: allocates runs of 4096, 512, 64,
+// 8, and finally single frames until the PMM runs out of each size, chaining
+// the runs through their first two words (next run, frame count). While memory
+// is exhausted, PMM requests and a heap allocation that needs HeapExpand()
+// must fail cleanly and small heap allocations must still be served from the
+// existing arena; afterwards every frame must be back and allocatable. Runs
+// before the SMP tests, while nothing else allocates memory.
+static bool TestPmmAndHeapExhaustion() {
+  const int64_t pmm_free_before = PmmFreeFrameCount();
+  const int64_t heap_free_before = HeapTotalFreeBytes();
+
+  uintptr_t chain = 0;
+  int64_t held_frames = 0;
+  for (int64_t run_frames = 4096; run_frames >= 1; run_frames /= 8) {
+    for (uintptr_t run = PmmAllocFrames(run_frames); run != 0;
+         run = PmmAllocFrames(run_frames)) {
+      volatile uintptr_t* const header =
+          reinterpret_cast<volatile uintptr_t*>(run);
+      header[0] = chain;
+      header[1] = static_cast<uintptr_t>(run_frames);
+      chain = run;
+      held_frames += run_frames;
+    }
+  }
+  const int64_t free_when_exhausted = PmmFreeFrameCount();
+  const uintptr_t extra_frame = PmmAllocFrame();
+  const uintptr_t extra_run = PmmAllocFrames(2);
+  void* const needs_expansion = Kmalloc(heap_free_before + kPageSize);
+  void* const fits_arena = Kmalloc(64);
+
+  Kfree(fits_arena);
+  Kfree(needs_expansion);
+  if (extra_frame != 0) {
+    PmmFreeFrame(extra_frame);
+  }
+  if (extra_run != 0) {
+    PmmFreeFrames(extra_run, 2);
+  }
+  while (chain != 0) {
+    const volatile uintptr_t* const header =
+        reinterpret_cast<const volatile uintptr_t*>(chain);
+    const uintptr_t next = header[0];
+    PmmFreeFrames(chain, static_cast<int64_t>(header[1]));
+    chain = next;
   }
 
-  if (!TestRbTreeEdgeCases() || !TestMultibootMmapEdgeCases()) {
-    return false;
-  }
+  SELFTEST_EXPECT(held_frames == pmm_free_before);
+  SELFTEST_EXPECT(free_when_exhausted == 0);
+  SELFTEST_EXPECT(extra_frame == 0);
+  SELFTEST_EXPECT(extra_run == 0);
+  SELFTEST_EXPECT(needs_expansion == nullptr);
+  SELFTEST_EXPECT(fits_arena != nullptr);
+  SELFTEST_EXPECT(PmmFreeFrameCount() == pmm_free_before);
+  SELFTEST_EXPECT(HeapTotalFreeBytes() == heap_free_before);
 
-  const int64_t free_after = HeapTotalFreeBytes();
-  return free_after == free_before;
+  const uintptr_t recovered = PmmAllocFrame();
+  SELFTEST_EXPECT(recovered != 0);
+  PmmFreeFrame(recovered);
+  return true;
 }
 
 struct SmpAllCpuStartupVerifyContext {
@@ -922,6 +1041,17 @@ static uint64_t ReadEferForSmpVerify() {
   return (static_cast<uint64_t>(high) << 32) | low;
 }
 
+// Returns true if CPUID reports no-execute page support (leaf 0x80000001, EDX
+// bit 20). boot.S sets EFER.NXE exactly on such CPUs.
+static bool CpuSupportsNxForSmpVerify() {
+  uint32_t eax = 0x80000001u;
+  uint32_t ebx = 0;
+  uint32_t ecx = 0;
+  uint32_t edx = 0;
+  asm volatile("cpuid" : "+a"(eax), "=b"(ebx), "+c"(ecx), "=d"(edx));
+  return (edx & (1u << 20)) != 0;
+}
+
 static void SmpAllCpuStartupVerifyWorker(const int cpu_index,
                                          void* const raw_ctx) {
   SmpAllCpuStartupVerifyContext* const ctx =
@@ -942,7 +1072,8 @@ static void SmpAllCpuStartupVerifyWorker(const int cpu_index,
       local != SmpGetCpuLocal(cpu_index) || local->self != local ||
       ReadGsBaseMsrForSmpVerify() != reinterpret_cast<uintptr_t>(local) ||
       (ReadCr0ForSmpVerify() & kCr0WriteProtect) == 0 ||
-      (ReadEferForSmpVerify() & kEferNoExecuteEnable) == 0 ||
+      ((ReadEferForSmpVerify() & kEferNoExecuteEnable) != 0) !=
+          CpuSupportsNxForSmpVerify() ||
       CurrentCpuId() != cpu_index || local->cpu_id != cpu_index ||
       local->apic_id != info->apic_id || info->apic_id == kInvalidX2ApicId) {
     ctx->failed.store(true, std::memory_order_release);
@@ -960,88 +1091,81 @@ static void SmpAllCpuStartupVerifyWorker(const int cpu_index,
 
 static bool VerifySmpAllCpuStartupAndGsBase() {
   const int cpu_count = SmpCpuCount();
-  if (cpu_count < 1 || cpu_count > kMaxSupportedCpus ||
-      SmpOnlineCpuCount() != cpu_count) {
-    return false;
-  }
+  SELFTEST_EXPECT(cpu_count >= 1 && cpu_count <= kMaxSupportedCpus);
+  SELFTEST_EXPECT(SmpOnlineCpuCount() == cpu_count);
 
   SmpAllCpuStartupVerifyContext ctx = {};
   ctx.cpu_count = cpu_count;
   SmpRunOnAllCpus(SmpAllCpuStartupVerifyWorker, &ctx);
-  if (ctx.failed.load(std::memory_order_acquire)) {
-    return false;
-  }
+  SELFTEST_EXPECT(!ctx.failed.load(std::memory_order_acquire));
 
-  const uint64_t expected_low =
-      (cpu_count >= 64) ? ~0ULL
-                        : ((1ULL << static_cast<uint32_t>(cpu_count)) - 1ULL);
-  const uint64_t expected_high =
-      (cpu_count <= 64) ? 0ULL
-      : (cpu_count >= 128)
-          ? ~0ULL
-          : ((1ULL << static_cast<uint32_t>(cpu_count - 64)) - 1ULL);
-  return ctx.mask_low.load(std::memory_order_acquire) == expected_low &&
-         ctx.mask_high.load(std::memory_order_acquire) == expected_high;
+  const CpuMask128 expected = CpuMask128::FirstCpus(cpu_count);
+  SELFTEST_EXPECT(ctx.mask_low.load(std::memory_order_acquire) == expected.low);
+  SELFTEST_EXPECT(ctx.mask_high.load(std::memory_order_acquire) ==
+                  expected.high);
+  return true;
 }
 
 static bool TestSmpDiscoveryAndApBringup() {
   const int cpu_count = SmpCpuCount();
   const int online_count = SmpOnlineCpuCount();
   const uintptr_t lapic_phys = SmpLocalApicPhysAddr();
-  if (cpu_count < 1 || cpu_count > kMaxSupportedCpus ||
-      online_count != cpu_count) {
-    return false;
-  }
+  SELFTEST_EXPECT(cpu_count >= 1 && cpu_count <= kMaxSupportedCpus);
+  SELFTEST_EXPECT(online_count == cpu_count);
   if (!SmpIsX2ApicEnabled()) {
-    if (lapic_phys == 0) {
-      return false;
-    }
+    SELFTEST_EXPECT(lapic_phys != 0);
     const uintptr_t lapic_neighbor_phys =
         (lapic_phys & ~(static_cast<uintptr_t>(kHugePageSize) - 1)) + kPageSize;
-    if (!PagingIsIdentityMapped(lapic_phys) ||
-        !PagingIsIdentityMapped(lapic_neighbor_phys) ||
-        !PagingEnsureIdentityMappedRange(lapic_phys, kPageSize) ||
-        !PagingEnsureIdentityMappedRange(lapic_neighbor_phys, kPageSize) ||
-        !PagingIsIdentityMapped(lapic_phys) ||
-        !PagingIsIdentityMapped(lapic_neighbor_phys)) {
-      return false;
-    }
+    SELFTEST_EXPECT(PagingIsIdentityMapped(lapic_phys));
+    SELFTEST_EXPECT(PagingIsIdentityMapped(lapic_neighbor_phys));
+    SELFTEST_EXPECT(PagingEnsureIdentityMappedRange(lapic_phys, kPageSize));
+    SELFTEST_EXPECT(
+        PagingEnsureIdentityMappedRange(lapic_neighbor_phys, kPageSize));
+    SELFTEST_EXPECT(PagingIsIdentityMapped(lapic_phys));
+    SELFTEST_EXPECT(PagingIsIdentityMapped(lapic_neighbor_phys));
   }
 
   const CpuInfo* const bsp = SmpGetCpuInfo(0);
-  if (bsp == nullptr || !bsp->is_bsp || !bsp->online ||
-      !bsp->long_mode_active || bsp->apic_id == kInvalidX2ApicId ||
-      bsp->observed_apic_id != bsp->apic_id || bsp->stack_base == 0 ||
-      bsp->stack_top <= bsp->stack_base || (bsp->stack_top & 0xF) != 0 ||
-      bsp->observed_rsp <= bsp->stack_base ||
-      bsp->observed_rsp > bsp->stack_top || bsp->observed_cr3 == 0) {
-    return false;
-  }
+  SELFTEST_EXPECT(bsp != nullptr);
+  SELFTEST_EXPECT(bsp->is_bsp);
+  SELFTEST_EXPECT(bsp->online);
+  SELFTEST_EXPECT(bsp->long_mode_active);
+  SELFTEST_EXPECT(bsp->apic_id != kInvalidX2ApicId);
+  SELFTEST_EXPECT(bsp->observed_apic_id == bsp->apic_id);
+  SELFTEST_EXPECT(bsp->stack_base != 0);
+  SELFTEST_EXPECT(bsp->stack_top > bsp->stack_base);
+  SELFTEST_EXPECT((bsp->stack_top & 0xF) == 0);
+  SELFTEST_EXPECT(bsp->observed_rsp > bsp->stack_base);
+  SELFTEST_EXPECT(bsp->observed_rsp <= bsp->stack_top);
+  SELFTEST_EXPECT(bsp->observed_cr3 != 0);
 
   for (int i = 1; i < cpu_count; ++i) {
     const CpuInfo* const ap = SmpGetCpuInfo(i);
-    if (ap == nullptr || ap->is_bsp || !ap->online || !ap->long_mode_active ||
-        ap->apic_id == kInvalidX2ApicId ||
-        ap->observed_apic_id != ap->apic_id || ap->stack_base == 0 ||
-        ap->stack_top != ap->stack_base + kApStackSize ||
-        (ap->stack_top & 0xF) != 0 || ap->observed_rsp <= ap->stack_base ||
-        ap->observed_rsp > ap->stack_top ||
-        ap->observed_cr3 != bsp->observed_cr3 ||
-        !PmmRangeIsValidUsableRam(ap->stack_base, kApStackSize)) {
-      return false;
-    }
+    SELFTEST_EXPECT(ap != nullptr);
+    SELFTEST_EXPECT(!ap->is_bsp);
+    SELFTEST_EXPECT(ap->online);
+    SELFTEST_EXPECT(ap->long_mode_active);
+    SELFTEST_EXPECT(ap->apic_id != kInvalidX2ApicId);
+    SELFTEST_EXPECT(ap->observed_apic_id == ap->apic_id);
+    SELFTEST_EXPECT(ap->stack_base != 0);
+    SELFTEST_EXPECT(ap->stack_top == ap->stack_base + kApStackSize);
+    SELFTEST_EXPECT((ap->stack_top & 0xF) == 0);
+    SELFTEST_EXPECT(ap->observed_rsp > ap->stack_base);
+    SELFTEST_EXPECT(ap->observed_rsp <= ap->stack_top);
+    SELFTEST_EXPECT(ap->observed_cr3 == bsp->observed_cr3);
+    SELFTEST_EXPECT(PmmRangeIsValidUsableRam(ap->stack_base, kApStackSize));
 
     for (int j = 0; j < i; ++j) {
       const CpuInfo* const other = SmpGetCpuInfo(j);
-      if (other == nullptr || ap->apic_id == other->apic_id ||
-          (ap->stack_base < other->stack_top &&
-           ap->stack_top > other->stack_base)) {
-        return false;
-      }
+      SELFTEST_EXPECT(other != nullptr);
+      SELFTEST_EXPECT(ap->apic_id != other->apic_id);
+      SELFTEST_EXPECT(ap->stack_base >= other->stack_top ||
+                      ap->stack_top <= other->stack_base);
     }
   }
 
-  return VerifySmpAllCpuStartupAndGsBase();
+  SELFTEST_EXPECT(VerifySmpAllCpuStartupAndGsBase());
+  return true;
 }
 
 struct ConcurrentHeapItem {
@@ -1113,10 +1237,9 @@ static void MultiCpuStressWorker(const int cpu_index, void* const raw_context) {
     //    IrqSpinLock.
     {
       const IrqSpinLockGuard guard(ctx->counter_lock);
-      if (AreInterruptsEnabled() || !ctx->counter_lock.IsLockedByCurrentCpu() ||
-          (ctx->invariant_a + ctx->invariant_b) != 0) {
-        ok = false;
-      }
+      ok = SELFTEST_OK(!AreInterruptsEnabled()) && ok;
+      ok = SELFTEST_OK(ctx->counter_lock.IsLockedByCurrentCpu()) && ok;
+      ok = SELFTEST_OK(ctx->invariant_a + ctx->invariant_b == 0) && ok;
       const int64_t delta = (cpu_index + 1) * 17 + iter;
       ctx->invariant_a += delta;
       ++ctx->shared_counter;
@@ -1127,12 +1250,15 @@ static void MultiCpuStressWorker(const int cpu_index, void* const raw_context) {
     //    verification.
     const ScopedPmmFrames frame_single(PmmAllocFrame(), 1);
     const ScopedPmmFrames frame_pair(PmmAllocFrames(2), 2);
-    if (frame_single.get() == 0 || frame_pair.get() == 0 ||
-        frame_single.get() == frame_pair.get() ||
-        (frame_single.get() & (kPageSize - 1)) != 0 ||
-        (frame_pair.get() & (kPageSize - 1)) != 0 ||
-        !PmmRangeIsValidUsableRam(frame_single.get(), kPageSize) ||
-        !PmmRangeIsValidUsableRam(frame_pair.get(), 2 * kPageSize)) {
+    const bool frames_ok =
+        SELFTEST_OK(frame_single.get() != 0) &&
+        SELFTEST_OK(frame_pair.get() != 0) &&
+        SELFTEST_OK(frame_single.get() != frame_pair.get()) &&
+        SELFTEST_OK((frame_single.get() & (kPageSize - 1)) == 0) &&
+        SELFTEST_OK((frame_pair.get() & (kPageSize - 1)) == 0) &&
+        SELFTEST_OK(PmmRangeIsValidUsableRam(frame_single.get(), kPageSize)) &&
+        SELFTEST_OK(PmmRangeIsValidUsableRam(frame_pair.get(), 2 * kPageSize));
+    if (!frames_ok) {
       ok = false;
       break;
     }
@@ -1168,12 +1294,15 @@ static void MultiCpuStressWorker(const int cpu_index, void* const raw_context) {
     const std::unique_ptr<uint64_t[]> heap_array =
         std::make_unique<uint64_t[]>(kArrayWords);
 
-    if (buf_a == nullptr || buf_b == nullptr || heap_item == nullptr ||
-        heap_array == nullptr ||
-        (reinterpret_cast<uintptr_t>(buf_a.get()) & (kHeapAlignment - 1)) !=
-            0 ||
-        (reinterpret_cast<uintptr_t>(buf_b.get()) & (kHeapAlignment - 1)) !=
-            0) {
+    const bool heap_ok = SELFTEST_OK(buf_a != nullptr) &&
+                         SELFTEST_OK(buf_b != nullptr) &&
+                         SELFTEST_OK(heap_item != nullptr) &&
+                         SELFTEST_OK(heap_array != nullptr) &&
+                         SELFTEST_OK((reinterpret_cast<uintptr_t>(buf_a.get()) &
+                                      (kHeapAlignment - 1)) == 0) &&
+                         SELFTEST_OK((reinterpret_cast<uintptr_t>(buf_b.get()) &
+                                      (kHeapAlignment - 1)) == 0);
+    if (!heap_ok) {
       ok = false;
       break;
     }
@@ -1195,70 +1324,65 @@ static void MultiCpuStressWorker(const int cpu_index, void* const raw_context) {
     // and Heap allocations so allocations across CPUs overlap in time.
     {
       const IrqSpinLockGuard guard(ctx->counter_lock);
-      if ((ctx->invariant_a + ctx->invariant_b) != 0) {
-        ok = false;
-      }
+      ok = SELFTEST_OK(ctx->invariant_a + ctx->invariant_b == 0) && ok;
       const int64_t delta = (cpu_index + 3) * 31 + iter;
       ctx->invariant_a -= delta;
       ++ctx->shared_counter;
       ctx->invariant_b += delta;
     }
 
-    if (f1_words[0] != frame_pat1 ||
-        f1_words[kPageSize / sizeof(uint64_t) - 1] != ~frame_pat1 ||
-        f2_first[0] != frame_pat2 ||
-        f2_second[kPageSize / sizeof(uint64_t) - 1] != ~frame_pat2 ||
-        !heap_item->IsValid(item_seed)) {
-      ok = false;
-    }
+    ok = SELFTEST_OK(f1_words[0] == frame_pat1) && ok;
+    ok = SELFTEST_OK(f1_words[kPageSize / sizeof(uint64_t) - 1] ==
+                     ~frame_pat1) &&
+         ok;
+    ok = SELFTEST_OK(f2_first[0] == frame_pat2) && ok;
+    ok = SELFTEST_OK(f2_second[kPageSize / sizeof(uint64_t) - 1] ==
+                     ~frame_pat2) &&
+         ok;
+    ok = SELFTEST_OK(heap_item->IsValid(item_seed)) && ok;
     for (int64_t i = 0; i < size_a; ++i) {
-      if (buf_a[i] != static_cast<uint8_t>(byte_a + (i & 0xF))) {
+      if (!SELFTEST_OK(buf_a[i] == static_cast<uint8_t>(byte_a + (i & 0xF)))) {
         ok = false;
         break;
       }
     }
     for (int64_t i = 0; i < size_b; ++i) {
-      if (buf_b[i] != static_cast<uint8_t>(byte_b ^ (i & 0xF))) {
+      if (!SELFTEST_OK(buf_b[i] == static_cast<uint8_t>(byte_b ^ (i & 0xF)))) {
         ok = false;
         break;
       }
     }
     for (int i = 0; i < kArrayWords; ++i) {
-      if (heap_array[i] != item_seed + i) {
+      if (!SELFTEST_OK(heap_array[i] == item_seed + i)) {
         ok = false;
         break;
       }
     }
 
-    // 4. Concurrent UART and VGA console logging on first and last iterations.
-    //    Exercise VgaWrite, VgaPutChar, VgaWriteDec, and VgaWriteHex across
-    //    all online CPUs while keeping cursor on the current line with '\r' so
-    //    it never wraps past 80 columns on high-core-count machines and Row 0
-    //    ("Hello, x86-64 Kernel World!") at 0xB8000 is never scrolled off
-    //    screen.
+    // 4. Concurrent UART and VGA console logging on the first and last
+    //    iterations. Exercises VgaWrite, VgaPutc, VgaWriteDec, and
+    //    VgaWriteHex on all online CPUs, ending every VGA write with '\r' so
+    //    the cursor stays on the current row and the greeting on row 0 never
+    //    scrolls off.
     if (iter == 0 || iter + 1 == kMultiCpuStressIterations) {
-      const char cpu_digit = static_cast<char>('0' + (cpu_index % 10));
-      const char pass_digit = (iter == 0) ? '0' : '1';
-      const char uart_msg[] = {
-          '[', 'S',       'M',        'P', ']', ' ', 'C',  'P', 'U',
-          ' ', cpu_digit, ' ',        's', 'y', 'n', 'c',  ' ', 's',
-          't', 'r',       'e',        's', 's', ' ', 'p',  'a', 's',
-          's', ' ',       pass_digit, ' ', 'o', 'k', '\n', '\0'};
-      const char vga_msg[] = {'[', 'S', 'M',       'P', ']', ' ', 'C',  'P',
-                              'U', ' ', cpu_digit, ' ', 'o', 'k', '\r', '\0'};
-      UartWrite(uart_msg);
-      VgaWrite(vga_msg);
-      VgaPutChar('\r');
+      LineBuffer uart_line;
+      uart_line.Append("[SMP] CPU ")
+          .AppendDec(static_cast<uint64_t>(cpu_index))
+          .Append(" sync stress iteration ")
+          .AppendDec(static_cast<uint64_t>(iter))
+          .Append(ok ? ": ok\n" : ": FAIL\n");
+      UartWrite(uart_line.c_str());
+      LineBuffer vga_line;
+      vga_line.Append("[SMP] CPU ")
+          .AppendDec(static_cast<uint64_t>(cpu_index))
+          .Append(ok ? " ok\r" : " FAIL\r");
+      VgaWrite(vga_line.c_str());
+      VgaPutc('\r');
       {
         const IrqSpinLockGuard guard(ctx->counter_lock);
         VgaWriteDec(static_cast<uint64_t>(cpu_index));
         VgaWriteHex(static_cast<uint64_t>(iter));
-        VgaPutChar('\r');
-      }
-      const int cur_row = VgaGetCursorRow();
-      const int cur_col = VgaGetCursorCol();
-      if (cur_row < 0 || cur_row >= 25 || cur_col < 0 || cur_col >= 80) {
-        ok = false;
+        VgaPutc('\r');
       }
     }
   }
@@ -1279,32 +1403,22 @@ static void MultiCpuSecondPassWorker(const int cpu_index,
 
 static bool TestSmpMultiCpuSyncStress() {
   const int cpu_count = SmpCpuCount();
-  if (cpu_count < 1 || cpu_count > kMaxSupportedCpus ||
-      SmpOnlineCpuCount() != cpu_count) {
-    return false;
-  }
+  SELFTEST_EXPECT(cpu_count >= 1 && cpu_count <= kMaxSupportedCpus);
+  SELFTEST_EXPECT(SmpOnlineCpuCount() == cpu_count);
 
   MultiCpuStressContext ctx = {};
   ctx.expected_cpus = cpu_count;
-  ctx.per_cpu_ok.reset(new bool[cpu_count]());
-  if (ctx.per_cpu_ok == nullptr) {
-    return false;
-  }
+  ctx.per_cpu_ok = std::make_unique<bool[]>(cpu_count);
 
   const int64_t pmm_free_before = PmmFreeFrameCount();
   const int64_t heap_free_before = HeapTotalFreeBytes();
-  if (pmm_free_before <= 0 || heap_free_before <= 0) {
-    return false;
-  }
+  SELFTEST_EXPECT(pmm_free_before > 0);
+  SELFTEST_EXPECT(heap_free_before > 0);
 
   SmpRunOnAllCpus(MultiCpuStressWorker, &ctx);
-  // Clear any scratch characters written to the current line and ensure the
-  // cursor is at column 0 before LogTestResult writes the test summary.
+  // Blank out the scratch characters that the workers left on the current VGA
+  // row; the cursor is back at column 0.
   VgaWrite("                      \r");
-  if (VgaGetCursorRow() < 0 || VgaGetCursorRow() >= 25 ||
-      VgaGetCursorCol() != 0) {
-    return false;
-  }
 
   // Dispatch a second round of work across all CPUs to verify APs returned
   // cleanly to their halted state after the first round and can be re-woken.
@@ -1313,21 +1427,17 @@ static bool TestSmpMultiCpuSyncStress() {
   const int64_t expected_counter =
       static_cast<int64_t>(cpu_count) * kMultiCpuStressIterations * 2;
   const int expected_second_pass = (cpu_count * (cpu_count + 1)) / 2;
-  if (ctx.shared_counter != expected_counter ||
-      (ctx.invariant_a + ctx.invariant_b) != 0 ||
-      ctx.second_pass_count != expected_second_pass) {
-    return false;
-  }
-
+  SELFTEST_EXPECT(ctx.shared_counter == expected_counter);
+  SELFTEST_EXPECT(ctx.invariant_a + ctx.invariant_b == 0);
+  SELFTEST_EXPECT(ctx.second_pass_count == expected_second_pass);
   for (int i = 0; i < cpu_count; ++i) {
-    if (!ctx.per_cpu_ok[i]) {
-      return false;
-    }
+    SELFTEST_EXPECT(ctx.per_cpu_ok[i]);
   }
 
-  return PmmFreeFrameCount() == pmm_free_before &&
-         HeapTotalFreeBytes() == heap_free_before &&
-         SmpOnlineCpuCount() == cpu_count;
+  SELFTEST_EXPECT(PmmFreeFrameCount() == pmm_free_before);
+  SELFTEST_EXPECT(HeapTotalFreeBytes() == heap_free_before);
+  SELFTEST_EXPECT(SmpOnlineCpuCount() == cpu_count);
+  return true;
 }
 
 constexpr uint64_t kInt3CanaryBase = 0x1111222233334440ULL;
@@ -1371,6 +1481,7 @@ static void Int3VerificationHandler(InterruptFrame* const frame) {
 static bool TriggerInt3AndVerifyAllRegisters() {
   g_int3_handler_hits.store(0, std::memory_order_release);
   g_int3_frame_ok.store(false, std::memory_order_release);
+  const InterruptHandlerFn previous_handler = IdtGetHandler(kVectorBreakpoint);
   IdtRegisterHandler(kVectorBreakpoint, Int3VerificationHandler);
 
   uint64_t post_regs[16] = {};
@@ -1455,36 +1566,38 @@ static bool TriggerInt3AndVerifyAllRegisters() {
       : "rax", "rcx", "rdx", "rsi", "rdi", "r8", "r9", "r10", "r11", "memory",
         "cc");
 
-  IdtUnregisterHandler(kVectorBreakpoint);
-  if (IdtGetHandler(kVectorBreakpoint) != nullptr ||
-      g_int3_handler_hits.load(std::memory_order_acquire) != 1 ||
-      !g_int3_frame_ok.load(std::memory_order_acquire) ||
-      (post_regs[15] & kRflagsDirectionFlag) == 0) {
-    return false;
+  if (previous_handler != nullptr) {
+    IdtRegisterHandler(kVectorBreakpoint, previous_handler);
+  } else {
+    IdtUnregisterHandler(kVectorBreakpoint);
   }
+  SELFTEST_EXPECT(IdtGetHandler(kVectorBreakpoint) == previous_handler);
+  SELFTEST_EXPECT(g_int3_handler_hits.load(std::memory_order_acquire) == 1);
+  SELFTEST_EXPECT(g_int3_frame_ok.load(std::memory_order_acquire));
+  SELFTEST_EXPECT((post_regs[15] & kRflagsDirectionFlag) != 0);
   for (int i = 0; i < 15; ++i) {
-    if (post_regs[i] != (kInt3CanaryBase + static_cast<uint64_t>(i))) {
-      return false;
-    }
+    SELFTEST_EXPECT(post_regs[i] == kInt3CanaryBase + static_cast<uint64_t>(i));
   }
   return true;
+}
+
+// Vector of the ring IPIs of TestIdtPerCpuAndLapicTimer(). No kernel subsystem
+// uses it, so every delivery is one of the test's IPIs. (Vector 0x21 would not
+// do: SmpRunOnAllCpus also sends it to wake the APs.)
+constexpr uint8_t kVectorSelfTestRingIpi = 0x40;
+
+// CPUs that received a ring IPI.
+AtomicCpuMask128 g_ring_ipi_receivers;
+
+static void SelfTestRingIpiHandler(InterruptFrame* const /*frame*/) {
+  g_ring_ipi_receivers.Add(CurrentCpuId());
 }
 
 struct IdtPerCpuAndTimerVerifyContext {
   int cpu_count = 0;
   std::unique_ptr<int64_t[]> initial_ticks;
-  std::unique_ptr<int64_t[]> initial_ipis;
   std::unique_ptr<bool[]> per_cpu_ok;
 };
-
-constexpr int kMaxTimerWaitSpins = 200000000;
-
-static uint64_t ReadGsBaseMsr() {
-  uint32_t low = 0;
-  uint32_t high = 0;
-  asm volatile("rdmsr" : "=a"(low), "=d"(high) : "c"(kMsrIa32GsBase));
-  return (static_cast<uint64_t>(high) << 32) | low;
-}
 
 static void IdtPerCpuAndTimerVerifyWorker(const int cpu_index,
                                           void* const raw_ctx) {
@@ -1496,96 +1609,88 @@ static void IdtPerCpuAndTimerVerifyWorker(const int cpu_index,
 
   CpuLocal* const local = CurrentCpu();
   const CpuInfo* const info = SmpGetCpuInfo(cpu_index);
-  if (local == nullptr || info == nullptr ||
-      local != SmpGetCpuLocal(cpu_index) || local->self != local ||
-      (reinterpret_cast<uintptr_t>(local) & 63u) != 0 ||
-      ReadGsBaseMsr() != reinterpret_cast<uintptr_t>(local) ||
-      CurrentCpuId() != cpu_index || local->cpu_id != cpu_index ||
-      local->apic_id != info->apic_id || !local->online ||
-      local->stack_base != info->stack_base ||
-      local->stack_top != info->stack_top) {
+  const bool state_ok =
+      SELFTEST_OK(local != nullptr) && SELFTEST_OK(info != nullptr) &&
+      SELFTEST_OK(local == SmpGetCpuLocal(cpu_index)) &&
+      SELFTEST_OK(local->self == local) &&
+      SELFTEST_OK((reinterpret_cast<uintptr_t>(local) & 63u) == 0) &&
+      SELFTEST_OK(ReadGsBaseMsrForSmpVerify() ==
+                  reinterpret_cast<uintptr_t>(local)) &&
+      SELFTEST_OK(CurrentCpuId() == cpu_index) &&
+      SELFTEST_OK(local->cpu_id == cpu_index) &&
+      SELFTEST_OK(local->apic_id == info->apic_id) &&
+      SELFTEST_OK(local->online) &&
+      SELFTEST_OK(local->stack_base == info->stack_base) &&
+      SELFTEST_OK(local->stack_top == info->stack_top);
+  if (!state_ok) {
     ctx->per_cpu_ok[cpu_index] = false;
     return;
   }
 
-  // Send a cross-CPU wakeup IPI (vector 0x21) to the next CPU in ring order so
-  // every online CPU (including CPU 0) receives at least one 0x21 IPI.
-  const int target_cpu = (cpu_index + 1) % ctx->cpu_count;
-  SmpSendIpi(target_cpu, kVectorWakeupIpi);
+  // Send a ring IPI to the next CPU, so that every CPU (CPU 0 included)
+  // receives exactly one.
+  SmpSendIpi((cpu_index + 1) % ctx->cpu_count, kVectorSelfTestRingIpi);
 
+  // With interrupts enabled, wait for two more timer ticks and the ring IPI of
+  // the previous CPU.
   const int64_t target_ticks = ctx->initial_ticks[cpu_index] + 2;
-  const int64_t target_ipis = ctx->initial_ipis[cpu_index] + 1;
-  bool advanced = false;
-  for (int spin = 0; spin < kMaxTimerWaitSpins; ++spin) {
-    if (local->timer_ticks.load(std::memory_order_acquire) >= target_ticks &&
-        local->ipi_count.load(std::memory_order_acquire) >= target_ipis) {
-      advanced = true;
-      break;
-    }
+  const TscDeadline deadline(kSelfTestWaitTimeoutTscCycles);
+  while (!deadline.Expired() &&
+         (local->timer_ticks.load(std::memory_order_acquire) < target_ticks ||
+          !g_ring_ipi_receivers.Load().Contains(cpu_index))) {
     asm volatile("sti; pause" : : : "memory", "cc");
   }
-
-  ctx->per_cpu_ok[cpu_index] = advanced;
+  ctx->per_cpu_ok[cpu_index] =
+      SELFTEST_OK(local->timer_ticks.load(std::memory_order_acquire) >=
+                  target_ticks) &&
+      SELFTEST_OK(g_ring_ipi_receivers.Load().Contains(cpu_index));
 }
 
 static bool TestIdtPerCpuAndLapicTimer() {
-  if (!IdtIsInitialized() || SmpCalibratedTimerInitialCount() == 0) {
-    return false;
-  }
+  SELFTEST_EXPECT(IdtIsInitialized());
+  SELFTEST_EXPECT(SmpCalibratedTimerInitialCount() != 0);
 
   const IdtPointer idtr = IdtGetPointer();
-  if (idtr.limit != sizeof(IdtGateDescriptor) * kIdtEntryCount - 1 ||
-      idtr.base != reinterpret_cast<uint64_t>(IdtGetGate(0))) {
-    return false;
-  }
+  SELFTEST_EXPECT(idtr.limit == sizeof(IdtGateDescriptor) * kIdtEntryCount - 1);
+  SELFTEST_EXPECT(idtr.base == reinterpret_cast<uint64_t>(IdtGetGate(0)));
   for (int v = 0; v < kIdtEntryCount; ++v) {
     const IdtGateDescriptor* const gate = IdtGetGate(v);
-    if (gate == nullptr || gate->selector != kIdtKernelCodeSelector ||
-        gate->ist != 0 || gate->type_attr != kIdtInterruptGateAttr ||
-        gate->reserved != 0 ||
-        IdtDecodeGateOffset(*gate) != g_isr_stub_table[v]) {
-      return false;
-    }
+    SELFTEST_EXPECT(gate != nullptr);
+    SELFTEST_EXPECT(gate->selector == kIdtKernelCodeSelector);
+    SELFTEST_EXPECT(gate->ist == 0);
+    SELFTEST_EXPECT(gate->type_attr == kIdtInterruptGateAttr);
+    SELFTEST_EXPECT(gate->reserved == 0);
+    SELFTEST_EXPECT(IdtDecodeGateOffset(*gate) == g_isr_stub_table[v]);
   }
 
-  if (!TriggerInt3AndVerifyAllRegisters()) {
-    return false;
-  }
+  SELFTEST_EXPECT(TriggerInt3AndVerifyAllRegisters());
 
   const int cpu_count = SmpCpuCount();
-  if (cpu_count < 1 || SmpOnlineCpuCount() != cpu_count) {
-    return false;
-  }
+  SELFTEST_EXPECT(cpu_count >= 1);
+  SELFTEST_EXPECT(SmpOnlineCpuCount() == cpu_count);
+  SELFTEST_EXPECT(IdtGetHandler(kVectorSelfTestRingIpi) == nullptr);
 
   IdtPerCpuAndTimerVerifyContext ctx = {};
   ctx.cpu_count = cpu_count;
-  ctx.initial_ticks.reset(new int64_t[cpu_count]());
-  ctx.initial_ipis.reset(new int64_t[cpu_count]());
-  ctx.per_cpu_ok.reset(new bool[cpu_count]());
-  if (ctx.initial_ticks == nullptr || ctx.initial_ipis == nullptr ||
-      ctx.per_cpu_ok == nullptr) {
-    return false;
-  }
+  ctx.initial_ticks = std::make_unique<int64_t[]>(cpu_count);
+  ctx.per_cpu_ok = std::make_unique<bool[]>(cpu_count);
   for (int i = 0; i < cpu_count; ++i) {
     const CpuLocal* const local = SmpGetCpuLocal(i);
-    if (local == nullptr) {
-      return false;
-    }
+    SELFTEST_EXPECT(local != nullptr);
     ctx.initial_ticks[i] = local->timer_ticks.load(std::memory_order_acquire);
-    ctx.initial_ipis[i] = local->ipi_count.load(std::memory_order_acquire);
   }
 
+  g_ring_ipi_receivers.Clear();
+  IdtRegisterHandler(kVectorSelfTestRingIpi, SelfTestRingIpiHandler);
   SmpRunOnAllCpus(IdtPerCpuAndTimerVerifyWorker, &ctx);
+  IdtUnregisterHandler(kVectorSelfTestRingIpi);
 
   for (int i = 0; i < cpu_count; ++i) {
     const CpuLocal* const local = SmpGetCpuLocal(i);
     const int64_t final_ticks =
         local->timer_ticks.load(std::memory_order_acquire);
-    const int64_t final_ipis = local->ipi_count.load(std::memory_order_acquire);
-    if (!ctx.per_cpu_ok[i] || final_ticks <= ctx.initial_ticks[i] ||
-        final_ipis <= ctx.initial_ipis[i]) {
-      return false;
-    }
+    SELFTEST_EXPECT(ctx.per_cpu_ok[i]);
+    SELFTEST_EXPECT(final_ticks > ctx.initial_ticks[i]);
     UartWrite("[TIMER] CPU ");
     UartWriteDec(static_cast<uint64_t>(i));
     UartWrite(" (APIC ID ");
@@ -1593,10 +1698,10 @@ static bool TestIdtPerCpuAndLapicTimer() {
     UartWrite("): timer_ticks=");
     UartWriteDec(static_cast<uint64_t>(final_ticks));
     UartWrite(", ipi_count=");
-    UartWriteDec(static_cast<uint64_t>(final_ipis));
+    UartWriteDec(static_cast<uint64_t>(
+        local->ipi_count.load(std::memory_order_acquire)));
     UartWrite("\n");
   }
-
   return true;
 }
 
@@ -1609,46 +1714,53 @@ constexpr int kPreemptProgressTasks = 2;
 constexpr int kStressTaskCount = 12;
 constexpr int kStressRounds = 32;
 constexpr int kStressChildSpawnInterval = 8;
-constexpr int kMaxPreemptCoordSpins = 200000000;
 
-static void ProgramLocalApicTimerInitCount(const uint32_t init_count) {
-  SmpSetLocalApicTimerInitialCount(init_count);
-}
+// Most tasks one scheduler test phase creates (TestTimerPreemptionPhase()).
+constexpr int kMaxPhaseTasks = kMaxSupportedCpus + kPreemptProgressTasks;
 
-struct CpuMask128 {
-  uint64_t low = 0;
-  uint64_t high = 0;
-};
+// Owns the tasks of one scheduler test phase and Join()s them all when it goes
+// out of scope, so that an early `return false` never leaves a task running
+// that still points into the phase's stack frame. On that path it first sets
+// `*stop_flag` (if given), which tells tasks that wait for each other to stop.
+class PhaseTaskGroup {
+ public:
+  PhaseTaskGroup(TaskScheduler& scheduler, std::atomic<bool>* const stop_flag)
+      : scheduler_(scheduler), stop_flag_(stop_flag) {}
 
-struct AtomicCpuMask128 {
-  std::atomic<uint64_t> low{0};
-  std::atomic<uint64_t> high{0};
-
-  bool SetBit(const int cpu) {
-    if (cpu >= 0 && cpu < 64) {
-      const uint64_t bit = 1ULL << static_cast<uint32_t>(cpu);
-      const uint64_t prev = low.fetch_or(bit, std::memory_order_acq_rel);
-      return (prev & bit) == 0;
+  ~PhaseTaskGroup() {
+    if (count_ > 0 && stop_flag_ != nullptr) {
+      stop_flag_->store(true, std::memory_order_release);
     }
-    if (cpu >= 64 && cpu < kMaxSupportedCpus) {
-      const uint64_t bit = 1ULL << static_cast<uint32_t>(cpu - 64);
-      const uint64_t prev = high.fetch_or(bit, std::memory_order_acq_rel);
-      return (prev & bit) == 0;
+    JoinAll();
+  }
+
+  PhaseTaskGroup(const PhaseTaskGroup&) = delete;
+  PhaseTaskGroup& operator=(const PhaseTaskGroup&) = delete;
+
+  // Takes ownership of `task`. Returns false if `task` is null, i.e. if
+  // creating it failed.
+  bool Add(Task* const task) {
+    if (task == nullptr) {
+      return false;
     }
-    return false;
+    CHECK(count_ < kMaxPhaseTasks);
+    tasks_[count_++] = task;
+    return true;
   }
 
-  bool HasExpected(const CpuMask128& expected) const {
-    return (low.load(std::memory_order_acquire) & expected.low) ==
-               expected.low &&
-           (high.load(std::memory_order_acquire) & expected.high) ==
-               expected.high;
+  // Joins every task added so far.
+  void JoinAll() {
+    for (int i = 0; i < count_; ++i) {
+      scheduler_.Join(tasks_[i]);
+    }
+    count_ = 0;
   }
 
-  bool HasAnyRemoteCpu() const {
-    return (low.load(std::memory_order_acquire) & ~1ULL) != 0 ||
-           high.load(std::memory_order_acquire) != 0;
-  }
+ private:
+  TaskScheduler& scheduler_;
+  std::atomic<bool>* const stop_flag_;
+  Task* tasks_[kMaxPhaseTasks];
+  int count_ = 0;
 };
 
 struct SchedulerTestContext {
@@ -1661,17 +1773,18 @@ struct SchedulerTestContext {
   std::atomic<int> stress_completed{0};
   std::atomic<int64_t> stress_child_completed{0};
   std::atomic<bool> stress_failed{false};
-  AtomicCpuMask128 timer_boosted_mask;
-  AtomicCpuMask128 timer_restored_mask;
+  // Indices of the spinners that have started (not CPUs).
   AtomicCpuMask128 spinner_started_mask;
   std::unique_ptr<std::atomic<int64_t>[]> spinner_iters;
   std::atomic<int> progress_done{0};
   std::atomic<bool> preempt_verified{false};
   std::atomic<bool> stop_spinners{false};
   CpuMask128 expected_cpu_mask = {};
-  uint32_t calibrated_timer_count = 0;
-  uint32_t stress_timer_count = 0;
 };
+
+static bool AllSpinnersStarted(const SchedulerTestContext* const ctx) {
+  return ctx->spinner_started_mask.Load().ContainsAll(ctx->expected_cpu_mask);
+}
 
 struct WeightedWorkerArg {
   SchedulerTestContext* ctx = nullptr;
@@ -1706,31 +1819,13 @@ struct StressChildArg {
   std::atomic<uint64_t> observed_token{0};
 };
 
-static void MaybeBoostCurrentCpuTimer(SchedulerTestContext* const ctx) {
-  const bool saved_irq = internal::LocalSaveAndDisableInterrupts();
-  const int cpu = CurrentCpuId();
-  if (ctx->timer_boosted_mask.SetBit(cpu) && ctx->stress_timer_count > 0) {
-    ProgramLocalApicTimerInitCount(ctx->stress_timer_count);
-  }
-  internal::LocalRestoreInterrupts(saved_irq);
-}
-
-static void MaybeRestoreCurrentCpuTimer(SchedulerTestContext* const ctx) {
-  const bool saved_irq = internal::LocalSaveAndDisableInterrupts();
-  const int cpu = CurrentCpuId();
-  if (ctx->timer_restored_mask.SetBit(cpu) && ctx->calibrated_timer_count > 0) {
-    ProgramLocalApicTimerInitCount(ctx->calibrated_timer_count);
-  }
-  internal::LocalRestoreInterrupts(saved_irq);
-}
-
 static void StressChildWorker(void* const raw_arg) {
   StressChildArg* const arg = static_cast<StressChildArg*>(raw_arg);
   if (arg == nullptr || arg->ctx == nullptr) {
     return;
   }
   SchedulerTestContext* const ctx = arg->ctx;
-  const std::shared_ptr<TaskScheduler>& scheduler = GetTaskScheduler();
+  TaskScheduler* const scheduler = GetTaskScheduler();
   Task* const self = scheduler->CurrentTask();
   alignas(16) volatile uint64_t child_canary[4] = {
       arg->expected_token ^ 0x1111111111111111ULL,
@@ -1748,9 +1843,8 @@ static void StressChildWorker(void* const raw_arg) {
   }
 
   for (int step = 0; step < 2; ++step) {
-    MaybeBoostCurrentCpuTimer(ctx);
     const int cpu = CurrentCpuId();
-    ctx->observed_cpu_mask.SetBit(cpu);
+    ctx->observed_cpu_mask.Add(cpu);
     scheduler->Yield();
     if (scheduler->CurrentTask() != self || !AreInterruptsEnabled()) {
       ctx->stress_failed.store(true, std::memory_order_release);
@@ -1776,7 +1870,7 @@ static void StressWorker(void* const raw_arg) {
     return;
   }
   SchedulerTestContext* const ctx = arg->ctx;
-  const std::shared_ptr<TaskScheduler>& scheduler = GetTaskScheduler();
+  TaskScheduler* const scheduler = GetTaskScheduler();
   const int cpu_count = SmpCpuCount();
   Task* const self = scheduler->CurrentTask();
 
@@ -1794,7 +1888,6 @@ static void StressWorker(void* const raw_arg) {
        (static_cast<uint64_t>(arg->worker_index + 1) * 0x9E3779B97F4A7C15ULL));
 
   for (int round = 0; round < kStressRounds; ++round) {
-    MaybeBoostCurrentCpuTimer(ctx);
     const uint64_t round_tag =
         seed ^ (static_cast<uint64_t>(round + 1) * 0xBF58476D1CE4E5B9ULL);
     for (int k = 0; k < 8; ++k) {
@@ -1802,7 +1895,7 @@ static void StressWorker(void* const raw_arg) {
     }
 
     const int cpu = CurrentCpuId();
-    ctx->observed_cpu_mask.SetBit(cpu);
+    ctx->observed_cpu_mask.Add(cpu);
 
     // Bombard a peer CPU with a wakeup/reschedule IPI (0x21) so asynchronous
     // interrupt handlers collide frequently with active scheduler operations.
@@ -1868,7 +1961,7 @@ static void WeightedYieldWorker(void* const raw_arg) {
     return;
   }
 
-  const std::shared_ptr<TaskScheduler>& scheduler = GetTaskScheduler();
+  TaskScheduler* const scheduler = GetTaskScheduler();
   alignas(16) volatile uint64_t stack_probe = 0xA5A55A5AULL;
   const uintptr_t probe_addr =
       reinterpret_cast<uintptr_t>(const_cast<uint64_t*>(&stack_probe));
@@ -1881,7 +1974,7 @@ static void WeightedYieldWorker(void* const raw_arg) {
 
   for (int i = 0; i < kWeightedYieldIters; ++i) {
     const int cpu = CurrentCpuId();
-    arg->ctx->observed_cpu_mask.SetBit(cpu);
+    arg->ctx->observed_cpu_mask.Add(cpu);
     for (int spin = 0; spin < 400; ++spin) {
       asm volatile("pause" : : : "memory");
     }
@@ -1893,7 +1986,7 @@ static void WeightedYieldWorker(void* const raw_arg) {
   }
 
   const int cpu = CurrentCpuId();
-  arg->ctx->observed_cpu_mask.SetBit(cpu);
+  arg->ctx->observed_cpu_mask.Add(cpu);
   arg->done.store(true, std::memory_order_release);
   arg->ctx->weighted_completed.fetch_add(1, std::memory_order_acq_rel);
 }
@@ -1904,11 +1997,11 @@ static void StealWorker(void* const raw_arg) {
     return;
   }
 
-  const std::shared_ptr<TaskScheduler>& scheduler = GetTaskScheduler();
+  TaskScheduler* const scheduler = GetTaskScheduler();
   for (int s = 0; s < kStealWorkerSlices; ++s) {
     const int cpu = CurrentCpuId();
-    arg->ctx->stolen_cpu_mask.SetBit(cpu);
-    arg->ctx->observed_cpu_mask.SetBit(cpu);
+    arg->ctx->stolen_cpu_mask.Add(cpu);
+    arg->ctx->observed_cpu_mask.Add(cpu);
     if (cpu != 0) {
       arg->ctx->remote_steal_slices.fetch_add(1, std::memory_order_acq_rel);
     }
@@ -1919,8 +2012,8 @@ static void StealWorker(void* const raw_arg) {
   }
 
   const int cpu = CurrentCpuId();
-  arg->ctx->stolen_cpu_mask.SetBit(cpu);
-  arg->ctx->observed_cpu_mask.SetBit(cpu);
+  arg->ctx->stolen_cpu_mask.Add(cpu);
+  arg->ctx->observed_cpu_mask.Add(cpu);
   if (cpu != 0) {
     arg->ctx->remote_steal_slices.fetch_add(1, std::memory_order_acq_rel);
   }
@@ -1934,35 +2027,28 @@ static void SpinnerWorker(void* const raw_arg) {
     return;
   }
 
-  MaybeBoostCurrentCpuTimer(arg->ctx);
+  SchedulerTestContext* const ctx = arg->ctx;
   const int idx = arg->spinner_index;
-  const int cpu = CurrentCpuId();
-  arg->ctx->observed_cpu_mask.SetBit(cpu);
-  arg->ctx->spinner_started_mask.SetBit(idx);
+  ctx->observed_cpu_mask.Add(CurrentCpuId());
+  ctx->spinner_started_mask.Add(idx);
 
   // CPU-bound spinner that NEVER calls Yield(); relies strictly on Local APIC
   // timer (0x20) preemption so PreemptProgressWorker tasks can run.
-  for (int spin = 0; spin < kMaxPreemptCoordSpins &&
-                     !arg->ctx->stop_spinners.load(std::memory_order_acquire);
-       ++spin) {
-    const int cur_cpu = CurrentCpuId();
-    arg->ctx->observed_cpu_mask.SetBit(cur_cpu);
+  const TscDeadline deadline(kSelfTestWaitTimeoutTscCycles);
+  while (!ctx->stop_spinners.load(std::memory_order_acquire) &&
+         !deadline.Expired()) {
+    ctx->observed_cpu_mask.Add(CurrentCpuId());
     const int64_t iters =
-        arg->ctx->spinner_iters[idx].fetch_add(1, std::memory_order_relaxed) +
-        1;
-    if (iters >= 64 &&
-        arg->ctx->spinner_started_mask.HasExpected(
-            arg->ctx->expected_cpu_mask) &&
-        arg->ctx->progress_done.load(std::memory_order_acquire) ==
+        ctx->spinner_iters[idx].fetch_add(1, std::memory_order_relaxed) + 1;
+    if (iters >= 64 && AllSpinnersStarted(ctx) &&
+        ctx->progress_done.load(std::memory_order_acquire) ==
             kPreemptProgressTasks) {
-      arg->ctx->preempt_verified.store(true, std::memory_order_release);
-      arg->ctx->stop_spinners.store(true, std::memory_order_release);
+      ctx->preempt_verified.store(true, std::memory_order_release);
       break;
     }
     asm volatile("pause" : : : "memory");
   }
-  arg->ctx->stop_spinners.store(true, std::memory_order_release);
-  MaybeRestoreCurrentCpuTimer(arg->ctx);
+  ctx->stop_spinners.store(true, std::memory_order_release);
   arg->done.store(true, std::memory_order_release);
 }
 
@@ -1972,15 +2058,15 @@ static void PreemptProgressWorker(void* const raw_arg) {
     return;
   }
 
-  const std::shared_ptr<TaskScheduler>& scheduler = GetTaskScheduler();
-  while (!ctx->spinner_started_mask.HasExpected(ctx->expected_cpu_mask) &&
+  TaskScheduler* const scheduler = GetTaskScheduler();
+  while (!AllSpinnersStarted(ctx) &&
          !ctx->stop_spinners.load(std::memory_order_acquire)) {
     scheduler->Yield();
   }
 
   for (int step = 0; step < 4; ++step) {
     const int cpu = CurrentCpuId();
-    ctx->observed_cpu_mask.SetBit(cpu);
+    ctx->observed_cpu_mask.Add(cpu);
     for (int spin = 0; spin < 4000; ++spin) {
       asm volatile("pause" : : : "memory");
     }
@@ -1988,237 +2074,214 @@ static void PreemptProgressWorker(void* const raw_arg) {
   ctx->progress_done.fetch_add(1, std::memory_order_acq_rel);
 }
 
-static bool TestTaskSchedulerSmp() {
-  const int cpu_count = SmpCpuCount();
-  const std::shared_ptr<TaskScheduler>& scheduler = GetTaskScheduler();
-  if (scheduler == nullptr || cpu_count < 1 || cpu_count > kMaxSupportedCpus ||
-      SmpOnlineCpuCount() != cpu_count) {
-    return false;
-  }
-
-  Task* const bootstrap = scheduler->CurrentTask();
-  if (bootstrap == nullptr || CurrentCpuId() != 0 ||
-      !scheduler->IsPreemptEnabled()) {
-    return false;
-  }
-
-  SchedulerTestContext ctx = {};
-  ctx.bootstrap_task = bootstrap;
-  ctx.observed_cpu_mask.SetBit(0);
-  ctx.calibrated_timer_count = SmpCalibratedTimerInitialCount();
-  ctx.stress_timer_count = (ctx.calibrated_timer_count > 32u)
-                               ? (ctx.calibrated_timer_count / 16u)
-                               : ctx.calibrated_timer_count;
-  ctx.spinner_iters.reset(new std::atomic<int64_t>[cpu_count]());
-  const std::unique_ptr<SpinnerWorkerArg[]> spinner_args(
-      new SpinnerWorkerArg[cpu_count]());
-  const std::unique_ptr<Task*[]> spinner_tasks(new Task*[cpu_count]());
-  if (ctx.spinner_iters == nullptr || spinner_args == nullptr ||
-      spinner_tasks == nullptr) {
-    return false;
-  }
-
-  const int64_t pmm_free_before = PmmFreeFrameCount();
-  const int64_t heap_free_before = HeapTotalFreeBytes();
-  if (pmm_free_before <= 0 || heap_free_before <= 0) {
-    return false;
-  }
-
-  // 1. Concurrent multi-task execution, Yield, Join, and weighted tasks
-  //    across online CPUs.
-  WeightedWorkerArg weighted_args[kWeightedTaskCount] = {};
-  Task* weighted_tasks[kWeightedTaskCount] = {};
+// Phase 1: weighted tasks that Yield() and are Join()ed, on all CPUs.
+static bool TestWeightedYieldPhase(TaskScheduler& scheduler,
+                                   SchedulerTestContext* const ctx) {
+  WeightedWorkerArg args[kWeightedTaskCount] = {};
+  PhaseTaskGroup tasks(scheduler, nullptr);
   for (int i = 0; i < kWeightedTaskCount; ++i) {
-    weighted_args[i].ctx = &ctx;
-    weighted_args[i].index = i;
+    args[i].ctx = ctx;
+    args[i].index = i;
     const int64_t weight = (i < kHighWeightTaskCount)
                                ? (kDefaultTaskWeight * 2)
                                : (kDefaultTaskWeight / 2);
-    weighted_tasks[i] =
-        scheduler->CreateTask(WeightedYieldWorker, &weighted_args[i], weight);
-    if (weighted_tasks[i] == nullptr) {
-      return false;
-    }
+    SELFTEST_EXPECT(
+        tasks.Add(scheduler.CreateTask(WeightedYieldWorker, &args[i], weight)));
   }
-  for (int i = 0; i < kWeightedTaskCount; ++i) {
-    scheduler->Join(weighted_tasks[i]);
-  }
+  tasks.JoinAll();
 
-  if (ctx.weighted_completed.load(std::memory_order_acquire) !=
-      kWeightedTaskCount) {
+  SELFTEST_EXPECT(ctx->weighted_completed.load(std::memory_order_acquire) ==
+                  kWeightedTaskCount);
+  for (int i = 0; i < kWeightedTaskCount; ++i) {
+    SELFTEST_EXPECT(args[i].done.load(std::memory_order_acquire));
+    SELFTEST_EXPECT(args[i].aligned_ok.load(std::memory_order_acquire));
+    SELFTEST_EXPECT(args[i].slices_done.load(std::memory_order_acquire) ==
+                    kWeightedYieldIters);
+  }
+  return true;
+}
+
+// Phase 2: cross-CPU work stealing. All tasks are enqueued on CPU 0 while
+// preemption is disabled; then preemption is enabled again and the other CPUs
+// are woken to steal some of them.
+static bool TestWorkStealingPhase(TaskScheduler& scheduler,
+                                  SchedulerTestContext* const ctx,
+                                  const int cpu_count) {
+  StealWorkerArg args[kStealTaskCount] = {};
+  PhaseTaskGroup tasks(scheduler, nullptr);
+  bool created_all = true;
+  scheduler.SetPreemptEnabled(false);
+  for (int i = 0; i < kStealTaskCount && created_all; ++i) {
+    args[i].ctx = ctx;
+    args[i].index = i;
+    created_all =
+        SELFTEST_OK(tasks.Add(scheduler.CreateTaskOnCpu(StealWorker,         //
+                                                        &args[i],            //
+                                                        kDefaultTaskWeight,  //
+                                                        0)));
+  }
+  scheduler.SetPreemptEnabled(true);
+  if (!created_all) {
     return false;
   }
-  for (int i = 0; i < kWeightedTaskCount; ++i) {
-    if (!weighted_args[i].done.load(std::memory_order_acquire) ||
-        !weighted_args[i].aligned_ok.load(std::memory_order_acquire) ||
-        weighted_args[i].slices_done.load(std::memory_order_acquire) !=
-            kWeightedYieldIters) {
-      return false;
-    }
-  }
-
-  // 2. Cross-CPU work stealing: enqueue all tasks onto CPU 0 while preemption
-  //    is temporarily disabled, then re-enable preemption and wake remote CPUs.
-  StealWorkerArg steal_args[kStealTaskCount] = {};
-  Task* steal_tasks[kStealTaskCount] = {};
-  scheduler->SetPreemptEnabled(false);
-  for (int i = 0; i < kStealTaskCount; ++i) {
-    steal_args[i].ctx = &ctx;
-    steal_args[i].index = i;
-    steal_tasks[i] = scheduler->CreateTaskOnCpu(StealWorker,         //
-                                                &steal_args[i],      //
-                                                kDefaultTaskWeight,  //
-                                                0);
-    if (steal_tasks[i] == nullptr) {
-      scheduler->SetPreemptEnabled(true);
-      return false;
-    }
-  }
-  scheduler->SetPreemptEnabled(true);
   for (int c = 1; c < cpu_count; ++c) {
     SmpSendIpi(c, kVectorWakeupIpi);
   }
+  tasks.JoinAll();
 
+  SELFTEST_EXPECT(ctx->steal_completed.load(std::memory_order_acquire) ==
+                  kStealTaskCount);
   for (int i = 0; i < kStealTaskCount; ++i) {
-    scheduler->Join(steal_tasks[i]);
-  }
-
-  if (ctx.steal_completed.load(std::memory_order_acquire) != kStealTaskCount) {
-    return false;
-  }
-  for (int i = 0; i < kStealTaskCount; ++i) {
-    if (!steal_args[i].done.load(std::memory_order_acquire)) {
-      return false;
-    }
+    SELFTEST_EXPECT(args[i].done.load(std::memory_order_acquire));
   }
   if (cpu_count > 1) {
-    if (!ctx.stolen_cpu_mask.HasAnyRemoteCpu() ||
-        ctx.remote_steal_slices.load(std::memory_order_acquire) <= 0) {
-      return false;
-    }
+    const CpuMask128 stolen = ctx->stolen_cpu_mask.Load();
+    SELFTEST_EXPECT((stolen.low & ~1ULL) != 0 || stolen.high != 0);
+    SELFTEST_EXPECT(ctx->remote_steal_slices.load(std::memory_order_acquire) >
+                    0);
   }
+  return true;
+}
 
-  // 3. High-frequency interrupt + cross-CPU API stress phase:
-  //    With boosted Local APIC timer ticks and continuous cross-CPU wakeup IPIs
-  //    (`0x21`), `kStressTaskCount` workers tightly hammer `CurrentTask()`,
-  //    `Yield()`, `RunqueueLoad()`, `ReapZombies()`, stack-frame canary checks,
-  //    and dynamic child `CreateTask`/`Join` across all online CPUs.
-  MaybeBoostCurrentCpuTimer(&ctx);
-  StressWorkerArg stress_args[kStressTaskCount] = {};
-  Task* stress_tasks[kStressTaskCount] = {};
+// Phase 3: high-frequency interrupt and cross-CPU API stress (with the LAPIC
+// timers boosted by the caller). kStressTaskCount workers on all CPUs hammer
+// CurrentTask(), Yield(), and RunqueueLoad(), bombard other CPUs with wakeup
+// IPIs (0x21), check stack canaries, and CreateTask() and Join() children.
+static bool TestInterruptStressPhase(TaskScheduler& scheduler,
+                                     SchedulerTestContext* const ctx) {
+  StressWorkerArg args[kStressTaskCount] = {};
+  PhaseTaskGroup tasks(scheduler, nullptr);
   for (int i = 0; i < kStressTaskCount; ++i) {
-    stress_args[i].ctx = &ctx;
-    stress_args[i].worker_index = i;
+    args[i].ctx = ctx;
+    args[i].worker_index = i;
     const int64_t weight =
         kDefaultTaskWeight + static_cast<int64_t>((i % 4) - 1) * 256;
-    stress_tasks[i] =
-        scheduler->CreateTask(StressWorker, &stress_args[i], weight);
-    if (stress_tasks[i] == nullptr) {
-      ProgramLocalApicTimerInitCount(ctx.calibrated_timer_count);
-      return false;
-    }
+    SELFTEST_EXPECT(
+        tasks.Add(scheduler.CreateTask(StressWorker, &args[i], weight)));
   }
-  for (int i = 0; i < kStressTaskCount; ++i) {
-    scheduler->Join(stress_tasks[i]);
-  }
+  tasks.JoinAll();
 
   const int64_t expected_children =
       static_cast<int64_t>(kStressTaskCount) *
       static_cast<int64_t>((kStressRounds + kStressChildSpawnInterval - 1) /
                            kStressChildSpawnInterval);
-  if (ctx.stress_failed.load(std::memory_order_acquire) ||
-      ctx.stress_completed.load(std::memory_order_acquire) !=
-          kStressTaskCount ||
-      ctx.stress_child_completed.load(std::memory_order_acquire) !=
-          expected_children) {
-    ProgramLocalApicTimerInitCount(ctx.calibrated_timer_count);
-    return false;
-  }
+  SELFTEST_EXPECT(!ctx->stress_failed.load(std::memory_order_acquire));
+  SELFTEST_EXPECT(ctx->stress_completed.load(std::memory_order_acquire) ==
+                  kStressTaskCount);
+  SELFTEST_EXPECT(ctx->stress_child_completed.load(std::memory_order_acquire) ==
+                  expected_children);
   for (int i = 0; i < kStressTaskCount; ++i) {
-    if (!stress_args[i].done.load(std::memory_order_acquire)) {
-      ProgramLocalApicTimerInitCount(ctx.calibrated_timer_count);
-      return false;
-    }
+    SELFTEST_EXPECT(args[i].done.load(std::memory_order_acquire));
   }
+  return true;
+}
 
-  // 4. Preemptive scheduling driven by Local APIC timer (0x20): spawn
-  //    `cpu_count` non-yielding CPU-bound spinners plus progress tasks, and
-  //    restore the calibrated Local APIC timer count on each CPU as its spinner
-  //    exits.
-  const CpuMask128 expected_cpu_mask = {
-      (cpu_count >= 64) ? ~0ULL
-                        : ((1ULL << static_cast<uint32_t>(cpu_count)) - 1ULL),
-      (cpu_count <= 64) ? 0ULL
-      : (cpu_count >= 128)
-          ? ~0ULL
-          : ((1ULL << static_cast<uint32_t>(cpu_count - 64)) - 1ULL),
-  };
-  ctx.expected_cpu_mask = expected_cpu_mask;
-  Task* progress_tasks[kPreemptProgressTasks] = {};
-
+// Phase 4: preemption by the LAPIC timer (0x20, boosted by the caller).
+// `cpu_count` spinners that never yield occupy the CPUs; the progress tasks
+// can only run, and the spinners only finish, if the timer preempts spinners.
+static bool TestTimerPreemptionPhase(TaskScheduler& scheduler,
+                                     SchedulerTestContext* const ctx,
+                                     const int cpu_count) {
+  const std::unique_ptr<SpinnerWorkerArg[]> spinner_args =
+      std::make_unique<SpinnerWorkerArg[]>(cpu_count);
+  // Destroyed in reverse order: on an early return, the spinners are stopped
+  // and joined first, which also releases the waiting progress tasks.
+  PhaseTaskGroup progress_tasks(scheduler, nullptr);
+  PhaseTaskGroup spinner_tasks(scheduler, &ctx->stop_spinners);
   for (int i = 0; i < cpu_count; ++i) {
-    spinner_args[i].ctx = &ctx;
+    spinner_args[i].ctx = ctx;
     spinner_args[i].spinner_index = i;
-    spinner_tasks[i] = scheduler->CreateTaskOnCpu(
-        SpinnerWorker, &spinner_args[i], kDefaultTaskWeight, i);
-    if (spinner_tasks[i] == nullptr) {
-      ProgramLocalApicTimerInitCount(ctx.calibrated_timer_count);
-      return false;
-    }
+    SELFTEST_EXPECT(
+        spinner_tasks.Add(scheduler.CreateTaskOnCpu(SpinnerWorker,       //
+                                                    &spinner_args[i],    //
+                                                    kDefaultTaskWeight,  //
+                                                    i)));
   }
   for (int i = 0; i < kPreemptProgressTasks; ++i) {
-    progress_tasks[i] =
-        scheduler->CreateTask(PreemptProgressWorker, &ctx, kDefaultTaskWeight);
-    if (progress_tasks[i] == nullptr) {
-      ProgramLocalApicTimerInitCount(ctx.calibrated_timer_count);
-      return false;
-    }
+    SELFTEST_EXPECT(progress_tasks.Add(
+        scheduler.CreateTask(PreemptProgressWorker, ctx, kDefaultTaskWeight)));
   }
+  progress_tasks.JoinAll();
+  spinner_tasks.JoinAll();
 
-  for (int i = 0; i < kPreemptProgressTasks; ++i) {
-    scheduler->Join(progress_tasks[i]);
-  }
+  SELFTEST_EXPECT(ctx->preempt_verified.load(std::memory_order_acquire));
+  SELFTEST_EXPECT(CurrentCpuId() == 0);
+  SELFTEST_EXPECT(scheduler.CurrentTask() == ctx->bootstrap_task);
   for (int i = 0; i < cpu_count; ++i) {
-    scheduler->Join(spinner_tasks[i]);
+    SELFTEST_EXPECT(spinner_args[i].done.load(std::memory_order_acquire));
+    SELFTEST_EXPECT(ctx->spinner_iters[i].load(std::memory_order_acquire) > 0);
   }
-  ProgramLocalApicTimerInitCount(ctx.calibrated_timer_count);
+  SELFTEST_EXPECT(
+      ctx->observed_cpu_mask.Load().ContainsAll(ctx->expected_cpu_mask));
+  return true;
+}
 
-  if (!ctx.preempt_verified.load(std::memory_order_acquire) ||
-      CurrentCpuId() != 0 || scheduler->CurrentTask() != bootstrap) {
-    return false;
-  }
-  for (int i = 0; i < cpu_count; ++i) {
-    if (!spinner_args[i].done.load(std::memory_order_acquire) ||
-        ctx.spinner_iters[i].load(std::memory_order_acquire) <= 0) {
-      return false;
-    }
-  }
-  if (!ctx.observed_cpu_mask.HasExpected(expected_cpu_mask)) {
-    return false;
-  }
+// Set by the task of TestDetachedTaskPhase(). A global, so that the task still
+// writes valid memory if it outlives a failed phase.
+std::atomic<bool> g_detached_task_ran{false};
 
-  // 5. Unjoined zombie reaping and zero memory leaks: spawn a detached task,
-  //    let it exit without Join(), reap it via ReapZombies(), and verify PMM
-  //    and Heap free counts match their exact pre-test baselines.
-  std::atomic<bool> detached_ran{false};
-  Task* const detached = scheduler->CreateTask(
-      [](void* const arg) {
-        static_cast<std::atomic<bool>*>(arg)->store(true,
-                                                    std::memory_order_release);
-      },              //
-      &detached_ran,  //
-      kDefaultTaskWeight);
-  if (detached == nullptr) {
-    return false;
+static void DetachedTaskEntry(void* const /*arg*/) {
+  g_detached_task_ran.store(true, std::memory_order_release);
+}
+
+// Phase 5: a detached task that exits without being Join()ed is reclaimed by
+// ReapZombies().
+static bool TestDetachedTaskPhase(TaskScheduler& scheduler) {
+  g_detached_task_ran.store(false, std::memory_order_release);
+  Task* const detached =
+      scheduler.CreateTask(DetachedTaskEntry, nullptr, kDefaultTaskWeight);
+  SELFTEST_EXPECT(detached != nullptr);
+  scheduler.Detach(detached);
+  const TscDeadline deadline(kSelfTestWaitTimeoutTscCycles);
+  while (!g_detached_task_ran.load(std::memory_order_acquire)) {
+    SELFTEST_EXPECT(!deadline.Expired());
+    scheduler.Yield();
   }
-  while (!detached_ran.load(std::memory_order_acquire)) {
-    scheduler->Yield();
+  int reaped = scheduler.ReapZombies();
+  while (reaped == 0) {
+    SELFTEST_EXPECT(!deadline.Expired());
+    scheduler.Yield();
+    reaped = scheduler.ReapZombies();
   }
-  while (scheduler->ReapZombies() == 0) {
-    scheduler->Yield();
+  SELFTEST_EXPECT(reaped == 1);
+  return true;
+}
+
+static bool TestTaskSchedulerSmp() {
+  const int cpu_count = SmpCpuCount();
+  TaskScheduler* const scheduler = GetTaskScheduler();
+  SELFTEST_EXPECT(scheduler != nullptr);
+  SELFTEST_EXPECT(cpu_count >= 1 && cpu_count <= kMaxSupportedCpus);
+  SELFTEST_EXPECT(SmpOnlineCpuCount() == cpu_count);
+
+  Task* const bootstrap = scheduler->CurrentTask();
+  SELFTEST_EXPECT(bootstrap != nullptr);
+  SELFTEST_EXPECT(CurrentCpuId() == 0);
+  SELFTEST_EXPECT(scheduler->IsPreemptEnabled());
+
+  SchedulerTestContext ctx = {};
+  ctx.bootstrap_task = bootstrap;
+  ctx.observed_cpu_mask.Add(0);
+  ctx.expected_cpu_mask = CpuMask128::FirstCpus(cpu_count);
+  ctx.spinner_iters = std::make_unique<std::atomic<int64_t>[]>(cpu_count);
+
+  const int64_t pmm_free_before = PmmFreeFrameCount();
+  const int64_t heap_free_before = HeapTotalFreeBytes();
+  SELFTEST_EXPECT(pmm_free_before > 0);
+  SELFTEST_EXPECT(heap_free_before > 0);
+
+  // Every phase joins all of its tasks before it returns, also when it fails.
+  TaskScheduler& sched = *scheduler;
+  SELFTEST_EXPECT(TestWeightedYieldPhase(sched, &ctx));
+  SELFTEST_EXPECT(TestWorkStealingPhase(sched, &ctx, cpu_count));
+  {
+    // Boosts the LAPIC timer of every CPU 16x for phases 3 and 4 and restores
+    // all of them on every exit, when the phases have joined their tasks.
+    const ScopedLapicTimerBoost timer_boost(true);
+    SELFTEST_EXPECT(TestInterruptStressPhase(sched, &ctx));
+    SELFTEST_EXPECT(TestTimerPreemptionPhase(sched, &ctx, cpu_count));
   }
-  const int64_t pmm_free_after = PmmFreeFrameCount();
-  const int64_t heap_free_after = HeapTotalFreeBytes();
+  SELFTEST_EXPECT(TestDetachedTaskPhase(sched));
 
   UartWrite("[SCHED] remote_steal_slices=");
   UartWriteDec(static_cast<uint64_t>(
@@ -2227,78 +2290,76 @@ static bool TestTaskSchedulerSmp() {
   UartWriteDec(
       static_cast<uint64_t>(ctx.progress_done.load(std::memory_order_acquire)));
   UartWrite(", cpu_mask=");
-  UartWriteHex(ctx.observed_cpu_mask.low.load(std::memory_order_acquire));
+  UartWriteHex(ctx.observed_cpu_mask.Load().low);
   UartWrite("\n");
 
-  return pmm_free_after == pmm_free_before &&
-         heap_free_after == heap_free_before &&
-         SmpOnlineCpuCount() == cpu_count;
+  SELFTEST_EXPECT(PmmFreeFrameCount() == pmm_free_before);
+  SELFTEST_EXPECT(HeapTotalFreeBytes() == heap_free_before);
+  SELFTEST_EXPECT(SmpOnlineCpuCount() == cpu_count);
+  return true;
 }
+
+struct BootTest {
+  const char* name;
+  bool (*run)();
+};
+
+// The boot tests in the order they run. The first one must pass for the
+// others to be meaningful.
+constexpr BootTest kBootTests[] = {
+    {"pmm_memory_map_init", TestPmmMemoryMapInit},
+    {"pmm_alloc_and_bounds", TestPmmAllocAndBounds},
+    {"pmm_free_and_reuse", TestPmmFreeAndReuse},
+    {"heap_varied_sizes_and_alignment", TestHeapVariedSizesAndAlignment},
+    {"heap_pattern_isolation", TestHeapPatternIsolation},
+    {"cpp_new_delete_lifecycle", TestCppNewDeleteLifecycle},
+    {"heap_stress_reuse", TestHeapStressReuse},
+    {"edge_cases_and_oom", TestEdgeCasesAndOom},
+    {"pmm_heap_exhaustion", TestPmmAndHeapExhaustion},
+    {"paging_edge_cases", TestPagingEdgeCases},
+    {"rbtree_edge_cases", TestRbTreeEdgeCases},
+    {"multiboot_mmap_edge_cases", TestMultibootMmapEdgeCases},
+    {"smp_discovery_and_ap_bringup", TestSmpDiscoveryAndApBringup},
+    {"smp_multicpu_sync_stress", TestSmpMultiCpuSyncStress},
+    {"idt_percpu_and_lapic_timer", TestIdtPerCpuAndLapicTimer},
+    {"task_scheduler_smp", TestTaskSchedulerSmp},
+};
+constexpr int kBootTestCount = sizeof(kBootTests) / sizeof(kBootTests[0]);
 
 }  // namespace
 
-void RunBootVerificationSuite() {
-  const bool pmm_ok = PmmTotalUsableFrameCount() > 0 &&
-                      PmmFreeFrameCount() > 0 &&
-                      PmmMaxPhysicalAddress() > kBootstrapIdentityMapSize;
-  LogTestResult("pmm_memory_map_init", pmm_ok);
-  if (!pmm_ok) {
-    ConsoleWrite("[TEST] MEMORY VERIFICATION FAILED\n");
-    return;
+bool RunBootVerificationSuite() {
+  const char* failed_tests[kBootTestCount];
+  int failed_count = 0;
+  for (int i = 0; i < kBootTestCount; ++i) {
+    const bool passed = kBootTests[i].run();
+    LogTestResult(kBootTests[i].name, passed);
+    if (!passed) {
+      failed_tests[failed_count++] = kBootTests[i].name;
+      if (i == 0) {
+        // Without a usable memory map, the other tests would only crash.
+        break;
+      }
+    }
   }
 
-  const int64_t free_before_allocs = PmmFreeFrameCount();
-  uintptr_t frame1 = 0;
-  uintptr_t frame2 = 0;
-  uintptr_t multi_frames = 0;
-  const bool alloc_bounds_ok =
-      TestPmmAllocAndBounds(&frame1, &frame2, &multi_frames);
-  LogTestResult("pmm_alloc_and_bounds", alloc_bounds_ok);
-
-  const bool free_reuse_ok =
-      TestPmmFreeAndReuse(free_before_allocs, frame1, frame2, multi_frames);
-  LogTestResult("pmm_free_and_reuse", free_reuse_ok);
-
-  const bool varied_ok =
-      HeapTotalFreeBytes() > 0 && TestHeapVariedSizesAndAlignment();
-  LogTestResult("heap_varied_sizes_and_alignment", varied_ok);
-
-  const bool pattern_ok = TestHeapPatternIsolation();
-  LogTestResult("heap_pattern_isolation", pattern_ok);
-
-  const bool cpp_ok = TestCppNewDeleteLifecycle();
-  LogTestResult("cpp_new_delete_lifecycle", cpp_ok);
-
-  const bool stress_ok = TestHeapStressReuse();
-  LogTestResult("heap_stress_reuse", stress_ok);
-
-  const bool edge_ok = TestEdgeCasesAndOom();
-  LogTestResult("edge_cases_and_oom", edge_ok);
-
-  const bool smp_ok = TestSmpDiscoveryAndApBringup();
-  LogTestResult("smp_discovery_and_ap_bringup", smp_ok);
-
-  const bool smp_sync_ok = TestSmpMultiCpuSyncStress();
-  LogTestResult("smp_multicpu_sync_stress", smp_sync_ok);
-
-  const bool idt_timer_ok = TestIdtPerCpuAndLapicTimer();
-  LogTestResult("idt_percpu_and_lapic_timer", idt_timer_ok);
-
-  const bool task_sched_ok = TestTaskSchedulerSmp();
-  UartWrite("[TEST] task_scheduler_smp: ");
-  UartWrite(task_sched_ok ? "PASS\n" : "FAIL\n");
-  VgaWrite("[TEST] task_scheduler_smp: ");
-  VgaWrite(task_sched_ok ? "PASS\r" : "FAIL\r");
-
-  if (pmm_ok && alloc_bounds_ok && free_reuse_ok && varied_ok && pattern_ok &&
-      cpp_ok && stress_ok && edge_ok && smp_ok && smp_sync_ok && idt_timer_ok &&
-      task_sched_ok) {
+  // The one VGA line of the suite; it ends with a newline so that the stress
+  // test's progress line goes to the next row and doesn't overwrite it.
+  if (failed_count == 0) {
     UartWrite("[TEST] ALL MEMORY TESTS PASSED\n");
-    VgaWrite("[TEST] ALL MEMORY TESTS PASSED ");
-  } else {
-    UartWrite("[TEST] MEMORY VERIFICATION FAILED\n");
-    VgaWrite("[TEST] MEMORY VERIFICATION FAILED");
+    VgaWrite("[TEST] ALL MEMORY TESTS PASSED (");
+    VgaWriteDec(static_cast<uint64_t>(kBootTestCount));
+    VgaWrite(" boot self-tests)\n");
+    return true;
   }
+  UartWrite("[TEST] MEMORY VERIFICATION FAILED\n");
+  VgaWrite("[TEST] MEMORY VERIFICATION FAILED:");
+  for (int i = 0; i < failed_count; ++i) {
+    VgaWrite(" ");
+    VgaWrite(failed_tests[i]);
+  }
+  VgaWrite("\n");
+  return false;
 }
 
 }  // namespace protos

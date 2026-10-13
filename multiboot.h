@@ -55,20 +55,25 @@ bool MultibootRecordMmapEntry(MultibootMemoryMap* out_map,  //
                               uint64_t raw_length,          //
                               uint32_t type);
 
-// Parses the Multiboot1 (`0x2BADB002`) or Multiboot2 (`0x36D76289`) memory map
-// at `multiboot_info_addr` (must lie below `max_physical_addr`), mapping the
-// bootloader structures on demand if they lie above the initial 64 MiB
-// bootstrap window, and populates `*out_map`. Returns true if a valid memory
-// map with usable RAM was found without region table overflow.
-bool MultibootParseMemoryMapFromBuffer(uint32_t multiboot_magic,
-                                       uint64_t multiboot_info_addr,
-                                       uintptr_t max_physical_addr,
-                                       MultibootMemoryMap* out_map);
-
+// Parses the Multiboot1 (`0x2BADB002`) or Multiboot2 (`0x36D76289`) boot
+// information at physical address `multiboot_info_addr` (which must lie below
+// `max_physical_addr`) into `*out_map`: the memory map, the Multiboot2
+// framebuffer tag, and the physical ranges occupied by the Multiboot
+// structures. Structures above the 64 MiB bootstrap identity map are mapped on
+// demand with `PagingMapBootstrapRange`. Also logs the magic number and every
+// memory map entry to the console ("[PMM] mmap entry: ..."); `PmmInit` calls
+// this at boot. Returns true if a valid memory map with usable RAM was found
+// without overflowing the region table.
 bool MultibootParseMemoryMap(uint32_t multiboot_magic,
                              uint64_t multiboot_info_addr,
                              uintptr_t max_physical_addr,
                              MultibootMemoryMap* out_map);
+
+// Same as `MultibootParseMemoryMap`, but without any console output.
+bool MultibootParseMemoryMapQuiet(uint32_t multiboot_magic,
+                                  uint64_t multiboot_info_addr,
+                                  uintptr_t max_physical_addr,
+                                  MultibootMemoryMap* out_map);
 
 }  // namespace protos
 

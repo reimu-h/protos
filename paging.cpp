@@ -2,7 +2,9 @@
 
 #include <cstdint>
 
+#include "check.h"
 #include "pmm.h"
+#include "smp.h"
 #include "spinlock.h"
 
 namespace protos {
@@ -13,17 +15,26 @@ constexpr int kEntriesPerPageTable = 512;
 constexpr int kMaxBootstrapPageTables = 16;
 constexpr uint64_t kPtePresent = 1ULL << 0;
 constexpr uint64_t kPteWritable = 1ULL << 1;
+constexpr uint64_t kPteUser = 1ULL << 2;
 constexpr uint64_t kPteWriteThrough = 1ULL << 3;
 constexpr uint64_t kPteCacheDisable = 1ULL << 4;
+constexpr uint64_t kPteAccessed = 1ULL << 5;
+constexpr uint64_t kPteDirty = 1ULL << 6;
 constexpr uint64_t kPteHugePage = kPageEntryHugePage;
+// The PAT bit is bit 7 in 4 KiB PTEs (where 2 MiB PDEs have PS) and bit 12 in
+// 2 MiB PDEs.
+constexpr uint64_t kPtePat = 1ULL << 7;
+constexpr uint64_t kPdeHugePagePat = 1ULL << 12;
+constexpr uint64_t kPteGlobal = 1ULL << 8;
+constexpr uint64_t kPteNoExecute = 1ULL << 63;
 constexpr uint64_t kPteAddressMask = 0x000FFFFFFFFFF000ULL;
 constexpr uint64_t kHugePageAddressMask = 0x000FFFFFFFE00000ULL;
 
 IrqSpinLock g_paging_lock;
 
-// Static fallback pool of 4 KiB-aligned page tables in `.bss` used when
-// mapping high-memory bootloader structures (e.g., UEFI Multiboot2 info,
-// GOP framebuffer, or PMM bitmap above 64 MiB) before `PmmInit` completes.
+// Static fallback pool of 4 KiB-aligned page tables in `.bss`, used for
+// mappings made before `PmmInit` (the Multiboot info, ACPI tables, the GOP
+// framebuffer, Local APIC MMIO) and whenever the PMM has no free frame.
 alignas(4096) uint64_t
     g_bootstrap_page_tables[kMaxBootstrapPageTables][kEntriesPerPageTable];
 int g_bootstrap_page_tables_used = 0;
@@ -49,10 +60,13 @@ static void WriteCr3(const uintptr_t cr3_phys) {
   asm volatile("mov cr3, %0" : : "r"(value) : "memory");
 }
 
-// Allocates a single 4 KiB page-table frame (from the PMM when `use_pmm` is
-// true, falling back to the static bootstrap pool in `.bss` when `use_pmm` is
-// false or the PMM has no free low-memory frames) and zeroes all 512 64-bit
-// page-table entries. Returns the physical address of the table, or 0 on OOM.
+// Allocates a single 4 KiB page-table frame and zeroes its 512 entries. The
+// frame comes from the PMM when `use_pmm` is true, and from the static
+// bootstrap pool when `use_pmm` is false or the PMM is out of frames. Zeroing
+// needs the frame to be identity-mapped already, which holds because `PmmInit`
+// adds only frames below the 64 MiB bootstrap mapping to its free tree until it
+// has extended the identity map over all usable RAM. Returns the physical
+// address of the table, or 0 if both sources are exhausted.
 static uintptr_t AllocZeroedPageTable(const bool use_pmm) {
   uintptr_t frame_phys = use_pmm ? PmmAllocFrame() : 0;
   if (frame_phys == 0) {
@@ -212,6 +226,8 @@ bool PagingMarkPageUncacheable(const uintptr_t phys_addr) {
       phys_addr >= kMaxCanonicalIdentityAddress) {
     return false;
   }
+  // The TLB flushes below reach only the calling CPU (see paging.h).
+  DCHECK(CurrentCpuOrNull() == nullptr);
   const uintptr_t pml4_phys = ReadCr3();
   if (pml4_phys == 0) {
     return false;
@@ -238,28 +254,36 @@ bool PagingMarkPageUncacheable(const uintptr_t phys_addr) {
     return false;
   }
 
-  constexpr uint64_t kUcFlags = kPteWriteThrough | kPteCacheDisable;
   if ((pde & kPteHugePage) != 0) {
+    // Split the 2 MiB page into 512 4 KiB pages with identical attributes and
+    // flush before changing any of them, so that the TLB never holds a 2 MiB
+    // and a 4 KiB translation with different attributes for the same address
+    // (Intel SDM Vol. 3A, 4.10.2.3).
     const uintptr_t pt_phys = AllocZeroedPageTable(true);
     if (pt_phys == 0) {
       return false;
     }
     uint64_t* const pt = reinterpret_cast<uint64_t*>(pt_phys);
     const uintptr_t huge_base = pde & kHugePageAddressMask;
-    const uint64_t base_flags = pde & (kPtePresent | kPteWritable | kUcFlags);
+    constexpr uint64_t kSharedFlags = kPtePresent | kPteWritable | kPteUser |
+                                      kPteWriteThrough | kPteCacheDisable |
+                                      kPteAccessed | kPteDirty | kPteGlobal |
+                                      kPteNoExecute;
+    const uint64_t page_flags =
+        (pde & kSharedFlags) | (((pde & kPdeHugePagePat) != 0) ? kPtePat : 0);
     for (int i = 0; i < kEntriesPerPageTable; ++i) {
-      pt[i] = (huge_base + static_cast<uintptr_t>(i) * kPageSize) | base_flags;
+      pt[i] = (huge_base + static_cast<uintptr_t>(i) * kPageSize) | page_flags;
     }
-    pt[pt_idx] |= kUcFlags;
     pd[pd_idx] = pt_phys | kPtePresent | kPteWritable;
     WriteCr3(pml4_phys);
-    return true;
   }
 
-  uint64_t* const pt = reinterpret_cast<uint64_t*>(pde & kPteAddressMask);
+  uint64_t* const pt =
+      reinterpret_cast<uint64_t*>(pd[pd_idx] & kPteAddressMask);
   if ((pt[pt_idx] & kPtePresent) == 0) {
     return false;
   }
+  constexpr uint64_t kUcFlags = kPteWriteThrough | kPteCacheDisable;
   if ((pt[pt_idx] & kUcFlags) != kUcFlags) {
     pt[pt_idx] |= kUcFlags;
     WriteCr3(pml4_phys);
@@ -269,31 +293,25 @@ bool PagingMarkPageUncacheable(const uintptr_t phys_addr) {
 
 bool PagingIsIdentityMapped(const uintptr_t addr) {
   const IrqSpinLockGuard lock_guard(g_paging_lock);
-  // Reject non-canonical lower-half addresses beyond the 48-bit identity limit.
   if (addr >= kMaxCanonicalIdentityAddress) {
     return false;
   }
-  // Locate the active top-level PML4 table from CR3.
   const uintptr_t pml4_phys = ReadCr3();
   if (pml4_phys == 0) {
     return false;
   }
 
-  // Extract the 9-bit page table indices for PML4 (bits 47:39), PDPT (bits
-  // 38:30), and PD (bits 29:21) from the virtual address.
   const int pml4_idx = (addr >> 39) & 0x1FF;
   const int pdpt_idx = (addr >> 30) & 0x1FF;
   const int pd_idx = (addr >> 21) & 0x1FF;
 
-  // Check that the PML4 entry is present and writable.
+  // Every level must be present and writable.
   const uint64_t* const pml4 = reinterpret_cast<const uint64_t*>(pml4_phys);
   const uint64_t pml4e = pml4[pml4_idx];
   if ((pml4e & (kPtePresent | kPteWritable)) != (kPtePresent | kPteWritable)) {
     return false;
   }
 
-  // Follow the PML4 entry to the PDPT and check that the PDPT entry is present
-  // and writable.
   const uint64_t* const pdpt =
       reinterpret_cast<const uint64_t*>(pml4e & kPteAddressMask);
   const uint64_t pdpte = pdpt[pdpt_idx];
@@ -301,8 +319,6 @@ bool PagingIsIdentityMapped(const uintptr_t addr) {
     return false;
   }
 
-  // Follow the PDPT entry to the Page Directory (PD) and verify that the PD
-  // entry is present and writable.
   const uint64_t* const pd =
       reinterpret_cast<const uint64_t*>(pdpte & kPteAddressMask);
   const uint64_t pde = pd[pd_idx];
@@ -311,15 +327,11 @@ bool PagingIsIdentityMapped(const uintptr_t addr) {
   }
 
   if ((pde & kPteHugePage) != 0) {
-    // Confirm identity mapping by checking that the physical 2 MiB huge-page
-    // base address encoded in the PD entry matches the 2 MiB-aligned virtual
-    // address.
     const uintptr_t mapped_base = pde & kHugePageAddressMask;
     const uintptr_t expected_base = addr & ~(kHugePageSize - 1);
     return mapped_base == expected_base;
   }
 
-  // 4 KiB page table (`PS == 0`): walk the PT entry for `addr`.
   const int pt_idx = (addr >> 12) & 0x1FF;
   const uint64_t* const pt =
       reinterpret_cast<const uint64_t*>(pde & kPteAddressMask);

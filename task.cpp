@@ -1,11 +1,10 @@
 #include "task.h"
 
+#include <atomic>
 #include <memory>
 #include <utility>
-#if !__STDC_HOSTED__
-#pragma GCC optimize("no-tree-loop-distribute-patterns")
-#endif
 
+#include "check.h"
 #include "core_runqueue_scheduler.h"
 #include "idt.h"
 #include "join_lifecycle_scheduler.h"
@@ -15,55 +14,61 @@
 namespace protos {
 namespace {
 
-// Active composed task scheduler instance initialized by `TaskInit()`.
-std::shared_ptr<TaskScheduler> g_task_scheduler;
+// Owns the scheduler composed by `TaskInit()`. Only `TaskInit()` and
+// `TaskResetForTest()` touch it.
+std::shared_ptr<TaskScheduler> g_task_scheduler_owner;
+
+// The scheduler published to all CPUs. `TaskInit()` stores it with release
+// semantics after `Init()` has completed; readers (interrupt handlers, AP idle
+// loops, tasks) load it with acquire semantics, so they see a fully
+// initialized scheduler or `nullptr`.
+std::atomic<TaskScheduler*> g_task_scheduler{nullptr};
 
 static void ApicTimerInterruptHandler(InterruptFrame* const frame) {
-  if (g_task_scheduler == nullptr) {
-    return;
+  TaskScheduler* const scheduler = GetTaskScheduler();
+  if (scheduler != nullptr) {
+    scheduler->OnTimerInterrupt(frame);
   }
-  g_task_scheduler->OnTimerInterrupt(frame);
 }
 
 static void WakeupIpiInterruptHandler(InterruptFrame* const frame) {
-  if (g_task_scheduler == nullptr) {
-    return;
+  TaskScheduler* const scheduler = GetTaskScheduler();
+  if (scheduler != nullptr) {
+    scheduler->OnWakeupIpi(frame);
   }
-  g_task_scheduler->OnWakeupIpi(frame);
-}
-
-static void ResetSchedulerStateInternal() {
-  if (IdtIsInitialized()) {
-    IdtUnregisterHandler(kVectorApicTimer);
-    IdtUnregisterHandler(kVectorWakeupIpi);
-  }
-  g_task_scheduler.reset();
 }
 
 }  // namespace
 
 void TaskInit() {
-  ResetSchedulerStateInternal();
-  if (!IdtIsInitialized()) {
-    IdtInit();
-  }
+  CHECK(IdtIsInitialized());
+  CHECK(GetTaskScheduler() == nullptr);
 
   std::shared_ptr<TaskScheduler> scheduler =
       CreatePreemptiveScheduler(CreateJoinLifecycleScheduler(
           CreateWorkStealingScheduler(CreateCoreRunqueueScheduler())));
   scheduler->Init();
-  g_task_scheduler = std::move(scheduler);
+  TaskScheduler* const published = scheduler.get();
+  g_task_scheduler_owner = std::move(scheduler);
+  g_task_scheduler.store(published, std::memory_order_release);
 
   IdtRegisterHandler(kVectorApicTimer, ApicTimerInterruptHandler);
   IdtRegisterHandler(kVectorWakeupIpi, WakeupIpiInterruptHandler);
 }
 
-const std::shared_ptr<TaskScheduler>& GetTaskScheduler() {
-  return g_task_scheduler;
+TaskScheduler* GetTaskScheduler() {
+  return g_task_scheduler.load(std::memory_order_acquire);
 }
 
 #if __STDC_HOSTED__
-void TaskResetForTest() { ResetSchedulerStateInternal(); }
+void TaskResetForTest() {
+  if (IdtIsInitialized()) {
+    IdtUnregisterHandler(kVectorApicTimer);
+    IdtUnregisterHandler(kVectorWakeupIpi);
+  }
+  g_task_scheduler.store(nullptr, std::memory_order_release);
+  g_task_scheduler_owner.reset();
+}
 #endif
 
 }  // namespace protos

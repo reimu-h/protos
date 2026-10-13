@@ -4,6 +4,7 @@
 #include <gtest/gtest.h>
 
 #include <atomic>
+#include <chrono>
 #include <cstdint>
 #include <cstdio>
 #include <memory>
@@ -18,12 +19,13 @@ namespace {
 
 namespace t = ::testing;
 
-constexpr int kMaxJoinRecordsForTest = 1024;
-
 static Task* FakeTaskPtr(const int id) {
   return reinterpret_cast<Task*>(static_cast<uintptr_t>(0x10000 + id * 0x10));
 }
 
+// The entry function and argument that the join layer passed to the inner
+// layer's CreateTask*(). Calling it runs the wrapped task to completion, as
+// the inner layer would.
 struct CapturedTaskLaunch {
   TaskFn entry = nullptr;
   void* arg = nullptr;
@@ -34,9 +36,27 @@ struct CapturedTaskLaunch {
   }
 };
 
-// 1. Init() clears all join records and delegates to inner->Init().
+// Creates a task through `sched` while `mock_inner` returns `task`, and stores
+// the wrapped launch in `*launch`.
+static void CreateFakeTask(MockTaskScheduler& mock_inner,  //
+                           TaskScheduler& sched,           //
+                           Task* const task,               //
+                           CapturedTaskLaunch* const launch) {
+  EXPECT_CALL(mock_inner, CreateTask)
+      .WillOnce([task, launch](const TaskFn entry,  //
+                               void* const arg,     //
+                               const int64_t /*weight*/) {
+        *launch = {entry, arg};
+        return task;
+      });
+  EXPECT_THAT(sched.CreateTask(NoopTask, nullptr, kDefaultTaskWeight),
+              t::Eq(task));
+}
+
+// 1. Init() frees all join records and delegates to inner->Init().
 TEST(JoinLifecycleSchedulerTest, InitClearsAllJoinRecordsAndDelegatesToInner) {
   ResetTestEnv();
+  const int64_t heap_before = HeapTotalFreeBytes();
   const auto mock_inner = std::make_shared<t::StrictMock<MockTaskScheduler>>();
   const std::shared_ptr<TaskScheduler> sched =
       CreateJoinLifecycleScheduler(mock_inner);
@@ -44,64 +64,50 @@ TEST(JoinLifecycleSchedulerTest, InitClearsAllJoinRecordsAndDelegatesToInner) {
   Task* const stale_zombie = FakeTaskPtr(1);
   Task* const stale_running = FakeTaskPtr(2);
   CapturedTaskLaunch zombie_launch;
+  CapturedTaskLaunch running_launch;
+  CreateFakeTask(*mock_inner, *sched, stale_zombie, &zombie_launch);
+  CreateFakeTask(*mock_inner, *sched, stale_running, &running_launch);
 
-  EXPECT_CALL(*mock_inner, CreateTask)
-      .WillOnce([&](const TaskFn entry, void* const arg, const int64_t weight) {
-        EXPECT_THAT(entry, t::NotNull());
-        EXPECT_THAT(arg, t::NotNull());
-        EXPECT_THAT(weight, t::Eq(kDefaultTaskWeight));
-        zombie_launch = {entry, arg};
-        return stale_zombie;
-      })
-      .WillOnce([&](const TaskFn entry, void* const arg, const int64_t weight) {
-        EXPECT_THAT(entry, t::NotNull());
-        EXPECT_THAT(arg, t::NotNull());
-        EXPECT_THAT(weight, t::Eq(kDefaultTaskWeight));
-        return stale_running;
-      });
-
-  EXPECT_THAT(sched->CreateTask(NoopTask, nullptr, kDefaultTaskWeight),
-              t::Eq(stale_zombie));
-  EXPECT_THAT(sched->CreateTask(NoopTask, nullptr, kDefaultTaskWeight),
-              t::Eq(stale_running));
-
-  // Complete `stale_zombie` without reaping it.
+  // `stale_zombie` exits and is detached, so it waits for ReapZombies().
   zombie_launch.RunToCompletion();
+  sched->Detach(stale_zombie);
+  EXPECT_THAT(HeapTotalFreeBytes(), t::Lt(heap_before));
 
-  // Calling Init() must clear all join records and forward to inner->Init().
+  // Init() must free every join record and forward to inner->Init().
   int init_calls = 0;
   EXPECT_CALL(*mock_inner, Init).WillOnce([&]() { ++init_calls; });
   sched->Init();
   EXPECT_THAT(init_calls, t::Eq(1));
+  EXPECT_THAT(HeapTotalFreeBytes(), t::Eq(heap_before));
 
-  // Because Init() cleared the join record table, ReapZombies() must find 0
-  // exited tasks and must not call inner->Join().
+  // The zombie's record is gone, so ReapZombies() finds nothing and must not
+  // call inner->Join() (StrictMock).
   EXPECT_THAT(sched->ReapZombies(), t::Eq(0));
 
-  // Full capacity of kMaxJoinRecordsForTest slots is available after Init().
-  for (int i = 0; i < kMaxJoinRecordsForTest; ++i) {
-    Task* const task = FakeTaskPtr(100 + i);
-    EXPECT_CALL(*mock_inner, CreateTask)
-        .WillOnce([task](const TaskFn /*entry*/,  //
-                         void* const /*arg*/,     //
-                         const int64_t /*weight*/) { return task; });
-    EXPECT_THAT(sched->CreateTask(NoopTask, nullptr, kDefaultTaskWeight),
-                t::Eq(task));
-  }
+  // Tasks created after Init() are tracked as usual.
+  Task* const self_task = FakeTaskPtr(3);
+  Task* const fresh_task = FakeTaskPtr(4);
+  CapturedTaskLaunch fresh_launch;
+  CreateFakeTask(*mock_inner, *sched, fresh_task, &fresh_launch);
+  fresh_launch.RunToCompletion();
+  EXPECT_CALL(*mock_inner, CurrentTask).WillOnce([&]() { return self_task; });
+  EXPECT_CALL(*mock_inner, Join).WillOnce([&](Task* const task) {
+    EXPECT_THAT(task, t::Eq(fresh_task));
+  });
+  sched->Join(fresh_task);
+  EXPECT_THAT(HeapTotalFreeBytes(), t::Eq(heap_before));
 }
 
-// 2. CreateTask and CreateTaskOnCpu delegate to inner, allocate/track a join
-//    record for non-null returned Task* pointers, and release the record when
-//    inner returns nullptr.
+// 2. CreateTask and CreateTaskOnCpu delegate to inner, track a join record for
+//    each non-null Task*, and free the record when inner returns nullptr.
 TEST(JoinLifecycleSchedulerTest,
      CreateTaskAndCreateTaskOnCpuTrackNonNullAndHandleNullptrCleanly) {
   ResetTestEnv();
+  const int64_t heap_before = HeapTotalFreeBytes();
   const auto mock_inner = std::make_shared<t::StrictMock<MockTaskScheduler>>();
   const std::shared_ptr<TaskScheduler> sched =
       CreateJoinLifecycleScheduler(mock_inner);
 
-  int observed_a = 0;
-  int observed_b = 0;
   int arg_a = 11;
   int arg_b = 22;
   Task* const self_task = FakeTaskPtr(1);
@@ -124,8 +130,10 @@ TEST(JoinLifecycleSchedulerTest,
                   &arg_a,                                                   //
                   kDefaultTaskWeight * 2),
               t::Eq(task_a));
+  const int64_t heap_with_one_record = HeapTotalFreeBytes();
+  EXPECT_THAT(heap_with_one_record, t::Lt(heap_before));
 
-  // Nullptr CreateTask return releases its pre-allocated join record slot.
+  // A nullptr CreateTask return frees the join record allocated for it.
   EXPECT_CALL(*mock_inner, CreateTask)
       .WillOnce([&](const TaskFn entry, void* const arg, const int64_t weight) {
         EXPECT_THAT(entry, t::NotNull());
@@ -135,6 +143,7 @@ TEST(JoinLifecycleSchedulerTest,
       });
   EXPECT_THAT(sched->CreateTask(NoopTask, nullptr, kDefaultTaskWeight),
               t::IsNull());
+  EXPECT_THAT(HeapTotalFreeBytes(), t::Eq(heap_with_one_record));
 
   // Non-null CreateTaskOnCpu return.
   EXPECT_CALL(*mock_inner, CreateTaskOnCpu)
@@ -155,8 +164,9 @@ TEST(JoinLifecycleSchedulerTest,
                   kDefaultTaskWeight / 2,                                   //
                   3),
               t::Eq(task_b));
+  const int64_t heap_with_two_records = HeapTotalFreeBytes();
 
-  // Nullptr CreateTaskOnCpu return releases its pre-allocated join record slot.
+  // A nullptr CreateTaskOnCpu return frees the join record allocated for it.
   EXPECT_CALL(*mock_inner, CreateTaskOnCpu)
       .WillOnce([&](const TaskFn entry,    //
                     void* const arg,       //
@@ -170,15 +180,13 @@ TEST(JoinLifecycleSchedulerTest,
       });
   EXPECT_THAT(sched->CreateTaskOnCpu(NoopTask, nullptr, kDefaultTaskWeight, 1),
               t::IsNull());
+  EXPECT_THAT(HeapTotalFreeBytes(), t::Eq(heap_with_two_records));
 
-  // Verify both `task_a` and `task_b` run their user callbacks and mark exited
-  // when their wrapped entry returns.
+  // Both wrapped entries run the user callbacks.
   launch_a.RunToCompletion();
   launch_b.RunToCompletion();
-  observed_a = arg_a;
-  observed_b = arg_b;
-  EXPECT_THAT(observed_a, t::Eq(111));
-  EXPECT_THAT(observed_b, t::Eq(222));
+  EXPECT_THAT(arg_a, t::Eq(111));
+  EXPECT_THAT(arg_b, t::Eq(222));
 
   std::vector<Task*> joined_tasks;
   EXPECT_CALL(*mock_inner, CurrentTask).WillRepeatedly([&]() {
@@ -191,6 +199,7 @@ TEST(JoinLifecycleSchedulerTest,
   sched->Join(task_a);
   sched->Join(task_b);
   EXPECT_THAT(joined_tasks, t::ElementsAre(task_a, task_b));
+  EXPECT_THAT(HeapTotalFreeBytes(), t::Eq(heap_before));
 }
 
 // 3. Join(task) when task has already finished before Join(task) is called:
@@ -206,15 +215,7 @@ TEST(JoinLifecycleSchedulerTest,
   Task* const target_task = FakeTaskPtr(11);
   Task* joined_task = nullptr;
   CapturedTaskLaunch target_launch;
-
-  EXPECT_CALL(*mock_inner, CreateTask)
-      .WillOnce(
-          [&](const TaskFn entry, void* const arg, const int64_t /*weight*/) {
-            target_launch = {entry, arg};
-            return target_task;
-          });
-  EXPECT_THAT(sched->CreateTask(NoopTask, nullptr, kDefaultTaskWeight),
-              t::Eq(target_task));
+  CreateFakeTask(*mock_inner, *sched, target_task, &target_launch);
 
   // Target finishes before Join(target_task) is invoked.
   target_launch.RunToCompletion();
@@ -228,16 +229,17 @@ TEST(JoinLifecycleSchedulerTest,
   sched->Join(target_task);
   EXPECT_THAT(joined_task, t::Eq(target_task));
 
-  // Join record slot was freed by Join(), so ReapZombies() finds nothing.
+  // Join() freed the join record, so ReapZombies() finds nothing.
   EXPECT_THAT(sched->ReapZombies(), t::Eq(0));
 }
 
 // 4. Join(task) when task has not yet exited: calls inner->Yield() repeatedly
-//    until task finishes its entry callback, then delegates to
-//    inner->Join(task) and frees the join record slot.
+//    until task finishes its entry callback, then frees the join record and
+//    delegates to inner->Join(task).
 TEST(JoinLifecycleSchedulerTest,
-     JoinWhenTaskRunningYieldsRepeatedlyUntilExitAndFreesSlot) {
+     JoinWhenTaskRunningYieldsRepeatedlyUntilExitAndFreesRecord) {
   ResetTestEnv();
+  const int64_t heap_before = HeapTotalFreeBytes();
   const auto mock_inner = std::make_shared<t::StrictMock<MockTaskScheduler>>();
   const std::shared_ptr<TaskScheduler> sched =
       CreateJoinLifecycleScheduler(mock_inner);
@@ -248,15 +250,7 @@ TEST(JoinLifecycleSchedulerTest,
   constexpr int kYieldsBeforeExit = 4;
   Task* joined_task = nullptr;
   CapturedTaskLaunch target_launch;
-
-  EXPECT_CALL(*mock_inner, CreateTask)
-      .WillOnce(
-          [&](const TaskFn entry, void* const arg, const int64_t /*weight*/) {
-            target_launch = {entry, arg};
-            return target_task;
-          });
-  EXPECT_THAT(sched->CreateTask(NoopTask, nullptr, kDefaultTaskWeight),
-              t::Eq(target_task));
+  CreateFakeTask(*mock_inner, *sched, target_task, &target_launch);
 
   EXPECT_CALL(*mock_inner, CurrentTask).WillRepeatedly([&]() {
     return self_task;
@@ -276,70 +270,59 @@ TEST(JoinLifecycleSchedulerTest,
   EXPECT_THAT(yield_count, t::Eq(kYieldsBeforeExit));
   EXPECT_THAT(joined_task, t::Eq(target_task));
   EXPECT_THAT(sched->ReapZombies(), t::Eq(0));
+  EXPECT_THAT(HeapTotalFreeBytes(), t::Eq(heap_before));
 }
 
-// 5. ReapZombies(): reaps all exited, unjoined tasks that have no active joiner
-//    by calling inner->Join(zombie) and returning the count of reaped tasks,
-//    while leaving still-running tasks and tasks currently being joined
-//    untouched; subsequent ReapZombies() returns 0.
+// 5. ReapZombies() reclaims exactly the detached tasks that have exited, in
+//    the order in which they became zombies, by calling inner->Join() on them.
+//    It leaves running detached tasks and every joinable task alone, including
+//    joinable tasks that have exited but have not been joined yet.
 TEST(JoinLifecycleSchedulerTest,
-     ReapZombiesReapsOnlyUnjoinedExitedTasksAndSkipsRunningOrBeingJoined) {
+     ReapZombiesReclaimsOnlyDetachedTasksThatHaveExited) {
   ResetTestEnv();
+  const int64_t heap_before = HeapTotalFreeBytes();
   const auto mock_inner = std::make_shared<t::StrictMock<MockTaskScheduler>>();
   const std::shared_ptr<TaskScheduler> sched =
       CreateJoinLifecycleScheduler(mock_inner);
 
   Task* const joiner_task = FakeTaskPtr(30);
-  Task* const zombie_1 = FakeTaskPtr(31);
-  Task* const running_task = FakeTaskPtr(32);
-  Task* const zombie_2 = FakeTaskPtr(33);
-  Task* const actively_joined_task = FakeTaskPtr(34);
+  Task* const detached_then_exited = FakeTaskPtr(31);
+  Task* const exited_joinable = FakeTaskPtr(32);
+  Task* const running_detached = FakeTaskPtr(33);
+  Task* const exited_then_detached = FakeTaskPtr(34);
+  Task* const actively_joined = FakeTaskPtr(35);
 
-  CapturedTaskLaunch launch_z1;
-  CapturedTaskLaunch launch_running;
-  CapturedTaskLaunch launch_z2;
+  CapturedTaskLaunch launch_detached_then_exited;
+  CapturedTaskLaunch launch_exited_joinable;
+  CapturedTaskLaunch launch_running_detached;
+  CapturedTaskLaunch launch_exited_then_detached;
   CapturedTaskLaunch launch_active;
+  CreateFakeTask(*mock_inner,           //
+                 *sched,                //
+                 detached_then_exited,  //
+                 &launch_detached_then_exited);
+  CreateFakeTask(*mock_inner, *sched, exited_joinable, &launch_exited_joinable);
+  CreateFakeTask(*mock_inner,       //
+                 *sched,            //
+                 running_detached,  //
+                 &launch_running_detached);
+  CreateFakeTask(*mock_inner,           //
+                 *sched,                //
+                 exited_then_detached,  //
+                 &launch_exited_then_detached);
+  CreateFakeTask(*mock_inner, *sched, actively_joined, &launch_active);
 
-  EXPECT_CALL(*mock_inner, CreateTask)
-      .WillOnce(
-          [&](const TaskFn entry, void* const arg, const int64_t /*weight*/) {
-            launch_z1 = {entry, arg};
-            return zombie_1;
-          })
-      .WillOnce(
-          [&](const TaskFn entry, void* const arg, const int64_t /*weight*/) {
-            launch_running = {entry, arg};
-            return running_task;
-          })
-      .WillOnce(
-          [&](const TaskFn entry, void* const arg, const int64_t /*weight*/) {
-            launch_z2 = {entry, arg};
-            return zombie_2;
-          })
-      .WillOnce(
-          [&](const TaskFn entry, void* const arg, const int64_t /*weight*/) {
-            launch_active = {entry, arg};
-            return actively_joined_task;
-          });
+  // Detach() never reaches the inner layer (StrictMock).
+  sched->Detach(detached_then_exited);
+  launch_detached_then_exited.RunToCompletion();
+  launch_exited_joinable.RunToCompletion();
+  sched->Detach(running_detached);
+  launch_exited_then_detached.RunToCompletion();
+  sched->Detach(exited_then_detached);
 
-  EXPECT_THAT(sched->CreateTask(NoopTask, nullptr, kDefaultTaskWeight),
-              t::Eq(zombie_1));
-  EXPECT_THAT(sched->CreateTask(NoopTask, nullptr, kDefaultTaskWeight),
-              t::Eq(running_task));
-  EXPECT_THAT(sched->CreateTask(NoopTask, nullptr, kDefaultTaskWeight),
-              t::Eq(zombie_2));
-  EXPECT_THAT(sched->CreateTask(NoopTask, nullptr, kDefaultTaskWeight),
-              t::Eq(actively_joined_task));
-
-  // `zombie_1` and `zombie_2` finish without any joiner.
-  launch_z1.RunToCompletion();
-  launch_z2.RunToCompletion();
-
-  // Start `Join(actively_joined_task)` on `joiner_task`. Inside `Yield()`,
-  // `actively_joined_task` finishes AND `ReapZombies()` runs before `Join()`
-  // finishes. `ReapZombies()` must reap `zombie_1` and `zombie_2`, skip
-  // `running_task` (not exited) and skip `actively_joined_task` (exited, but
-  // has an active `joiner`).
+  // Start `Join(actively_joined)` on `joiner_task`. Inside `Yield()`,
+  // `actively_joined` finishes AND `ReapZombies()` runs before `Join()`
+  // finishes.
   std::vector<Task*> reaped_during_yield;
   int reap_count_during_yield = -1;
   int reap_count_second_call = -1;
@@ -361,85 +344,94 @@ TEST(JoinLifecycleSchedulerTest,
     }
   });
 
-  sched->Join(actively_joined_task);
+  sched->Join(actively_joined);
 
   EXPECT_THAT(reap_count_during_yield, t::Eq(2));
-  EXPECT_THAT(reaped_during_yield, t::ElementsAre(zombie_1, zombie_2));
+  EXPECT_THAT(reaped_during_yield,
+              t::ElementsAre(detached_then_exited, exited_then_detached));
   EXPECT_THAT(reap_count_second_call, t::Eq(0));
-  EXPECT_THAT(joined_by_joiner, t::Eq(actively_joined_task));
+  EXPECT_THAT(joined_by_joiner, t::Eq(actively_joined));
 
-  // `running_task` was left untouched by ReapZombies(); once it finishes,
-  // ReapZombies() reaps it and subsequent ReapZombies() returns 0.
-  launch_running.RunToCompletion();
+  // `exited_joinable` survived both ReapZombies() calls and can still be
+  // joined.
+  Task* joined_later = nullptr;
+  EXPECT_CALL(*mock_inner, Join).WillOnce([&](Task* const task) {
+    joined_later = task;
+  });
+  sched->Join(exited_joinable);
+  EXPECT_THAT(joined_later, t::Eq(exited_joinable));
 
+  // `running_detached` is reaped once it exits.
+  EXPECT_THAT(sched->ReapZombies(), t::Eq(0));
+  launch_running_detached.RunToCompletion();
   Task* reaped_running = nullptr;
   EXPECT_CALL(*mock_inner, Join).WillOnce([&](Task* const task) {
     reaped_running = task;
   });
   EXPECT_THAT(sched->ReapZombies(), t::Eq(1));
-  EXPECT_THAT(reaped_running, t::Eq(running_task));
+  EXPECT_THAT(reaped_running, t::Eq(running_detached));
   EXPECT_THAT(sched->ReapZombies(), t::Eq(0));
+  EXPECT_THAT(HeapTotalFreeBytes(), t::Eq(heap_before));
 }
 
-// 6. Join record table capacity & slot reuse: creating, finishing, and
-//    joining/reaping more than 1024 (kMaxJoinRecords) tasks over time succeeds
-//    by reusing freed join record slots.
-TEST(JoinLifecycleSchedulerTest,
-     JoinRecordTableCapacityAndSlotReuseAcrossMoreThanMaxJoinRecords) {
+// 6. Join records are allocated dynamically: more than a thousand can be live
+//    at once, and every record is freed again, whether its task is joined or
+//    detached and reaped.
+TEST(JoinLifecycleSchedulerTest, ManyLiveRecordsAreAllReclaimedByJoinOrReap) {
   ResetTestEnv();
+  const int64_t heap_before = HeapTotalFreeBytes();
   const auto mock_inner = std::make_shared<t::StrictMock<MockTaskScheduler>>();
   const std::shared_ptr<TaskScheduler> sched =
       CreateJoinLifecycleScheduler(mock_inner);
 
+  constexpr int kWaves = 2;
+  constexpr int kTasksPerWave = 1500;
   Task* const self_task = FakeTaskPtr(1);
-  int joined_count = 0;
+  int next_task_id = 1000;
+  int inner_join_calls = 0;
+  std::vector<CapturedTaskLaunch> launches;
 
+  EXPECT_CALL(*mock_inner, CreateTask)
+      .WillRepeatedly(
+          [&](const TaskFn entry, void* const arg, const int64_t /*weight*/) {
+            launches.push_back({entry, arg});
+            return FakeTaskPtr(next_task_id++);
+          });
   EXPECT_CALL(*mock_inner, CurrentTask).WillRepeatedly([&]() {
     return self_task;
   });
   EXPECT_CALL(*mock_inner, Join).WillRepeatedly([&](Task* const task) {
     EXPECT_THAT(task, t::NotNull());
-    ++joined_count;
+    ++inner_join_calls;
   });
 
-  // Fill all 1024 slots simultaneously, then finish and join half (512) and
-  // reap the other half (512), repeated over 3 full waves (3072 tasks total).
-  constexpr int kWaves = 3;
   for (int wave = 0; wave < kWaves; ++wave) {
-    std::vector<Task*> wave_tasks;
-    std::vector<CapturedTaskLaunch> wave_launches;
-    wave_tasks.reserve(kMaxJoinRecordsForTest);
-    wave_launches.reserve(kMaxJoinRecordsForTest);
-
-    for (int i = 0; i < kMaxJoinRecordsForTest; ++i) {
-      Task* const task = FakeTaskPtr(1000 + wave * kMaxJoinRecordsForTest + i);
-      CapturedTaskLaunch launch;
-      EXPECT_CALL(*mock_inner, CreateTask)
-          .WillOnce([task, &launch](const TaskFn entry,  //
-                                    void* const arg,     //
-                                    const int64_t /*weight*/) {
-            launch = {entry, arg};
-            return task;
-          });
-      EXPECT_THAT(sched->CreateTask(NoopTask, nullptr, kDefaultTaskWeight),
-                  t::Eq(task));
-      wave_tasks.push_back(task);
-      wave_launches.push_back(launch);
+    launches.clear();
+    std::vector<Task*> tasks;
+    tasks.reserve(kTasksPerWave);
+    for (int i = 0; i < kTasksPerWave; ++i) {
+      Task* const task =
+          sched->CreateTask(NoopTask, nullptr, kDefaultTaskWeight);
+      ASSERT_THAT(task, t::NotNull());
+      tasks.push_back(task);
+    }
+    for (const CapturedTaskLaunch& launch : launches) {
+      launch.RunToCompletion();
     }
 
-    for (int i = 0; i < kMaxJoinRecordsForTest; ++i) {
-      wave_launches[i].RunToCompletion();
-    }
-
-    const int half = kMaxJoinRecordsForTest / 2;
+    // Join the first half; detach the second half and reap it.
+    const int half = kTasksPerWave / 2;
     for (int i = 0; i < half; ++i) {
-      sched->Join(wave_tasks[i]);
+      sched->Join(tasks[i]);
     }
-    EXPECT_THAT(sched->ReapZombies(), t::Eq(kMaxJoinRecordsForTest - half));
+    for (int i = half; i < kTasksPerWave; ++i) {
+      sched->Detach(tasks[i]);
+    }
+    EXPECT_THAT(sched->ReapZombies(), t::Eq(kTasksPerWave - half));
     EXPECT_THAT(sched->ReapZombies(), t::Eq(0));
+    EXPECT_THAT(HeapTotalFreeBytes(), t::Eq(heap_before));
   }
-
-  EXPECT_THAT(joined_count, t::Eq(kWaves * kMaxJoinRecordsForTest));
+  EXPECT_THAT(inner_join_calls, t::Eq(kWaves * kTasksPerWave));
 }
 
 // 7. Multi-threaded concurrency test: one thread runs Join(task)
@@ -515,7 +507,91 @@ TEST(JoinLifecycleSchedulerTest,
   EXPECT_THAT(sched->ReapZombies(), t::Eq(0));
 }
 
-// 8. Direct forwarding of Yield, PollIdleCpu, RunqueueLoad, StealTask,
+// 8. A reaper thread that calls ReapZombies() in a loop never reclaims a
+//    joinable task, even one that has exited long before its owner joins it,
+//    while it still reclaims every detached task (TSAN covers the locking).
+TEST(JoinLifecycleSchedulerTest,
+     ConcurrentReapZombiesNeverReclaimsTasksThatAwaitJoin) {
+  constexpr int kTasksPerThread = 200;
+  SetupEnv(3);
+  const int64_t heap_before = HeapTotalFreeBytes();
+  const auto mock_inner = std::make_shared<t::StrictMock<MockTaskScheduler>>();
+  const std::shared_ptr<TaskScheduler> sched =
+      CreateJoinLifecycleScheduler(mock_inner);
+
+  thread_local CapturedTaskLaunch tls_last_launch;
+  std::atomic<int> next_task_id{1};
+  std::atomic<int> inner_joins{0};
+  Task* const joiner_task = FakeTaskPtr(1 << 20);
+
+  EXPECT_CALL(*mock_inner, CreateTask)
+      .WillRepeatedly(
+          [&](const TaskFn entry, void* const arg, const int64_t /*weight*/) {
+            tls_last_launch = {entry, arg};
+            return FakeTaskPtr(
+                next_task_id.fetch_add(1, std::memory_order_relaxed));
+          });
+  EXPECT_CALL(*mock_inner, CurrentTask).WillRepeatedly([&]() {
+    return joiner_task;
+  });
+  EXPECT_CALL(*mock_inner, Join).WillRepeatedly([&](Task* const task) {
+    EXPECT_THAT(task, t::NotNull());
+    inner_joins.fetch_add(1, std::memory_order_acq_rel);
+  });
+
+  std::atomic<int> reaped{0};
+  std::atomic<bool> stop_reaper{false};
+  std::thread reaper([&]() {
+    BindCpuLocal(&g_env.cpu_locals[1]);
+    SetInterruptsEnabledForTest(true);
+    while (!stop_reaper.load(std::memory_order_acquire)) {
+      reaped.fetch_add(sched->ReapZombies(), std::memory_order_acq_rel);
+      std::this_thread::yield();
+    }
+    ResetCpuLocalForTest();
+  });
+
+  // Detached tasks exit either before or after they are detached.
+  std::thread detacher([&]() {
+    BindCpuLocal(&g_env.cpu_locals[2]);
+    SetInterruptsEnabledForTest(true);
+    for (int i = 0; i < kTasksPerThread; ++i) {
+      Task* const task =
+          sched->CreateTask(NoopTask, nullptr, kDefaultTaskWeight);
+      if ((i & 1) == 0) {
+        tls_last_launch.RunToCompletion();
+        sched->Detach(task);
+      } else {
+        sched->Detach(task);
+        tls_last_launch.RunToCompletion();
+      }
+    }
+    ResetCpuLocalForTest();
+  });
+
+  // Joinable tasks exit, then give the reaper time to run before the join.
+  for (int i = 0; i < kTasksPerThread; ++i) {
+    Task* const task = sched->CreateTask(NoopTask, nullptr, kDefaultTaskWeight);
+    tls_last_launch.RunToCompletion();
+    std::this_thread::yield();
+    sched->Join(task);
+  }
+
+  detacher.join();
+  while (reaped.load(std::memory_order_acquire) < kTasksPerThread) {
+    std::this_thread::yield();
+  }
+  stop_reaper.store(true, std::memory_order_release);
+  reaper.join();
+
+  EXPECT_THAT(reaped.load(std::memory_order_acquire), t::Eq(kTasksPerThread));
+  EXPECT_THAT(inner_joins.load(std::memory_order_acquire),
+              t::Eq(2 * kTasksPerThread));
+  EXPECT_THAT(sched->ReapZombies(), t::Eq(0));
+  EXPECT_THAT(HeapTotalFreeBytes(), t::Eq(heap_before));
+}
+
+// 9. Direct forwarding of Yield, PollIdleCpu, RunqueueLoad, StealTask,
 //    SetPreemptEnabled, IsPreemptEnabled, OnTimerInterrupt, OnWakeupIpi, and
 //    CurrentTask to inner.
 TEST(JoinLifecycleSchedulerTest, DirectlyForwardsPassThroughMethodsToInner) {
@@ -605,12 +681,13 @@ TEST(JoinLifecycleSchedulerTest, DirectlyForwardsPassThroughMethodsToInner) {
   EXPECT_THAT(sched->CurrentTask(), t::Eq(expected_current));
 }
 
-// 9. DCHECK death tests (JoinLifecycleSchedulerDeathTest) verifying
-//    preconditions: null inner in CreateJoinLifecycleScheduler, null entry in
-//    CreateTask/CreateTaskOnCpu, null task in Join, CurrentTask() == nullptr in
-//    Join, self-join (Join(self)), joining an unknown/unregistered Task*,
-//    double-joining an already-joined Task*, and calling Join or returning from
-//    a task while holding an IrqSpinLock.
+// 10. DCHECK death tests (JoinLifecycleSchedulerDeathTest) verifying
+//     preconditions: null inner in CreateJoinLifecycleScheduler, null entry in
+//     CreateTask/CreateTaskOnCpu, null task in Join, CurrentTask() == nullptr
+//     in Join, self-join (Join(self)), joining or detaching an unknown Task*,
+//     calling Join while holding an IrqSpinLock, joining a detached task,
+//     detaching twice, detaching a task that is being joined, returning from a
+//     task while holding an IrqSpinLock, and double-joining.
 TEST(JoinLifecycleSchedulerDeathTest, PreconditionViolationsTriggerDcheck) {
   ResetTestEnv();
 
@@ -629,22 +706,19 @@ TEST(JoinLifecycleSchedulerDeathTest, PreconditionViolationsTriggerDcheck) {
   Task* const self_task = FakeTaskPtr(1);
   Task* const target_task = FakeTaskPtr(2);
   Task* const unknown_task = FakeTaskPtr(3);
+  Task* const running_task = FakeTaskPtr(4);
+  Task* const lock_leaking_task = FakeTaskPtr(5);
   CapturedTaskLaunch target_launch;
-
-  EXPECT_CALL(*mock_inner, CreateTask)
-      .WillOnce(
-          [&](const TaskFn entry, void* const arg, const int64_t /*weight*/) {
-            target_launch = {entry, arg};
-            return target_task;
-          });
-  ASSERT_THAT(sched->CreateTask(NoopTask, nullptr, kDefaultTaskWeight),
-              t::Eq(target_task));
+  CapturedTaskLaunch running_launch;
+  CreateFakeTask(*mock_inner, *sched, target_task, &target_launch);
+  CreateFakeTask(*mock_inner, *sched, running_task, &running_launch);
 
   // Complete `target_task` so valid `Join(target_task)` can complete.
   target_launch.RunToCompletion();
 
-  // 2. Null task in Join(nullptr).
+  // 2. Null task in Join(nullptr) and Detach(nullptr).
   EXPECT_DEATH(sched->Join(nullptr), "Check failed");
+  EXPECT_DEATH(sched->Detach(nullptr), "Check failed");
 
   // 3. CurrentTask() == nullptr in Join.
   EXPECT_CALL(*mock_inner, CurrentTask).WillRepeatedly([]() {
@@ -660,8 +734,9 @@ TEST(JoinLifecycleSchedulerDeathTest, PreconditionViolationsTriggerDcheck) {
   // 4. Self-join: Join(self).
   EXPECT_DEATH(sched->Join(self_task), "Check failed");
 
-  // 5. Joining an unknown/unregistered Task*.
+  // 5. Joining or detaching an unknown/unregistered Task*.
   EXPECT_DEATH(sched->Join(unknown_task), "Check failed");
+  EXPECT_DEATH(sched->Detach(unknown_task), "Check failed");
 
   // 6. Calling Join while holding an IrqSpinLock.
   EXPECT_DEATH(
@@ -672,7 +747,47 @@ TEST(JoinLifecycleSchedulerDeathTest, PreconditionViolationsTriggerDcheck) {
       },
       "Check failed");
 
-  // 7. Double-joining an already-joined Task*.
+  // 7. Joining a detached task, and detaching a task twice.
+  EXPECT_DEATH(
+      {
+        sched->Detach(target_task);
+        sched->Join(target_task);
+      },
+      "Check failed");
+  EXPECT_DEATH(
+      {
+        sched->Detach(running_task);
+        sched->Detach(running_task);
+      },
+      "Check failed");
+
+  // 8. Detaching a task while another task is joining it.
+  EXPECT_DEATH(
+      {
+        EXPECT_CALL(*mock_inner, Yield).WillOnce([&]() {
+          sched->Detach(running_task);
+        });
+        sched->Join(running_task);
+      },
+      "Check failed");
+
+  // 9. Returning from a task while holding an IrqSpinLock.
+  static IrqSpinLock leaked_lock;
+  CapturedTaskLaunch lock_leaking_launch;
+  EXPECT_CALL(*mock_inner, CreateTask)
+      .WillOnce(
+          [&](const TaskFn entry, void* const arg, const int64_t /*weight*/) {
+            lock_leaking_launch = {entry, arg};
+            return lock_leaking_task;
+          });
+  ASSERT_THAT(
+      sched->CreateTask([](void* const /*arg*/) { leaked_lock.Lock(); },  //
+                        nullptr,                                          //
+                        kDefaultTaskWeight),
+      t::Eq(lock_leaking_task));
+  EXPECT_DEATH(lock_leaking_launch.RunToCompletion(), "Check failed");
+
+  // 10. Double-joining an already-joined Task*.
   EXPECT_CALL(*mock_inner, Join).WillOnce([&](Task* const task) {
     EXPECT_THAT(task, t::Eq(target_task));
   });
@@ -680,11 +795,12 @@ TEST(JoinLifecycleSchedulerDeathTest, PreconditionViolationsTriggerDcheck) {
   EXPECT_DEATH(sched->Join(target_task), "Check failed");
 }
 
-// 10. Same-CPU preemption / synchronous child completion inside CreateTask and
-//     CreateTaskOnCpu before inner returns the Task* pointer must not spin-wait
-//     or livelock in MarkRecordExited.
+// 11. A task that runs to completion on the creating CPU before the inner
+//     CreateTask*() call returns (as a synchronous inner layer would do) must
+//     not wait for its record to be finalized, which would deadlock: the
+//     creator finalizes the record only after the inner call returns.
 TEST(JoinLifecycleSchedulerTest,
-     SynchronousTaskCompletionInsideCreateTaskDoesNotLivelock) {
+     SynchronousTaskCompletionInsideCreateTaskDoesNotDeadlock) {
   ResetTestEnv();
   const int64_t heap_before = HeapTotalFreeBytes();
   const auto mock_inner = std::make_shared<t::StrictMock<MockTaskScheduler>>();
@@ -696,8 +812,8 @@ TEST(JoinLifecycleSchedulerTest,
   Task* const sync_task_2 = FakeTaskPtr(3);
   int callback_runs = 0;
 
-  // Simulate same-CPU preemption where the newly created task is scheduled and
-  // runs to completion inside inner_->CreateTask BEFORE CreateTask returns.
+  // The newly created task runs to completion inside inner_->CreateTask*()
+  // BEFORE it returns.
   EXPECT_CALL(*mock_inner, CreateTask)
       .WillOnce(
           [&](const TaskFn entry, void* const arg, const int64_t /*weight*/) {
@@ -726,8 +842,8 @@ TEST(JoinLifecycleSchedulerTest,
               t::Eq(sync_task_2));
   EXPECT_THAT(callback_runs, t::Eq(2));
 
-  // Join sync_task_1 immediately (must not yield) and reap sync_task_2 via
-  // ReapZombies().
+  // Join sync_task_1 immediately (must not yield), and detach sync_task_2 and
+  // reap it via ReapZombies().
   std::vector<Task*> joined_tasks;
   EXPECT_CALL(*mock_inner, CurrentTask).WillRepeatedly([&]() {
     return self_task;
@@ -737,70 +853,16 @@ TEST(JoinLifecycleSchedulerTest,
   });
 
   sched->Join(sync_task_1);
+  sched->Detach(sync_task_2);
   EXPECT_THAT(sched->ReapZombies(), t::Eq(1));
   EXPECT_THAT(joined_tasks, t::ElementsAre(sync_task_1, sync_task_2));
   EXPECT_THAT(HeapTotalFreeBytes(), t::Eq(heap_before));
 }
 
-// 11. Dynamic scaling beyond 1024 concurrent active/unjoined tasks without
-//     hitting a fixed table limit or leaking heap memory.
-TEST(JoinLifecycleSchedulerTest,
-     SupportsMoreThan1024ConcurrentUnjoinedTasksSimultaneously) {
-  ResetTestEnv();
-  const int64_t heap_before = HeapTotalFreeBytes();
-  const auto mock_inner = std::make_shared<t::StrictMock<MockTaskScheduler>>();
-  const std::shared_ptr<TaskScheduler> sched =
-      CreateJoinLifecycleScheduler(mock_inner);
-
-  constexpr int kNumConcurrentTasks = 1500;
-  Task* const self_task = FakeTaskPtr(1);
-  std::vector<Task*> tasks;
-  std::vector<CapturedTaskLaunch> launches;
-  tasks.reserve(kNumConcurrentTasks);
-  launches.reserve(kNumConcurrentTasks);
-
-  for (int i = 0; i < kNumConcurrentTasks; ++i) {
-    Task* const task = FakeTaskPtr(5000 + i);
-    CapturedTaskLaunch launch;
-    EXPECT_CALL(*mock_inner, CreateTask)
-        .WillOnce([task, &launch](const TaskFn entry,  //
-                                  void* const arg,     //
-                                  const int64_t /*weight*/) {
-          launch = {entry, arg};
-          return task;
-        });
-    ASSERT_THAT(sched->CreateTask(NoopTask, nullptr, kDefaultTaskWeight),
-                t::Eq(task));
-    tasks.push_back(task);
-    launches.push_back(launch);
-  }
-
-  for (int i = 0; i < kNumConcurrentTasks; ++i) {
-    launches[i].RunToCompletion();
-  }
-
-  int inner_join_calls = 0;
-  EXPECT_CALL(*mock_inner, CurrentTask).WillRepeatedly([&]() {
-    return self_task;
-  });
-  EXPECT_CALL(*mock_inner, Join).WillRepeatedly([&](Task* const task) {
-    EXPECT_THAT(task, t::NotNull());
-    ++inner_join_calls;
-  });
-
-  const int half = kNumConcurrentTasks / 2;
-  for (int i = 0; i < half; ++i) {
-    sched->Join(tasks[i]);
-  }
-  EXPECT_THAT(sched->ReapZombies(), t::Eq(kNumConcurrentTasks - half));
-  EXPECT_THAT(sched->ReapZombies(), t::Eq(0));
-  EXPECT_THAT(inner_join_calls, t::Eq(kNumConcurrentTasks));
-  EXPECT_THAT(HeapTotalFreeBytes(), t::Eq(heap_before));
-}
-
 // 12. OOM during AllocateJoinRecord returns nullptr cleanly without invoking
-//     inner->CreateTask or inner->CreateTaskOnCpu, and remote-CPU task entry
-//     waits for FinalizeJoinRecord before executing the user callback.
+//     inner->CreateTask or inner->CreateTaskOnCpu, and a task that starts on
+//     another CPU waits for FinalizeJoinRecord before running its user
+//     function.
 TEST(JoinLifecycleSchedulerTest,
      AllocateJoinRecordOomReturnsNullptrAndRemoteCpuEntryWaitsForFinalization) {
   SetupEnv(2);
@@ -821,9 +883,9 @@ TEST(JoinLifecycleSchedulerTest,
   EXPECT_THAT(PmmFreeFrameCount(), t::Eq(pmm_before));
   EXPECT_THAT(HeapTotalFreeBytes(), t::Eq(heap_before));
 
-  // Verify remote CPU task launch waits for FinalizeJoinRecord before entering
-  // user callback so Join(remote_task) from a third thread or after entry
-  // always sees the finalized task_tree_ entry.
+  // A task that starts on CPU 1 while its creator on CPU 0 is still inside
+  // CreateTaskOnCpu() must not run its user function before the record is
+  // finalized, so that Join(remote_task) from anywhere finds the record.
   BindCpuLocal(SmpGetCpuLocal(0));
   Task* const self_task = FakeTaskPtr(70);
   Task* const remote_task = FakeTaskPtr(71);
@@ -848,6 +910,10 @@ TEST(JoinLifecycleSchedulerTest,
         while (!child_entered_inner.load(std::memory_order_acquire)) {
           std::this_thread::yield();
         }
+        // The record is finalized only after this returns. Hold the return
+        // long enough that a task that didn't wait would have run its user
+        // function by now.
+        std::this_thread::sleep_for(std::chrono::milliseconds(50));
         EXPECT_FALSE(child_ran_user_fn.load(std::memory_order_acquire));
         return remote_task;
       });

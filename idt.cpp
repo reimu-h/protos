@@ -12,13 +12,19 @@
 #include "uart.h"
 #include "vga.h"
 
-#if __STDC_HOSTED__
-extern "C" {
-uint64_t g_isr_stub_table[protos::kIdtEntryCount] = {};
+namespace protos {
+
+// Returns CR2, the linear address of the most recent page fault. Host tests
+// link a fake instead (idt_host_fakes.cpp).
+uint64_t ReadCr2();
+
+#if !__STDC_HOSTED__
+uint64_t ReadCr2() {
+  uint64_t cr2 = 0;
+  asm volatile("mov %0, cr2" : "=r"(cr2));
+  return cr2;
 }
 #endif
-
-namespace protos {
 
 namespace {
 
@@ -31,7 +37,6 @@ std::atomic<bool> g_idt_initialized{false};
 
 #if __STDC_HOSTED__
 std::atomic<int> g_host_idt_load_count{0};
-std::atomic<uint64_t> g_host_cr2{0};
 #endif
 
 static bool IsValidGateTypeAttr(const uint8_t type_attr) {
@@ -42,27 +47,44 @@ static bool IsValidGateTypeAttr(const uint8_t type_attr) {
          (gate_type == 0x0Eu || gate_type == 0x0Fu);
 }
 
-static uint64_t ReadCr2() {
+// Kernel panic path, shared by unhandled CPU exceptions and failed CHECKs
+// (internal::KernelCheckFailure()). The first CPU to panic owns the panic: it
+// stops the other CPUs (SmpStopOtherCpusForPanic()) and then prints without
+// taking the console locks, which a stopped CPU may hold. A nested panic on
+// that CPU prints to the UART only, and every other panicking CPU halts
+// without printing (see internal::EnterPanic()).
+
+// Consoles the panic path prints to.
+enum class PanicOutput {
+  kUartAndVga,
+  kUartOnly,
+};
+
 #if !__STDC_HOSTED__
-  uint64_t cr2 = 0;
-  asm volatile("mov %0, cr2" : "=r"(cr2));
-  return cr2;
-#else
-  return g_host_cr2.load(std::memory_order_relaxed);
+// Panic arbitration state for internal::EnterPanic().
+std::atomic<uint64_t> g_panic_owner{0};
+int g_panic_depth = 0;
+// Panic token of a CPU that has not bound a CpuLocal yet (CpuLocal addresses
+// are 64-byte aligned, so none equals it). Only one such CPU runs at a time:
+// the BSP before SmpInit(), or an AP inside BindCpuLocal().
+constexpr uint64_t kUnboundCpuPanicToken = 1;
 #endif
-}
 
-static void PanicWriteStr(const char* const str) {
+static void PanicWriteStr(const PanicOutput output, const char* const str) {
   UartPanicWrite(str);
-  VgaPanicWrite(str);
+  if (output == PanicOutput::kUartAndVga) {
+    VgaPanicWrite(str);
+  }
 }
 
-static void PanicWriteDec(const uint64_t value) {
+static void PanicWriteDec(const PanicOutput output, const uint64_t value) {
   UartPanicWriteDec(value);
-  VgaPanicWriteDec(value);
+  if (output == PanicOutput::kUartAndVga) {
+    VgaPanicWriteDec(value);
+  }
 }
 
-static void PanicWriteHex(const uint64_t value) {
+static void PanicWriteHex(const PanicOutput output, const uint64_t value) {
   constexpr const char* kHexDigits = "0123456789ABCDEF";
   char buf[19];
   buf[0] = '0';
@@ -70,7 +92,7 @@ static void PanicWriteHex(const uint64_t value) {
   if (value == 0) {
     buf[2] = '0';
     buf[3] = '\0';
-    PanicWriteStr(buf);
+    PanicWriteStr(output, buf);
     return;
   }
   char rev[16];
@@ -85,75 +107,96 @@ static void PanicWriteHex(const uint64_t value) {
     buf[2 + i] = rev[count - 1 - i];
   }
   buf[2 + count] = '\0';
-  PanicWriteStr(buf);
+  PanicWriteStr(output, buf);
 }
 
-[[noreturn]] static void PanicUnhandledException(
-    const InterruptFrame* const frame) {
+[[noreturn]] static void PanicHalt() {
 #if !__STDC_HOSTED__
-  asm volatile("cli" : : : "memory", "cc");
-#endif
-  const int vector = static_cast<int>(frame->vector);
-  const char* const mnemonic = IdtExceptionMnemonic(vector);
-  const uint64_t cr2 = ReadCr2();
-  const CpuLocal* const cpu = CurrentCpuOrNull();
-  const int cpu_id = (cpu != nullptr) ? cpu->cpu_id : -1;
-
-  PanicWriteStr("[FATAL] Unhandled CPU exception ");
-  PanicWriteDec(frame->vector);
-  PanicWriteStr(" (");
-  PanicWriteStr(mnemonic);
-  PanicWriteStr(") err=");
-  PanicWriteHex(frame->error_code);
-  PanicWriteStr(" rip=");
-  PanicWriteHex(frame->rip);
-  PanicWriteStr(" rsp=");
-  PanicWriteHex(frame->rsp);
-  PanicWriteStr(" rflags=");
-  PanicWriteHex(frame->rflags);
-  PanicWriteStr(" cr2=");
-  PanicWriteHex(cr2);
-  PanicWriteStr(" cpu=");
-  if (cpu_id >= 0) {
-    PanicWriteDec(static_cast<uint64_t>(cpu_id));
-  } else {
-    PanicWriteStr("unbound");
-  }
-  PanicWriteStr("\n");
-
-#if __STDC_HOSTED__
-  if (cpu_id >= 0) {
-    std::fprintf(stderr,  //
-                 "[FATAL] Unhandled CPU exception %llu (%s) err=0x%llx "
-                 "rip=0x%llx rsp=0x%llx rflags=0x%llx cr2=0x%llx cpu=%d\n",  //
-                 static_cast<unsigned long long>(frame->vector),             //
-                 mnemonic,                                                   //
-                 static_cast<unsigned long long>(frame->error_code),         //
-                 static_cast<unsigned long long>(frame->rip),                //
-                 static_cast<unsigned long long>(frame->rsp),                //
-                 static_cast<unsigned long long>(frame->rflags),             //
-                 static_cast<unsigned long long>(cr2),                       //
-                 cpu_id);
-  } else {
-    std::fprintf(
-        stderr,  //
-        "[FATAL] Unhandled CPU exception %llu (%s) err=0x%llx "
-        "rip=0x%llx rsp=0x%llx rflags=0x%llx cr2=0x%llx cpu=unbound\n",  //
-        static_cast<unsigned long long>(frame->vector),                  //
-        mnemonic,                                                        //
-        static_cast<unsigned long long>(frame->error_code),              //
-        static_cast<unsigned long long>(frame->rip),                     //
-        static_cast<unsigned long long>(frame->rsp),                     //
-        static_cast<unsigned long long>(frame->rflags),                  //
-        static_cast<unsigned long long>(cr2));
-  }
-  std::fflush(stderr);
-  std::_Exit(134);
-#else
   for (;;) {
     asm volatile("cli; hlt");
   }
+#else
+  std::fflush(stderr);
+  std::_Exit(134);
 #endif
+}
+
+// Enters the panic path. On bare metal, disables interrupts and arbitrates
+// between CPUs: returns where the calling CPU prints the diagnostic, or halts
+// here if it must stay silent. Host builds always print to both consoles.
+static PanicOutput BeginPanic() {
+#if !__STDC_HOSTED__
+  asm volatile("cli" : : : "memory", "cc");
+  const CpuLocal* const cpu = CurrentCpuOrNullForPanic();
+  const uint64_t token = (cpu != nullptr) ? reinterpret_cast<uintptr_t>(cpu)
+                                          : kUnboundCpuPanicToken;
+  switch (internal::EnterPanic(&g_panic_owner, &g_panic_depth, token)) {
+    case internal::PanicRole::kOwner:
+      SmpStopOtherCpusForPanic();
+      return PanicOutput::kUartAndVga;
+    case internal::PanicRole::kNestedOwner:
+      return PanicOutput::kUartOnly;
+    case internal::PanicRole::kSilent:
+      break;
+  }
+  // The owner's stop NMI parks this CPU if it arrives later.
+  PanicHalt();
+#else
+  return PanicOutput::kUartAndVga;
+#endif
+}
+
+}  // namespace
+
+#if !__STDC_HOSTED__
+[[noreturn]] void internal::KernelCheckFailure(const char* const expr,
+                                               const char* const file,
+                                               const int line) {
+  const PanicOutput output = BeginPanic();
+  PanicWriteStr(output, "[FATAL] Check failed: ");
+  PanicWriteStr(output, expr);
+  PanicWriteStr(output, " at ");
+  PanicWriteStr(output, file);
+  PanicWriteStr(output, ":");
+  PanicWriteDec(output, (line > 0) ? static_cast<uint64_t>(line) : 0);
+  PanicWriteStr(output, "\n");
+  PanicHalt();
+}
+#endif
+
+namespace {
+
+[[noreturn]] static void PanicUnhandledException(
+    const InterruptFrame* const frame) {
+  // Read CR2 first: a fault in the code below would overwrite it.
+  const uint64_t cr2 = ReadCr2();
+  const PanicOutput output = BeginPanic();
+  const int vector = static_cast<int>(frame->vector);
+  const char* const mnemonic = IdtExceptionMnemonic(vector);
+  const CpuLocal* const cpu = CurrentCpuOrNullForPanic();
+
+  PanicWriteStr(output, "[FATAL] Unhandled CPU exception ");
+  PanicWriteDec(output, frame->vector);
+  PanicWriteStr(output, " (");
+  PanicWriteStr(output, mnemonic);
+  PanicWriteStr(output, ") err=");
+  PanicWriteHex(output, frame->error_code);
+  PanicWriteStr(output, " rip=");
+  PanicWriteHex(output, frame->rip);
+  PanicWriteStr(output, " rsp=");
+  PanicWriteHex(output, frame->rsp);
+  PanicWriteStr(output, " rflags=");
+  PanicWriteHex(output, frame->rflags);
+  PanicWriteStr(output, " cr2=");
+  PanicWriteHex(output, cr2);
+  PanicWriteStr(output, " cpu=");
+  if (cpu != nullptr) {
+    PanicWriteDec(output, static_cast<uint64_t>(cpu->cpu_id));
+  } else {
+    PanicWriteStr(output, "unbound");
+  }
+  PanicWriteStr(output, "\n");
+  PanicHalt();
 }
 
 }  // namespace
@@ -219,10 +262,6 @@ const char* IdtExceptionMnemonic(const int vector) {
 
 void IdtInit() {
   for (int v = 0; v < kIdtEntryCount; ++v) {
-#if __STDC_HOSTED__
-    g_isr_stub_table[v] =
-        0xFFFFFFFF80100000ULL + static_cast<uint64_t>(v) * 16ULL;
-#endif
     g_handlers[v].store(nullptr, std::memory_order_relaxed);
     g_idt[v] = IdtEncodeGate(g_isr_stub_table[v],     //
                              kIdtKernelCodeSelector,  //
@@ -333,6 +372,18 @@ extern "C" void IdtDispatch(InterruptFrame* const frame) {
     return;
   }
 
+  if (vector >= kVectorLegacyPicBase &&
+      vector < kVectorLegacyPicBase + kLegacyPicVectorCount) {
+    // Legacy 8259 PIC vector (see kVectorLegacyPicBase): no Local APIC EOI.
+    // With every PIC line masked this is a spurious IRQ7/IRQ15, which must not
+    // be acknowledged at the PIC either; a handler for an unmasked line has to
+    // send the PIC EOI itself.
+    if (handler != nullptr) {
+      handler(frame);
+    }
+    return;
+  }
+
   SmpSendLocalApicEoi();
   if (handler != nullptr) {
     handler(frame);
@@ -348,15 +399,10 @@ void IdtResetForTest() {
   g_idt_pointer = {};
   g_idt_initialized.store(false, std::memory_order_release);
   g_host_idt_load_count.store(0, std::memory_order_relaxed);
-  g_host_cr2.store(0, std::memory_order_relaxed);
 }
 
 int IdtGetHostLoadCountForTest() {
   return g_host_idt_load_count.load(std::memory_order_relaxed);
-}
-
-void IdtSetHostCr2ForTest(const uint64_t cr2) {
-  g_host_cr2.store(cr2, std::memory_order_relaxed);
 }
 #endif
 

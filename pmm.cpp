@@ -22,10 +22,11 @@ namespace {
 // Intrusive node stored at the start of the first 4 KiB frame of each
 // contiguous free physical frame run:
 //
-//   +-------------------+------------------------------------+
-//   | FreeRunNode       | Remaining bytes of free run        |
-//   | (48 bytes)        | (`frame_count * kPageSize - 48`)   |
-//   +-------------------+------------------------------------+
+//   +-----------------------+--------------------------------------------+
+//   | FreeRunNode           | Remaining bytes of free run                |
+//   | (sizeof(FreeRunNode)) | (frame_count * kPageSize -                 |
+//   |                       |  sizeof(FreeRunNode))                      |
+//   +-----------------------+--------------------------------------------+
 //   ^
 //   run base physical address (4 KiB page-aligned)
 //
@@ -74,8 +75,9 @@ struct PhysInterval {
 // and the framebuffer from at most `kMaxMemoryRegions` entries.
 constexpr int kMaxUsableIntervals = kMaxMemoryRegions * 2 + 16;
 
-// Spinlock protecting `g_free_run_tree`, `g_pmm_free_frames`, and PMM queries
-// across concurrent multi-CPU calls.
+// Spinlock protecting `g_free_run_tree` and `g_pmm_free_frames` across
+// concurrent multi-CPU calls. The remaining state is written only by
+// `PmmInit` (before other CPUs start) and `PmmResetForTest`.
 IrqSpinLock g_pmm_lock;
 
 // Intrusive Red-Black Tree containing all currently FREE contiguous physical
@@ -197,13 +199,16 @@ static FreeRunNode* PmmCoalesceFreeRun(const uintptr_t base_addr,
   DCHECK(static_cast<uintptr_t>(frame_count) <=
          (g_max_managed_phys_addr - base_addr) / kPageSize);
 
+  // Freeing frames that are already free (a double free or an overlapping
+  // range) would corrupt the tree and double-count frames, so these checks stay
+  // on in every build.
   const uintptr_t end_addr = base_addr + frame_count * kPageSize;
   const FreeRunNode* const next_check = g_free_run_tree.LowerBound(base_addr);
   const FreeRunNode* const prev_check = (next_check != nullptr)
                                             ? FreeRunTree::Prev(next_check)
                                             : g_free_run_tree.Last();
-  DCHECK(prev_check == nullptr || RunEndAddress(prev_check) <= base_addr);
-  DCHECK(next_check == nullptr || RunBaseAddress(next_check) >= end_addr);
+  CHECK(prev_check == nullptr || RunEndAddress(prev_check) <= base_addr);
+  CHECK(next_check == nullptr || RunBaseAddress(next_check) >= end_addr);
 
   FreeRunNode* run = FreeRunTreeInsert(base_addr, frame_count);
 
@@ -433,35 +438,16 @@ static void PmmFreeFramesLocked(const uintptr_t base_addr,
   PmmCoalesceFreeRun(base_addr, count);
 }
 
-struct [[gnu::packed]] Multiboot1BasicInfo {
-  uint32_t flags;
-  uint32_t mem_lower;
-  uint32_t mem_upper;
-};
-
-static void CollectUsableRegions(const uint32_t multiboot_magic,
-                                 const uint64_t multiboot_info_addr,
-                                 const MultibootMemoryMap& memory_map) {
-  bool added_available = false;
+// Fills `g_usable_intervals` with the available regions of `memory_map` minus
+// its non-available regions, lower memory, the kernel image, the Multiboot
+// information structures, and the framebuffer. Multiboot modules and the
+// Multiboot1 command line and boot loader name strings are not carved out,
+// because `MultibootMemoryMap` does not record them (no modules are loaded).
+static void CollectUsableRegions(const MultibootMemoryMap& memory_map) {
   for (int i = 0; i < memory_map.region_count; ++i) {
     if (memory_map.regions[i].type == kMemoryTypeAvailable) {
       AddAvailableRegion(memory_map.regions[i].base,
                          memory_map.regions[i].length);
-      added_available = true;
-    }
-  }
-
-  if (!added_available && multiboot_magic == kMultiboot1Magic &&
-      multiboot_info_addr != 0 &&
-      multiboot_info_addr < kMaxCanonicalIdentityAddress) {
-    const Multiboot1BasicInfo* const mb1 =
-        reinterpret_cast<const Multiboot1BasicInfo*>(multiboot_info_addr);
-    if ((mb1->flags & kMultiboot1FlagMemBasic) != 0 && mb1->mem_upper > 0) {
-      constexpr uint64_t kUpperMemoryBase = 0x100000ULL;
-      const uint64_t upper_end =
-          kUpperMemoryBase + static_cast<uint64_t>(mb1->mem_upper) * 1024ULL;
-      AddAvailableRegion(static_cast<uintptr_t>(kUpperMemoryBase),
-                         static_cast<int64_t>(upper_end - kUpperMemoryBase));
     }
   }
 
@@ -513,11 +499,11 @@ void PmmInit(const uint32_t multiboot_magic,
                                 &g_memory_map));
 
   if (g_memory_map.fb_addr != 0) {
-    VgaAttachFramebuffer(g_memory_map.fb_addr,    //
-                         g_memory_map.fb_pitch,   //
-                         g_memory_map.fb_width,   //
-                         g_memory_map.fb_height,  //
-                         g_memory_map.fb_bpp);
+    VgaInitFramebuffer(g_memory_map.fb_addr,    //
+                       g_memory_map.fb_pitch,   //
+                       g_memory_map.fb_width,   //
+                       g_memory_map.fb_height,  //
+                       g_memory_map.fb_bpp);
     ConsoleWrite("[PMM] Framebuffer: addr=");
     ConsoleWriteHex(g_memory_map.fb_addr);
     ConsoleWrite(" width=");
@@ -531,13 +517,14 @@ void PmmInit(const uint32_t multiboot_magic,
 
   const uintptr_t kernel_start = KernelStartAddr();
   const uintptr_t kernel_end = KernelEndAddr();
-  CollectUsableRegions(multiboot_magic, multiboot_info_addr, g_memory_map);
+  CollectUsableRegions(g_memory_map);
 
   CHECK(g_usable_interval_count > 0);
 
+  // Intervals are non-empty and start at or above `kLowerMemoryLimit`.
   const uintptr_t highest_usable_addr =
       g_usable_intervals[g_usable_interval_count - 1].end;
-  CHECK(highest_usable_addr > kLowerMemoryLimit);
+  DCHECK(highest_usable_addr > kLowerMemoryLimit);
 
   g_max_managed_phys_addr = highest_usable_addr;
   g_max_frames = g_max_managed_phys_addr / kPageSize;
@@ -631,30 +618,34 @@ void PmmFreeFrame(const uintptr_t frame_addr) {
   PmmFreeFramesLocked(frame_addr, 1);
 }
 
-uintptr_t PmmMaxPhysicalAddress() {
-  const IrqSpinLockGuard lock_guard(g_pmm_lock);
-  return g_max_managed_phys_addr;
-}
+uintptr_t PmmMaxPhysicalAddress() { return g_max_managed_phys_addr; }
 
-int64_t PmmMaxFrameCount() {
-  const IrqSpinLockGuard lock_guard(g_pmm_lock);
-  return g_max_frames;
-}
+int64_t PmmMaxFrameCount() { return g_max_frames; }
 
 int64_t PmmFreeFrameCount() {
   const IrqSpinLockGuard lock_guard(g_pmm_lock);
   return g_pmm_free_frames;
 }
 
-int64_t PmmTotalUsableFrameCount() {
-  const IrqSpinLockGuard lock_guard(g_pmm_lock);
-  return g_pmm_total_usable_frames;
-}
+int64_t PmmTotalUsableFrameCount() { return g_pmm_total_usable_frames; }
 
 #if __STDC_HOSTED__
 void PmmResetForTest() {
   const IrqSpinLockGuard lock_guard(g_pmm_lock);
   ResetPmmState();
+}
+
+std::vector<PmmIntervalForTest> PmmCollectUsableIntervalsForTest(
+    const MultibootMemoryMap& memory_map) {
+  const IrqSpinLockGuard lock_guard(g_pmm_lock);
+  ResetPmmState();
+  CollectUsableRegions(memory_map);
+  std::vector<PmmIntervalForTest> intervals;
+  for (int i = 0; i < g_usable_interval_count; ++i) {
+    intervals.push_back(
+        {g_usable_intervals[i].start, g_usable_intervals[i].end});
+  }
+  return intervals;
 }
 #endif
 

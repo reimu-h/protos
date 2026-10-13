@@ -47,6 +47,14 @@ constexpr int kVectorControlProtection = 21;
 constexpr int kVectorVmmCommunication = 29;
 constexpr int kVectorSecurityException = 30;
 
+// Vectors of the legacy 8259 PICs. boot.S remaps them away from the CPU
+// exception vectors (IRQ0-7 to 0xE0-0xE7, IRQ8-15 to 0xE8-0xEF) and masks every
+// line, so the only interrupts expected here are spurious IRQ7/IRQ15
+// deliveries. `IdtDispatch` sends no Local APIC EOI for these vectors: the PIC
+// delivers them as ExtINT, which never sets a Local APIC in-service bit.
+constexpr int kVectorLegacyPicBase = 0xE0;
+constexpr int kLegacyPicVectorCount = 16;
+
 // Local APIC interrupt vectors (32..255).
 constexpr uint8_t kVectorApicTimer = 0x20;
 constexpr uint8_t kVectorWakeupIpi = 0x21;
@@ -162,19 +170,16 @@ InterruptHandlerFn IdtGetHandler(int vector);
 extern "C" void IdtDispatch(InterruptFrame* frame);
 
 #if __STDC_HOSTED__
-// Host unit-test helpers for resetting IDT state and inspecting `lidt` calls
-// and simulated `CR2` fault addresses.
+// Host unit-test helpers for resetting IDT state and counting `lidt` calls.
+// (idt_host_fakes.h has the helper for the faked `CR2` register.)
 void IdtResetForTest();
 int IdtGetHostLoadCountForTest();
-void IdtSetHostCr2ForTest(uint64_t cr2);
 #endif
 
 }  // namespace protos
 
-#if __STDC_HOSTED__
-extern "C" uint64_t g_isr_stub_table[protos::kIdtEntryCount];
-#else
+// Addresses of the 256 ISR entry stubs, indexed by vector. boot.S defines the
+// table; host tests link a stand-in from idt_host_fakes.cpp.
 extern "C" const uint64_t g_isr_stub_table[protos::kIdtEntryCount];
-#endif
 
 #endif  // PROTOS_IDT_H_

@@ -10,6 +10,7 @@
 #include <cstring>
 #include <string>
 #include <thread>
+#include <utility>
 #include <vector>
 
 #include "idt.h"
@@ -26,7 +27,8 @@ namespace t = ::testing;
 
 constexpr uint32_t kMultiboot1Magic = 0x2BADB002;
 constexpr uint32_t kMultiboot2Magic = 0x36D76289;
-constexpr int64_t kFakeRamFrames = 256;
+// Large enough for the AP stacks of kMaxSupportedCpus CPUs.
+constexpr int64_t kFakeRamFrames = 1024;
 constexpr int64_t kFakeRamBytes = kFakeRamFrames * kPageSize;
 
 alignas(kPageSize) uint8_t g_fake_ram[kFakeRamBytes];
@@ -96,11 +98,74 @@ struct FakeHostState {
   int64_t max_pmm_frame = kFakeRamFrames;
   int pmm_alloc_calls = 0;
   int fail_pmm_on_call = -1;
+  std::vector<std::pair<uintptr_t, int64_t>> freed_frames;
   std::string uart_log;
   std::string vga_log;
 };
 
 FakeHostState g_state;
+
+// CPUID and MSR state behind the hooks installed by InstallFakeCpuHooks().
+struct FakeCpu {
+  bool x2apic_supported = false;
+  uint32_t max_leaf = 0x0B;
+  uint32_t leaf15_ebx = 0;
+  uint32_t leaf15_ecx = 0;
+  uint32_t leaf16_ecx = 0;
+  uint64_t apic_base_msr = 0xFEE00900;
+  uint32_t x2apic_id_msr = 0;
+  std::vector<std::pair<uint32_t, uint64_t>> msr_writes;
+};
+
+FakeCpu g_cpu;
+
+static void FakeCpuid(const uint32_t leaf,     //
+                      const uint32_t subleaf,  //
+                      uint32_t* const eax,     //
+                      uint32_t* const ebx,     //
+                      uint32_t* const ecx,     //
+                      uint32_t* const /*edx*/) {
+  if (subleaf != 0) {
+    return;
+  }
+  if (leaf == 0) {
+    *eax = g_cpu.max_leaf;
+  } else if (leaf == 1) {
+    *ecx = g_cpu.x2apic_supported ? (1u << 21) : 0;
+  } else if (leaf == 0x15 && g_cpu.max_leaf >= 0x15) {
+    *eax = 1;
+    *ebx = g_cpu.leaf15_ebx;
+    *ecx = g_cpu.leaf15_ecx;
+  } else if (leaf == 0x16 && g_cpu.max_leaf >= 0x16) {
+    *ecx = g_cpu.leaf16_ecx;
+  }
+}
+
+static uint64_t FakeReadMsr(const uint32_t msr) {
+  if (msr == 0x1B) {
+    return g_cpu.apic_base_msr;
+  }
+  if (msr == 0x802) {
+    return g_cpu.x2apic_id_msr;
+  }
+  return 0;
+}
+
+static void FakeWriteMsr(const uint32_t msr, const uint64_t value) {
+  g_cpu.msr_writes.emplace_back(msr, value);
+  if (msr == 0x1B) {
+    g_cpu.apic_base_msr = value;
+  }
+}
+
+// Installs the g_cpu hooks; call after SmpSetHostTestHooks(), which clears
+// them.
+static void InstallFakeCpuHooks() {
+  SmpSetHostHardwareHooksForTest(g_cpu.x2apic_supported,  //
+                                 FakeCpuid,               //
+                                 FakeReadMsr,             //
+                                 FakeWriteMsr);
+}
 
 static uintptr_t BaseAddr() { return reinterpret_cast<uintptr_t>(g_fake_ram); }
 
@@ -110,6 +175,7 @@ static uintptr_t OffsetAddr(const int64_t offset) {
 
 static void ResetState(const uintptr_t acpi32_arena = 0) {
   g_state = FakeHostState{};
+  g_cpu = FakeCpu{};
   std::memset(g_fake_ram, 0, sizeof(g_fake_ram));
   IdtResetForTest();
   SmpSetHostTestHooks(0, 0, 0, acpi32_arena, nullptr);
@@ -248,6 +314,41 @@ static void AppendX2ApicRecord(std::vector<uint8_t>* const out,  //
   out->insert(out->end(), bytes, bytes + sizeof(rec));
 }
 
+// Writes an MADT with `records`, an RSDT that points to it, and an RSDP v1 in
+// the simulated BIOS ROM area, and returns the BIOS ROM base address for
+// SmpSetHostTestHooks(). Requires ResetState(BaseAddr()).
+static uintptr_t WriteBiosAcpiTables(const std::vector<uint8_t>& records) {
+  const uintptr_t rsdt_addr = OffsetAddr(0x6100);
+  const uintptr_t madt_addr = OffsetAddr(0x6400);
+  const uintptr_t bios_rom_base = OffsetAddr(0x7000);
+  WriteMadt(madt_addr, kDefaultLocalApicPhysAddr, records);
+  WriteRsdt(rsdt_addr, {static_cast<uint32_t>(madt_addr)});
+  WriteRsdpV1(bios_rom_base + 64, static_cast<uint32_t>(rsdt_addr));
+  return bios_rom_base;
+}
+
+// Returns MADT records for CPUs with Local APIC IDs 0 .. count - 1.
+static std::vector<uint8_t> LapicRecords(const int count) {
+  std::vector<uint8_t> records;
+  for (int i = 0; i < count; ++i) {
+    AppendLapicRecord(&records,                 //
+                      static_cast<uint8_t>(i),  //
+                      static_cast<uint8_t>(i),  //
+                      1);
+  }
+  return records;
+}
+
+// Simulated AP bring-up that succeeds, as SmpInit() does by default.
+static bool StartAp(CpuInfo* const cpu_info) {
+  cpu_info->observed_apic_id = cpu_info->apic_id;
+  cpu_info->observed_rsp = cpu_info->stack_top - 64;
+  cpu_info->observed_cr3 = 0x105000;
+  cpu_info->long_mode_active = true;
+  cpu_info->online = true;
+  return true;
+}
+
 }  // namespace
 
 bool PagingMapBootstrapRange(const uintptr_t phys_addr, const int64_t size) {
@@ -272,6 +373,10 @@ uintptr_t PmmAllocFrames(const int64_t count) {
   const uintptr_t addr = BaseAddr() + g_state.next_pmm_frame * kPageSize;
   g_state.next_pmm_frame += count;
   return addr;
+}
+
+void PmmFreeFrames(const uintptr_t base_addr, const int64_t count) {
+  g_state.freed_frames.emplace_back(base_addr, count);
 }
 
 void UartWrite(const char* const str) { g_state.uart_log.append(str); }
@@ -334,12 +439,12 @@ TEST(SmpTest, ParseRsdpValidatesV1AndV2AndRejectsMalformed) {
   uintptr_t rsdt = 0;
   uintptr_t xsdt = 0;
   EXPECT_TRUE(
-      SmpParseRsdp(v1_addr, kMaxCanonicalIdentityAddress, &rsdt, &xsdt));
+      SmpParseRsdpForTest(v1_addr, kMaxCanonicalIdentityAddress, &rsdt, &xsdt));
   EXPECT_THAT(rsdt, t::Eq(0x12345000u));
   EXPECT_THAT(xsdt, t::Eq(0u));
 
   EXPECT_TRUE(
-      SmpParseRsdp(v2_addr, kMaxCanonicalIdentityAddress, &rsdt, &xsdt));
+      SmpParseRsdpForTest(v2_addr, kMaxCanonicalIdentityAddress, &rsdt, &xsdt));
   EXPECT_THAT(rsdt, t::Eq(0x12345000u));
   EXPECT_THAT(xsdt, t::Eq(0x9876543200ULL));
 
@@ -353,34 +458,34 @@ TEST(SmpTest, ParseRsdpValidatesV1AndV2AndRejectsMalformed) {
   raw_v2->extended_checksum = 0;
   raw_v2->extended_checksum = ComputeChecksumByte(raw_v2, 40);
   EXPECT_TRUE(
-      SmpParseRsdp(v2_addr, kMaxCanonicalIdentityAddress, &rsdt, &xsdt));
+      SmpParseRsdpForTest(v2_addr, kMaxCanonicalIdentityAddress, &rsdt, &xsdt));
   EXPECT_THAT(xsdt, t::Eq(0x9876543200ULL));
   WriteRsdpV2(v2_addr, 0x12345000, 0x9876543200ULL);
 
   // Out-of-bounds physical limit must fail cleanly.
-  EXPECT_FALSE(SmpParseRsdp(v1_addr, v1_addr + 10, &rsdt, &xsdt));
+  EXPECT_FALSE(SmpParseRsdpForTest(v1_addr, v1_addr + 10, &rsdt, &xsdt));
 
   // Corrupted v2 extended checksum must be rejected.
   raw_v2->extended_checksum ^= 0xFF;
   EXPECT_FALSE(
-      SmpParseRsdp(v2_addr, kMaxCanonicalIdentityAddress, &rsdt, &xsdt));
+      SmpParseRsdpForTest(v2_addr, kMaxCanonicalIdentityAddress, &rsdt, &xsdt));
   raw_v2->extended_checksum ^= 0xFF;
 
   // Invalid v2 length (< 36) must be rejected.
   raw_v2->length = 20;
   raw_v2->extended_checksum = ComputeChecksumByte(raw_v2, sizeof(RawRsdpV2));
   EXPECT_FALSE(
-      SmpParseRsdp(v2_addr, kMaxCanonicalIdentityAddress, &rsdt, &xsdt));
+      SmpParseRsdpForTest(v2_addr, kMaxCanonicalIdentityAddress, &rsdt, &xsdt));
 
   // Corrupted v1 checksum or signature must be rejected.
   RawRsdpV1* const raw_v1 = reinterpret_cast<RawRsdpV1*>(v1_addr);
   raw_v1->checksum ^= 0x01;
   EXPECT_FALSE(
-      SmpParseRsdp(v1_addr, kMaxCanonicalIdentityAddress, &rsdt, &xsdt));
+      SmpParseRsdpForTest(v1_addr, kMaxCanonicalIdentityAddress, &rsdt, &xsdt));
 
   WriteRsdpV1(v1_addr, 0);
   EXPECT_FALSE(
-      SmpParseRsdp(v1_addr, kMaxCanonicalIdentityAddress, &rsdt, &xsdt));
+      SmpParseRsdpForTest(v1_addr, kMaxCanonicalIdentityAddress, &rsdt, &xsdt));
 }
 
 TEST(SmpTest, FindRsdpInMemoryRangeHonorsAlignmentAndChecksums) {
@@ -449,40 +554,47 @@ TEST(SmpTest, FindRsdpInMultiboot2PrefersAcpiNewAndFallsBackToOld) {
   *reinterpret_cast<uint32_t*>(buf + 4) = 0;
 
   // When both Tag 14 and Tag 15 are valid, Tag 15 (ACPI 2.0+) is preferred.
-  EXPECT_THAT(SmpFindRsdpInMultiboot2(mb_base, kMaxCanonicalIdentityAddress),
-              t::Eq(new_rsdp_addr));
+  EXPECT_THAT(
+      SmpFindRsdpInMultiboot2ForTest(mb_base, kMaxCanonicalIdentityAddress),
+      t::Eq(new_rsdp_addr));
 
   // If Tag 15 claims an RSDP v2 length (e.g. 512) larger than the Multiboot2
   // tag payload size (36), it must be rejected without reading out-of-bounds,
   // falling back to Tag 14.
   reinterpret_cast<RawRsdpV2*>(new_rsdp_addr)->length = 512;
-  EXPECT_THAT(SmpFindRsdpInMultiboot2(mb_base, kMaxCanonicalIdentityAddress),
-              t::Eq(old_rsdp_addr));
+  EXPECT_THAT(
+      SmpFindRsdpInMultiboot2ForTest(mb_base, kMaxCanonicalIdentityAddress),
+      t::Eq(old_rsdp_addr));
   WriteRsdpV2(new_rsdp_addr, 0xAAAA0000, 0xBBBB0000ULL);
 
   // If Tag 15 has a corrupted extended checksum, fallback to Tag 14 succeeds.
   reinterpret_cast<RawRsdpV2*>(new_rsdp_addr)->extended_checksum ^= 0xFF;
-  EXPECT_THAT(SmpFindRsdpInMultiboot2(mb_base, kMaxCanonicalIdentityAddress),
-              t::Eq(old_rsdp_addr));
+  EXPECT_THAT(
+      SmpFindRsdpInMultiboot2ForTest(mb_base, kMaxCanonicalIdentityAddress),
+      t::Eq(old_rsdp_addr));
 
   // If Tag 14 is also corrupted, but Tag 15's v1 header (rsdt_address != 0) is
   // still valid, Tag 15's v1 header is used as fallback.
   reinterpret_cast<RawRsdpV1*>(old_rsdp_addr)->checksum ^= 0xFF;
-  EXPECT_THAT(SmpFindRsdpInMultiboot2(mb_base, kMaxCanonicalIdentityAddress),
-              t::Eq(new_rsdp_addr));
+  EXPECT_THAT(
+      SmpFindRsdpInMultiboot2ForTest(mb_base, kMaxCanonicalIdentityAddress),
+      t::Eq(new_rsdp_addr));
 
   // If Tag 15's v1 checksum is also corrupted, returns 0.
   reinterpret_cast<RawRsdpV2*>(new_rsdp_addr)->v1.checksum ^= 0xFF;
-  EXPECT_THAT(SmpFindRsdpInMultiboot2(mb_base, kMaxCanonicalIdentityAddress),
-              t::Eq(0u));
+  EXPECT_THAT(
+      SmpFindRsdpInMultiboot2ForTest(mb_base, kMaxCanonicalIdentityAddress),
+      t::Eq(0u));
 
   // Malformed Multiboot2 total_size (< 8 or > 4 MiB) must return 0.
   *reinterpret_cast<uint32_t*>(buf) = 4;
-  EXPECT_THAT(SmpFindRsdpInMultiboot2(mb_base, kMaxCanonicalIdentityAddress),
-              t::Eq(0u));
+  EXPECT_THAT(
+      SmpFindRsdpInMultiboot2ForTest(mb_base, kMaxCanonicalIdentityAddress),
+      t::Eq(0u));
   *reinterpret_cast<uint32_t*>(buf) = 8 * 1024 * 1024;
-  EXPECT_THAT(SmpFindRsdpInMultiboot2(mb_base, kMaxCanonicalIdentityAddress),
-              t::Eq(0u));
+  EXPECT_THAT(
+      SmpFindRsdpInMultiboot2ForTest(mb_base, kMaxCanonicalIdentityAddress),
+      t::Eq(0u));
 }
 
 TEST(SmpTest, FindMadtInSdtSearchesXsdtAndFallsBackToRsdt) {
@@ -544,8 +656,8 @@ TEST(SmpTest, ParseMadtHandlesBspReorderingFilteringDuplicatesAndOverrides) {
   // Unknown entry type 2 (Interrupt Source Override, 10 bytes, must be skipped)
   const uint8_t iso_entry[10] = {2, 10, 0, 0, 2, 0, 0, 0, 0, 0};
   recs.insert(recs.end(), iso_entry, iso_entry + sizeof(iso_entry));
-  // BSP with APIC ID 4 (Online-Capable flag == 2)
-  AppendLapicRecord(&recs, 12, 4, 2);
+  // BSP with APIC ID 4 (Enabled)
+  AppendLapicRecord(&recs, 12, 4, 1);
   // Duplicate APIC ID 2 (must be deduplicated)
   AppendLapicRecord(&recs, 13, 2, 1);
   // CPU with APIC ID 7 via Local x2APIC (Type 9)
@@ -567,10 +679,12 @@ TEST(SmpTest, ParseMadtHandlesBspReorderingFilteringDuplicatesAndOverrides) {
   EXPECT_THAT(topo.local_apic_phys_addr, t::Eq(0xFEE01000ULL));
   EXPECT_THAT(topo.bsp_apic_id, t::Eq(4u));
   ASSERT_THAT(topo.cpu_count, t::Eq(3));
+  EXPECT_THAT(topo.ignored_cpu_count, t::Eq(0));
 
   // BSP (APIC ID 4) must be placed at index 0, preserving relative order of APs
   // (APIC ID 2 at index 1, APIC ID 7 at index 2).
   EXPECT_THAT(topo.cpus[0].apic_id, t::Eq(4u));
+  EXPECT_THAT(topo.cpus[0].acpi_processor_id, t::Eq(12u));
   EXPECT_TRUE(topo.cpus[0].is_bsp);
   EXPECT_TRUE(topo.cpus[0].online);
 
@@ -587,13 +701,76 @@ TEST(SmpTest, ParseMadtHandlesBspReorderingFilteringDuplicatesAndOverrides) {
   ASSERT_TRUE(SmpParseMadt(madt_addr, kMaxCanonicalIdentityAddress, 99, &topo));
   ASSERT_THAT(topo.cpu_count, t::Eq(4));
   EXPECT_THAT(topo.cpus[0].apic_id, t::Eq(99u));
+  EXPECT_THAT(topo.cpus[0].acpi_processor_id, t::Eq(0u));
   EXPECT_TRUE(topo.cpus[0].is_bsp);
   EXPECT_THAT(topo.cpus[1].apic_id, t::Eq(2u));
   EXPECT_THAT(topo.cpus[2].apic_id, t::Eq(4u));
   EXPECT_THAT(topo.cpus[3].apic_id, t::Eq(7u));
 }
 
-TEST(SmpTest, ParseMadtHandlesMalformedEntriesAndClampsMaxCpus) {
+TEST(SmpTest, ParseMadtIgnoresProcessorsThatAreOnlyOnlineCapable) {
+  ResetState();
+  const uintptr_t madt_addr = OffsetAddr(0x4000);
+
+  // Online Capable (flags bit 1) without Enabled (bit 0) marks a hot-pluggable
+  // processor that is not present. Enabled wins if both bits are set.
+  std::vector<uint8_t> recs;
+  AppendLapicRecord(&recs, 0, 0, 1);
+  AppendLapicRecord(&recs, 1, 1, 2);
+  AppendLapicRecord(&recs, 2, 2, 1);
+  AppendX2ApicRecord(&recs, 3, 3, 2);
+  AppendLapicRecord(&recs, 4, 4, 3);
+  WriteMadt(madt_addr, kDefaultLocalApicPhysAddr, recs);
+
+  SmpTopology topo = {};
+  ASSERT_TRUE(SmpParseMadt(madt_addr, kMaxCanonicalIdentityAddress, 0, &topo));
+  ASSERT_THAT(topo.cpu_count, t::Eq(3));
+  EXPECT_THAT(topo.cpus[0].apic_id, t::Eq(0u));
+  EXPECT_THAT(topo.cpus[1].apic_id, t::Eq(2u));
+  EXPECT_THAT(topo.cpus[2].apic_id, t::Eq(4u));
+
+  // A BSP that is listed only as Online Capable is still placed at index 0.
+  ASSERT_TRUE(SmpParseMadt(madt_addr, kMaxCanonicalIdentityAddress, 1, &topo));
+  ASSERT_THAT(topo.cpu_count, t::Eq(4));
+  EXPECT_THAT(topo.cpus[0].apic_id, t::Eq(1u));
+  EXPECT_THAT(topo.cpus[0].acpi_processor_id, t::Eq(0u));
+
+  // A table whose processors are all only Online Capable lists no CPU.
+  recs.clear();
+  AppendLapicRecord(&recs, 0, 0, 2);
+  AppendX2ApicRecord(&recs, 1, 1, 2);
+  WriteMadt(madt_addr, kDefaultLocalApicPhysAddr, recs);
+  EXPECT_FALSE(SmpParseMadt(madt_addr, kMaxCanonicalIdentityAddress, 0, &topo));
+}
+
+TEST(SmpTest, SmpInitDoesNotStartProcessorsThatAreOnlyOnlineCapable) {
+  ResetState(BaseAddr());
+  std::vector<uint8_t> recs;
+  AppendLapicRecord(&recs, 0, 0, 1);
+  AppendLapicRecord(&recs, 1, 1, 2);
+  AppendLapicRecord(&recs, 2, 2, 1);
+  AppendX2ApicRecord(&recs, 3, 3, 2);
+  const uintptr_t bios_rom_base = WriteBiosAcpiTables(recs);
+  IdtInit();
+  SmpSetHostTestHooks(0,              //
+                      0,              //
+                      bios_rom_base,  //
+                      BaseAddr(),     //
+                      [](const int /*cpu_index*/, CpuInfo* const cpu_info) {
+                        EXPECT_THAT(cpu_info->apic_id, t::Eq(2u));
+                        return StartAp(cpu_info);
+                      });
+  SmpInit(kMultiboot1Magic, 0);
+
+  ASSERT_THAT(SmpCpuCount(), t::Eq(2));
+  EXPECT_THAT(SmpOnlineCpuCount(), t::Eq(2));
+  EXPECT_THAT(SmpGetCpuInfo(1)->apic_id, t::Eq(2u));
+  // Only one AP stack was allocated.
+  EXPECT_THAT(g_state.pmm_alloc_calls, t::Eq(1));
+  EXPECT_THAT(g_state.uart_log, t::HasSubstr("[SMP] Online CPUs: 2/2"));
+}
+
+TEST(SmpTest, ParseMadtHandlesMalformedEntriesAndCapsCpuCount) {
   ResetState();
   const uintptr_t madt_addr = OffsetAddr(0x5000);
 
@@ -628,12 +805,12 @@ TEST(SmpTest, ParseMadtHandlesMalformedEntriesAndClampsMaxCpus) {
   WriteMadt(madt_addr, kDefaultLocalApicPhysAddr, recs);
   EXPECT_FALSE(SmpParseMadt(madt_addr, kMaxCanonicalIdentityAddress, 0, &topo));
 
-  // MADT with a large number of enabled processors (e.g. 128 CPUs) must
-  // dynamically allocate and preserve all CPUs without clamping, placing the
-  // BSP at index 0.
+  // MADT with more enabled processors than kMaxSupportedCpus: the BSP, listed
+  // last, still gets index 0, followed by the first kMaxSupportedCpus - 1 other
+  // processors in table order; the remaining entries are counted as ignored.
   recs.clear();
-  constexpr int kLargeCpuCount = 128;
-  for (int i = 1; i < kLargeCpuCount; ++i) {
+  constexpr int kListedCpuCount = 200;
+  for (int i = 1; i < kListedCpuCount; ++i) {
     AppendLapicRecord(&recs,                    //
                       static_cast<uint8_t>(i),  //
                       static_cast<uint8_t>(i),  //
@@ -642,14 +819,52 @@ TEST(SmpTest, ParseMadtHandlesMalformedEntriesAndClampsMaxCpus) {
   AppendLapicRecord(&recs, 0x77, 0, 1);
   WriteMadt(madt_addr, kDefaultLocalApicPhysAddr, recs);
   ASSERT_TRUE(SmpParseMadt(madt_addr, kMaxCanonicalIdentityAddress, 0, &topo));
-  EXPECT_THAT(topo.cpu_count, t::Eq(kLargeCpuCount));
-  EXPECT_THAT(topo.cpus[0].apic_id, t::Eq(0));
-  EXPECT_THAT(topo.cpus[0].acpi_processor_id, t::Eq(0x77));
+  ASSERT_THAT(topo.cpu_count, t::Eq(kMaxSupportedCpus));
+  EXPECT_THAT(topo.ignored_cpu_count,
+              t::Eq(kListedCpuCount - kMaxSupportedCpus));
+  EXPECT_THAT(topo.cpus[0].apic_id, t::Eq(0u));
+  EXPECT_THAT(topo.cpus[0].acpi_processor_id, t::Eq(0x77u));
   EXPECT_TRUE(topo.cpus[0].is_bsp);
-  for (int i = 1; i < kLargeCpuCount; ++i) {
-    EXPECT_THAT(topo.cpus[i].apic_id, t::Eq(static_cast<uint8_t>(i)));
+  for (int i = 1; i < kMaxSupportedCpus; ++i) {
+    EXPECT_THAT(topo.cpus[i].apic_id, t::Eq(static_cast<uint32_t>(i)));
     EXPECT_FALSE(topo.cpus[i].is_bsp);
   }
+
+  // Exactly kMaxSupportedCpus processors fit without ignoring any.
+  recs.clear();
+  for (int i = 0; i < kMaxSupportedCpus; ++i) {
+    AppendLapicRecord(&recs,                    //
+                      static_cast<uint8_t>(i),  //
+                      static_cast<uint8_t>(i),  //
+                      1);
+  }
+  WriteMadt(madt_addr, kDefaultLocalApicPhysAddr, recs);
+  ASSERT_TRUE(SmpParseMadt(madt_addr, kMaxCanonicalIdentityAddress, 0, &topo));
+  EXPECT_THAT(topo.cpu_count, t::Eq(kMaxSupportedCpus));
+  EXPECT_THAT(topo.ignored_cpu_count, t::Eq(0));
+}
+
+TEST(SmpTest, SmpInitStartsAtMostMaxSupportedCpusAndLogsTheRest) {
+  ResetState(BaseAddr());
+  std::vector<uint8_t> recs;
+  constexpr int kListedCpuCount = kMaxSupportedCpus + 5;
+  for (int i = 0; i < kListedCpuCount; ++i) {
+    AppendX2ApicRecord(&recs,                     //
+                       static_cast<uint32_t>(i),  //
+                       static_cast<uint32_t>(i),  //
+                       1);
+  }
+  const uintptr_t bios_rom_base = WriteBiosAcpiTables(recs);
+  IdtInit();
+  SmpSetHostTestHooks(0, 0, bios_rom_base, BaseAddr(), nullptr);
+  SmpInit(kMultiboot1Magic, 0);
+
+  EXPECT_THAT(SmpCpuCount(), t::Eq(kMaxSupportedCpus));
+  EXPECT_THAT(SmpOnlineCpuCount(), t::Eq(kMaxSupportedCpus));
+  EXPECT_THAT(g_state.pmm_alloc_calls, t::Eq(kMaxSupportedCpus - 1));
+  EXPECT_THAT(g_state.uart_log,
+              t::HasSubstr("[SMP] Ignoring 5 more processor entries (limit: "
+                           "128 CPUs)"));
 }
 
 TEST(SmpTest, DiscoverTopologyAndSmpInitEndToEndAndPanicsOnFailure) {
@@ -719,8 +934,10 @@ TEST(SmpTest, DiscoverTopologyAndSmpInitEndToEndAndPanicsOnFailure) {
     EXPECT_TRUE(info->long_mode_active);
     EXPECT_THAT(info->stack_top - info->stack_base, t::Eq(kApStackSize));
   }
-  EXPECT_DEATH(SmpGetCpuInfo(-1), "Check failed");
-  EXPECT_DEATH(SmpGetCpuInfo(4), "Check failed");
+  EXPECT_DEATH(SmpGetCpuInfo(-1),
+               "Check failed: index >= 0 && index < g_topology\\.cpu_count");
+  EXPECT_DEATH(SmpGetCpuInfo(4),
+               "Check failed: index >= 0 && index < g_topology\\.cpu_count");
 
   // Verify SmpInit also succeeds via Legacy BIOS ROM scan (skipping the stale
   // RSDP at +64 and discovering the valid RSDP v1 -> RSDT at +128) under
@@ -730,37 +947,80 @@ TEST(SmpTest, DiscoverTopologyAndSmpInitEndToEndAndPanicsOnFailure) {
   EXPECT_THAT(SmpOnlineCpuCount(), t::Eq(4));
 
   // Verify SmpInit panics via CHECK if topology discovery fails, if mapping
-  // the Local APIC MMIO page fails, if PMM stack allocation fails, or if an AP
-  // fails to come online.
+  // the Local APIC MMIO page fails, or if PMM stack allocation fails.
   SmpSetHostTestHooks(0, 0, 0, BaseAddr(), nullptr);
-  EXPECT_DEATH(SmpInit(kMultiboot1Magic, 0), "Check failed");
+  EXPECT_DEATH(SmpInit(kMultiboot1Magic, 0),
+               "Check failed: SmpDiscoverTopology\\(multiboot_magic");
 
   SmpSetHostTestHooks(0, 0, bios_rom_base, BaseAddr(), nullptr);
   g_state.fail_map_addr = kDefaultLocalApicPhysAddr;
-  EXPECT_DEATH(SmpInit(kMultiboot2Magic, mb_base), "Check failed");
+  EXPECT_DEATH(
+      SmpInit(kMultiboot2Magic, mb_base),
+      "Check failed: PagingMapBootstrapRange\\(lapic_base, kPageSize\\)");
   g_state.fail_map_addr = 0;
 
   g_state.pmm_alloc_calls = 0;
   g_state.fail_pmm_on_call = 2;
-  EXPECT_DEATH(SmpInit(kMultiboot2Magic, mb_base), "Check failed");
+  EXPECT_DEATH(SmpInit(kMultiboot2Magic, mb_base),
+               "Check failed: stack_phys != 0");
   g_state.fail_pmm_on_call = -1;
+}
 
+TEST(SmpTest, SmpInitLeavesOutApsThatDoNotStart) {
+  ResetState(BaseAddr());
+  const uintptr_t bios_rom_base = WriteBiosAcpiTables(LapicRecords(5));
+  IdtInit();
   SmpSetHostTestHooks(0,              //
                       0,              //
                       bios_rom_base,  //
                       BaseAddr(),     //
-                      [](const int cpu_index, CpuInfo* const cpu_info) {
-                        if (cpu_index == 2) {
+                      [](const int /*cpu_index*/, CpuInfo* const cpu_info) {
+                        // The CPUs with APIC IDs 2 and 4 never report in.
+                        if (cpu_info->apic_id == 2 || cpu_info->apic_id == 4) {
                           return false;
                         }
-                        cpu_info->observed_apic_id = cpu_info->apic_id;
-                        cpu_info->observed_rsp = cpu_info->stack_top - 64;
-                        cpu_info->observed_cr3 = 0x105000;
-                        cpu_info->long_mode_active = true;
-                        cpu_info->online = true;
-                        return true;
+                        return StartAp(cpu_info);
                       });
-  EXPECT_DEATH(SmpInit(kMultiboot2Magic, mb_base), "Check failed");
+  SmpInit(kMultiboot1Magic, 0);
+
+  ASSERT_THAT(SmpCpuCount(), t::Eq(3));
+  EXPECT_THAT(SmpOnlineCpuCount(), t::Eq(3));
+  constexpr uint32_t kExpectedApicIds[] = {0, 1, 3};
+  for (int i = 0; i < 3; ++i) {
+    const CpuInfo* const info = SmpGetCpuInfo(i);
+    const CpuLocal* const local = SmpGetCpuLocal(i);
+    EXPECT_THAT(info->apic_id, t::Eq(kExpectedApicIds[i]));
+    EXPECT_TRUE(info->online);
+    EXPECT_THAT(info->stack_top - info->stack_base, t::Eq(kApStackSize));
+    EXPECT_THAT(local->self, t::Eq(local));
+    EXPECT_THAT(local->cpu_id, t::Eq(i));
+    EXPECT_THAT(local->apic_id, t::Eq(kExpectedApicIds[i]));
+    EXPECT_THAT(local->stack_base, t::Eq(info->stack_base));
+    EXPECT_TRUE(local->online);
+  }
+  // The stacks of the CPUs that did not start were returned to the PMM: the
+  // second and fourth of the four AP stacks, allocated from frame 32 on.
+  EXPECT_THAT(
+      g_state.freed_frames,
+      t::ElementsAre(t::Pair(OffsetAddr(36 * kPageSize), kApStackFrames),
+                     t::Pair(OffsetAddr(44 * kPageSize), kApStackFrames)));
+  EXPECT_THAT(SmpGetCpuInfo(2)->stack_base, t::Eq(OffsetAddr(40 * kPageSize)));
+  EXPECT_THAT(
+      g_state.uart_log,
+      t::HasSubstr("[SMP] CPU 2 (APIC ID 2): did not start; continuing without "
+                   "it\n[SMP] CPU 2 (APIC ID 3, AP): online\n[SMP] CPU 3 (APIC "
+                   "ID 4): did not start; continuing without it\n"));
+  EXPECT_THAT(g_state.uart_log, t::HasSubstr("[SMP] Online CPUs: 3/3"));
+
+  // The remaining CPUs work as a normal topology.
+  std::atomic<int> ran_on_cpus{0};
+  SmpRunOnAllCpus(
+      [](const int cpu_index, void* const ctx) {
+        EXPECT_THAT(CurrentCpuId(), t::Eq(cpu_index));
+        static_cast<std::atomic<int>*>(ctx)->fetch_add(1);
+      },
+      &ran_on_cpus);
+  EXPECT_THAT(ran_on_cpus.load(), t::Eq(3));
 }
 
 TEST(SmpTest, PreconditionViolationsTriggerDcheck) {
@@ -769,38 +1029,50 @@ TEST(SmpTest, PreconditionViolationsTriggerDcheck) {
   uintptr_t rsdt = 0;
   uintptr_t xsdt = 0;
   SmpTopology topo = {};
+  constexpr const char* kZeroMaxPhysicalAddr =
+      "Check failed: max_physical_addr > 0";
+  constexpr const char* kInvalidBspApicId =
+      "Check failed: bsp_apic_id != kInvalidX2ApicId";
+  constexpr const char* kNullTopology = "Check failed: out_topology != nullptr";
 
-  EXPECT_DEATH(SmpFindRsdpInMultiboot2(0, kMaxCanonicalIdentityAddress),
-               "Check failed");
-  EXPECT_DEATH(SmpFindRsdpInMultiboot2(addr, 0), "Check failed");
+  EXPECT_DEATH(SmpFindRsdpInMultiboot2ForTest(0, kMaxCanonicalIdentityAddress),
+               "Check failed: multiboot_info_addr != 0");
+  EXPECT_DEATH(SmpFindRsdpInMultiboot2ForTest(addr, 0), kZeroMaxPhysicalAddr);
 
-  EXPECT_DEATH(SmpFindRsdpInMemoryRange(0, 1024), "Check failed");
-  EXPECT_DEATH(SmpFindRsdpInMemoryRange(addr, 0), "Check failed");
-  EXPECT_DEATH(SmpFindRsdpInMemoryRange(addr, -16), "Check failed");
+  EXPECT_DEATH(SmpFindRsdpInMemoryRange(0, 1024),
+               "Check failed: range_start != 0");
+  EXPECT_DEATH(SmpFindRsdpInMemoryRange(addr, 0),
+               "Check failed: range_length > 0");
+  EXPECT_DEATH(SmpFindRsdpInMemoryRange(addr, -16),
+               "Check failed: range_length > 0");
 
-  EXPECT_DEATH(SmpParseRsdp(0, kMaxCanonicalIdentityAddress, &rsdt, &xsdt),
-               "Check failed");
-  EXPECT_DEATH(SmpParseRsdp(addr, 0, &rsdt, &xsdt), "Check failed");
-  EXPECT_DEATH(SmpParseRsdp(addr, kMaxCanonicalIdentityAddress, nullptr, &xsdt),
-               "Check failed");
-  EXPECT_DEATH(SmpParseRsdp(addr, kMaxCanonicalIdentityAddress, &rsdt, nullptr),
-               "Check failed");
+  EXPECT_DEATH(
+      SmpParseRsdpForTest(0, kMaxCanonicalIdentityAddress, &rsdt, &xsdt),
+      "Check failed: rsdp_addr != 0");
+  EXPECT_DEATH(SmpParseRsdpForTest(addr, 0, &rsdt, &xsdt),
+               kZeroMaxPhysicalAddr);
+  EXPECT_DEATH(
+      SmpParseRsdpForTest(addr, kMaxCanonicalIdentityAddress, nullptr, &xsdt),
+      "Check failed: out_rsdt_addr != nullptr");
+  EXPECT_DEATH(
+      SmpParseRsdpForTest(addr, kMaxCanonicalIdentityAddress, &rsdt, nullptr),
+      "Check failed: out_xsdt_addr != nullptr");
 
   EXPECT_DEATH(SmpFindMadtInSdt(0, 0, kMaxCanonicalIdentityAddress),
-               "Check failed");
-  EXPECT_DEATH(SmpFindMadtInSdt(addr, 0, 0), "Check failed");
+               "Check failed: rsdt_addr != 0 \\|\\| xsdt_addr != 0");
+  EXPECT_DEATH(SmpFindMadtInSdt(addr, 0, 0), kZeroMaxPhysicalAddr);
 
   EXPECT_DEATH(SmpParseMadt(0, kMaxCanonicalIdentityAddress, 0, &topo),
-               "Check failed");
-  EXPECT_DEATH(SmpParseMadt(addr, 0, 0, &topo), "Check failed");
+               "Check failed: madt_addr != 0");
+  EXPECT_DEATH(SmpParseMadt(addr, 0, 0, &topo), kZeroMaxPhysicalAddr);
   EXPECT_DEATH(
       SmpParseMadt(addr, kMaxCanonicalIdentityAddress, kInvalidX2ApicId, &topo),
-      "Check failed");
+      kInvalidBspApicId);
   EXPECT_DEATH(SmpParseMadt(addr, kMaxCanonicalIdentityAddress, 0, nullptr),
-               "Check failed");
+               kNullTopology);
 
   EXPECT_DEATH(SmpDiscoverTopology(kMultiboot2Magic, 0, 0, 0, 0, 0, &topo),
-               "Check failed");
+               kZeroMaxPhysicalAddr);
   EXPECT_DEATH(SmpDiscoverTopology(kMultiboot2Magic,              //
                                    0,                             //
                                    0,                             //
@@ -808,7 +1080,7 @@ TEST(SmpTest, PreconditionViolationsTriggerDcheck) {
                                    kMaxCanonicalIdentityAddress,  //
                                    kInvalidX2ApicId,              //
                                    &topo),
-               "Check failed");
+               kInvalidBspApicId);
   EXPECT_DEATH(SmpDiscoverTopology(kMultiboot2Magic,              //
                                    0,                             //
                                    0,                             //
@@ -816,28 +1088,34 @@ TEST(SmpTest, PreconditionViolationsTriggerDcheck) {
                                    kMaxCanonicalIdentityAddress,  //
                                    0,                             //
                                    nullptr),
-               "Check failed");
+               kNullTopology);
 
   // Calling SMP query accessors or SmpRunOnAllCpus before SmpInit succeeds
   // must trigger DCHECK.
-  EXPECT_DEATH(SmpCpuCount(), "Check failed");
-  EXPECT_DEATH(SmpOnlineCpuCount(), "Check failed");
-  EXPECT_DEATH(SmpGetCpuInfo(0), "Check failed");
-  EXPECT_DEATH(SmpGetCpuLocal(0), "Check failed");
-  EXPECT_DEATH(SmpLocalApicPhysAddr(), "Check failed");
-  EXPECT_DEATH(SmpCalibratedTimerInitialCount(), "Check failed");
-  EXPECT_DEATH(SmpSendIpi(0, kVectorWakeupIpi), "Check failed");
+  constexpr const char* kNotInitialized = "Check failed: g_smp_initialized";
+  EXPECT_DEATH(SmpCpuCount(), kNotInitialized);
+  EXPECT_DEATH(SmpOnlineCpuCount(), kNotInitialized);
+  EXPECT_DEATH(SmpGetCpuInfo(0), kNotInitialized);
+  EXPECT_DEATH(SmpGetCpuLocal(0), kNotInitialized);
+  EXPECT_DEATH(SmpLocalApicPhysAddr(), kNotInitialized);
+  EXPECT_DEATH(SmpCalibratedTimerInitialCount(), kNotInitialized);
+  EXPECT_DEATH(SmpSendIpi(0, kVectorWakeupIpi), kNotInitialized);
   EXPECT_DEATH(SmpRunOnAllCpus([](const int, void* const) {}, nullptr),
-               "Check failed");
-  EXPECT_DEATH(BindCpuLocal(nullptr), "Check failed");
+               kNotInitialized);
+  EXPECT_DEATH(BindCpuLocal(nullptr), "Check failed: cpu != nullptr");
   CpuLocal invalid_self = {};
-  EXPECT_DEATH(BindCpuLocal(&invalid_self), "Check failed");
-  EXPECT_DEATH(CurrentCpu(), "Check failed");
-  EXPECT_DEATH(CurrentCpuId(), "Check failed");
-  EXPECT_DEATH(ComputeApicTimerInitialCount(1000, 0, 100), "Check failed");
+  EXPECT_DEATH(BindCpuLocal(&invalid_self), "Check failed: cpu->self == cpu");
+  EXPECT_DEATH(CurrentCpu(), "Check failed: cpu != nullptr");
+  EXPECT_DEATH(CurrentCpuId(), "Check failed: cpu != nullptr");
+  constexpr const char* kBadPitReloadCount =
+      "Check failed: pit_reload_count > 0 && pit_reload_count <= "
+      "kMaxPitReloadCount";
+  EXPECT_DEATH(ComputeApicTimerInitialCount(1000, 0, 100), kBadPitReloadCount);
   EXPECT_DEATH(ComputeApicTimerInitialCount(1000, 0x10000, 100),
-               "Check failed");
-  EXPECT_DEATH(ComputeApicTimerInitialCount(1000, 10000, 0), "Check failed");
+               kBadPitReloadCount);
+  EXPECT_DEATH(
+      ComputeApicTimerInitialCount(1000, 10000, 0),
+      "Check failed: target_hz > 0 && target_hz <= kPitBaseFrequencyHz");
 }
 
 TEST(SmpTest, CpuLocalLayoutAlignmentAndThreadLocalBinding) {
@@ -847,6 +1125,7 @@ TEST(SmpTest, CpuLocalLayoutAlignmentAndThreadLocalBinding) {
 
   ResetState();
   EXPECT_THAT(CurrentCpuOrNull(), t::IsNull());
+  EXPECT_THAT(CurrentCpuOrNullForPanic(), t::IsNull());
 
   constexpr int kThreadCount = 4;
   alignas(64) CpuLocal locals[kThreadCount] = {};
@@ -857,7 +1136,7 @@ TEST(SmpTest, CpuLocalLayoutAlignmentAndThreadLocalBinding) {
   for (int i = 0; i < kThreadCount; ++i) {
     locals[i].self = &locals[i];
     locals[i].cpu_id = i;
-    locals[i].apic_id = static_cast<uint8_t>(i + 10);
+    locals[i].apic_id = static_cast<uint32_t>(i + 10);
     locals[i].online = true;
     threads.emplace_back([i, &locals, &ready]() {
       BindCpuLocal(&locals[i]);
@@ -867,10 +1146,12 @@ TEST(SmpTest, CpuLocalLayoutAlignmentAndThreadLocalBinding) {
       }
       for (int iter = 0; iter < 200; ++iter) {
         ASSERT_THAT(CurrentCpuOrNull(), t::Eq(&locals[i]));
+        ASSERT_THAT(CurrentCpuOrNullForPanic(), t::Eq(&locals[i]));
         ASSERT_THAT(CurrentCpu(), t::Eq(&locals[i]));
         ASSERT_THAT(CurrentCpu()->self, t::Eq(&locals[i]));
         ASSERT_THAT(CurrentCpuId(), t::Eq(i));
-        ASSERT_THAT(CurrentCpu()->apic_id, t::Eq(static_cast<uint8_t>(i + 10)));
+        ASSERT_THAT(CurrentCpu()->apic_id,
+                    t::Eq(static_cast<uint32_t>(i + 10)));
         CurrentCpu()->timer_ticks.fetch_add(1, std::memory_order_relaxed);
       }
       ResetCpuLocalForTest();
@@ -938,7 +1219,7 @@ TEST(SmpTest,
   EXPECT_THAT(SmpGetHostEoiCountForTest(), t::Eq(1));
 
   // Verify SmpSendIpi increments target CpuLocal::ipi_count on vector 0x21 and
-  // sends EOI, whereas kVectorSpurious (0xFF) does not send EOI.
+  // sends EOI.
   const int64_t ap_ipi_before =
       SmpGetCpuLocal(1)->ipi_count.load(std::memory_order_acquire);
   SmpSendIpi(1, kVectorWakeupIpi);
@@ -946,28 +1227,90 @@ TEST(SmpTest,
               t::Eq(ap_ipi_before + 1));
   EXPECT_THAT(SmpGetHostEoiCountForTest(), t::Eq(2));
 
-  SmpSendIpi(1, kVectorSpurious);
-  EXPECT_THAT(SmpGetHostEoiCountForTest(), t::Eq(2));
-
   // Out-of-range SmpGetCpuLocal or SmpSendIpi arguments must trigger DCHECK.
-  EXPECT_DEATH(SmpGetCpuLocal(-1), "Check failed");
-  EXPECT_DEATH(SmpGetCpuLocal(SmpCpuCount()), "Check failed");
-  EXPECT_DEATH(SmpSendIpi(-1, kVectorWakeupIpi), "Check failed");
-  EXPECT_DEATH(SmpSendIpi(SmpCpuCount(), kVectorWakeupIpi), "Check failed");
-  EXPECT_DEATH(SmpSendIpi(1, 0x1F), "Check failed");
+  constexpr const char* kBadCpuLocalIndex =
+      "Check failed: cpu_index >= 0 && cpu_index < g_topology\\.cpu_count";
+  constexpr const char* kBadIpiTarget =
+      "Check failed: target_cpu_index >= 0 && target_cpu_index < "
+      "g_topology\\.cpu_count";
+  EXPECT_DEATH(SmpGetCpuLocal(-1), kBadCpuLocalIndex);
+  EXPECT_DEATH(SmpGetCpuLocal(SmpCpuCount()), kBadCpuLocalIndex);
+  EXPECT_DEATH(SmpSendIpi(-1, kVectorWakeupIpi), kBadIpiTarget);
+  EXPECT_DEATH(SmpSendIpi(SmpCpuCount(), kVectorWakeupIpi), kBadIpiTarget);
+  EXPECT_DEATH(SmpSendIpi(1, 0x1F),
+               "Check failed: vector >= "
+               "static_cast<uint8_t>\\(kCpuExceptionCount\\)");
+  // The spurious vector never gets an EOI, so a fixed IPI on it would block
+  // the target's lower-priority interrupts for good.
+  EXPECT_DEATH(SmpSendIpi(1, kVectorSpurious),
+               "Check failed: vector != kVectorSpurious");
+}
 
-  // Zero calibrated timer initial count must trigger CHECK failure in SmpInit.
-  EXPECT_DEATH(
-      {
-        ResetState(BaseAddr());
-        WriteMadt(madt_addr, kDefaultLocalApicPhysAddr, recs);
-        WriteRsdt(rsdt_addr, {static_cast<uint32_t>(madt_addr)});
-        WriteRsdpV1(bios_rom_base + 64, static_cast<uint32_t>(rsdt_addr));
-        SmpSetHostTestHooks(2, 0, bios_rom_base, BaseAddr(), nullptr);
-        SmpSetHostTimerCalibrationTicksForTest(0);
-        SmpInit(kMultiboot1Magic, 0);
-      },
-      "Check failed");
+TEST(SmpTest, TimerCountFallsBackToCpuidClockThenToFixedCountWithoutPit) {
+  const std::vector<uint8_t> recs = LapicRecords(1);
+  struct Case {
+    const char* name;
+    uint64_t pit_calibration_ticks;
+    uint32_t max_leaf;
+    uint32_t leaf15_ebx;
+    uint32_t leaf15_ecx;
+    uint32_t leaf16_ecx;
+    uint32_t expected_count;
+    // Expected fallback message, or nullptr if PIT calibration worked.
+    const char* expected_log;
+  };
+  const Case kCases[] = {
+      {"PIT calibration", 60000, 0x16, 2, 24000000, 100,
+       ComputeApicTimerInitialCount(60000, kPitCalibrationReloadCount,
+                                    kApicTimerTargetHz),
+       nullptr},
+      // 24 MHz core crystal clock / 16 / 250 Hz.
+      {"CPUID crystal clock", 0, 0x15, 2, 24000000, 0, 6000,
+       "[SMP] No PIT calibration; Local APIC timer clock from CPUID: 24000000 "
+       "Hz"},
+      // Without a TSC/crystal ratio in leaf 0x15, the timer runs at the
+      // 100 MHz bus clock of leaf 0x16.
+      {"CPUID bus clock", 0, 0x16, 0, 24000000, 100, 25000,
+       "[SMP] No PIT calibration; Local APIC timer clock from CPUID: "
+       "100000000 Hz"},
+      // Leaf 0x15 says the timer runs at the crystal clock, but does not
+      // enumerate its frequency.
+      {"unknown crystal clock", 0, 0x16, 2, 0, 100,
+       kFallbackApicTimerInitialCount,
+       "[SMP] WARNING: no PIT or CPUID timer frequency"},
+      {"no CPUID data", 0, 0x0B, 0, 0, 0, kFallbackApicTimerInitialCount,
+       "[SMP] WARNING: no PIT or CPUID timer frequency; LAPIC timer rate is "
+       "uncalibrated"},
+  };
+  for (const Case& c : kCases) {
+    SCOPED_TRACE(c.name);
+    ResetState(BaseAddr());
+    const uintptr_t bios_rom_base = WriteBiosAcpiTables(recs);
+    IdtInit();
+    SmpSetHostTestHooks(0, 0, bios_rom_base, BaseAddr(), nullptr);
+    g_cpu.max_leaf = c.max_leaf;
+    g_cpu.leaf15_ebx = c.leaf15_ebx;
+    g_cpu.leaf15_ecx = c.leaf15_ecx;
+    g_cpu.leaf16_ecx = c.leaf16_ecx;
+    InstallFakeCpuHooks();
+    SmpSetHostTimerCalibrationTicksForTest(c.pit_calibration_ticks);
+    SmpInit(kMultiboot1Magic, 0);
+    EXPECT_FALSE(SmpIsX2ApicEnabled());
+    EXPECT_THAT(SmpCalibratedTimerInitialCount(), t::Eq(c.expected_count));
+    if (c.expected_log == nullptr) {
+      EXPECT_THAT(g_state.uart_log, t::Not(t::HasSubstr("No PIT calibration")));
+      EXPECT_THAT(g_state.uart_log, t::Not(t::HasSubstr("WARNING")));
+    } else {
+      EXPECT_THAT(g_state.uart_log, t::HasSubstr(c.expected_log));
+    }
+    // The last-resort warning also goes to the screen.
+    if (c.expected_count == kFallbackApicTimerInitialCount) {
+      EXPECT_THAT(g_state.vga_log,
+                  t::HasSubstr("[SMP] WARNING: no PIT or CPUID"));
+    } else {
+      EXPECT_THAT(g_state.vga_log, t::Not(t::HasSubstr("WARNING")));
+    }
+  }
 }
 
 TEST(SmpTest,
@@ -999,14 +1342,15 @@ TEST(SmpTest,
       &single_cpu_calls);
   EXPECT_THAT(single_cpu_calls, t::Eq(1));
 
-  // Null work_fn or nested SmpRunOnAllCpus must trigger DCHECK.
-  EXPECT_DEATH(SmpRunOnAllCpus(nullptr, nullptr), "Check failed");
+  // Null work_fn or nested SmpRunOnAllCpus must fail a check.
+  EXPECT_DEATH(SmpRunOnAllCpus(nullptr, nullptr),
+               "Check failed: work_fn != nullptr");
   EXPECT_DEATH(SmpRunOnAllCpus(
                    [](const int, void* const) {
                      SmpRunOnAllCpus([](const int, void* const) {}, nullptr);
                    },
                    nullptr),
-               "Check failed");
+               "Check failed: !dispatch_already_running");
 
   // 2. Multi-CPU topology (4 CPUs): SmpRunOnAllCpus executes concurrently
   //    across all 4 CPUs with a simultaneous barrier and IrqSpinLock
@@ -1070,7 +1414,52 @@ TEST(SmpTest,
   }
 }
 
-TEST(SmpTest, CalibrateApicTimerCountBoundedLoopGuardAndFallbackOnTimeout) {
+TEST(SmpTest, SmpRunOnAllCpusChecksItsCallingContext) {
+  ResetState(BaseAddr());
+  const uintptr_t bios_rom_base = WriteBiosAcpiTables(LapicRecords(4));
+  IdtInit();
+  SmpSetHostTestHooks(0, 0, bios_rom_base, BaseAddr(), nullptr);
+  SmpInit(kMultiboot1Magic, 0);
+  ASSERT_THAT(SmpCpuCount(), t::Eq(4));
+
+  // Only CPU 0 can dispatch: APs pick up work only in their idle loop.
+  EXPECT_DEATH(
+      {
+        BindCpuLocal(SmpGetCpuLocal(2));
+        SmpRunOnAllCpus([](const int, void* const) {}, nullptr);
+      },
+      "Check failed: CurrentCpuId\\(\\) == 0");
+  // An AP's work_fn might need a lock that the caller holds.
+  EXPECT_DEATH(
+      {
+        IrqSpinLock lock;
+        const IrqSpinLockGuard guard(lock);
+        SmpRunOnAllCpus([](const int, void* const) {}, nullptr);
+      },
+      "Check failed: !HoldsAnyIrqSpinLock\\(\\)");
+  EXPECT_DEATH(
+      {
+        SetInterruptsEnabledForTest(false);
+        SmpRunOnAllCpus([](const int, void* const) {}, nullptr);
+      },
+      "Check failed: AreInterruptsEnabled\\(\\)");
+
+  // work_fn runs with interrupts enabled on every CPU, CPU 0 included, and the
+  // caller's interrupt state is restored afterwards.
+  std::atomic<int> interrupts_enabled_count{0};
+  SmpRunOnAllCpus(
+      [](const int, void* const ctx) {
+        if (AreInterruptsEnabled()) {
+          static_cast<std::atomic<int>*>(ctx)->fetch_add(1);
+        }
+      },
+      &interrupts_enabled_count);
+  EXPECT_THAT(interrupts_enabled_count.load(), t::Eq(4));
+  EXPECT_TRUE(AreInterruptsEnabled());
+  EXPECT_THAT(CurrentCpuId(), t::Eq(0));
+}
+
+TEST(SmpTest, CalibrateApicTimerCountBoundedLoopGuardAndZeroOnFailure) {
   static int g_speaker_polls = 0;
   static int g_ready_after_poll = 0;
   static uint32_t g_mock_current_count = 0;
@@ -1086,13 +1475,13 @@ TEST(SmpTest, CalibrateApicTimerCountBoundedLoopGuardAndFallbackOnTimeout) {
       +[](const uintptr_t) -> uint32_t { return g_mock_current_count; };
 
   // 1. Timeout when PIT port 0x61 bit 5 never sets: bounded to max_polls and
-  // returns kFallbackApicTimerInitialCount without hanging.
+  // returns 0 without hanging.
   g_speaker_polls = 0;
   g_mock_current_count = 0xFFFFFFFFu - 50000u;
   const uint32_t timeout_count = CalibrateApicTimerCount(
       kDefaultLocalApicPhysAddr, 256, read_speaker_timeout, read_apic_count);
   EXPECT_THAT(g_speaker_polls, t::Eq(256));
-  EXPECT_THAT(timeout_count, t::Eq(kFallbackApicTimerInitialCount));
+  EXPECT_THAT(timeout_count, t::Eq(0u));
 
   // 2. Normal completion before max_polls: returns calibrated count.
   const auto read_speaker_ready = +[]() -> uint8_t {
@@ -1109,14 +1498,13 @@ TEST(SmpTest, CalibrateApicTimerCountBoundedLoopGuardAndFallbackOnTimeout) {
               t::Eq(ComputeApicTimerInitialCount(
                   60000, kPitCalibrationReloadCount, kApicTimerTargetHz)));
 
-  // 3. Zero elapsed APIC ticks even when terminal count reached falls back to
-  // kFallbackApicTimerInitialCount.
+  // 3. Zero elapsed APIC ticks even when terminal count reached returns 0.
   g_speaker_polls = 0;
   g_ready_after_poll = 1;
   g_mock_current_count = 0xFFFFFFFFu;
   const uint32_t zero_elapsed_count = CalibrateApicTimerCount(
       kDefaultLocalApicPhysAddr, 256, read_speaker_ready, read_apic_count);
-  EXPECT_THAT(zero_elapsed_count, t::Eq(kFallbackApicTimerInitialCount));
+  EXPECT_THAT(zero_elapsed_count, t::Eq(0u));
 }
 
 TEST(SmpTest,
@@ -1135,7 +1523,7 @@ TEST(SmpTest,
   AppendX2ApicRecord(&recs, 0xFFu, 0x10000001u, 1);
   AppendX2ApicRecord(&recs, 0x100u, 0x20000002u, 1);
   AppendX2ApicRecord(&recs, 0x12345678u, 0x30000003u, 1);
-  AppendX2ApicRecord(&recs, 0xFFFFFFFEu, 0x40000004u, 2);
+  AppendX2ApicRecord(&recs, 0xFFFFFFFEu, 0x40000004u, 1);
   AppendX2ApicRecord(&recs, kInvalidX2ApicId, 0x50000005u, 1);
   // Duplicate 32-bit x2APIC ID must be deduplicated without colliding on low 8
   // bits (0x200 vs 0x100 have identical low 8 bits 0x00, so both must remain!).
@@ -1289,7 +1677,8 @@ TEST(SmpTest,
   const uintptr_t fake_lapic_base =
       reinterpret_cast<uintptr_t>(fake_mmio_lapic);
   EXPECT_THAT(SmpReadLapicIdForTest(fake_lapic_base), t::Eq(0x42u));
-  EXPECT_DEATH(SmpReadLapicIdForTest(0), "Check failed");
+  EXPECT_DEATH(SmpReadLapicIdForTest(0),
+               "Check failed: g_x2apic_mode \\|\\| lapic_base != 0");
 
   const bool irq_before_ipi = AreInterruptsEnabled();
   SmpLapicSendIpiCommandForTest(fake_lapic_base, 0x42u, 0x00004021u);
@@ -1303,7 +1692,7 @@ TEST(SmpTest,
   fake_mmio_lapic[0x300 / sizeof(uint32_t)] = (1u << 12);
   EXPECT_DEATH(
       SmpLapicSendIpiCommandForTest(fake_lapic_base, 0x11u, 0x00004021u),
-      "Check failed");
+      "Check failed: WaitForIcrIdle\\(lapic_base\\)");
   fake_mmio_lapic[0x300 / sizeof(uint32_t)] = 0;
 
   // Verify EnableLocalApic steps down from x2APIC (EXTD=1, EN=1) to xAPIC
@@ -1321,7 +1710,8 @@ TEST(SmpTest,
   EXPECT_THAT(g_msr_writes[1].second, t::Eq(0xFEE00900ULL));
   EXPECT_THAT(fake_mmio_lapic[0x080 / sizeof(uint32_t)], t::Eq(0u));
   EXPECT_THAT(fake_mmio_lapic[0x0F0 / sizeof(uint32_t)], t::Eq(0x000011FFu));
-  EXPECT_DEATH(SmpEnableLocalApicForTest(0), "Check failed");
+  EXPECT_DEATH(SmpEnableLocalApicForTest(0),
+               "Check failed: g_x2apic_mode \\|\\| lapic_base != 0");
 
   // Also verify EnableLocalApic in x2APIC mode enables EN (bit 11) then EXTD
   // (bit 10) and writes TPR (MSR 0x808) and SVR (MSR 0x80F).
@@ -1343,12 +1733,25 @@ TEST(SmpTest,
   EXPECT_THAT(g_msr_writes[3].second, t::Eq(0x1FFu));
   g_apic_base_msr = 0xFEE00D00ULL;
 
-  // 4. End-to-end SmpInit and SmpRunOnAllCpus with 32-bit x2APIC IDs.
+  // 4. End-to-end SmpInit and SmpRunOnAllCpus in x2APIC mode with 32-bit APIC
+  // IDs. SmpInit detects x2APIC through the hooks (IA32_APIC_BASE.EXTD is
+  // already set), so it must run after SmpSetHostTestHooks(), which clears
+  // them.
   WriteRsdt(rsdt_addr, {static_cast<uint32_t>(madt_addr)});
   WriteRsdpV1(bios_rom_base + 64, static_cast<uint32_t>(rsdt_addr));
   IdtInit();
   SmpSetHostTestHooks(0x100u, 0, bios_rom_base, BaseAddr(), nullptr);
+  SmpSetHostHardwareHooksForTest(false,          //
+                                 cpuid_hook,     //
+                                 read_msr_hook,  //
+                                 write_msr_hook);
+  g_msr_lapic_id = 0x100u;
+  g_msr_writes.clear();
   SmpInit(kMultiboot1Magic, 0);
+  ASSERT_TRUE(SmpIsX2ApicEnabled());
+  // SmpInit enabled the BSP's Local APIC through the x2APIC TPR and SVR MSRs.
+  EXPECT_THAT(g_msr_writes,
+              t::ElementsAre(t::Pair(0x808u, 0u), t::Pair(0x80Fu, 0x1FFu)));
   ASSERT_THAT(SmpCpuCount(), t::Eq(5));
   EXPECT_THAT(SmpGetCpuInfo(0)->apic_id, t::Eq(0x100u));
   EXPECT_THAT(SmpGetCpuLocal(0)->apic_id, t::Eq(0x100u));
@@ -1365,6 +1768,88 @@ TEST(SmpTest,
       },
       &high_apic_seen);
   EXPECT_THAT(high_apic_seen.load(std::memory_order_acquire), t::Eq(4));
+}
+
+TEST(SmpTest, SmpInitIdentifiesTheBspByItsLocalApicIdRegister) {
+  ResetState(BaseAddr());
+  std::vector<uint8_t> recs;
+  for (uint32_t id = 0; id < 4; ++id) {
+    AppendX2ApicRecord(&recs, id, id, 1);
+  }
+  const uintptr_t bios_rom_base = WriteBiosAcpiTables(recs);
+  IdtInit();
+  // CPUID reports initial APIC ID 0, but the BSP's x2APIC ID register (MSR
+  // 0x802) and the MADT agree on 2. Matching by the CPUID value would leave
+  // the real BSP entry in the AP list, and SmpInit would send INIT to it.
+  SmpSetHostTestHooks(0, 0, bios_rom_base, BaseAddr(), nullptr);
+  g_cpu.x2apic_supported = true;
+  g_cpu.x2apic_id_msr = 2;
+  InstallFakeCpuHooks();
+  SmpInit(kMultiboot1Magic, 0);
+
+  ASSERT_TRUE(SmpIsX2ApicEnabled());
+  ASSERT_THAT(SmpCpuCount(), t::Eq(4));
+  constexpr uint32_t kExpectedApicIds[] = {2, 0, 1, 3};
+  for (int i = 0; i < 4; ++i) {
+    EXPECT_THAT(SmpGetCpuInfo(i)->apic_id, t::Eq(kExpectedApicIds[i]));
+    EXPECT_THAT(SmpGetCpuLocal(i)->apic_id, t::Eq(kExpectedApicIds[i]));
+    EXPECT_THAT(SmpGetCpuInfo(i)->is_bsp, t::Eq(i == 0));
+  }
+  EXPECT_THAT(SmpGetCpuInfo(0)->observed_apic_id, t::Eq(2u));
+  EXPECT_THAT(g_state.uart_log,
+              t::HasSubstr("[SMP] BSP Local APIC ID 2 differs from its CPUID "
+                           "initial APIC ID 0; using the Local APIC ID\n"));
+  EXPECT_THAT(g_state.uart_log, t::HasSubstr("[SMP] CPU 0 (APIC ID 2, BSP)"));
+}
+
+TEST(SmpTest, SmpInitSkipsApicIdsThatXapicModeCannotAddress) {
+  ResetState(BaseAddr());
+  std::vector<uint8_t> recs;
+  AppendLapicRecord(&recs, 0, 0, 1);
+  AppendX2ApicRecord(&recs, 0xFFu, 1, 1);
+  AppendLapicRecord(&recs, 2, 1, 1);
+  AppendX2ApicRecord(&recs, 0x100u, 3, 1);
+  AppendLapicRecord(&recs, 4, 2, 1);
+  const uintptr_t bios_rom_base = WriteBiosAcpiTables(recs);
+  IdtInit();
+  SmpSetHostTestHooks(0, 0, bios_rom_base, BaseAddr(), nullptr);
+  SmpInit(kMultiboot1Magic, 0);
+
+  // ICR destinations are 8 bits wide in xAPIC mode, so APIC IDs >= 0xFF
+  // cannot be started (0x100 would be truncated to the BSP's ID 0).
+  ASSERT_FALSE(SmpIsX2ApicEnabled());
+  ASSERT_THAT(SmpCpuCount(), t::Eq(3));
+  EXPECT_THAT(SmpGetCpuInfo(1)->apic_id, t::Eq(1u));
+  EXPECT_THAT(SmpGetCpuInfo(2)->apic_id, t::Eq(2u));
+  EXPECT_THAT(g_state.pmm_alloc_calls, t::Eq(2));
+  EXPECT_THAT(g_state.uart_log,
+              t::HasSubstr("[SMP] Skipping APIC ID 255: not addressable in "
+                           "xAPIC mode\n[SMP] Skipping APIC ID 256: not "
+                           "addressable in xAPIC mode\n"));
+  EXPECT_THAT(g_state.uart_log, t::HasSubstr("[SMP] Online CPUs: 3/3"));
+}
+
+TEST(SmpTest, StopOtherCpusForPanicSendsAnNmiToAllOtherCpus) {
+  ResetState(BaseAddr());
+  // Before SmpInit has enabled the Local APIC, there is nothing to stop.
+  g_cpu.x2apic_supported = true;
+  InstallFakeCpuHooks();
+  SmpStopOtherCpusForPanic();
+  EXPECT_THAT(g_cpu.msr_writes, t::IsEmpty());
+
+  const uintptr_t bios_rom_base = WriteBiosAcpiTables(LapicRecords(4));
+  IdtInit();
+  SmpSetHostTestHooks(0, 0, bios_rom_base, BaseAddr(), nullptr);
+  InstallFakeCpuHooks();
+  SmpInit(kMultiboot1Magic, 0);
+  ASSERT_TRUE(SmpIsX2ApicEnabled());
+  ASSERT_THAT(SmpCpuCount(), t::Eq(4));
+
+  g_cpu.msr_writes.clear();
+  SmpStopOtherCpusForPanic();
+  // One x2APIC ICR write (MSR 0x830): delivery mode NMI (0x400), level assert
+  // (bit 14), destination shorthand "all excluding self" (bits 18-19).
+  EXPECT_THAT(g_cpu.msr_writes, t::ElementsAre(t::Pair(0x830u, 0x000C4400ULL)));
 }
 
 }  // namespace

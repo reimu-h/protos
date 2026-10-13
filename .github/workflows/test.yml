@@ -7,10 +7,14 @@ on:
   pull_request:
   workflow_dispatch:
 
+permissions:
+  contents: read
+
 jobs:
   test:
     name: Build and Test
     runs-on: ubuntu-latest
+    timeout-minutes: 45
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
@@ -38,4 +42,18 @@ jobs:
         run: sudo sysctl -w vm.mmap_rnd_bits=28
 
       - name: Run all tests
-        run: make test USE_DOCKER=0
+        run: make test USE_DOCKER=0 WERROR=1 REQUIRE_UEFI=1
+
+  docker:
+    name: Docker Build and Boot Test
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Build the kernel in the Docker image
+        run: make all USE_DOCKER=1 WERROR=1
+
+      - name: Boot test in the Docker image
+        run: make run-boot-test USE_DOCKER=1 REQUIRE_UEFI=1

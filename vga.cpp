@@ -4,6 +4,7 @@
 
 #include "paging.h"
 #include "spinlock.h"
+#include "uart.h"
 
 namespace protos {
 
@@ -15,6 +16,8 @@ constexpr int kVgaHeight = 25;
 constexpr uint8_t kVgaColorWhiteOnBlack = 0x0F;
 constexpr int kGlyphWidth = 8;
 constexpr int kGlyphHeight = 16;
+// Lit glyph pixel in a 32-bpp framebuffer (white; the top byte is unused).
+constexpr uint32_t kWhitePixel32 = 0x00FFFFFF;
 
 IrqSpinLock g_vga_lock;
 int g_cursor_row = 0;
@@ -31,13 +34,18 @@ int g_fb_bpp = 0;
 // Compact 8x8 bitmap font for ASCII 0x20..0x7E (each uint64_t packs 8 rows of
 // 8 horizontal pixels, byte 0 on top, bit 0 on the left; rendered at 2x
 // vertical scale -> 8x16).
+//
+// Derived from font8x8_basic (https://github.com/dhepper/font8x8, public
+// domain), which is based on the IBM PC BIOS 8x8 font. Glyphs are moved down
+// one row (letters and digits sit on row 7), and many are shifted one pixel
+// right or slightly reshaped.
 constexpr uint64_t kAsciiFont8x8[95] = {
     0x0000000000000000ULL,  // ' '
     0x180018183C3C3C18ULL,  // '!'
     0x0000000000666666ULL,  // '"'
     0x36367F367F363600ULL,  // '#'
-    0x187C063C603E1800ULL,  // '$'
-    0x006333180C666300ULL,  // '%'
+    0x183E603C067C1800ULL,  // '$'
+    0x63660C1833630000ULL,  // '%'
     0x6E333B6E1C361C00ULL,  // '&'
     0x0000000000181818ULL,  // '\''
     0x30180C0C0C183000ULL,  // '('
@@ -48,7 +56,7 @@ constexpr uint64_t kAsciiFont8x8[95] = {
     0x0000007E00000000ULL,  // '-'
     0x0018180000000000ULL,  // '.'
     0x02060C1830604000ULL,  // '/'
-    0x3E63737B6F673E00ULL,  // '0'
+    0x3E676F7B73633E00ULL,  // '0'
     0x7E181818181C1800ULL,  // '1'
     0x7F060C3060663C00ULL,  // '2'
     0x3C66603860663C00ULL,  // '3'
@@ -148,33 +156,64 @@ static void RenderCellToFramebuffer(const int row,  //
 
   volatile uint8_t* const fb_base =
       reinterpret_cast<volatile uint8_t*>(g_fb_addr);
-  const int bytes_per_pixel = g_fb_bpp / 8;
 
   for (int py = 0; py < kGlyphHeight; ++py) {
     const uint8_t row_bits = (glyph >> ((py / 2) * 8)) & 0xFF;
     volatile uint8_t* const line =
         fb_base + static_cast<int64_t>(base_y + py) * g_fb_pitch;
-    for (int px = 0; px < kGlyphWidth; ++px) {
-      const bool lit = (row_bits & (1U << px)) != 0;
-      const uint8_t intensity = lit ? 0xFF : 0x00;
-      volatile uint8_t* const pixel = line + (base_x + px) * bytes_per_pixel;
-      pixel[0] = intensity;
-      pixel[1] = intensity;
-      pixel[2] = intensity;
-      if (bytes_per_pixel == 4) {
-        pixel[3] = 0x00;
+    if (g_fb_bpp == 32) {
+      // One aligned 32-bit store per pixel (VgaInitFramebuffer checks the
+      // alignment).
+      volatile uint32_t* const pixels =
+          reinterpret_cast<volatile uint32_t*>(line) + base_x;
+      for (int px = 0; px < kGlyphWidth; ++px) {
+        pixels[px] = ((row_bits >> px) & 1u) != 0 ? kWhitePixel32 : 0u;
+      }
+    } else {
+      volatile uint8_t* const pixels = line + base_x * 3;
+      for (int px = 0; px < kGlyphWidth; ++px) {
+        const uint8_t intensity = ((row_bits >> px) & 1u) != 0 ? 0xFF : 0x00;
+        pixels[px * 3 + 0] = intensity;
+        pixels[px * 3 + 1] = intensity;
+        pixels[px * 3 + 2] = intensity;
       }
     }
   }
 }
 
 static void Outb(const uint16_t port, const uint8_t value) {
-#if !__STDC_HOSTED__
-  asm volatile("out dx, al" : : "d"(port), "a"(value));
-#else
-  (void)port;
-  (void)value;
-#endif
+  // `{AT&T|Intel}` dialect alternatives: the kernel is compiled with
+  // -masm=intel, while host tests use GCC's default AT&T syntax.
+  asm volatile("out{b %0, %w1| %w1, %0}" : : "a"(value), "Nd"(port));
+}
+
+// Returns true if the 80x25 console fits on the described framebuffer and
+// RenderCellToFramebuffer can draw on it (see VgaInitFramebuffer in vga.h).
+static bool IsSupportedFramebuffer(const uintptr_t addr,  //
+                                   const int pitch,       //
+                                   const int width,       //
+                                   const int height,      //
+                                   const int bpp) {
+  if (addr == 0 || (bpp != 32 && bpp != 24) ||
+      width < kVgaWidth * kGlyphWidth || height < kVgaHeight * kGlyphHeight ||
+      static_cast<int64_t>(pitch) < static_cast<int64_t>(width) * (bpp / 8)) {
+    return false;
+  }
+  if (bpp == 32 && ((addr % 4) != 0 || (pitch % 4) != 0)) {
+    return false;
+  }
+  const uint64_t fb_bytes = static_cast<uint64_t>(pitch) * height;
+  return addr < kMaxCanonicalIdentityAddress &&
+         fb_bytes <= kMaxCanonicalIdentityAddress - addr;
+}
+
+static void UartWriteInt(const int value) {
+  if (value < 0) {
+    UartWrite("-");
+    UartWriteDec(static_cast<uint64_t>(-static_cast<int64_t>(value)));
+  } else {
+    UartWriteDec(static_cast<uint64_t>(value));
+  }
 }
 
 static void UpdateCursor() {
@@ -190,11 +229,18 @@ static void UpdateCursor() {
 }
 
 static void WriteCell(const int row, const int col, const char ch) {
-  g_text_shadow[row][col] = ch;
   if (g_fb_active) {
-    RenderCellToFramebuffer(row, col, ch);
+    // The framebuffer always shows g_text_shadow (VgaInitFramebuffer renders
+    // all of it). Redrawing a cell takes 128 pixel stores to memory that is
+    // often uncached, so cells that already show `ch` are skipped, which makes
+    // scrolling much cheaper.
+    if (g_text_shadow[row][col] != ch) {
+      g_text_shadow[row][col] = ch;
+      RenderCellToFramebuffer(row, col, ch);
+    }
     return;
   }
+  g_text_shadow[row][col] = ch;
   volatile uint16_t* const vga =
       reinterpret_cast<volatile uint16_t*>(kVgaBufferAddress);
   vga[row * kVgaWidth + col] =
@@ -313,12 +359,6 @@ void VgaPutc(const char ch) {
   UpdateCursor();
 }
 
-void VgaPutChar(const char ch) {
-  const IrqSpinLockGuard lock_guard(g_vga_lock);
-  VgaPutcLocked(ch);
-  UpdateCursor();
-}
-
 void VgaWrite(const char* const str) {
   const IrqSpinLockGuard lock_guard(g_vga_lock);
   VgaWriteLocked(str);
@@ -366,28 +406,94 @@ int VgaGetCursorCol() {
   return g_cursor_col;
 }
 
-void VgaPanicWrite(const char* const str) { VgaWriteLocked(str); }
+// Panic-path counterpart of VgaPutcLocked() that advances the caller's copy of
+// the cursor instead of the shared one.
+static void PanicPutcAt(const char ch, int* const row, int* const col) {
+  if (ch == '\r') {
+    *col = 0;
+    return;
+  }
+  if (ch != '\n') {
+    WriteCell(*row, *col, (ch == '\t') ? ' ' : ch);
+    ++*col;
+    if (*col < kVgaWidth) {
+      return;
+    }
+  }
+  *col = 0;
+  if (*row + 1 < kVgaHeight) {
+    ++*row;
+  } else {
+    ScrollUpOneRow();
+  }
+}
 
-void VgaPanicWriteDec(const uint64_t value) { VgaWriteDecLocked(value); }
+void VgaPanicWrite(const char* const str) {
+  if (str == nullptr) {
+    return;
+  }
+  // Read the shared cursor once and clamp it: a CPU stopped in the middle of a
+  // locked write may have left it out of range.
+  int row = *static_cast<const volatile int*>(&g_cursor_row);
+  int col = *static_cast<const volatile int*>(&g_cursor_col);
+  if (row < 0 || row >= kVgaHeight) {
+    row = kVgaHeight - 1;
+  }
+  if (col < 0 || col >= kVgaWidth) {
+    col = 0;
+  }
+  for (int i = 0; str[i] != '\0'; ++i) {
+    PanicPutcAt(str[i], &row, &col);
+  }
+  g_cursor_row = row;
+  g_cursor_col = col;
+  UpdateCursor();
+}
 
-void VgaInitFramebuffer(const uintptr_t fb_phys_addr,  //
+void VgaPanicWriteDec(const uint64_t value) {
+  char buffer[21];
+  int pos = static_cast<int>(sizeof(buffer)) - 1;
+  buffer[pos] = '\0';
+  uint64_t remaining = value;
+  do {
+    --pos;
+    buffer[pos] = static_cast<char>('0' + (remaining % 10));
+    remaining /= 10;
+  } while (remaining > 0);
+  VgaPanicWrite(&buffer[pos]);
+}
+
+bool VgaInitFramebuffer(const uintptr_t fb_phys_addr,  //
                         const int pitch,               //
                         const int width,               //
                         const int height,              //
                         const int bpp) {
+  const char* rejection = nullptr;
+  if (!IsSupportedFramebuffer(fb_phys_addr, pitch, width, height, bpp)) {
+    rejection = "unsupported";
+  } else if (!PagingMapBootstrapRange(fb_phys_addr,
+                                      static_cast<int64_t>(pitch) * height)) {
+    rejection = "unmappable";
+  }
+  if (rejection != nullptr) {
+    // The serial port is the only console that is sure to be visible here.
+    UartWrite("[VGA] Ignoring ");
+    UartWrite(rejection);
+    UartWrite(" framebuffer: addr=");
+    UartWriteHex(fb_phys_addr);
+    UartWrite(" pitch=");
+    UartWriteInt(pitch);
+    UartWrite(" width=");
+    UartWriteInt(width);
+    UartWrite(" height=");
+    UartWriteInt(height);
+    UartWrite(" bpp=");
+    UartWriteInt(bpp);
+    UartWrite("\n");
+    return false;
+  }
+
   const IrqSpinLockGuard lock_guard(g_vga_lock);
-  if (fb_phys_addr == 0 || pitch <= 0 || width < kVgaWidth * kGlyphWidth ||
-      height < kVgaHeight * kGlyphHeight || (bpp != 32 && bpp != 24) ||
-      static_cast<int64_t>(pitch) < static_cast<int64_t>(width) * (bpp / 8)) {
-    return;
-  }
-  const int64_t fb_bytes = static_cast<int64_t>(pitch) * height;
-  if (fb_phys_addr >= kMaxCanonicalIdentityAddress ||
-      static_cast<uintptr_t>(fb_bytes) >
-          kMaxCanonicalIdentityAddress - fb_phys_addr ||
-      !PagingMapBootstrapRange(fb_phys_addr, fb_bytes)) {
-    return;
-  }
   g_fb_addr = fb_phys_addr;
   g_fb_pitch = pitch;
   g_fb_width = width;
@@ -397,18 +503,13 @@ void VgaInitFramebuffer(const uintptr_t fb_phys_addr,  //
 
   for (int r = 0; r < kVgaHeight; ++r) {
     for (int c = 0; c < kVgaWidth; ++c) {
-      const char ch = (g_text_shadow[r][c] != '\0') ? g_text_shadow[r][c] : ' ';
-      RenderCellToFramebuffer(r, c, ch);
+      if (g_text_shadow[r][c] == '\0') {
+        g_text_shadow[r][c] = ' ';
+      }
+      RenderCellToFramebuffer(r, c, g_text_shadow[r][c]);
     }
   }
-}
-
-void VgaAttachFramebuffer(const uintptr_t fb_phys_addr,  //
-                          const int pitch,               //
-                          const int width,               //
-                          const int height,              //
-                          const int bpp) {
-  VgaInitFramebuffer(fb_phys_addr, pitch, width, height, bpp);
+  return true;
 }
 
 }  // namespace protos

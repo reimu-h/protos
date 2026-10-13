@@ -5,12 +5,6 @@
 #include <cstdint>
 #include <memory>
 #include <new>
-#if !__STDC_HOSTED__
-#pragma GCC optimize("no-tree-loop-distribute-patterns")
-#endif
-#if __STDC_HOSTED__
-#include <thread>
-#endif
 
 #include "check.h"
 #include "heap.h"
@@ -30,13 +24,15 @@ constexpr uint32_t kCpuidLeafFeatures = 1u;
 constexpr uint32_t kCpuidEcxRdrandBit = 1u << 30;
 constexpr int kRdrandMaxRetries = 10;
 
-constexpr int kMaxStressWorkers = 64;
-constexpr int kMaxStressRounds = 4096;
-constexpr int kMaxLiveAllocsPerWorker = 8;
-constexpr int kMaxHeapAllocBytesLimit = 16384;
-constexpr int kMaxPmmAllocFramesLimit = 8;
-constexpr int kMaxActiveDetachedChildren = 64;
-constexpr int kPreemptProbeMaxSpins = 50000000;
+// Total number of detached children that the workers of one run may create.
+constexpr int kMaxDetachedChildrenPerRun = 64;
+// Payload budget, in bytes, of all live worker heap allocations together.
+constexpr int kLiveHeapBudgetBytes = 128 * 1024;
+// Preemption probes to try before giving up. A probe proves nothing only if
+// another CPU stole its spinner before the spinner ran on CPU 0.
+constexpr int kMaxPreemptProbeAttempts = 16;
+
+static_assert(kMinStressHeapAllocBytes == kHeapAlignment);
 
 constexpr uint64_t kHeapObjectMagic = 0x5354524553534F42ULL;  // "STRESSOB"
 constexpr uint64_t kHeapObjectPoison = 0xDEAD535452455353ULL;
@@ -44,24 +40,70 @@ constexpr uint64_t kHeapObjectPoison = 0xDEAD535452455353ULL;
 std::atomic<uint64_t> g_entropy_call_seq{1};
 std::atomic<uint64_t> g_stress_pass_count{0};
 
-#if __STDC_HOSTED__
-std::atomic<bool> g_rdrand_hook_active{false};
-std::atomic<bool> g_rdrand_force_supported{false};
-std::atomic<RdrandTestHookFn> g_rdrand_hook_fn{nullptr};
-#endif
+StressTestHooks g_hooks;
 
-#if !__STDC_HOSTED__
-static void ProgramLocalApicTimerInitCount(const uint32_t init_count) {
-  SmpSetLocalApicTimerInitialCount(init_count);
+static void CpuRelax() {
+  if (g_hooks.cpu_relax != nullptr) {
+    g_hooks.cpu_relax();
+    return;
+  }
+  asm volatile("pause" : : : "memory");
 }
 
-static void ProgramLapicTimerOnCpuCallback(const int /*cpu_index*/,
+static void NonYieldingSpinPoint() {
+  if (g_hooks.non_yielding_spin != nullptr) {
+    g_hooks.non_yielding_spin();
+  }
+}
+
+static bool HardwareSupportsRdrand() {
+  uint32_t eax = kCpuidLeafFeatures;
+  uint32_t ebx = 0;
+  uint32_t ecx = 0;
+  uint32_t edx = 0;
+  asm volatile("cpuid" : "+a"(eax), "=b"(ebx), "+c"(ecx), "=d"(edx) : : "cc");
+  return (ecx & kCpuidEcxRdrandBit) != 0;
+}
+
+static bool HardwareRdrandAttempt(uint64_t* const out) {
+  uint64_t val = 0;
+  uint8_t ok = 0;
+  asm volatile("rdrand %0" : "=r"(val), "=@ccc"(ok) : : "cc");
+  *out = val;
+  return ok != 0;
+}
+
+static void SetLapicTimerInitialCountOnCpu(const int /*cpu_index*/,
                                            void* const context) {
   DCHECK(context != nullptr);
-  const uint32_t target_count = *static_cast<const uint32_t*>(context);
-  ProgramLocalApicTimerInitCount(target_count);
+  SmpSetLocalApicTimerInitialCount(*static_cast<const uint32_t*>(context));
 }
-#endif
+
+// Prints the FAIL marker with the failed check and the seed of the run over
+// UART and VGA, then panics.
+[[noreturn]] static void FailStressRun(const char* const check,  //
+                                       const uint64_t seed,      //
+                                       const char* const file,   //
+                                       const int line) {
+  UartWrite("[STRESS] random_multicpu_stress: FAIL (");
+  UartWrite(check);
+  UartWrite(") seed=");
+  UartWriteHex(seed);
+  UartWrite("\n");
+  VgaWrite("[STRESS] random_multicpu_stress: FAIL (");
+  VgaWrite(check);
+  VgaWrite(")\n");
+  internal::CheckFailure(check, file, line);
+}
+
+// Like `CHECK(cond)`, but prints the stress test's FAIL marker with the seed
+// of the run first.
+#define STRESS_CHECK(seed, cond)                         \
+  do {                                                   \
+    if (__builtin_expect(!static_cast<bool>(cond), 0)) { \
+      FailStressRun(#cond, (seed), __FILE__, __LINE__);  \
+    }                                                    \
+  } while (false)
 
 enum class StressAllocKind : uint8_t {
   kNone = 0,
@@ -79,7 +121,9 @@ struct StressHeapObject {
   uint64_t payload[16] = {};
   uint64_t checksum = 0;
 
-  static void* operator new(const size_t size) {
+  // Returns nullptr when the heap is exhausted. Being non-throwing makes every
+  // `new StressHeapObject()` check for that before constructing the object.
+  static void* operator new(const size_t size) noexcept {
     return Kmalloc(static_cast<int64_t>(size));
   }
 
@@ -89,6 +133,7 @@ struct StressHeapObject {
     Kfree(ptr);
   }
 };
+static_assert(noexcept(StressHeapObject::operator new(0)));
 
 struct LiveAllocation {
   StressAllocKind kind = StressAllocKind::kNone;
@@ -111,19 +156,22 @@ struct StressSharedState {
   int effective_max_heap_bytes = 256;
   int max_pmm_alloc_frames = 1;
   uint64_t master_seed = 1;
+  uint64_t wait_timeout_tsc_cycles = kSelfTestWaitTimeoutTscCycles;
 
-  std::atomic<uint64_t> cpu_participation_mask{0};
-  std::atomic<uint64_t> cpu_participation_mask_high{0};
+  AtomicCpuMask128 cpu_participation;
   std::atomic<int64_t> cooperative_yields{0};
   std::atomic<int64_t> preemptive_spin_bursts{0};
+  std::atomic<int64_t> timer_ticks_during_spin{0};
   std::atomic<int64_t> timer_preemptions_observed{0};
   std::atomic<int64_t> wakeup_ipis_sent{0};
   std::atomic<int64_t> task_migrations_observed{0};
+  std::atomic<int64_t> cross_cpu_steals_verified{0};
   std::atomic<int64_t> child_tasks_joined{0};
   std::atomic<int64_t> child_tasks_detached{0};
   std::atomic<int64_t> detached_children_finished{0};
-  std::atomic<int64_t> active_detached_children{0};
   std::atomic<int64_t> zombies_reaped{0};
+  std::atomic<int64_t> min_child_task_weight{INT64_MAX};
+  std::atomic<int64_t> max_child_task_weight{0};
   std::atomic<int64_t> kmalloc_ops{0};
   std::atomic<int64_t> kmalloc_aligned_ops{0};
   std::atomic<int64_t> cpp_new_delete_ops{0};
@@ -138,7 +186,6 @@ struct StressSharedState {
 struct DetachedChildContext {
   StressSharedState* shared = nullptr;
   uint64_t seed = 0;
-  int initial_cpu = 0;
   bool allow_yield = false;
 };
 
@@ -147,32 +194,31 @@ struct JoinedChildContext {
   Task* parent_task = nullptr;
   uint64_t expected_token = 0;
   std::atomic<uint64_t> observed_token{0};
-  int initial_cpu = 0;
   bool allow_yield = false;
 };
 
-struct PreemptProbeContext {
+// Shared by the steal-barrier tasks of VerifyStealingAndPreemption().
+struct StealBarrierContext {
   StressSharedState* shared = nullptr;
-  int initial_cpu = 0;
-  std::atomic<bool> started{false};
+  AtomicCpuMask128 running_cpus;
+  std::atomic<int> ran_on_cpu0{0};
+  std::atomic<bool> release{false};
 };
 
-struct CpuParticipationBarrierContext {
-  StressSharedState* shared = nullptr;
-  std::atomic<uint64_t>* barrier_mask_low = nullptr;
-  std::atomic<uint64_t>* barrier_mask_high = nullptr;
-  uint64_t expected_cpu_mask_low = 0;
-  uint64_t expected_cpu_mask_high = 0;
-  int initial_cpu = 0;
+// State of one attempt of RunPreemptionProbe().
+struct PreemptProbeContext {
+  uint64_t timeout_tsc_cycles = 0;
+  std::atomic<int> start_cpu{-1};
+  std::atomic<bool> finished{false};
+  std::atomic<bool> release{false};
 };
 
 struct StressWorkerContext {
   StressSharedState* shared = nullptr;
   Task* task = nullptr;
   int worker_index = 0;
-  int initial_cpu = 0;
   uint64_t worker_seed = 0;
-  LiveAllocation live_allocs[kMaxLiveAllocsPerWorker] = {};
+  LiveAllocation live_allocs[kMaxStressLiveAllocsPerWorker] = {};
   std::atomic<bool> done{false};
 };
 
@@ -480,63 +526,72 @@ static void AllocateIntoSlot(StressSharedState* const shared,  //
   }
 }
 
+// Records the calling task's CPU in the participation mask and counts a
+// migration if it differs from the CPU that this task saw at its previous
+// checkpoint, `*last_cpu` (-1 before the task's first checkpoint).
 static void RecordCpuAndMigration(StressSharedState* const shared,
                                   int* const last_cpu) {
   DCHECK(shared != nullptr);
   DCHECK(last_cpu != nullptr);
   const int cpu = CurrentCpuId();
-  if (cpu >= 0 && cpu < 64) {
-    shared->cpu_participation_mask.fetch_or(1ULL << static_cast<uint32_t>(cpu),
-                                            std::memory_order_acq_rel);
-  } else if (cpu >= 64 && cpu < kMaxSupportedCpus) {
-    shared->cpu_participation_mask_high.fetch_or(
-        1ULL << static_cast<uint32_t>(cpu - 64), std::memory_order_acq_rel);
-  }
-  if (cpu != *last_cpu) {
+  shared->cpu_participation.Add(cpu);
+  if (*last_cpu >= 0 && cpu != *last_cpu) {
     shared->task_migrations_observed.fetch_add(1, std::memory_order_acq_rel);
-    *last_cpu = cpu;
+  }
+  *last_cpu = cpu;
+}
+
+static void RecordChildWeight(StressSharedState* const shared,
+                              const int64_t weight) {
+  DCHECK(shared != nullptr);
+  int64_t min_weight =
+      shared->min_child_task_weight.load(std::memory_order_relaxed);
+  while (weight < min_weight &&
+         !shared->min_child_task_weight.compare_exchange_weak(
+             min_weight, weight, std::memory_order_relaxed)) {
+  }
+  int64_t max_weight =
+      shared->max_child_task_weight.load(std::memory_order_relaxed);
+  while (weight > max_weight &&
+         !shared->max_child_task_weight.compare_exchange_weak(
+             max_weight, weight, std::memory_order_relaxed)) {
   }
 }
 
-static void PreemptProbeChildEntry(void* const raw_arg) {
+// Steal-barrier task of VerifyStealingAndPreemption(): records the CPU it
+// runs on and spins, never yielding, until it is released.
+static void StealBarrierEntry(void* const raw_arg) {
+  StealBarrierContext* const ctx = static_cast<StealBarrierContext*>(raw_arg);
+  DCHECK(ctx != nullptr);
+  DCHECK(ctx->shared != nullptr);
+  int cpu = -1;
+  RecordCpuAndMigration(ctx->shared, &cpu);
+  if (cpu == 0) {
+    ctx->ran_on_cpu0.fetch_add(1, std::memory_order_acq_rel);
+  } else {
+    // Created on CPU 0, so another CPU stole this task.
+    ctx->shared->cross_cpu_steals_verified.fetch_add(1,
+                                                     std::memory_order_acq_rel);
+  }
+  ctx->running_cpus.Add(cpu);
+  while (!ctx->release.load(std::memory_order_acquire)) {
+    CpuRelax();
+  }
+}
+
+// Spinner of RunPreemptionProbe(): records the CPU it starts on and spins,
+// never yielding, until it is released or times out.
+static void PreemptProbeSpinnerEntry(void* const raw_arg) {
   PreemptProbeContext* const probe = static_cast<PreemptProbeContext*>(raw_arg);
-  if (probe == nullptr || probe->shared == nullptr) {
-    return;
-  }
-  StressSharedState* const shared = probe->shared;
-  int last_cpu = probe->initial_cpu;
-  RecordCpuAndMigration(shared, &last_cpu);
-  shared->timer_preemptions_observed.fetch_add(1, std::memory_order_acq_rel);
-  probe->started.store(true, std::memory_order_release);
-}
-
-static void CpuParticipationBarrierEntry(void* const raw_arg) {
-  CpuParticipationBarrierContext* const ctx =
-      static_cast<CpuParticipationBarrierContext*>(raw_arg);
-  if (ctx == nullptr || ctx->shared == nullptr ||
-      ctx->barrier_mask_low == nullptr || ctx->barrier_mask_high == nullptr) {
-    return;
-  }
-  StressSharedState* const shared = ctx->shared;
-  int last_cpu = ctx->initial_cpu;
-  RecordCpuAndMigration(shared, &last_cpu);
-  if (last_cpu >= 0 && last_cpu < 64) {
-    ctx->barrier_mask_low->fetch_or(1ULL << static_cast<uint32_t>(last_cpu),
-                                    std::memory_order_acq_rel);
-  } else if (last_cpu >= 64 && last_cpu < kMaxSupportedCpus) {
-    ctx->barrier_mask_high->fetch_or(
-        1ULL << static_cast<uint32_t>(last_cpu - 64),
-        std::memory_order_acq_rel);
-  }
-  while ((ctx->barrier_mask_low->load(std::memory_order_acquire) &
-          ctx->expected_cpu_mask_low) != ctx->expected_cpu_mask_low ||
-         (ctx->barrier_mask_high->load(std::memory_order_acquire) &
-          ctx->expected_cpu_mask_high) != ctx->expected_cpu_mask_high) {
+  DCHECK(probe != nullptr);
+  probe->start_cpu.store(CurrentCpuId(), std::memory_order_release);
+  const TscDeadline deadline(probe->timeout_tsc_cycles);
+  while (!probe->release.load(std::memory_order_acquire) &&
+         !deadline.Expired()) {
+    NonYieldingSpinPoint();
     asm volatile("pause" : : : "memory");
-#if __STDC_HOSTED__
-    std::this_thread::yield();
-#endif
   }
+  probe->finished.store(true, std::memory_order_release);
 }
 
 static void JoinedChildEntry(void* const raw_arg) {
@@ -545,7 +600,7 @@ static void JoinedChildEntry(void* const raw_arg) {
     return;
   }
   StressSharedState* const shared = arg->shared;
-  const std::shared_ptr<TaskScheduler>& scheduler = GetTaskScheduler();
+  TaskScheduler* const scheduler = GetTaskScheduler();
   Task* const self = scheduler->CurrentTask();
 
   alignas(16) volatile uint64_t child_canaries[4] = {
@@ -564,7 +619,7 @@ static void JoinedChildEntry(void* const raw_arg) {
     return;
   }
 
-  int last_cpu = arg->initial_cpu;
+  int last_cpu = -1;
   RecordCpuAndMigration(shared, &last_cpu);
 
   if (arg->allow_yield) {
@@ -596,11 +651,10 @@ static void DetachedChildEntry(void* const raw_arg) {
     return;
   }
   StressSharedState* const shared = arg->shared;
-  const std::shared_ptr<TaskScheduler>& scheduler = GetTaskScheduler();
+  TaskScheduler* const scheduler = GetTaskScheduler();
   Task* const self = scheduler->CurrentTask();
 
   const uint64_t seed = arg->seed;
-  const int initial_cpu = arg->initial_cpu;
   const bool allow_yield = arg->allow_yield;
   arg.reset();
 
@@ -616,12 +670,11 @@ static void DetachedChildEntry(void* const raw_arg) {
       (canary_addr & 0xFu) != 0 || !AreInterruptsEnabled()) {
     shared->stack_canary_corruptions.fetch_add(1, std::memory_order_acq_rel);
     shared->invariant_failed.store(true, std::memory_order_release);
-    shared->active_detached_children.fetch_sub(1, std::memory_order_acq_rel);
     shared->detached_children_finished.fetch_add(1, std::memory_order_acq_rel);
     return;
   }
 
-  int last_cpu = initial_cpu;
+  int last_cpu = -1;
   RecordCpuAndMigration(shared, &last_cpu);
 
   if (allow_yield) {
@@ -641,7 +694,6 @@ static void DetachedChildEntry(void* const raw_arg) {
     shared->invariant_failed.store(true, std::memory_order_release);
   }
 
-  shared->active_detached_children.fetch_sub(1, std::memory_order_acq_rel);
   shared->detached_children_finished.fetch_add(1, std::memory_order_acq_rel);
 }
 
@@ -681,26 +733,22 @@ static void RunNonYieldingSpinBurst(StressSharedState* const shared,  //
   for (int s = 0; s < spin_iters; ++s) {
     accumulator = MixEntropy64(accumulator, static_cast<uint64_t>(s));
     asm volatile("pause" : "+r"(accumulator) : : "memory");
-#if __STDC_HOSTED__
-    if (s == (spin_iters / 2) && IdtIsInitialized() && AreInterruptsEnabled()) {
-      InterruptFrame timer_frame = {};
-      timer_frame.vector = kVectorApicTimer;
-      timer_frame.rflags = internal::kRflagsInterruptEnableBit;
-      IdtDispatch(&timer_frame);
-    }
-#endif
+    NonYieldingSpinPoint();
   }
 
   RecordCpuAndMigration(shared, last_cpu);
   const CpuLocal* const cpu_after_local = CurrentCpu();
   const int cpu_after = cpu_after_local->cpu_id;
+  if (cpu_after != cpu_before) {
+    // The burst never yields, so only an interrupt can have moved it.
+    shared->timer_preemptions_observed.fetch_add(1, std::memory_order_acq_rel);
+    return;
+  }
   const int64_t ticks_after =
       cpu_after_local->timer_ticks.load(std::memory_order_relaxed);
-  if (cpu_after == cpu_before && ticks_after > ticks_before) {
-    shared->timer_preemptions_observed.fetch_add(ticks_after - ticks_before,
-                                                 std::memory_order_acq_rel);
-  } else if (cpu_after != cpu_before) {
-    shared->timer_preemptions_observed.fetch_add(1, std::memory_order_acq_rel);
+  if (ticks_after > ticks_before) {
+    shared->timer_ticks_during_spin.fetch_add(ticks_after - ticks_before,
+                                              std::memory_order_acq_rel);
   }
 }
 
@@ -711,7 +759,7 @@ static void StressWorkerEntry(void* const raw_arg) {
     return;
   }
   StressSharedState* const shared = worker->shared;
-  const std::shared_ptr<TaskScheduler>& scheduler = GetTaskScheduler();
+  TaskScheduler* const scheduler = GetTaskScheduler();
   Task* const self = scheduler->CurrentTask();
 
   alignas(16) volatile uint64_t stack_canaries[8] = {};
@@ -725,52 +773,13 @@ static void StressWorkerEntry(void* const raw_arg) {
   }
 
   Prng64 prng(worker->worker_seed);
-  int last_cpu = worker->initial_cpu;
+  int last_cpu = -1;
   RecordCpuAndMigration(shared, &last_cpu);
 
   int alloc_seq = 0;
   int child_seq = 0;
   bool spawned_joined_child = false;
   bool spawned_detached_child = false;
-
-  // Worker 0 executes an explicit non-yielding spinner + probe child check on
-  // round 0 to deterministically prove timer-driven preemption (`0x20`) of a
-  // CPU-bound non-yielding task.
-  if (worker->worker_index == 0) {
-    PreemptProbeContext probe_ctx = {};
-    probe_ctx.shared = shared;
-    probe_ctx.initial_cpu = CurrentCpuId();
-    Task* const probe_task =
-        scheduler->CreateTaskOnCpu(PreemptProbeChildEntry,  //
-                                   &probe_ctx,              //
-                                   kDefaultTaskWeight,      //
-                                   probe_ctx.initial_cpu);
-    if (probe_task == nullptr) {
-      shared->invariant_failed.store(true, std::memory_order_release);
-      return;
-    }
-    shared->preemptive_spin_bursts.fetch_add(1, std::memory_order_acq_rel);
-    for (int spin = 0; spin < kPreemptProbeMaxSpins &&
-                       !probe_ctx.started.load(std::memory_order_acquire);
-         ++spin) {
-      asm volatile("pause" : : : "memory");
-#if __STDC_HOSTED__
-      if ((spin & 15) == 7 && IdtIsInitialized() && AreInterruptsEnabled()) {
-        InterruptFrame timer_frame = {};
-        timer_frame.vector = kVectorApicTimer;
-        timer_frame.rflags = internal::kRflagsInterruptEnableBit;
-        IdtDispatch(&timer_frame);
-      }
-#endif
-    }
-    scheduler->Join(probe_task);
-    shared->child_tasks_joined.fetch_add(1, std::memory_order_acq_rel);
-    RecordCpuAndMigration(shared, &last_cpu);
-    if (!probe_ctx.started.load(std::memory_order_acquire)) {
-      shared->invariant_failed.store(true, std::memory_order_release);
-      return;
-    }
-  }
 
   for (int round = 0; round < shared->rounds_per_worker; ++round) {
     const uint64_t round_tag =
@@ -848,18 +857,17 @@ static void StressWorkerEntry(void* const raw_arg) {
       child_ctx.parent_task = self;
       child_ctx.expected_token = round_tag ^ 0xA5A55A5AA5A55A5AULL;
       const int64_t child_weight = SelectRandomChildWeight(&prng, child_seq++);
+      RecordChildWeight(shared, child_weight);
       child_ctx.allow_yield = (child_weight >= 128);
 
       Task* child = nullptr;
       if (prng.NextBool()) {
         const int target_cpu = prng.NextIntRange(0, shared->cpu_count - 1);
-        child_ctx.initial_cpu = target_cpu;
         child = scheduler->CreateTaskOnCpu(JoinedChildEntry,  //
                                            &child_ctx,        //
                                            child_weight,      //
                                            target_cpu);
       } else {
-        child_ctx.initial_cpu = CurrentCpuId();
         child =
             scheduler->CreateTask(JoinedChildEntry, &child_ctx, child_weight);
       }
@@ -882,11 +890,11 @@ static void StressWorkerEntry(void* const raw_arg) {
     const bool do_detached =
         (!spawned_detached_child || prng.NextChance(1, 4)) &&
         (shared->child_tasks_detached.load(std::memory_order_acquire) <
-         kMaxActiveDetachedChildren);
+         kMaxDetachedChildrenPerRun);
     if (do_detached) {
       const int64_t detached_idx =
           shared->child_tasks_detached.fetch_add(1, std::memory_order_acq_rel);
-      if (detached_idx < kMaxActiveDetachedChildren) {
+      if (detached_idx < kMaxDetachedChildrenPerRun) {
         std::unique_ptr<DetachedChildContext> det_ctx(
             new DetachedChildContext());
         if (det_ctx != nullptr) {
@@ -894,30 +902,26 @@ static void StressWorkerEntry(void* const raw_arg) {
           det_ctx->seed = round_tag ^ prng.NextU64();
           const int64_t det_weight =
               SelectRandomChildWeight(&prng, child_seq++);
+          RecordChildWeight(shared, det_weight);
           det_ctx->allow_yield = (det_weight >= 128);
-          shared->active_detached_children.fetch_add(1,
-                                                     std::memory_order_acq_rel);
 
           Task* det_task = nullptr;
           if (prng.NextBool()) {
             const int target_cpu = prng.NextIntRange(0, shared->cpu_count - 1);
-            det_ctx->initial_cpu = target_cpu;
             det_task = scheduler->CreateTaskOnCpu(
                 DetachedChildEntry, det_ctx.get(), det_weight, target_cpu);
           } else {
-            det_ctx->initial_cpu = CurrentCpuId();
             det_task = scheduler->CreateTask(DetachedChildEntry,  //
                                              det_ctx.get(),       //
                                              det_weight);
           }
           if (det_task == nullptr) {
-            shared->active_detached_children.fetch_sub(
-                1, std::memory_order_acq_rel);
             shared->child_tasks_detached.fetch_sub(1,
                                                    std::memory_order_acq_rel);
             shared->invariant_failed.store(true, std::memory_order_release);
             break;
           }
+          scheduler->Detach(det_task);
           (void)det_ctx.release();
           spawned_detached_child = true;
         } else {
@@ -952,35 +956,143 @@ static void StressWorkerEntry(void* const raw_arg) {
   shared->workers_completed.fetch_add(1, std::memory_order_acq_rel);
 }
 
+// Proves that CPU 0 preempts a task that never yields. The bootstrap task
+// creates a non-yielding spinner on CPU 0 and yields to it. The bootstrap task
+// can't be stolen by other CPUs, so once it runs again, CPU 0 must have
+// switched away from the spinner, which only an interrupt can do. That proves
+// a preemption if the spinner started on CPU 0 and is still spinning. If
+// another CPU stole the spinner before it ran on CPU 0, the attempt proves
+// nothing and is repeated.
+static void RunPreemptionProbe(TaskScheduler& scheduler,
+                               StressSharedState* const shared) {
+  DCHECK(shared != nullptr);
+  const uint64_t seed = shared->master_seed;
+  for (int attempt = 0; attempt < kMaxPreemptProbeAttempts; ++attempt) {
+    PreemptProbeContext probe;
+    probe.timeout_tsc_cycles = shared->wait_timeout_tsc_cycles;
+    Task* const spinner =
+        scheduler.CreateTaskOnCpu(PreemptProbeSpinnerEntry,  //
+                                  &probe,                    //
+                                  kDefaultTaskWeight,        //
+                                  0);
+    STRESS_CHECK(seed, spinner != nullptr);
+    scheduler.Yield();
+    const bool spinner_ran_on_cpu0 =
+        probe.start_cpu.load(std::memory_order_acquire) == 0;
+    const bool spinner_finished =
+        probe.finished.load(std::memory_order_acquire);
+    probe.release.store(true, std::memory_order_release);
+    scheduler.Join(spinner);
+    if (spinner_ran_on_cpu0) {
+      // A spinner that ran on CPU 0 until it timed out was never preempted.
+      STRESS_CHECK(seed, !spinner_finished);
+      shared->timer_preemptions_observed.fetch_add(1,
+                                                   std::memory_order_acq_rel);
+      return;
+    }
+  }
+  FailStressRun("other CPUs stole every preemption probe spinner", seed,
+                __FILE__, __LINE__);
+}
+
+// Verifies work stealing and timer preemption with tasks created by the
+// bootstrap task on CPU 0 once the randomized phase is over (it exercises both
+// but can't guarantee either).
+//
+// On SMP, `cpu_count - 1` non-yielding barrier tasks are enqueued on CPU 0
+// while preemption is disabled. CPU 0 keeps running the bootstrap task, which
+// doesn't yield until all of them run, and with preemption disabled no CPU
+// preempts or steals from an interrupt handler. So the barrier tasks can only
+// run if idle CPUs steal them, and a CPU that runs one keeps it until it is
+// released: every other CPU must steal exactly one. While they hold the other
+// CPUs, preemption is enabled again for RunPreemptionProbe(); a CPU busy with a
+// barrier task only steals the probe's spinner in the moment before the
+// bootstrap task yields to it.
+static void VerifyStealingAndPreemption(TaskScheduler& scheduler,
+                                        StressSharedState* const shared) {
+  DCHECK(shared != nullptr);
+  const uint64_t seed = shared->master_seed;
+  const int cpu_count = shared->cpu_count;
+  if (cpu_count == 1) {
+    RunPreemptionProbe(scheduler, shared);
+    return;
+  }
+
+  StealBarrierContext barrier;
+  barrier.shared = shared;
+  const std::unique_ptr<Task*[]> barrier_tasks =
+      std::make_unique<Task*[]>(cpu_count);
+  scheduler.SetPreemptEnabled(false);
+  for (int i = 1; i < cpu_count; ++i) {
+    barrier_tasks[i] = scheduler.CreateTaskOnCpu(StealBarrierEntry,   //
+                                                 &barrier,            //
+                                                 kDefaultTaskWeight,  //
+                                                 0);
+    STRESS_CHECK(seed, barrier_tasks[i] != nullptr);
+  }
+
+  CpuMask128 other_cpus = CpuMask128::FirstCpus(cpu_count);
+  other_cpus.low &= ~1ULL;
+  const TscDeadline deadline(shared->wait_timeout_tsc_cycles);
+  for (int spin = 0; !barrier.running_cpus.Load().ContainsAll(other_cpus);
+       ++spin) {
+    if ((spin & 255) == 0) {
+      // Wake the CPUs that haven't stolen a barrier task yet.
+      const CpuMask128 running = barrier.running_cpus.Load();
+      for (int c = 1; c < cpu_count; ++c) {
+        const uint64_t word = (c < 64) ? running.low : running.high;
+        if ((word & (1ULL << static_cast<uint32_t>(c & 63))) == 0) {
+          SmpSendIpi(c, kVectorWakeupIpi);
+          shared->wakeup_ipis_sent.fetch_add(1, std::memory_order_acq_rel);
+        }
+      }
+    }
+    if (deadline.Expired()) {
+      FailStressRun("timed out waiting for every CPU to steal a barrier task",
+                    seed, __FILE__, __LINE__);
+    }
+    CpuRelax();
+  }
+  STRESS_CHECK(seed, barrier.ran_on_cpu0.load(std::memory_order_acquire) == 0);
+  scheduler.SetPreemptEnabled(true);
+
+  RunPreemptionProbe(scheduler, shared);
+
+  barrier.release.store(true, std::memory_order_release);
+  for (int i = 1; i < cpu_count; ++i) {
+    scheduler.Join(barrier_tasks[i]);
+  }
+}
+
 }  // namespace
 
-#if __STDC_HOSTED__
-void SetRdrandHookForTest(const bool force_supported,
-                          const RdrandTestHookFn hook_fn) {
-  g_rdrand_force_supported.store(force_supported, std::memory_order_release);
-  g_rdrand_hook_fn.store(hook_fn, std::memory_order_release);
-  g_rdrand_hook_active.store(true, std::memory_order_release);
+void SetStressTestHooksForTest(const StressTestHooks& hooks) {
+  g_hooks = hooks;
 }
 
-void ResetRdrandHookForTest() {
-  g_rdrand_hook_active.store(false, std::memory_order_release);
-  g_rdrand_force_supported.store(false, std::memory_order_release);
-  g_rdrand_hook_fn.store(nullptr, std::memory_order_release);
+void SetLapicTimerInitialCountOnAllCpus(const uint32_t initial_count) {
+  uint32_t count = initial_count;
+  SmpRunOnAllCpus(SetLapicTimerInitialCountOnCpu, &count);
 }
-#endif
+
+ScopedLapicTimerBoost::ScopedLapicTimerBoost(const bool enable)
+    : calibrated_count_(SmpCalibratedTimerInitialCount()) {
+  if (enable && calibrated_count_ > 32u) {
+    SetLapicTimerInitialCountOnAllCpus(calibrated_count_ / 16u);
+    boosted_ = true;
+  }
+}
+
+void ScopedLapicTimerBoost::Restore() {
+  if (boosted_) {
+    SetLapicTimerInitialCountOnAllCpus(calibrated_count_);
+    boosted_ = false;
+  }
+}
 
 bool CpuSupportsRdrand() {
-#if __STDC_HOSTED__
-  if (g_rdrand_hook_active.load(std::memory_order_acquire)) {
-    return g_rdrand_force_supported.load(std::memory_order_acquire);
-  }
-#endif
-  uint32_t eax = kCpuidLeafFeatures;
-  uint32_t ebx = 0;
-  uint32_t ecx = 0;
-  uint32_t edx = 0;
-  asm volatile("cpuid" : "+a"(eax), "=b"(ebx), "+c"(ecx), "=d"(edx) : : "cc");
-  return (ecx & kCpuidEcxRdrandBit) != 0;
+  return (g_hooks.rdrand_supported != nullptr) ? g_hooks.rdrand_supported()
+                                               : HardwareSupportsRdrand();
 }
 
 bool TryReadRdrand64(uint64_t* const out) {
@@ -989,25 +1101,12 @@ bool TryReadRdrand64(uint64_t* const out) {
     *out = 0;
     return false;
   }
+  bool (*const attempt_fn)(uint64_t*) = (g_hooks.rdrand_attempt != nullptr)
+                                            ? g_hooks.rdrand_attempt
+                                            : HardwareRdrandAttempt;
   for (int attempt = 0; attempt < kRdrandMaxRetries; ++attempt) {
-#if __STDC_HOSTED__
-    if (g_rdrand_hook_active.load(std::memory_order_acquire)) {
-      const RdrandTestHookFn hook_fn =
-          g_rdrand_hook_fn.load(std::memory_order_acquire);
-      if (hook_fn != nullptr) {
-        uint64_t hooked_val = 0;
-        if (hook_fn(&hooked_val)) {
-          *out = hooked_val;
-          return true;
-        }
-        continue;
-      }
-    }
-#endif
     uint64_t val = 0;
-    uint8_t ok = 0;
-    asm volatile("rdrand %0" : "=r"(val), "=@ccc"(ok) : : "cc");
-    if (ok != 0) {
+    if (attempt_fn(&val)) {
       *out = val;
       return true;
     }
@@ -1141,18 +1240,28 @@ Prng64 Prng64::Fork(const uint64_t stream_id) {
   return Prng64(MixEntropy64(next_word, stream_id ^ 0xD1B54A32D192ED03ULL));
 }
 
-StressTestStats ExecuteRandomMultiCpuStress(const StressTestConfig& config) {
-  DCHECK(config.num_workers >= 0 && config.num_workers <= kMaxStressWorkers);
-  DCHECK(config.rounds_per_worker > 0 &&
-         config.rounds_per_worker <= kMaxStressRounds);
-  DCHECK(config.max_live_allocs_per_worker > 0 &&
-         config.max_live_allocs_per_worker <= kMaxLiveAllocsPerWorker);
-  DCHECK(config.max_heap_alloc_bytes >= kHeapAlignment &&
-         config.max_heap_alloc_bytes <= kMaxHeapAllocBytesLimit);
-  DCHECK(config.max_pmm_alloc_frames >= 1 &&
-         config.max_pmm_alloc_frames <= kMaxPmmAllocFramesLimit);
+uint64_t ResolveStressTestSeed(const uint64_t requested_seed) {
+  if (requested_seed != 0) {
+    return requested_seed;
+  }
+  return HarvestHardwareEntropySeed(
+      static_cast<uint64_t>(PmmFreeFrameCount()) ^
+      (static_cast<uint64_t>(HeapTotalFreeBytes()) << 16));
+}
 
-  const std::shared_ptr<TaskScheduler>& scheduler = GetTaskScheduler();
+StressTestStats ExecuteRandomMultiCpuStress(const StressTestConfig& config) {
+  CHECK(config.num_workers >= 0 && config.num_workers <= kMaxStressWorkers);
+  CHECK(config.rounds_per_worker >= 1 &&
+        config.rounds_per_worker <= kMaxStressRoundsPerWorker);
+  CHECK(config.max_live_allocs_per_worker >= 1 &&
+        config.max_live_allocs_per_worker <= kMaxStressLiveAllocsPerWorker);
+  CHECK(config.max_heap_alloc_bytes >= kMinStressHeapAllocBytes &&
+        config.max_heap_alloc_bytes <= kMaxStressHeapAllocBytes);
+  CHECK(config.max_pmm_alloc_frames >= 1 &&
+        config.max_pmm_alloc_frames <= kMaxStressPmmAllocFrames);
+  CHECK(config.wait_timeout_tsc_cycles > 0);
+
+  TaskScheduler* const scheduler = GetTaskScheduler();
   CHECK(scheduler != nullptr);
   const int cpu_count = SmpCpuCount();
   CHECK(cpu_count >= 1 && cpu_count <= kMaxSupportedCpus);
@@ -1172,11 +1281,7 @@ StressTestStats ExecuteRandomMultiCpuStress(const StressTestConfig& config) {
   CHECK(pmm_free_before > 0);
   CHECK(heap_free_before > 0);
 
-  const uint64_t master_seed =
-      (config.seed != 0) ? config.seed
-                         : HarvestHardwareEntropySeed(
-                               static_cast<uint64_t>(pmm_free_before) ^
-                               (static_cast<uint64_t>(heap_free_before) << 16));
+  const uint64_t master_seed = ResolveStressTestSeed(config.seed);
   CHECK(master_seed != 0);
 
   if (config.log_to_console) {
@@ -1185,16 +1290,7 @@ StressTestStats ExecuteRandomMultiCpuStress(const StressTestConfig& config) {
     UartWrite("\n");
   }
 
-#if !__STDC_HOSTED__
-  const uint32_t calibrated_timer_count = SmpCalibratedTimerInitialCount();
-  const uint32_t stress_timer_count = (calibrated_timer_count > 32u)
-                                          ? (calibrated_timer_count / 16u)
-                                          : calibrated_timer_count;
-  if (config.boost_lapic_timer && stress_timer_count > 0) {
-    uint32_t boost_count = stress_timer_count;
-    SmpRunOnAllCpus(ProgramLapicTimerOnCpuCallback, &boost_count);
-  }
-#endif
+  ScopedLapicTimerBoost timer_boost(config.boost_lapic_timer);
 
   const int num_workers =
       (config.num_workers > 0)
@@ -1203,18 +1299,20 @@ StressTestStats ExecuteRandomMultiCpuStress(const StressTestConfig& config) {
                                                   : kMaxStressWorkers);
   CHECK(num_workers >= 1 && num_workers <= kMaxStressWorkers);
 
-  // Bound per-allocation heap bytes so peak simultaneous live heap allocations
-  // across all workers and tasks remain <= 256 KiB and well below
-  // `heap_free_before`, guaranteeing `HeapExpand()` is never triggered.
+  // Cap the size of random heap allocations so that the payload of all live
+  // worker allocations together stays within kLiveHeapBudgetBytes, far below
+  // the free heap, and the run normally never has to expand the heap (which
+  // would fail the heap_free_after == heap_free_before check). This is a
+  // heuristic: it ignores task control blocks, join records, child contexts,
+  // and KmallocAligned padding.
   const int total_live_slots = num_workers * config.max_live_allocs_per_worker;
-  const int safe_slot_budget =
-      (total_live_slots > 0) ? (131072 / total_live_slots) : 2048;
+  const int slot_budget = kLiveHeapBudgetBytes / total_live_slots;
   int effective_max_heap_bytes = config.max_heap_alloc_bytes;
-  if (effective_max_heap_bytes > safe_slot_budget) {
-    effective_max_heap_bytes = safe_slot_budget;
+  if (effective_max_heap_bytes > slot_budget) {
+    effective_max_heap_bytes = slot_budget;
   }
-  if (effective_max_heap_bytes < kHeapAlignment) {
-    effective_max_heap_bytes = static_cast<int>(kHeapAlignment);
+  if (effective_max_heap_bytes < kMinStressHeapAllocBytes) {
+    effective_max_heap_bytes = kMinStressHeapAllocBytes;
   }
 
   StressSharedState shared = {};
@@ -1226,11 +1324,11 @@ StressTestStats ExecuteRandomMultiCpuStress(const StressTestConfig& config) {
   shared.effective_max_heap_bytes = effective_max_heap_bytes;
   shared.max_pmm_alloc_frames = config.max_pmm_alloc_frames;
   shared.master_seed = master_seed;
-  shared.cpu_participation_mask.store(1ULL, std::memory_order_relaxed);
+  shared.wait_timeout_tsc_cycles = config.wait_timeout_tsc_cycles;
+  shared.cpu_participation.Add(0);
 
-  std::unique_ptr<StressWorkerContext[]> workers(
-      new StressWorkerContext[num_workers]);
-  CHECK(workers != nullptr);
+  std::unique_ptr<StressWorkerContext[]> workers =
+      std::make_unique<StressWorkerContext[]>(num_workers);
 
   Prng64 master_prng(master_seed);
 
@@ -1248,20 +1346,16 @@ StressTestStats ExecuteRandomMultiCpuStress(const StressTestConfig& config) {
         master_prng.NextRange(kDefaultTaskWeight / 2, kDefaultTaskWeight * 2);
 
     if (cpu_count > 1 && i < (num_workers / 2)) {
-      workers[i].initial_cpu = 0;
       workers[i].task = scheduler->CreateTaskOnCpu(
           StressWorkerEntry, &workers[i], worker_weight, 0);
     } else if ((i & 1) == 0) {
-      const int target_cpu = i % cpu_count;
-      workers[i].initial_cpu = target_cpu;
       workers[i].task = scheduler->CreateTaskOnCpu(
-          StressWorkerEntry, &workers[i], worker_weight, target_cpu);
+          StressWorkerEntry, &workers[i], worker_weight, i % cpu_count);
     } else {
-      workers[i].initial_cpu = i % cpu_count;
       workers[i].task =
           scheduler->CreateTask(StressWorkerEntry, &workers[i], worker_weight);
     }
-    CHECK(workers[i].task != nullptr);
+    STRESS_CHECK(master_seed, workers[i].task != nullptr);
   }
   scheduler->SetPreemptEnabled(true);
 
@@ -1274,132 +1368,32 @@ StressTestStats ExecuteRandomMultiCpuStress(const StressTestConfig& config) {
     scheduler->Join(workers[i].task);
   }
 
-  // Wait for all detached child tasks to complete and reap all zombies.
-  while (shared.detached_children_finished.load(std::memory_order_acquire) <
-         shared.child_tasks_detached.load(std::memory_order_acquire)) {
-    const int reaped = scheduler->ReapZombies();
-    if (reaped > 0) {
-      shared.zombies_reaped.fetch_add(reaped, std::memory_order_acq_rel);
-    }
-    scheduler->Yield();
-  }
-
-  while (shared.zombies_reaped.load(std::memory_order_acquire) <
-         shared.child_tasks_detached.load(std::memory_order_acquire)) {
-    const int reaped = scheduler->ReapZombies();
-    if (reaped > 0) {
-      shared.zombies_reaped.fetch_add(reaped, std::memory_order_acq_rel);
-    } else {
-      scheduler->Yield();
-#if __STDC_HOSTED__
-      std::this_thread::yield();
-#else
-      asm volatile("pause" : : : "memory");
-#endif
-    }
-  }
-  const int final_reaped = scheduler->ReapZombies();
-  if (final_reaped > 0) {
-    shared.zombies_reaped.fetch_add(final_reaped, std::memory_order_acq_rel);
-  }
-
-  // Ensure every online CPU (0 .. cpu_count - 1) has participated and at least
-  // one cross-CPU migration has occurred even if num_workers < cpu_count or
-  // host OS thread scheduling delayed an AP thread during the worker window.
-  // By the Pigeonhole Principle, spawning `cpu_count - 1` non-yielding,
-  // non-exiting barrier tasks across `cpu_count - 1` APs with preemption
-  // disabled while CPU 0 spins without yielding/stealing guarantees that each
-  // AP holds at most one barrier task and every AP `1 .. cpu_count - 1` must
-  // enter a barrier task before the rendezvous completes.
-  const uint64_t expected_cpu_mask_low =
-      (cpu_count >= 64) ? ~0ULL
-                        : ((1ULL << static_cast<uint32_t>(cpu_count)) - 1ULL);
-  const uint64_t expected_cpu_mask_high =
-      (cpu_count <= 64)
-          ? 0ULL
-          : ((cpu_count >= 128)
-                 ? ~0ULL
-                 : ((1ULL << static_cast<uint32_t>(cpu_count - 64)) - 1ULL));
-  if (cpu_count > 1 &&
-      ((shared.cpu_participation_mask.load(std::memory_order_acquire) &
-        expected_cpu_mask_low) != expected_cpu_mask_low ||
-       (shared.cpu_participation_mask_high.load(std::memory_order_acquire) &
-        expected_cpu_mask_high) != expected_cpu_mask_high ||
-       shared.task_migrations_observed.load(std::memory_order_acquire) == 0)) {
-    const bool prev_preempt = scheduler->IsPreemptEnabled();
-    scheduler->SetPreemptEnabled(false);
-    shared.cpu_participation_mask.fetch_or(1ULL, std::memory_order_acq_rel);
-
-    std::atomic<uint64_t> barrier_mask_low{1ULL};
-    std::atomic<uint64_t> barrier_mask_high{0ULL};
-    std::unique_ptr<CpuParticipationBarrierContext[]> barrier_ctxs(
-        new CpuParticipationBarrierContext[cpu_count]());
-    std::unique_ptr<Task*[]> barrier_tasks(new Task*[cpu_count]());
-    CHECK(barrier_ctxs != nullptr);
-    CHECK(barrier_tasks != nullptr);
-    for (int c = 1; c < cpu_count; ++c) {
-      barrier_ctxs[c].shared = &shared;
-      barrier_ctxs[c].barrier_mask_low = &barrier_mask_low;
-      barrier_ctxs[c].barrier_mask_high = &barrier_mask_high;
-      barrier_ctxs[c].expected_cpu_mask_low = expected_cpu_mask_low;
-      barrier_ctxs[c].expected_cpu_mask_high = expected_cpu_mask_high;
-      barrier_ctxs[c].initial_cpu = 0;
-      barrier_tasks[c] =
-          scheduler->CreateTaskOnCpu(CpuParticipationBarrierEntry,  //
-                                     &barrier_ctxs[c],              //
-                                     kDefaultTaskWeight,            //
-                                     c);
-      CHECK(barrier_tasks[c] != nullptr);
-      SmpSendIpi(c, kVectorWakeupIpi);
-      shared.wakeup_ipis_sent.fetch_add(1, std::memory_order_acq_rel);
-    }
-
-    int wait_spins = 0;
-    while ((barrier_mask_low.load(std::memory_order_acquire) &
-            expected_cpu_mask_low) != expected_cpu_mask_low ||
-           (barrier_mask_high.load(std::memory_order_acquire) &
-            expected_cpu_mask_high) != expected_cpu_mask_high) {
-      if ((wait_spins & 255) == 0) {
-        const uint64_t mask_low =
-            barrier_mask_low.load(std::memory_order_acquire);
-        const uint64_t mask_high =
-            barrier_mask_high.load(std::memory_order_acquire);
-        for (int c = 1; c < cpu_count; ++c) {
-          const bool arrived =
-              (c < 64) ? ((mask_low & (1ULL << static_cast<uint32_t>(c))) != 0)
-                       : ((mask_high &
-                           (1ULL << static_cast<uint32_t>(c - 64))) != 0);
-          if (!arrived) {
-            SmpSendIpi(c, kVectorWakeupIpi);
-            shared.wakeup_ipis_sent.fetch_add(1, std::memory_order_acq_rel);
-          }
-        }
+  // Wait until every detached child has finished and has been reaped.
+  {
+    const TscDeadline deadline(config.wait_timeout_tsc_cycles);
+    while (shared.zombies_reaped.load(std::memory_order_acquire) <
+           shared.child_tasks_detached.load(std::memory_order_acquire)) {
+      const int reaped = scheduler->ReapZombies();
+      if (reaped > 0) {
+        shared.zombies_reaped.fetch_add(reaped, std::memory_order_acq_rel);
+        continue;
       }
-      ++wait_spins;
-      asm volatile("pause" : : : "memory");
-#if __STDC_HOSTED__
-      std::this_thread::yield();
-#endif
+      if (deadline.Expired()) {
+        FailStressRun("timed out waiting to reap the detached children",
+                      master_seed, __FILE__, __LINE__);
+      }
+      scheduler->Yield();
+      CpuRelax();
     }
-
-    for (int c = 1; c < cpu_count; ++c) {
-      scheduler->Join(barrier_tasks[c]);
-      shared.child_tasks_joined.fetch_add(1, std::memory_order_acq_rel);
-    }
-    scheduler->SetPreemptEnabled(prev_preempt);
   }
+
+  VerifyStealingAndPreemption(*scheduler, &shared);
 
   for (int i = 0; i < num_workers; ++i) {
-    CHECK(workers[i].done.load(std::memory_order_acquire));
+    STRESS_CHECK(master_seed, workers[i].done.load(std::memory_order_acquire));
   }
   workers.reset();
-
-#if !__STDC_HOSTED__
-  if (config.boost_lapic_timer && calibrated_timer_count > 0) {
-    uint32_t restore_count = calibrated_timer_count;
-    SmpRunOnAllCpus(ProgramLapicTimerOnCpuCallback, &restore_count);
-  }
-#endif
+  timer_boost.Restore();
 
   const int64_t pmm_free_after = PmmFreeFrameCount();
   const int64_t heap_free_after = HeapTotalFreeBytes();
@@ -1407,25 +1401,32 @@ StressTestStats ExecuteRandomMultiCpuStress(const StressTestConfig& config) {
   StressTestStats stats = {};
   stats.seed = master_seed;
   stats.cpu_count = cpu_count;
-  stats.cpu_participation_mask =
-      shared.cpu_participation_mask.load(std::memory_order_acquire);
-  stats.cpu_participation_mask_high =
-      shared.cpu_participation_mask_high.load(std::memory_order_acquire);
+  const CpuMask128 participation = shared.cpu_participation.Load();
+  stats.cpu_participation_mask = participation.low;
+  stats.cpu_participation_mask_high = participation.high;
   stats.cooperative_yields =
       shared.cooperative_yields.load(std::memory_order_acquire);
   stats.preemptive_spin_bursts =
       shared.preemptive_spin_bursts.load(std::memory_order_acquire);
+  stats.timer_ticks_during_spin =
+      shared.timer_ticks_during_spin.load(std::memory_order_acquire);
   stats.timer_preemptions_observed =
       shared.timer_preemptions_observed.load(std::memory_order_acquire);
   stats.wakeup_ipis_sent =
       shared.wakeup_ipis_sent.load(std::memory_order_acquire);
   stats.task_migrations_observed =
       shared.task_migrations_observed.load(std::memory_order_acquire);
+  stats.cross_cpu_steals_verified =
+      shared.cross_cpu_steals_verified.load(std::memory_order_acquire);
   stats.child_tasks_joined =
       shared.child_tasks_joined.load(std::memory_order_acquire);
   stats.child_tasks_detached =
       shared.child_tasks_detached.load(std::memory_order_acquire);
   stats.zombies_reaped = shared.zombies_reaped.load(std::memory_order_acquire);
+  stats.min_child_task_weight =
+      shared.min_child_task_weight.load(std::memory_order_acquire);
+  stats.max_child_task_weight =
+      shared.max_child_task_weight.load(std::memory_order_acquire);
   stats.kmalloc_ops = shared.kmalloc_ops.load(std::memory_order_acquire);
   stats.kmalloc_aligned_ops =
       shared.kmalloc_aligned_ops.load(std::memory_order_acquire);
@@ -1443,36 +1444,46 @@ StressTestStats ExecuteRandomMultiCpuStress(const StressTestConfig& config) {
   stats.heap_free_before = heap_free_before;
   stats.heap_free_after = heap_free_after;
 
-  CHECK(!shared.invariant_failed.load(std::memory_order_acquire));
-  CHECK(shared.workers_completed.load(std::memory_order_acquire) ==
-        num_workers);
-  CHECK((stats.cpu_participation_mask & expected_cpu_mask_low) ==
-        expected_cpu_mask_low);
-  CHECK((stats.cpu_participation_mask_high & expected_cpu_mask_high) ==
-        expected_cpu_mask_high);
-  CHECK(stats.cooperative_yields > 0);
-  CHECK(stats.preemptive_spin_bursts > 0);
-  CHECK(stats.timer_preemptions_observed > 0);
+  const bool invariant_failed =
+      shared.invariant_failed.load(std::memory_order_acquire);
+  const int workers_completed =
+      shared.workers_completed.load(std::memory_order_acquire);
+  const int64_t detached_children_finished =
+      shared.detached_children_finished.load(std::memory_order_acquire);
+  const uint64_t seed = master_seed;
+  STRESS_CHECK(seed, !invariant_failed);
+  STRESS_CHECK(seed, workers_completed == num_workers);
+  STRESS_CHECK(seed,
+               participation.ContainsAll(CpuMask128::FirstCpus(cpu_count)));
+  STRESS_CHECK(seed, stats.cooperative_yields > 0);
+  STRESS_CHECK(seed, stats.preemptive_spin_bursts > 0);
+  STRESS_CHECK(seed, stats.timer_preemptions_observed > 0);
   if (cpu_count > 1) {
-    CHECK(stats.wakeup_ipis_sent > 0);
-    CHECK(stats.task_migrations_observed > 0);
+    STRESS_CHECK(seed, stats.wakeup_ipis_sent > 0);
+    STRESS_CHECK(seed, stats.cross_cpu_steals_verified == cpu_count - 1);
+  } else {
+    STRESS_CHECK(seed, stats.task_migrations_observed == 0);
+    STRESS_CHECK(seed, stats.cross_cpu_steals_verified == 0);
   }
-  CHECK(stats.child_tasks_joined > 0);
-  CHECK(stats.child_tasks_detached > 0);
-  CHECK(stats.zombies_reaped == stats.child_tasks_detached);
-  CHECK(stats.kmalloc_ops > 0);
-  CHECK(stats.kmalloc_aligned_ops > 0);
-  CHECK(stats.cpp_new_delete_ops > 0);
-  CHECK(stats.pmm_alloc_ops > 0);
-  CHECK(stats.payload_verifications > 0);
-  CHECK(stats.payload_corruptions == 0);
-  CHECK(stats.stack_canary_corruptions == 0);
-  CHECK(stats.pmm_free_after == stats.pmm_free_before);
-  CHECK(stats.heap_free_after == stats.heap_free_before);
-  CHECK(CurrentCpuId() == 0);
-  CHECK(scheduler->CurrentTask() == bootstrap_task);
-  CHECK(scheduler->IsPreemptEnabled());
-  CHECK(AreInterruptsEnabled());
+  STRESS_CHECK(seed, stats.child_tasks_joined > 0);
+  STRESS_CHECK(seed, stats.child_tasks_detached > 0);
+  STRESS_CHECK(seed, detached_children_finished == stats.child_tasks_detached);
+  STRESS_CHECK(seed, stats.zombies_reaped == stats.child_tasks_detached);
+  STRESS_CHECK(seed, stats.min_child_task_weight == kMinTaskWeight);
+  STRESS_CHECK(seed, stats.max_child_task_weight == kMaxTaskWeight);
+  STRESS_CHECK(seed, stats.kmalloc_ops > 0);
+  STRESS_CHECK(seed, stats.kmalloc_aligned_ops > 0);
+  STRESS_CHECK(seed, stats.cpp_new_delete_ops > 0);
+  STRESS_CHECK(seed, stats.pmm_alloc_ops > 0);
+  STRESS_CHECK(seed, stats.payload_verifications > 0);
+  STRESS_CHECK(seed, stats.payload_corruptions == 0);
+  STRESS_CHECK(seed, stats.stack_canary_corruptions == 0);
+  STRESS_CHECK(seed, stats.pmm_free_after == stats.pmm_free_before);
+  STRESS_CHECK(seed, stats.heap_free_after == stats.heap_free_before);
+  STRESS_CHECK(seed, CurrentCpuId() == 0);
+  STRESS_CHECK(seed, scheduler->CurrentTask() == bootstrap_task);
+  STRESS_CHECK(seed, scheduler->IsPreemptEnabled());
+  STRESS_CHECK(seed, AreInterruptsEnabled());
 
   if (config.log_to_console) {
     UartWrite("[STRESS] cpus=");
@@ -1483,6 +1494,8 @@ StressTestStats ExecuteRandomMultiCpuStress(const StressTestConfig& config) {
     UartWriteDec(static_cast<uint64_t>(stats.timer_preemptions_observed));
     UartWrite(", migrations=");
     UartWriteDec(static_cast<uint64_t>(stats.task_migrations_observed));
+    UartWrite(", steals=");
+    UartWriteDec(static_cast<uint64_t>(stats.cross_cpu_steals_verified));
     UartWrite(", joined=");
     UartWriteDec(static_cast<uint64_t>(stats.child_tasks_joined));
     UartWrite(", reaped=");
@@ -1510,14 +1523,8 @@ StressTestStats ExecuteRandomMultiCpuStress(const StressTestConfig& config) {
 }
 
 void RunRandomMultiCpuStressTest(const uint64_t seed_override) {
-  StressTestConfig config = {};
+  StressTestConfig config;
   config.seed = seed_override;
-  config.num_workers = 0;
-  config.rounds_per_worker = 24;
-  config.max_live_allocs_per_worker = 4;
-  config.max_heap_alloc_bytes = 2048;
-  config.max_pmm_alloc_frames = 3;
-  config.boost_lapic_timer = true;
   config.log_to_console = true;
   (void)ExecuteRandomMultiCpuStress(config);
 }

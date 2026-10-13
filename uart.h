@@ -16,11 +16,11 @@ void UartWrite(const char* str);
 void UartWriteHex(uint64_t value);
 // Writes a 64-bit unsigned integer in base-10 decimal to COM1.
 void UartWriteDec(uint64_t value);
-// Lockless emergency panic writer for COM1; must only be called with local
-// interrupts disabled in unrecoverable panic paths (e.g., CheckFailure).
+// COM1 writer for the kernel panic path (idt.cpp); call it only from the CPU
+// that owns the panic, with interrupts disabled. It does not take the UART
+// lock, which a stopped CPU may hold.
 void UartPanicWrite(const char* str);
-// Lockless emergency base-10 decimal writer for COM1; must only be called with
-// local interrupts disabled in unrecoverable panic paths.
+// Base-10 decimal counterpart of UartPanicWrite(), with the same restrictions.
 void UartPanicWriteDec(uint64_t value);
 
 }  // namespace protos

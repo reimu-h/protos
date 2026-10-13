@@ -10,6 +10,7 @@
 #include <thread>
 #include <vector>
 
+#include "idt_host_fakes.h"
 #include "smp.h"
 #include "uart.h"
 #include "vga.h"
@@ -19,20 +20,40 @@ namespace {
 
 namespace t = ::testing;
 
+// Console whose panic output the fakes below copy to stderr, where death tests
+// can match it (copying both would interleave them).
+enum class PanicConsole { kNone, kUart, kVga };
+
 struct FakeIdtEnv {
   std::atomic<int64_t> eoi_count{0};
-  std::string uart_panic_log;
-  std::string vga_panic_log;
+  PanicConsole stderr_console = PanicConsole::kNone;
 };
 
 FakeIdtEnv g_env;
 
 static void ResetEnv() {
   IdtResetForTest();
+  IdtSetHostCr2ForTest(0);
   ResetCpuLocalForTest();
   g_env.eoi_count.store(0, std::memory_order_relaxed);
-  g_env.uart_panic_log.clear();
-  g_env.vga_panic_log.clear();
+  g_env.stderr_console = PanicConsole::kNone;
+}
+
+static void WritePanicOutput(const PanicConsole console,
+                             const char* const str) {
+  if (str != nullptr && g_env.stderr_console == console) {
+    std::fputs(str, stderr);
+  }
+}
+
+static void WritePanicOutputDec(const PanicConsole console,
+                                const uint64_t value) {
+  char buf[32];
+  std::snprintf(buf,          //
+                sizeof(buf),  //
+                "%llu",       //
+                static_cast<unsigned long long>(value));
+  WritePanicOutput(console, buf);
 }
 
 }  // namespace
@@ -42,33 +63,19 @@ void SmpSendLocalApicEoi() {
 }
 
 void UartPanicWrite(const char* const str) {
-  if (str != nullptr) {
-    g_env.uart_panic_log.append(str);
-  }
+  WritePanicOutput(PanicConsole::kUart, str);
 }
 
 void UartPanicWriteDec(const uint64_t value) {
-  char buf[32];
-  std::snprintf(buf,          //
-                sizeof(buf),  //
-                "%llu",       //
-                static_cast<unsigned long long>(value));
-  g_env.uart_panic_log.append(buf);
+  WritePanicOutputDec(PanicConsole::kUart, value);
 }
 
 void VgaPanicWrite(const char* const str) {
-  if (str != nullptr) {
-    g_env.vga_panic_log.append(str);
-  }
+  WritePanicOutput(PanicConsole::kVga, str);
 }
 
 void VgaPanicWriteDec(const uint64_t value) {
-  char buf[32];
-  std::snprintf(buf,          //
-                sizeof(buf),  //
-                "%llu",       //
-                static_cast<unsigned long long>(value));
-  g_env.vga_panic_log.append(buf);
+  WritePanicOutputDec(PanicConsole::kVga, value);
 }
 
 namespace {
@@ -298,6 +305,51 @@ TEST(IdtTest, DispatchHandlesLocalApicTimerWakeupIpiSpuriousAndCustomVectors) {
   EXPECT_THAT(g_env.eoi_count.load(), t::Eq(7));
 }
 
+TEST(IdtTest, LegacyPicVectorsSkipLocalApicEoiAndStillCallHandlers) {
+  static_assert(kVectorLegacyPicBase >= kCpuExceptionCount);
+  static_assert(kVectorLegacyPicBase + kLegacyPicVectorCount <=
+                kVectorSpurious);
+  static_assert(kVectorApicTimer < kVectorLegacyPicBase &&
+                kVectorWakeupIpi < kVectorLegacyPicBase);
+  ResetEnv();
+  IdtInit();
+
+  // Spurious IRQ7/IRQ15 and any other PIC vector: no panic and no EOI.
+  for (int v = kVectorLegacyPicBase;
+       v < kVectorLegacyPicBase + kLegacyPicVectorCount; ++v) {
+    InterruptFrame frame = {};
+    frame.vector = static_cast<uint64_t>(v);
+    IdtDispatch(&frame);
+  }
+  EXPECT_THAT(g_env.eoi_count.load(), t::Eq(0));
+
+  // A registered handler (e.g. a future driver that unmasks a PIC line) runs
+  // and still gets no Local APIC EOI.
+  static int irq7_calls = 0;
+  irq7_calls = 0;
+  constexpr int kSpuriousIrq7Vector = kVectorLegacyPicBase + 7;
+  IdtRegisterHandler(kSpuriousIrq7Vector, [](InterruptFrame* const frame) {
+    EXPECT_THAT(frame->vector,
+                t::Eq(static_cast<uint64_t>(kVectorLegacyPicBase + 7)));
+    ++irq7_calls;
+  });
+  InterruptFrame irq7_frame = {};
+  irq7_frame.vector = kSpuriousIrq7Vector;
+  IdtDispatch(&irq7_frame);
+  EXPECT_THAT(irq7_calls, t::Eq(1));
+  EXPECT_THAT(g_env.eoi_count.load(), t::Eq(0));
+  IdtUnregisterHandler(kSpuriousIrq7Vector);
+
+  // The vectors just outside the PIC range are ordinary external vectors.
+  InterruptFrame below_frame = {};
+  below_frame.vector = kVectorLegacyPicBase - 1;
+  IdtDispatch(&below_frame);
+  InterruptFrame above_frame = {};
+  above_frame.vector = kVectorLegacyPicBase + kLegacyPicVectorCount;
+  IdtDispatch(&above_frame);
+  EXPECT_THAT(g_env.eoi_count.load(), t::Eq(2));
+}
+
 TEST(IdtTest, ConcurrentMultiThreadedPerCpuDispatchUnderTsan) {
   ResetEnv();
   IdtInit();
@@ -326,7 +378,7 @@ TEST(IdtTest, ConcurrentMultiThreadedPerCpuDispatchUnderTsan) {
         asm volatile("pause" : : : "memory");
       }
 
-      for (int t = 0; t < kTicksPerThread; ++t) {
+      for (int tick = 0; tick < kTicksPerThread; ++tick) {
         EXPECT_THAT(CurrentCpu(), t::Eq(&locals[i]));
         EXPECT_THAT(CurrentCpuId(), t::Eq(i));
         InterruptFrame frame = {};
@@ -363,24 +415,30 @@ TEST(IdtDeathTest, UnhandledCpuExceptionsLogDiagnosticsAndPanic) {
   ResetEnv();
   IdtInit();
 
-  EXPECT_DEATH(
-      {
-        CpuLocal cpu = {};
-        cpu.self = &cpu;
-        cpu.cpu_id = 3;
-        BindCpuLocal(&cpu);
-        IdtSetHostCr2ForTest(0xDEADBEEF12340000ULL);
-        InterruptFrame pf_frame = {};
-        pf_frame.vector = kVectorPageFault;
-        pf_frame.error_code = 0x2;
-        pf_frame.rip = 0x104567ULL;
-        pf_frame.rsp = 0x207FF0ULL;
-        pf_frame.rflags = 0x202ULL;
-        IdtDispatch(&pf_frame);
-      },
-      "Unhandled CPU exception 14 \\(#PF\\) err=0x2 rip=0x104567 "
-      "rsp=0x207ff0 rflags=0x202 cr2=0xdeadbeef12340000 cpu=3");
+  // The same message goes to both consoles.
+  for (const PanicConsole console : {PanicConsole::kUart, PanicConsole::kVga}) {
+    g_env.stderr_console = console;
+    EXPECT_DEATH(
+        {
+          CpuLocal cpu = {};
+          cpu.self = &cpu;
+          cpu.cpu_id = 3;
+          BindCpuLocal(&cpu);
+          IdtSetHostCr2ForTest(0xDEADBEEF12340000ULL);
+          InterruptFrame pf_frame = {};
+          pf_frame.vector = kVectorPageFault;
+          pf_frame.error_code = 0x2;
+          pf_frame.rip = 0xFFFFFFFF80104567ULL;
+          pf_frame.rsp = 0x207FF0ULL;
+          pf_frame.rflags = 0x202ULL;
+          IdtDispatch(&pf_frame);
+        },
+        "^\\[FATAL\\] Unhandled CPU exception 14 \\(#PF\\) err=0x2 "
+        "rip=0xFFFFFFFF80104567 rsp=0x207FF0 rflags=0x202 "
+        "cr2=0xDEADBEEF12340000 cpu=3\n$");
+  }
 
+  g_env.stderr_console = PanicConsole::kUart;
   EXPECT_DEATH(
       {
         ResetCpuLocalForTest();
@@ -393,8 +451,49 @@ TEST(IdtDeathTest, UnhandledCpuExceptionsLogDiagnosticsAndPanic) {
         de_frame.rflags = 0;
         IdtDispatch(&de_frame);
       },
-      "Unhandled CPU exception 0 \\(#DE\\) err=0x0 rip=0x0 "
-      "rsp=0x0 rflags=0x0 cr2=0x0 cpu=unbound");
+      "^\\[FATAL\\] Unhandled CPU exception 0 \\(#DE\\) err=0x0 rip=0x0 "
+      "rsp=0x0 rflags=0x0 cr2=0x0 cpu=unbound\n$");
+}
+
+TEST(IdtTest, EnterPanicLetsOnlyTheFirstCpuPrint) {
+  std::atomic<uint64_t> owner{0};
+  int depth = 0;
+
+  // Many CPUs panic at the same time: exactly one of them owns the panic.
+  constexpr int kCpuCount = 8;
+  std::atomic<int> owner_count{0};
+  std::atomic<int> silent_count{0};
+  std::vector<std::thread> cpus;
+  cpus.reserve(kCpuCount);
+  for (int i = 0; i < kCpuCount; ++i) {
+    cpus.emplace_back([i, &owner, &depth, &owner_count, &silent_count]() {
+      const uint64_t token = 0x1000 + 64 * static_cast<uint64_t>(i);
+      const internal::PanicRole role =
+          internal::EnterPanic(&owner, &depth, token);
+      if (role == internal::PanicRole::kOwner) {
+        owner_count.fetch_add(1);
+      } else if (role == internal::PanicRole::kSilent) {
+        silent_count.fetch_add(1);
+      }
+    });
+  }
+  for (std::thread& cpu : cpus) {
+    cpu.join();
+  }
+  EXPECT_THAT(owner_count.load(), t::Eq(1));
+  EXPECT_THAT(silent_count.load(), t::Eq(kCpuCount - 1));
+  EXPECT_THAT(depth, t::Eq(1));
+
+  // The owner panicking again prints to the UART only, and a third time not
+  // at all; other CPUs stay silent.
+  const uint64_t owner_token = owner.load();
+  EXPECT_THAT(internal::EnterPanic(&owner, &depth, owner_token),
+              t::Eq(internal::PanicRole::kNestedOwner));
+  EXPECT_THAT(internal::EnterPanic(&owner, &depth, owner_token + 64),
+              t::Eq(internal::PanicRole::kSilent));
+  EXPECT_THAT(internal::EnterPanic(&owner, &depth, owner_token),
+              t::Eq(internal::PanicRole::kSilent));
+  EXPECT_THAT(owner.load(), t::Eq(owner_token));
 }
 
 TEST(IdtDeathTest, PreconditionViolationsTriggerDcheck) {

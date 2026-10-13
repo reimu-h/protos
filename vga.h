@@ -12,7 +12,6 @@ void VgaClear();
 // Writes a single character to the console at the current cursor position,
 // advancing the cursor and scrolling as needed.
 void VgaPutc(char ch);
-void VgaPutChar(char ch);
 
 // Writes a null-terminated string to the console at the current cursor
 // position, advancing the cursor and scrolling as needed.
@@ -29,30 +28,31 @@ void VgaWriteDec(uint64_t value);
 int VgaGetCursorRow();
 int VgaGetCursorCol();
 
-// Lockless emergency panic writer for the VGA console; must only be called with
-// local interrupts disabled in unrecoverable panic paths (e.g., CheckFailure).
+// Console writer for the kernel panic path (idt.cpp); call it only from the
+// CPU that owns the panic, with interrupts disabled. It does not take the
+// console lock, which a stopped CPU may hold, and works on a clamped copy of
+// the cursor.
 void VgaPanicWrite(const char* str);
 
-// Lockless emergency base-10 decimal writer for the VGA console; must only be
-// called with local interrupts disabled in unrecoverable panic paths.
+// Base-10 decimal counterpart of VgaPanicWrite(), with the same restrictions.
 void VgaPanicWriteDec(uint64_t value);
 
-// Initializes and activates a Multiboot2 direct-color linear pixel framebuffer
-// (such as UEFI GOP on pure-UEFI machines without legacy 0xB8000 VGA text mode)
-// and renders the current 80x25 text buffer onto it. Once active, legacy VGA
-// text memory (0xB8000) and CRT cursor I/O ports (0x3D4/0x3D5) are not touched.
-void VgaInitFramebuffer(uintptr_t fb_phys_addr,  //
+// Switches the console to a direct-color linear pixel framebuffer (such as the
+// UEFI GOP framebuffer from Multiboot2, for machines without the legacy 0xB8000
+// text mode), identity-maps it, and renders the current 80x25 text onto it with
+// an 8x16 font. Afterwards, legacy VGA text memory (0xB8000) and the CRT cursor
+// I/O ports (0x3D4/0x3D5) are no longer touched.
+//
+// Supported framebuffers are 32 or 24 bits per pixel, at least 640x400 pixels
+// (80x25 cells), with `pitch >= width * bpp / 8`, and, for 32 bpp, a 4-byte
+// aligned address and pitch. Returns false, logs the rejected parameters to the
+// serial port, and leaves the console unchanged if the framebuffer is not
+// supported or cannot be mapped.
+bool VgaInitFramebuffer(uintptr_t fb_phys_addr,  //
                         int pitch,               //
                         int width,               //
                         int height,              //
                         int bpp);
-
-// Alias for VgaInitFramebuffer used during Multiboot2 framebuffer attachment.
-void VgaAttachFramebuffer(uintptr_t fb_phys_addr,  //
-                          int pitch,               //
-                          int width,               //
-                          int height,              //
-                          int bpp);
 
 }  // namespace protos
 

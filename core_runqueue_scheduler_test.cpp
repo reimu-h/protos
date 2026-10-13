@@ -21,23 +21,35 @@ namespace {
 
 namespace t = ::testing;
 
+// Returns the length of the longest run of consecutive `id` entries in `trace`.
+static int MaxConsecutiveRun(const std::vector<int>& trace, const int id) {
+  int longest = 0;
+  int current = 0;
+  for (const int entry : trace) {
+    current = (entry == id) ? current + 1 : 0;
+    if (current > longest) {
+      longest = current;
+    }
+  }
+  return longest;
+}
+
 // ============================================================================
-// 1. `Init()` and Topology Initialization Across 1..4 CPUs
+// 1. `Init()` and Topology Initialization (1..4 and 128 CPUs)
 // ============================================================================
 
 TEST(CoreRunqueueSchedulerTest,
      InitAdoptsBootstrapTaskAndInitializesPerCpuRunqueuesAcrossTopologies) {
   for (const int num_cpus : {1, 2, 3, 4, 128}) {
     SetupEnv(num_cpus);
-    // Unbind CpuLocal before Init() to verify Init() automatically binds BSP
-    // CpuLocal(0) when unbound.
-    ResetCpuLocalForTest();
     EXPECT_TRUE(IdtIsInitialized());
 
     const std::shared_ptr<TaskScheduler> core = CreateCoreRunqueueScheduler();
     ASSERT_THAT(core, t::NotNull());
-    // Before Init(), PollIdleCpu must safely return false.
+    // Before Init(), PollIdleCpu must safely return false and RunqueueLoad
+    // must report an empty runqueue.
     EXPECT_FALSE(core->PollIdleCpu(0));
+    EXPECT_THAT(core->RunqueueLoad(0), t::Eq(0));
 
     core->Init();
 
@@ -80,13 +92,12 @@ TEST(CoreRunqueueSchedulerTest,
 }
 
 // ============================================================================
-// 2. `CreateTask`, `CreateTaskOnCpu`, Stack Alignment, `Yield`, `Exit`
+// 2. `CreateTask`, `CreateTaskOnCpu`, Stack Alignment, `Yield`, Task Return
 // ============================================================================
 
 struct LifecycleTaskCtx {
   TaskScheduler* sched = nullptr;
   std::vector<int> trace;
-  bool explicit_exit = false;
   int task_index = 0;
   bool stack_aligned = false;
   Task* observed_task = nullptr;
@@ -110,7 +121,7 @@ static void LifecycleWorker(void* const raw_arg) {
 }
 
 TEST(CoreRunqueueSchedulerTest,
-     CreateTaskAndCreateTaskOnCpuVerifyAlignmentIdentityYieldAndExitModes) {
+     CreateTaskAndCreateTaskOnCpuVerifyPlacementAlignmentIdentityAndYield) {
   SetupEnv(3);
   const int64_t pmm_before = PmmFreeFrameCount();
   const int64_t heap_before = HeapTotalFreeBytes();
@@ -118,26 +129,23 @@ TEST(CoreRunqueueSchedulerTest,
   const std::shared_ptr<TaskScheduler> core = CreateCoreRunqueueScheduler();
   core->Init();
 
-  LifecycleTaskCtx ctx_implicit;
-  ctx_implicit.sched = core.get();
-  ctx_implicit.task_index = 1;
-  ctx_implicit.explicit_exit = false;
+  LifecycleTaskCtx ctx_a;
+  ctx_a.sched = core.get();
+  ctx_a.task_index = 1;
 
-  LifecycleTaskCtx ctx_explicit;
-  ctx_explicit.sched = core.get();
-  ctx_explicit.task_index = 2;
-  ctx_explicit.explicit_exit = true;
+  LifecycleTaskCtx ctx_b;
+  ctx_b.sched = core.get();
+  ctx_b.task_index = 2;
 
   LifecycleTaskCtx ctx_remote;
   ctx_remote.sched = core.get();
   ctx_remote.task_index = 3;
-  ctx_remote.explicit_exit = false;
 
   // CreateTask always places onto CPU 0's runqueue.
   Task* const task_a =
-      core->CreateTask(LifecycleWorker, &ctx_implicit, kDefaultTaskWeight);
+      core->CreateTask(LifecycleWorker, &ctx_a, kDefaultTaskWeight);
   Task* const task_b = core->CreateTaskOnCpu(LifecycleWorker,     //
-                                             &ctx_explicit,       //
+                                             &ctx_b,              //
                                              kDefaultTaskWeight,  //
                                              0);
   // CreateTaskOnCpu places onto the explicit target_cpu (CPU 2) without sending
@@ -161,15 +169,15 @@ TEST(CoreRunqueueSchedulerTest,
   core->Join(task_b);
   EXPECT_THAT(core->RunqueueLoad(0), t::Eq(0));
 
-  EXPECT_TRUE(ctx_implicit.stack_aligned);
-  EXPECT_THAT(ctx_implicit.observed_task, t::Eq(task_a));
-  EXPECT_THAT(ctx_implicit.observed_cpu, t::Eq(0));
-  EXPECT_THAT(ctx_implicit.trace, t::ElementsAre(10, 11, 12));
+  EXPECT_TRUE(ctx_a.stack_aligned);
+  EXPECT_THAT(ctx_a.observed_task, t::Eq(task_a));
+  EXPECT_THAT(ctx_a.observed_cpu, t::Eq(0));
+  EXPECT_THAT(ctx_a.trace, t::ElementsAre(10, 11, 12));
 
-  EXPECT_TRUE(ctx_explicit.stack_aligned);
-  EXPECT_THAT(ctx_explicit.observed_task, t::Eq(task_b));
-  EXPECT_THAT(ctx_explicit.observed_cpu, t::Eq(0));
-  EXPECT_THAT(ctx_explicit.trace, t::ElementsAre(20, 21, 22));
+  EXPECT_TRUE(ctx_b.stack_aligned);
+  EXPECT_THAT(ctx_b.observed_task, t::Eq(task_b));
+  EXPECT_THAT(ctx_b.observed_cpu, t::Eq(0));
+  EXPECT_THAT(ctx_b.trace, t::ElementsAre(20, 21, 22));
 
   // Steal `task_c` from CPU 2 onto CPU 0 and run it to completion.
   EXPECT_TRUE(core->StealTask(0, 2));
@@ -290,7 +298,7 @@ TEST(CoreRunqueueSchedulerTest,
 
   // Create three tasks on CPU 0 with weights 2048 (2x), 1024 (1x), and 512
   // (0.5x). All three start at min_vruntime == 0 and are ordered initially by
-  // FIFO enqueue_seq (0, 1, 2).
+  // FIFO enqueue_seq (1, 2, 3).
   Task* const t_high =
       core->CreateTask(WeightedShareWorker, &args[0], kDefaultTaskWeight * 2);
   Task* const t_med =
@@ -302,8 +310,8 @@ TEST(CoreRunqueueSchedulerTest,
   core->Join(t_med);
   core->Join(t_low);
 
-  // First 3 dispatches must follow initial FIFO enqueue_seq tie-breaking
-  // (0, 1, 2) because all 3 started at vruntime == 0.
+  // The first 3 dispatches must follow creation order (FIFO enqueue_seq
+  // tie-breaking) because all 3 started at vruntime == 0.
   ASSERT_THAT(static_cast<int>(shared.dispatch_order.size()), t::Eq(24));
   EXPECT_THAT(shared.dispatch_order[0], t::Eq(0));
   EXPECT_THAT(shared.dispatch_order[1], t::Eq(1));
@@ -336,7 +344,7 @@ TEST(CoreRunqueueSchedulerTest,
 }
 
 // ============================================================================
-// 4. Monotonic `min_vruntime` Floor Clamping on Create and `StealTask`
+// 4. `min_vruntime` Floor on Create and `vruntime` Rebasing on `StealTask`
 // ============================================================================
 
 struct MinVruntimeFloorCtx {
@@ -344,6 +352,7 @@ struct MinVruntimeFloorCtx {
   std::vector<int> create_trace;
   std::vector<int> migrate_trace;
   Task* newborn = nullptr;
+  bool steal_from_high_cpu_result = false;
 };
 
 static void NewbornFloorWorker(void* const raw_arg) {
@@ -388,8 +397,20 @@ static void LocalPeerFloorWorker(void* const raw_arg) {
   }
 }
 
+// Runs on CPU 1 and, while running there, steals a task from CPU 0 (it has to
+// be running rather than queued: StealTask does nothing while the destination
+// has queued work), then interleaves with it.
+static void StealingPeerFloorWorker(void* const raw_arg) {
+  MinVruntimeFloorCtx* const ctx = static_cast<MinVruntimeFloorCtx*>(raw_arg);
+  ctx->steal_from_high_cpu_result = ctx->sched->StealTask(1, 0);
+  for (int i = 0; i < 4; ++i) {
+    ctx->migrate_trace.push_back(10);
+    ctx->sched->Yield();
+  }
+}
+
 TEST(CoreRunqueueSchedulerTest,
-     MonotonicMinVruntimeFloorClampingOnCreationAndCrossCpuSteal) {
+     MinVruntimeFloorOnCreationAndVruntimeRebasingOnCrossCpuSteal) {
   SetupEnv(2);
   const int64_t pmm_before = PmmFreeFrameCount();
   const int64_t heap_before = HeapTotalFreeBytes();
@@ -411,25 +432,14 @@ TEST(CoreRunqueueSchedulerTest,
   core->Join(ctx.newborn);
 
   ASSERT_THAT(static_cast<int>(ctx.create_trace.size()), t::Eq(8));
-  int max_consecutive_newborn = 0;
-  int current_run = 0;
-  for (const int id : ctx.create_trace) {
-    if (id == 2) {
-      ++current_run;
-      if (current_run > max_consecutive_newborn) {
-        max_consecutive_newborn = current_run;
-      }
-    } else {
-      current_run = 0;
-    }
-  }
-  EXPECT_THAT(max_consecutive_newborn, t::Le(2));
+  EXPECT_THAT(MaxConsecutiveRun(ctx.create_trace, 2), t::Le(2));
 
-  // (b) Cross-CPU migration floor: create `remote_task` on CPU 1 (where
+  // (b) Low-to-high migration: create `remote_task` on CPU 1 (where
   //     min_vruntime == 0), then steal it onto CPU 0 (where min_vruntime > 0)
   //     and run it alongside `local_peer` on CPU 0. Because `StealTask(0, 1)`
-  //     clamps `remote_task`'s vruntime to CPU 0's min_vruntime, `remote_task`
-  //     (20) interleaves with `local_peer` (10) instead of starving it.
+  //     rebases `remote_task`'s vruntime onto CPU 0's min_vruntime,
+  //     `remote_task` (20) interleaves with `local_peer` (10) instead of
+  //     starving it.
   Task* const remote_task =
       core->CreateTaskOnCpu(MigratedFloorWorker, &ctx, kDefaultTaskWeight, 1);
   EXPECT_THAT(core->RunqueueLoad(1), t::Eq(1));
@@ -444,40 +454,38 @@ TEST(CoreRunqueueSchedulerTest,
   core->Join(local_peer);
 
   ASSERT_THAT(static_cast<int>(ctx.migrate_trace.size()), t::Eq(8));
-  int max_consecutive_migrated = 0;
-  current_run = 0;
-  for (const int id : ctx.migrate_trace) {
-    if (id == 20) {
-      ++current_run;
-      if (current_run > max_consecutive_migrated) {
-        max_consecutive_migrated = current_run;
-      }
-    } else {
-      current_run = 0;
-    }
-  }
-  EXPECT_THAT(max_consecutive_migrated, t::Le(2));
+  EXPECT_THAT(MaxConsecutiveRun(ctx.migrate_trace, 20), t::Le(2));
 
-  // (c) High-to-low min_vruntime migration normalization: create a task on
-  //     high-min_vruntime CPU 0, steal it onto low-min_vruntime CPU 1 (where
-  //     min_vruntime == 0), then create `cpu1_peer` on CPU 1. Because
-  //     `StealTask(1, 0)` normalizes `from_high_cpu`'s `vruntime` to CPU 1's
-  //     `min_vruntime` (0), `from_high_cpu` (enqueued first on CPU 1) remains
-  //     at the head of CPU 1's runqueue ahead of `cpu1_peer` instead of being
-  //     stranded behind it with CPU 0's inflated `vruntime`.
+  // (c) High-to-low migration: `cpu1_peer` is created on CPU 1 (min_vruntime
+  //     still 0) and `from_high_cpu` on CPU 0, whose min_vruntime is now more
+  //     than 10 slices. Impersonating CPU 1, the bootstrap task dispatches
+  //     `cpu1_peer`, which steals `from_high_cpu` while running on CPU 1.
+  //     `StealTask(1, 0)` rebases `from_high_cpu`'s vruntime onto CPU 1's
+  //     min_vruntime, so the two interleave. Keeping (or clamping to) its CPU 0
+  //     vruntime would instead let `cpu1_peer` (10) run all 4 of its slices
+  //     before `from_high_cpu` (20) ran once.
   ctx.migrate_trace.clear();
+  Task* const cpu1_peer = core->CreateTaskOnCpu(StealingPeerFloorWorker,  //
+                                                &ctx,                     //
+                                                kDefaultTaskWeight,       //
+                                                1);
   Task* const from_high_cpu =
       core->CreateTaskOnCpu(MigratedFloorWorker, &ctx, kDefaultTaskWeight, 0);
-  EXPECT_TRUE(core->StealTask(1, 0));
-  Task* const cpu1_peer =
-      core->CreateTaskOnCpu(LocalPeerFloorWorker, &ctx, kDefaultTaskWeight, 1);
-  EXPECT_TRUE(core->StealTask(0, 1));
-  core->Join(from_high_cpu);
-  EXPECT_TRUE(core->StealTask(0, 1));
+  ASSERT_THAT(cpu1_peer, t::NotNull());
+  ASSERT_THAT(from_high_cpu, t::NotNull());
+
+  BindCpuLocal(SmpGetCpuLocal(1));
+  EXPECT_TRUE(core->PollIdleCpu(1));
+  BindCpuLocal(SmpGetCpuLocal(0));
   core->Join(cpu1_peer);
+  core->Join(from_high_cpu);
+
+  EXPECT_TRUE(ctx.steal_from_high_cpu_result);
   ASSERT_THAT(static_cast<int>(ctx.migrate_trace.size()), t::Eq(8));
-  EXPECT_THAT(ctx.migrate_trace[0], t::Eq(20));
-  EXPECT_THAT(ctx.migrate_trace[4], t::Eq(10));
+  EXPECT_THAT(ctx.migrate_trace[0], t::Eq(10));
+  EXPECT_THAT(ctx.migrate_trace[1], t::Eq(20));
+  EXPECT_THAT(MaxConsecutiveRun(ctx.migrate_trace, 10), t::Le(2));
+  EXPECT_THAT(MaxConsecutiveRun(ctx.migrate_trace, 20), t::Le(2));
 
   EXPECT_THAT(PmmFreeFrameCount(), t::Eq(pmm_before));
   EXPECT_THAT(HeapTotalFreeBytes(), t::Eq(heap_before));
@@ -490,10 +498,6 @@ TEST(CoreRunqueueSchedulerTest,
 struct StealOrderCtx {
   TaskScheduler* sched = nullptr;
   std::vector<int> execution_order;
-  bool steal_from_cpu0_while_bootstrap_queued_result = true;
-  bool steal_second_task_from_cpu0_result = false;
-  int cpu0_load_observed_inside_worker = -1;
-  Task* extra_task = nullptr;
 };
 
 static void RecordIdOneWorker(void* const raw_arg) {
@@ -506,34 +510,8 @@ static void RecordIdTwoWorker(void* const raw_arg) {
   ctx->execution_order.push_back(2);
 }
 
-static void RecordIdThreeWorker(void* const raw_arg) {
-  StealOrderCtx* const ctx = static_cast<StealOrderCtx*>(raw_arg);
-  ctx->execution_order.push_back(3);
-}
-
-static void StealSkipBootstrapProbeWorker(void* const raw_arg) {
-  StealOrderCtx* const ctx = static_cast<StealOrderCtx*>(raw_arg);
-  // While this worker is running on CPU 0, the bootstrap task is sitting in
-  // CPU 0's runqueue tree (with `is_bootstrap == true`).
-  ctx->cpu0_load_observed_inside_worker = ctx->sched->RunqueueLoad(0);
-  // Attempting to steal from CPU 0 to empty CPU 2 when ONLY the bootstrap task
-  // is queued on CPU 0 must skip the bootstrap task and return false!
-  ctx->steal_from_cpu0_while_bootstrap_queued_result =
-      ctx->sched->StealTask(2, 0);
-
-  // If a non-bootstrap task is also enqueued on CPU 0 alongside the bootstrap
-  // task, StealTask(2, 0) must skip the bootstrap task and steal the
-  // non-bootstrap task!
-  ctx->extra_task = ctx->sched->CreateTaskOnCpu(RecordIdThreeWorker,  //
-                                                ctx,                  //
-                                                kDefaultTaskWeight,   //
-                                                0);
-  ASSERT_THAT(ctx->extra_task, t::NotNull());
-  ctx->steal_second_task_from_cpu0_result = ctx->sched->StealTask(2, 0);
-}
-
 TEST(CoreRunqueueSchedulerTest,
-     StealTaskLockOrderingSkipsBootstrapAndRespectsDestinationAndSourceState) {
+     StealTaskMovesLeftmostTaskAndRespectsDestinationAndSourceState) {
   SetupEnv(4);
   const int64_t pmm_before = PmmFreeFrameCount();
   const int64_t heap_before = HeapTotalFreeBytes();
@@ -593,24 +571,102 @@ TEST(CoreRunqueueSchedulerTest,
   core->Join(t2);
   EXPECT_THAT(ctx.execution_order, t::ElementsAre(1, 2));
 
-  // 7. Verify `StealTask` never steals the bootstrap task (`is_bootstrap`):
-  //    Run `StealSkipBootstrapProbeWorker` on CPU 0. While it executes,
-  //    bootstrap is in CPU 0's runqueue tree.
-  Task* const probe = core->CreateTaskOnCpu(StealSkipBootstrapProbeWorker,  //
-                                            &ctx,                           //
-                                            kDefaultTaskWeight,             //
-                                            0);
-  core->Join(probe);
-  EXPECT_THAT(ctx.cpu0_load_observed_inside_worker, t::Eq(0));
-  EXPECT_FALSE(ctx.steal_from_cpu0_while_bootstrap_queued_result);
-  EXPECT_TRUE(ctx.steal_second_task_from_cpu0_result);
-  ASSERT_THAT(ctx.extra_task, t::NotNull());
-  EXPECT_THAT(core->RunqueueLoad(2), t::Eq(1));
+  EXPECT_THAT(PmmFreeFrameCount(), t::Eq(pmm_before));
+  EXPECT_THAT(HeapTotalFreeBytes(), t::Eq(heap_before));
+}
 
-  // Steal `extra_task` from CPU 2 onto CPU 0 and join it.
-  EXPECT_TRUE(core->StealTask(0, 2));
-  core->Join(ctx.extra_task);
-  EXPECT_THAT(ctx.execution_order, t::ElementsAre(1, 2, 3));
+struct StealProbeResult {
+  int src_load_before = -1;
+  bool stolen = false;
+  int src_load_after = -1;
+  int dst_load_after = -1;
+};
+
+struct SkipBootstrapCtx {
+  TaskScheduler* sched = nullptr;
+  StealProbeResult probe;
+  int helper_first_cpu = -1;
+  int helper_resumed_cpu = -1;
+};
+
+// Runs on CPU 0 while the bootstrap task waits in Join(), that is, while the
+// bootstrap task is queued in CPU 0's runqueue, and steals from CPU 0 for
+// CPU 2.
+static void StealFromCpu0ProbeWorker(void* const raw_arg) {
+  SkipBootstrapCtx* const ctx = static_cast<SkipBootstrapCtx*>(raw_arg);
+  ctx->probe.src_load_before = ctx->sched->RunqueueLoad(0);
+  ctx->probe.stolen = ctx->sched->StealTask(2, 0);
+  ctx->probe.src_load_after = ctx->sched->RunqueueLoad(0);
+  ctx->probe.dst_load_after = ctx->sched->RunqueueLoad(2);
+}
+
+// Created with weight 1, so the Yield() in its first slice charges it about
+// 1M of vruntime and leaves it queued behind the bootstrap task.
+static void SkipBootstrapHelperWorker(void* const raw_arg) {
+  SkipBootstrapCtx* const ctx = static_cast<SkipBootstrapCtx*>(raw_arg);
+  ctx->helper_first_cpu = CurrentCpuId();
+  ctx->sched->Yield();
+  ctx->helper_resumed_cpu = CurrentCpuId();
+}
+
+TEST(CoreRunqueueSchedulerTest,
+     StealTaskSkipsBootstrapTaskAtHeadOfSourceRunqueue) {
+  SetupEnv(4);
+  const int64_t pmm_before = PmmFreeFrameCount();
+  const int64_t heap_before = HeapTotalFreeBytes();
+
+  const std::shared_ptr<TaskScheduler> core = CreateCoreRunqueueScheduler();
+  core->Init();
+  Task* const bootstrap = core->CurrentTask();
+
+  SkipBootstrapCtx ctx;
+  ctx.sched = core.get();
+
+  // 1. With only the bootstrap task queued on CPU 0 there is nothing to steal:
+  //    RunqueueLoad(0) excludes it and StealTask(2, 0) returns false.
+  Task* const first_probe = core->CreateTaskOnCpu(StealFromCpu0ProbeWorker,  //
+                                                  &ctx,                      //
+                                                  kDefaultTaskWeight,        //
+                                                  0);
+  ASSERT_THAT(first_probe, t::NotNull());
+  core->Join(first_probe);
+  EXPECT_THAT(ctx.probe.src_load_before, t::Eq(0));
+  EXPECT_FALSE(ctx.probe.stolen);
+  EXPECT_THAT(ctx.probe.dst_load_after, t::Eq(0));
+
+  // 2. Run the helper's first slice; its Yield() switches back to the
+  //    bootstrap task and leaves the helper queued on CPU 0.
+  Task* const helper = core->CreateTaskOnCpu(SkipBootstrapHelperWorker,  //
+                                             &ctx,                       //
+                                             kMinTaskWeight,             //
+                                             0);
+  ASSERT_THAT(helper, t::NotNull());
+  core->Yield();
+  ASSERT_THAT(ctx.helper_first_cpu, t::Eq(0));
+  ASSERT_THAT(ctx.helper_resumed_cpu, t::Eq(-1));
+
+  // 3. While the second probe runs, the bootstrap task is the leftmost task in
+  //    CPU 0's runqueue and the helper is behind it. StealTask(2, 0) must skip
+  //    the bootstrap task and move the helper.
+  ctx.probe = StealProbeResult{};
+  Task* const second_probe = core->CreateTaskOnCpu(StealFromCpu0ProbeWorker,  //
+                                                   &ctx,                      //
+                                                   kDefaultTaskWeight,        //
+                                                   0);
+  ASSERT_THAT(second_probe, t::NotNull());
+  core->Join(second_probe);
+  EXPECT_THAT(ctx.probe.src_load_before, t::Eq(1));
+  EXPECT_TRUE(ctx.probe.stolen);
+  EXPECT_THAT(ctx.probe.src_load_after, t::Eq(0));
+  EXPECT_THAT(ctx.probe.dst_load_after, t::Eq(1));
+  EXPECT_THAT(core->CurrentTask(), t::Eq(bootstrap));
+
+  // 4. Standing in for CPU 2's idle loop resumes the helper on CPU 2.
+  BindCpuLocal(SmpGetCpuLocal(2));
+  EXPECT_TRUE(core->PollIdleCpu(2));
+  BindCpuLocal(SmpGetCpuLocal(0));
+  EXPECT_THAT(ctx.helper_resumed_cpu, t::Eq(2));
+  core->Join(helper);
 
   EXPECT_THAT(PmmFreeFrameCount(), t::Eq(pmm_before));
   EXPECT_THAT(HeapTotalFreeBytes(), t::Eq(heap_before));
@@ -644,7 +700,7 @@ static void TimerPreemptWorkerA(void* const raw_arg) {
   TimerPreemptCtx* const ctx = static_cast<TimerPreemptCtx*>(raw_arg);
   InterruptFrame frame = {};
   frame.vector = kVectorApicTimer;
-  frame.rflags = internal::kRflagsInterruptEnableBit;
+  frame.rflags = kRflagsInterruptEnableBit;
 
   // At entry, `task_a->vruntime == 0` and `task_b` is in CPU 0's runqueue at
   // `vruntime == 512`.
@@ -672,9 +728,8 @@ static void ApSimpleRunWorker(void* const raw_arg) {
   ++(*counter);
 }
 
-TEST(
-    CoreRunqueueSchedulerTest,
-    OnTimerInterruptChargesWeightedVruntimeAndOnWakeupIpiPreemptsIdleAndLagging) {
+TEST(CoreRunqueueSchedulerTest,
+     InterruptsChargeWeightedVruntimeAndPreemptLaggingTasksButNotIdleTasks) {
   SetupEnv(2);
   const int64_t pmm_before = PmmFreeFrameCount();
   const int64_t heap_before = HeapTotalFreeBytes();
@@ -683,7 +738,7 @@ TEST(
 
   InterruptFrame frame = {};
   frame.vector = kVectorApicTimer;
-  frame.rflags = internal::kRflagsInterruptEnableBit;
+  frame.rflags = kRflagsInterruptEnableBit;
 
   // Calling OnTimerInterrupt / OnWakeupIpi before Init() is a safe no-op.
   core->OnTimerInterrupt(&frame);
@@ -721,28 +776,27 @@ TEST(
   EXPECT_THAT(ctx.task_b_slices_after_tick_1, t::Eq(1));
   EXPECT_THAT(ctx.task_b_slices_after_tick_2, t::Eq(2));
 
-  // Part B: Verify `OnWakeupIpi` and `OnTimerInterrupt` immediately preempt the
-  // idle task on an Application Processor (CPU 1).
-  int ap_wakeup_runs = 0;
-  Task* const ap_ipi_task = core->CreateTaskOnCpu(
-      ApSimpleRunWorker, &ap_wakeup_runs, kDefaultTaskWeight, 1);
+  // Part B: Interrupts never preempt an AP's idle task, even with work queued
+  // on that AP. The idle loop runs queued work itself by calling PollIdleCpu()
+  // after every wakeup, so it is never suspended in the middle of its own work.
+  int ap_runs = 0;
+  Task* const ap_task =
+      core->CreateTaskOnCpu(ApSimpleRunWorker, &ap_runs, kDefaultTaskWeight, 1);
+  ASSERT_THAT(ap_task, t::NotNull());
   BindCpuLocal(SmpGetCpuLocal(1));
   InterruptFrame ipi_frame = {};
   ipi_frame.vector = kVectorWakeupIpi;
-  ipi_frame.rflags = internal::kRflagsInterruptEnableBit;
+  ipi_frame.rflags = kRflagsInterruptEnableBit;
   core->OnWakeupIpi(&ipi_frame);
-  EXPECT_THAT(ap_wakeup_runs, t::Eq(1));
-  BindCpuLocal(SmpGetCpuLocal(0));
-  core->Join(ap_ipi_task);
-
-  int ap_timer_runs = 0;
-  Task* const ap_timer_task = core->CreateTaskOnCpu(
-      ApSimpleRunWorker, &ap_timer_runs, kDefaultTaskWeight, 1);
-  BindCpuLocal(SmpGetCpuLocal(1));
   core->OnTimerInterrupt(&frame);
-  EXPECT_THAT(ap_timer_runs, t::Eq(1));
+  EXPECT_THAT(ap_runs, t::Eq(0));
+  EXPECT_THAT(core->RunqueueLoad(1), t::Eq(1));
+
+  EXPECT_TRUE(core->PollIdleCpu(1));
+  EXPECT_THAT(ap_runs, t::Eq(1));
+  EXPECT_THAT(core->RunqueueLoad(1), t::Eq(0));
   BindCpuLocal(SmpGetCpuLocal(0));
-  core->Join(ap_timer_task);
+  core->Join(ap_task);
 
   EXPECT_THAT(PmmFreeFrameCount(), t::Eq(pmm_before));
   EXPECT_THAT(HeapTotalFreeBytes(), t::Eq(heap_before));
@@ -757,7 +811,7 @@ struct ZombieStageCtx {
   bool zombie_ran = false;
 };
 
-static void ExplicitExitZombieWorker(void* const raw_arg) {
+static void ReturnImmediatelyZombieWorker(void* const raw_arg) {
   ZombieStageCtx* const ctx = static_cast<ZombieStageCtx*>(raw_arg);
   ctx->zombie_ran = true;
 }
@@ -774,7 +828,7 @@ TEST(CoreRunqueueSchedulerTest,
   ZombieStageCtx ctx;
   ctx.sched = core.get();
   Task* const zombie =
-      core->CreateTask(ExplicitExitZombieWorker, &ctx, kDefaultTaskWeight);
+      core->CreateTask(ReturnImmediatelyZombieWorker, &ctx, kDefaultTaskWeight);
   ASSERT_THAT(zombie, t::NotNull());
 
   // Immediately after creation, both the 4-frame kernel stack and TCB are
@@ -840,7 +894,7 @@ static void MtCoreConcurrencyWorker(void* const raw_arg) {
 
   InterruptFrame timer_frame = {};
   timer_frame.vector = kVectorApicTimer;
-  timer_frame.rflags = internal::kRflagsInterruptEnableBit;
+  timer_frame.rflags = kRflagsInterruptEnableBit;
 
   for (int round = 0; round < 6; ++round) {
     const int cpu = CurrentCpuId();
@@ -870,7 +924,7 @@ static void MtCoreConcurrencyWorker(void* const raw_arg) {
 }
 
 TEST(CoreRunqueueSchedulerTest,
-     ConcurrentMultiThreadedYieldStealTaskAndTimerPreemptionUnderTsan) {
+     ConcurrentMultiThreadedYieldStealTaskAndTimerPreemption) {
   constexpr int kNumCpus = 4;
   constexpr int kNumTasks = 24;
   SetupEnv(kNumCpus);
@@ -1005,58 +1059,81 @@ TEST(CoreRunqueueSchedulerDeathTest,
 
   // 1. Calling methods before `Init()` must trigger `DCHECK`.
   const std::shared_ptr<TaskScheduler> uninit = CreateCoreRunqueueScheduler();
-  EXPECT_DEATH(uninit->CreateTask(NoopTask), "Check failed");
+  constexpr const char* kNotInitialized =
+      "Check failed: initialized_\\.load\\(std::memory_order_acquire\\)";
+  EXPECT_DEATH(uninit->CreateTask(NoopTask, nullptr, kDefaultTaskWeight),
+               kNotInitialized);
   EXPECT_DEATH(
       uninit->CreateTaskOnCpu(NoopTask, nullptr, kDefaultTaskWeight, 0),
-      "Check failed");
-  EXPECT_DEATH(uninit->Yield(), "Check failed");
-  EXPECT_DEATH(uninit->Join(nullptr), "Check failed");
-  EXPECT_DEATH(uninit->ReapZombies(), "Check failed");
-  EXPECT_DEATH(uninit->RunqueueLoad(0), "Check failed");
-  EXPECT_DEATH(uninit->StealTask(0, 1), "Check failed");
-  EXPECT_DEATH(uninit->CurrentTask(), "Check failed");
+      kNotInitialized);
+  EXPECT_DEATH(uninit->Yield(), kNotInitialized);
+  EXPECT_DEATH(uninit->Join(nullptr), kNotInitialized);
+  EXPECT_DEATH(uninit->ReapZombies(), kNotInitialized);
+  EXPECT_DEATH(uninit->StealTask(0, 1), kNotInitialized);
+  EXPECT_DEATH(uninit->CurrentTask(), kNotInitialized);
 
+  // `Init()` must run after `IdtInit()`, exactly once, on the BSP (CPU 0) with
+  // its `CpuLocal` bound; it no longer binds one itself.
   const std::shared_ptr<TaskScheduler> core = CreateCoreRunqueueScheduler();
   g_env.idt_initialized = false;
-  EXPECT_DEATH(core->Init(), "Check failed");
+  EXPECT_DEATH(core->Init(), "Check failed: IdtIsInitialized\\(\\)");
   g_env.idt_initialized = true;
+  ResetCpuLocalForTest();
+  EXPECT_DEATH(core->Init(),
+               "Check failed: GetCurrentCpuOrNull\\(\\) != nullptr");
+  BindCpuLocal(SmpGetCpuLocal(1));
+  EXPECT_DEATH(core->Init(), "Check failed: GetCurrentCpuId\\(\\) == 0");
+  BindCpuLocal(SmpGetCpuLocal(0));
   core->Init();
-  EXPECT_DEATH(core->Init(), "Check failed");
+  EXPECT_DEATH(
+      core->Init(),
+      "Check failed: !initialized_\\.load\\(std::memory_order_acquire\\)");
 
   // 2. Invalid `CreateTask` / `CreateTaskOnCpu` arguments (`entry == nullptr`,
   //    invalid `weight`, out-of-range or offline `target_cpu`).
-  EXPECT_DEATH(core->CreateTask(nullptr), "Check failed");
-  EXPECT_DEATH(core->CreateTask(NoopTask, nullptr, 0), "Check failed");
-  EXPECT_DEATH(core->CreateTask(NoopTask, nullptr, -5), "Check failed");
+  constexpr const char* kBadWeight =
+      "Check failed: weight >= kMinTaskWeight && weight <= kMaxTaskWeight";
+  constexpr const char* kBadTargetCpu =
+      "Check failed: target_cpu >= 0 && target_cpu < cpu_count_";
+  EXPECT_DEATH(core->CreateTask(nullptr, nullptr, kDefaultTaskWeight),
+               "Check failed: entry != nullptr");
+  EXPECT_DEATH(core->CreateTask(NoopTask, nullptr, 0), kBadWeight);
+  EXPECT_DEATH(core->CreateTask(NoopTask, nullptr, -5), kBadWeight);
   EXPECT_DEATH(core->CreateTask(NoopTask, nullptr, kMaxTaskWeight + 1),
-               "Check failed");
+               kBadWeight);
   EXPECT_DEATH(core->CreateTaskOnCpu(NoopTask, nullptr, kDefaultTaskWeight, -1),
-               "Check failed");
+               kBadTargetCpu);
   EXPECT_DEATH(core->CreateTaskOnCpu(NoopTask, nullptr, kDefaultTaskWeight, 2),
-               "Check failed");
+               kBadTargetCpu);
 
   g_env.cpu_locals[1].online = false;
   EXPECT_DEATH(core->CreateTaskOnCpu(NoopTask, nullptr, kDefaultTaskWeight, 1),
-               "Check failed");
+               "Check failed: IsCpuOnline\\(target_cpu, cpu_count_\\)");
   g_env.cpu_locals[1].online = true;
 
   // 3. Out-of-range CPU indices on `RunqueueLoad` and `StealTask`.
-  EXPECT_DEATH(core->RunqueueLoad(-1), "Check failed");
-  EXPECT_DEATH(core->RunqueueLoad(2), "Check failed");
-  EXPECT_DEATH(core->StealTask(-1, 0), "Check failed");
-  EXPECT_DEATH(core->StealTask(2, 0), "Check failed");
-  EXPECT_DEATH(core->StealTask(0, -1), "Check failed");
-  EXPECT_DEATH(core->StealTask(0, 2), "Check failed");
+  constexpr const char* kBadCpuIndex =
+      "Check failed: cpu_index >= 0 && cpu_index < cpu_count_";
+  constexpr const char* kBadDstCpu =
+      "Check failed: dst_cpu >= 0 && dst_cpu < cpu_count_";
+  constexpr const char* kBadSrcCpu =
+      "Check failed: src_cpu >= 0 && src_cpu < cpu_count_";
+  EXPECT_DEATH(core->RunqueueLoad(-1), kBadCpuIndex);
+  EXPECT_DEATH(core->RunqueueLoad(2), kBadCpuIndex);
+  EXPECT_DEATH(core->StealTask(-1, 0), kBadDstCpu);
+  EXPECT_DEATH(core->StealTask(2, 0), kBadDstCpu);
+  EXPECT_DEATH(core->StealTask(0, -1), kBadSrcCpu);
+  EXPECT_DEATH(core->StealTask(0, 2), kBadSrcCpu);
 
-  // 4. Invalid `Join` calls (null task, self-join, joining an idle task, or
-  //    joining the bootstrap task).
-  EXPECT_DEATH(core->Join(nullptr), "Check failed");
-  EXPECT_DEATH(core->Join(core->CurrentTask()), "Check failed");
+  // 4. Invalid `Join` calls: a null task, a self-join (here by the bootstrap
+  //    task), joining an idle task, and a task joining the bootstrap task.
+  EXPECT_DEATH(core->Join(nullptr), "Check failed: task != nullptr");
+  EXPECT_DEATH(core->Join(core->CurrentTask()), "Check failed: task != self");
 
   BindCpuLocal(SmpGetCpuLocal(1));
   Task* const ap1_idle = core->CurrentTask();
   BindCpuLocal(SmpGetCpuLocal(0));
-  EXPECT_DEATH(core->Join(ap1_idle), "Check failed");
+  EXPECT_DEATH(core->Join(ap1_idle), "Check failed: !task->is_idle");
 
   DeathLockWorkerCtx worker_ctx;
   worker_ctx.sched = core.get();
@@ -1069,17 +1146,18 @@ TEST(CoreRunqueueSchedulerDeathTest,
                                          kDefaultTaskWeight);
         core->Join(t);
       },
-      "Check failed");
+      "Check failed: !task->is_bootstrap");
 
-  // 5. Yielding, Joining, or Exiting while holding an `IrqSpinLock` must
-  //    trigger `DCHECK`.
+  // 5. Yielding, Joining, or returning from a task while holding an
+  //    `IrqSpinLock` must trigger `DCHECK`.
+  constexpr const char* kLockHeld = "Check failed: !HoldsAnyIrqSpinLock\\(\\)";
   EXPECT_DEATH(
       {
         IrqSpinLock lock;
         const IrqSpinLockGuard guard(lock);
         core->Yield();
       },
-      "Check failed");
+      kLockHeld);
 
   EXPECT_DEATH(
       {
@@ -1089,7 +1167,7 @@ TEST(CoreRunqueueSchedulerDeathTest,
         const IrqSpinLockGuard guard(lock);
         core->Join(dummy);
       },
-      "Check failed");
+      kLockHeld);
 
   EXPECT_DEATH(
       {
@@ -1098,7 +1176,113 @@ TEST(CoreRunqueueSchedulerDeathTest,
                                          kDefaultTaskWeight);
         core->Join(t);
       },
-      "Check failed");
+      kLockHeld);
+}
+
+// ============================================================================
+// 10. Task Stack Overflow Canary
+// ============================================================================
+
+struct StackUseCtx {
+  TaskScheduler* sched = nullptr;
+  uintptr_t stack_base = 0;
+  uintptr_t frame_address = 0;
+  int64_t checksum = 0;
+};
+
+// Fills 8 KiB of locals (half the task stack), yields while they are live,
+// and checks them afterwards.
+static void DeepStackUseWorker(void* const raw_arg) {
+  StackUseCtx* const ctx = static_cast<StackUseCtx*>(raw_arg);
+  ctx->stack_base = CoreTaskStackBaseForTest(ctx->sched->CurrentTask());
+  ctx->frame_address = reinterpret_cast<uintptr_t>(__builtin_frame_address(0));
+  volatile uint8_t buffer[8192];
+  for (int i = 0; i < 8192; ++i) {
+    buffer[i] = static_cast<uint8_t>(i);
+  }
+  ctx->sched->Yield();
+  int64_t sum = 0;
+  for (int i = 0; i < 8192; ++i) {
+    sum += buffer[i];
+  }
+  ctx->checksum = sum;
+}
+
+TEST(CoreRunqueueSchedulerTest, StackCanaryToleratesDeepButInBoundsStackUse) {
+  SetupEnv(1);
+  const int64_t pmm_before = PmmFreeFrameCount();
+  const int64_t heap_before = HeapTotalFreeBytes();
+
+  const std::shared_ptr<TaskScheduler> core = CreateCoreRunqueueScheduler();
+  core->Init();
+
+  StackUseCtx ctx;
+  ctx.sched = core.get();
+  // Half the default weight: the worker's Yield() charges it more than the
+  // bootstrap task, so it is switched out (and its canary checked) mid-run.
+  Task* const task = core->CreateTask(DeepStackUseWorker,  //
+                                      &ctx,                //
+                                      kDefaultTaskWeight / 2);
+  ASSERT_THAT(task, t::NotNull());
+  core->Join(task);
+
+  // The canary lives at the lowest address of the worker's own stack.
+  EXPECT_THAT(ctx.stack_base, t::Ne(0u));
+  EXPECT_THAT(ctx.frame_address, t::Gt(ctx.stack_base));
+  EXPECT_THAT(ctx.frame_address,
+              t::Lt(ctx.stack_base + static_cast<uintptr_t>(kTaskStackSize)));
+  EXPECT_THAT(ctx.checksum, t::Eq(int64_t{32} * (255 * 256 / 2)));
+
+  EXPECT_THAT(PmmFreeFrameCount(), t::Eq(pmm_before));
+  EXPECT_THAT(HeapTotalFreeBytes(), t::Eq(heap_before));
+}
+
+// Simulates a stack overflow that reached the bottom of the calling task's
+// stack, then exits.
+static void SmashStackCanaryWorker(void* const raw_arg) {
+  TaskScheduler* const sched = static_cast<TaskScheduler*>(raw_arg);
+  *reinterpret_cast<volatile uint64_t*>(
+      CoreTaskStackBaseForTest(sched->CurrentTask())) = 0;
+}
+
+// Smashes the canary only while switched out: it restores the original value
+// after its Yield() returns, so only the switch-out check can catch it.
+static void SmashStackCanaryAcrossYieldWorker(void* const raw_arg) {
+  TaskScheduler* const sched = static_cast<TaskScheduler*>(raw_arg);
+  volatile uint64_t* const canary = reinterpret_cast<volatile uint64_t*>(
+      CoreTaskStackBaseForTest(sched->CurrentTask()));
+  const uint64_t saved = *canary;
+  *canary = ~saved;
+  sched->Yield();
+  *canary = saved;
+}
+
+TEST(CoreRunqueueSchedulerDeathTest,
+     StackCanaryIsCheckedWhenTaskIsSwitchedOutAndWhenItExits) {
+  SetupEnv(1);
+  const std::shared_ptr<TaskScheduler> core = CreateCoreRunqueueScheduler();
+  core->Init();
+
+  constexpr const char* kStackOverflow =
+      "Check failed: task_stack_canary_intact";
+  // Weight 1: the worker's Yield() charges it about 1M of vruntime, so it is
+  // switched out to the bootstrap task.
+  EXPECT_DEATH(
+      {
+        Task* const t = core->CreateTask(SmashStackCanaryAcrossYieldWorker,  //
+                                         core.get(),                         //
+                                         kMinTaskWeight);
+        core->Join(t);
+      },
+      kStackOverflow);
+  EXPECT_DEATH(
+      {
+        Task* const t = core->CreateTask(SmashStackCanaryWorker,  //
+                                         core.get(),              //
+                                         kDefaultTaskWeight);
+        core->Join(t);
+      },
+      kStackOverflow);
 }
 
 }  // namespace

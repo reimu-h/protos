@@ -7,8 +7,34 @@
 
 namespace protos {
 
-// Creates the cross-CPU placement and work-stealing task scheduler layer
-// wrapping `inner`.
+// Creates the cross-CPU placement and work-stealing layer wrapping `inner`.
+// `inner` must be non-null and must provide the core layer's `RunqueueLoad()`
+// and `StealTask()` semantics (see core_runqueue_scheduler.h), so in practice
+// this layer wraps `CreateCoreRunqueueScheduler()` directly, inside the
+// join-lifecycle and preemptive layers (see `TaskInit()`). It adds:
+//
+// - Placement: `CreateTask()` picks the online CPU with the smallest
+//   `RunqueueLoad()`, counting the calling CPU as one task busier because it
+//   is running the caller. Ties go to the lowest CPU index.
+// - Wakeups: `CreateTask()` and `CreateTaskOnCpu()` send `kVectorWakeupIpi` to
+//   the target CPU unless it is the calling CPU, so a halted AP notices the new
+//   task at once instead of at its next timer tick.
+// - Stealing: when the calling CPU has nothing queued, `PollIdleCpu()` and
+//   `Yield()` first move one task to it from the CPU with the largest
+//   `RunqueueLoad()`. `OnTimerInterrupt()` and `OnWakeupIpi()` do the same
+//   only if that CPU has at least two queued tasks, because the interrupted
+//   CPU may be busy with a task that `RunqueueLoad()` does not count. Each
+//   steal tries at most a few donors, busiest first.
+//
+// Every other method, and every call after the stealing step, is forwarded to
+// `inner` unchanged; in particular, `inner` decides whether an interrupt
+// preempts the running task.
+//
+// Interrupts and threading: the layer reads the calling CPU only with local
+// interrupts disabled. `PollIdleCpu(cpu_index)` does nothing and returns false
+// unless it is called on CPU `cpu_index`, so it never steals work for another
+// CPU. With the core as `inner`, `PollIdleCpu()`, `OnTimerInterrupt()` and
+// `OnWakeupIpi()` are safe before `Init()`.
 std::shared_ptr<TaskScheduler> CreateWorkStealingScheduler(
     std::shared_ptr<TaskScheduler> inner);
 

@@ -4,9 +4,6 @@
 #include <cstdint>
 #include <memory>
 #include <utility>
-#if !__STDC_HOSTED__
-#pragma GCC optimize("no-tree-loop-distribute-patterns")
-#endif
 
 #include "check.h"
 #include "idt.h"
@@ -16,10 +13,9 @@
 namespace protos {
 namespace {
 
-[[gnu::noinline]] static CpuLocal* GetCurrentCpuOrNull() {
-  return CurrentCpuOrNull();
-}
-
+// Outermost layer: owns the global preemption flag and decides whether a timer
+// interrupt or wakeup IPI may reach the inner layers at all. Everything else
+// is forwarded unchanged.
 class PreemptiveTaskScheduler final : public TaskScheduler {
  public:
   explicit PreemptiveTaskScheduler(std::shared_ptr<TaskScheduler> inner)
@@ -47,6 +43,7 @@ class PreemptiveTaskScheduler final : public TaskScheduler {
 
   void Yield() override { inner_->Yield(); }
   void Join(Task* const task) override { inner_->Join(task); }
+  void Detach(Task* const task) override { inner_->Detach(task); }
   int ReapZombies() override { return inner_->ReapZombies(); }
 
   bool PollIdleCpu(const int cpu_index) override {
@@ -86,33 +83,23 @@ class PreemptiveTaskScheduler final : public TaskScheduler {
   Task* CurrentTask() const override { return inner_->CurrentTask(); }
 
  private:
+  // Returns true if the context interrupted by `frame` may be switched out.
+  // The decision depends only on the saved RFLAGS in `frame`, not on the
+  // current interrupt flag, which is always clear inside an interrupt gate.
+  // Host tests call the handlers directly and must pass a frame like the one
+  // the CPU would push (`rflags = kRflagsInterruptEnableBit | 0x2`).
   bool CanPreemptFromInterrupt(const InterruptFrame* const frame) const {
-    const CpuLocal* const cpu = GetCurrentCpuOrNull();
+    if (frame == nullptr || (frame->rflags & kRflagsInterruptEnableBit) == 0) {
+      return false;
+    }
+    const CpuLocal* const cpu = CurrentCpuOrNull();
     if (cpu == nullptr || !cpu->online) {
       return false;
     }
     if (!preempt_enabled_.load(std::memory_order_acquire)) {
       return false;
     }
-    if (internal::TopHeldLock() != nullptr) {
-      return false;
-    }
-#if !__STDC_HOSTED__
-    if (frame == nullptr ||
-        (frame->rflags & internal::kRflagsInterruptEnableBit) == 0) {
-      return false;
-    }
-    return true;
-#else
-    if (!internal::LocalAreInterruptsEnabled()) {
-      return false;
-    }
-    if (frame != nullptr && frame->rflags != 0 &&
-        (frame->rflags & internal::kRflagsInterruptEnableBit) == 0) {
-      return false;
-    }
-    return true;
-#endif
+    return !HoldsAnyIrqSpinLock();
   }
 
   const std::shared_ptr<TaskScheduler> inner_;

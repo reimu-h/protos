@@ -2,7 +2,6 @@
 
 #include <cstddef>
 #include <cstdint>
-#include <memory>
 #include <new>
 
 #include "check.h"
@@ -17,10 +16,6 @@ namespace {
 // ASCII "HEAP", stored in every valid HeapBlockHeader to detect invalid frees
 // or header corruption.
 constexpr uint32_t kHeapBlockMagic = 0x48454150;
-// Initial heap arena size in 4 KiB frames (256 * 4 KiB = 1 MiB).
-constexpr int64_t kInitialHeapFrames = 256;
-// Minimum number of 4 KiB frames requested when expanding the heap (64 KiB).
-constexpr int64_t kMinExpandFrames = 16;
 
 // Intrusive header placed immediately before each heap block's usable payload:
 //
@@ -33,8 +28,9 @@ constexpr int64_t kMinExpandFrames = 16;
 //
 // Free blocks are stored in an address-ordered Red-Black Tree (`g_free_tree`)
 // augmented with `max_free_size` (the largest free block payload `size` in the
-// node's subtree) to support O(log n) address-ordered first-fit allocation and
-// O(log n) neighbor lookup for immediate physical coalescing.
+// node's subtree) to support O(log n) address-ordered first-fit allocation of
+// `kHeapAlignment`-aligned blocks and O(log n) neighbor lookup for immediate
+// physical coalescing.
 struct alignas(kHeapAlignment) HeapBlockHeader {
   uint32_t magic;
   uint32_t is_free;
@@ -47,6 +43,11 @@ struct alignas(kHeapAlignment) HeapBlockHeader {
 constexpr int64_t kBlockHeaderSize = sizeof(HeapBlockHeader);
 static_assert(kBlockHeaderSize == 64);
 static_assert(alignof(HeapBlockHeader) == kHeapAlignment);
+
+// Smallest alignment padding that `KmallocAlignedLocked` turns into a separate
+// free block (a header plus a minimal payload) via `HeapSplitFront`. Smaller
+// paddings are absorbed by shifting the header forward (`HeapShiftHeader`).
+constexpr int64_t kMinFrontSplitOffset = kBlockHeaderSize + kHeapAlignment;
 
 struct FreeBlockRbTraits {
   static uintptr_t GetKey(const HeapBlockHeader& block) {
@@ -72,10 +73,10 @@ struct FreeBlockRbTraits {
 using FreeBlockTree =
     RbTree<HeapBlockHeader, &HeapBlockHeader::rb_node, FreeBlockRbTraits>;
 
-// Spinlock protecting `g_free_tree`, `g_total_free_bytes`, and
-// `g_heap_initialized` across concurrent multi-CPU heap operations.
-// When `Kmalloc` triggers `HeapExpand -> PmmAllocFrames`, lock acquisition
-// follows the strict order `g_heap_lock -> g_pmm_lock`.
+// Spinlock protecting `g_free_tree`, `g_total_free_bytes`,
+// `g_heap_initialized`, and `g_max_phys_addr` across concurrent multi-CPU heap
+// operations. When `Kmalloc` triggers `HeapExpand -> PmmAllocFrames`, lock
+// acquisition follows the strict order `g_heap_lock -> g_pmm_lock`.
 IrqSpinLock g_heap_lock;
 
 // Intrusive Red-Black Tree containing all currently FREE heap blocks across all
@@ -90,6 +91,9 @@ int64_t g_total_free_bytes = 0;
 // True once `HeapInit()` has successfully allocated and inserted the initial
 // heap arena.
 bool g_heap_initialized = false;
+// `PmmMaxPhysicalAddress()`, cached by `HeapInit()` because it does not change
+// after `PmmInit()`, so that allocations and frees never query the PMM.
+uintptr_t g_max_phys_addr = 0;
 
 // Rounds `value` up to the nearest multiple of `alignment` (must be a power
 // of two).
@@ -148,7 +152,7 @@ static void FreeTreeRemove(HeapBlockHeader* const block) {
   g_total_free_bytes -= block->size;
 }
 
-// Inserts `initial_block` into `g_free_tree` (if not already present) and
+// Inserts the in-use (`is_free == 0`) `initial_block` into `g_free_tree` and
 // merges it in O(log n) time with its in-order predecessor (`Prev`) and/or
 // successor (`Next`) if they are physically adjacent in memory. Clears absorbed
 // headers' magic numbers and returns a pointer to the resulting merged free
@@ -157,9 +161,7 @@ static HeapBlockHeader* HeapCoalesceBlock(
     HeapBlockHeader* const initial_block) {
   DCHECK(initial_block != nullptr);
   HeapBlockHeader* block = initial_block;
-  if (block->is_free == 0) {
-    FreeTreeInsert(block);
-  }
+  FreeTreeInsert(block);
 
   HeapBlockHeader* const prev_free = FreeBlockTree::Prev(block);
   HeapBlockHeader* const next_free = FreeBlockTree::Next(block);
@@ -199,12 +201,14 @@ static bool HeapCanSplitBlock(const HeapBlockHeader* const block,
   return block->size >= min_split_threshold;
 }
 
-// Splits `block` at offset `sizeof(HeapBlockHeader) + aligned_size` into two
-// contiguous blocks and inserts the trailing remainder into `g_free_tree` in
-// O(log n) time. Requires `HeapCanSplitBlock(block, aligned_size)`.
+// Splits the in-use (`is_free == 0`, not in `g_free_tree`) `block` at offset
+// `sizeof(HeapBlockHeader) + aligned_size` into two contiguous blocks and
+// inserts the trailing remainder into `g_free_tree` in O(log n) time. Requires
+// `HeapCanSplitBlock(block, aligned_size)`.
 static void HeapSplitBlock(HeapBlockHeader* const block,
                            const int64_t aligned_size) {
   DCHECK(block != nullptr);
+  DCHECK(block->is_free == 0);
   DCHECK(HeapCanSplitBlock(block, aligned_size));
 
   const uintptr_t new_block_addr =
@@ -217,27 +221,20 @@ static void HeapSplitBlock(HeapBlockHeader* const block,
   new_block->max_free_size = 0;
   new_block->rb_node = {};
   new_block->align_offset = 0;
-
-  if (block->is_free == 1) {
-    g_total_free_bytes -= (block->size - aligned_size);
-    block->size = aligned_size;
-    g_free_tree.PropagateAugment(block);
-  } else {
-    block->size = aligned_size;
-  }
+  block->size = aligned_size;
 
   FreeTreeInsert(new_block);
 }
 
 // Splits the front of an already-removed `block` when `offset >=
-// kBlockHeaderSize + kHeapAlignment`, returning the leading `[block, block +
-// offset)` slice to `g_free_tree` and returning the new aligned block header at
+// kMinFrontSplitOffset`, returning the leading `[block, block + offset)` slice
+// to `g_free_tree` and returning the new aligned block header at
 // `block + offset`.
 static HeapBlockHeader* HeapSplitFront(HeapBlockHeader* const block,
                                        const int64_t offset) {
   DCHECK(block != nullptr);
   DCHECK(block->is_free == 0);
-  DCHECK(offset >= kBlockHeaderSize + kHeapAlignment);
+  DCHECK(offset >= kMinFrontSplitOffset);
   DCHECK((offset & (kHeapAlignment - 1)) == 0);
   DCHECK(block->size > offset);
 
@@ -262,15 +259,15 @@ static HeapBlockHeader* HeapSplitFront(HeapBlockHeader* const block,
 }
 
 // Shifts the header of an already-removed `block` forward by `offset` bytes
-// when `0 < offset < kBlockHeaderSize + kHeapAlignment` (where the prefix gap
-// is too small to form a standalone free block), recording `align_offset =
-// offset` so `Kfree` can restore the original block boundary for coalescing.
+// when `0 < offset < kMinFrontSplitOffset` (where the prefix gap is too small
+// to form a standalone free block), recording `align_offset = offset` so
+// `Kfree` can restore the original block boundary for coalescing.
 static HeapBlockHeader* HeapShiftHeader(HeapBlockHeader* const block,
                                         const int64_t offset) {
   DCHECK(block != nullptr);
   DCHECK(block->is_free == 0);
   DCHECK(offset > 0);
-  DCHECK(offset < kBlockHeaderSize + kHeapAlignment);
+  DCHECK(offset < kMinFrontSplitOffset);
   DCHECK((offset & (kHeapAlignment - 1)) == 0);
   DCHECK(block->size > offset);
 
@@ -309,17 +306,17 @@ static HeapBlockHeader* HeapInsertArena(const uintptr_t arena_addr,
   return HeapCoalesceBlock(new_block);
 }
 
-// Requests additional contiguous 4 KiB frames from the PMM to satisfy an
-// allocation of `aligned_size` bytes (requesting at least `kMinExpandFrames`
-// when possible, falling back to the exact frame count needed), and inserts
-// the new arena into `g_free_tree`.
-static HeapBlockHeader* HeapExpand(const int64_t aligned_size) {
-  const uintptr_t max_phys = PmmMaxPhysicalAddress();
-  if (aligned_size <= 0 || max_phys <= kBlockHeaderSize ||
-      static_cast<uintptr_t>(aligned_size) > max_phys - kBlockHeaderSize) {
+// Requests additional contiguous 4 KiB frames from the PMM for a free block
+// with at least `min_payload_size` payload bytes (requesting at least
+// `kMinExpandFrames` when possible, falling back to the exact frame count
+// needed), and inserts the new arena into `g_free_tree`.
+static HeapBlockHeader* HeapExpand(const int64_t min_payload_size) {
+  if (min_payload_size <= 0 || g_max_phys_addr <= kBlockHeaderSize ||
+      static_cast<uintptr_t>(min_payload_size) >
+          g_max_phys_addr - kBlockHeaderSize) {
     return nullptr;
   }
-  const int64_t needed_bytes = kBlockHeaderSize + aligned_size;
+  const int64_t needed_bytes = kBlockHeaderSize + min_payload_size;
   const int64_t exact_frames = (needed_bytes + kPageSize - 1) / kPageSize;
   const int64_t preferred_frames =
       (exact_frames < kMinExpandFrames) ? kMinExpandFrames : exact_frames;
@@ -339,7 +336,10 @@ static HeapBlockHeader* HeapExpand(const int64_t aligned_size) {
 
 // Finds the lowest-address free block in `g_free_tree` whose payload can
 // accommodate `aligned_size` bytes after aligning the payload start to
-// `eff_align` in O(log n) time using subtree `max_free_size` augmentation.
+// `eff_align`. The subtree predicate prunes by payload size only, so the search
+// is O(log n) for `eff_align == kHeapAlignment` (every payload is already
+// aligned) but may visit every free block of at least `aligned_size` bytes for
+// larger alignments, whose padding depends on each block's address.
 static HeapBlockHeader* HeapFindFirstFit(const int64_t aligned_size,
                                          const int64_t eff_align) {
   return g_free_tree.FindFirstAugmented(
@@ -364,11 +364,10 @@ static void* KmallocAlignedLocked(const int64_t size, const int64_t alignment) {
   const int64_t eff_align =
       (alignment < kHeapAlignment) ? kHeapAlignment : alignment;
   const int64_t max_pad = eff_align - kHeapAlignment;
-  const uintptr_t max_phys = PmmMaxPhysicalAddress();
   const uintptr_t min_overhead =
       static_cast<uintptr_t>(kBlockHeaderSize + kHeapAlignment + max_pad);
-  if (max_phys <= min_overhead ||
-      static_cast<uintptr_t>(size) > max_phys - min_overhead) {
+  if (g_max_phys_addr <= min_overhead ||
+      static_cast<uintptr_t>(size) > g_max_phys_addr - min_overhead) {
     return nullptr;
   }
 
@@ -387,7 +386,7 @@ static void* KmallocAlignedLocked(const int64_t size, const int64_t alignment) {
   DCHECK(candidate->size >= aligned_size + offset);
 
   FreeTreeRemove(candidate);
-  if (offset >= kBlockHeaderSize + kHeapAlignment) {
+  if (offset >= kMinFrontSplitOffset) {
     candidate = HeapSplitFront(candidate, offset);
   } else if (offset > 0) {
     candidate = HeapShiftHeader(candidate, offset);
@@ -408,12 +407,11 @@ void HeapInit() {
   g_free_tree.Clear();
   g_total_free_bytes = 0;
   g_heap_initialized = false;
+  g_max_phys_addr = PmmMaxPhysicalAddress();
 
   const uintptr_t arena_addr = PmmAllocFrames(kInitialHeapFrames);
   CHECK(arena_addr != 0);
-  const int64_t arena_bytes = kInitialHeapFrames * kPageSize;
-  const HeapBlockHeader* const block = HeapInsertArena(arena_addr, arena_bytes);
-  CHECK(block != nullptr);
+  HeapInsertArena(arena_addr, kInitialHeapFrames * kPageSize);
   g_heap_initialized = true;
 }
 
@@ -444,7 +442,9 @@ void* Kmalloc(const int64_t size) {
 // Validates that `ptr` points to a live, 16-byte-aligned payload preceded by a
 // valid in-use `HeapBlockHeader`, restores any shifted alignment header,
 // inserts the block into `g_free_tree`, and coalesces it with physically
-// adjacent free neighbors in O(log n) time.
+// adjacent free neighbors in O(log n) time. Double frees fail the header's
+// `magic`/`is_free` checks, which is best effort: once a freed block has been
+// coalesced or reused, its old header bytes may have been overwritten.
 void Kfree(void* const ptr) {
   if (ptr == nullptr) {
     return;
@@ -453,7 +453,7 @@ void Kfree(void* const ptr) {
   DCHECK(g_heap_initialized);
   const uintptr_t ptr_addr = reinterpret_cast<uintptr_t>(ptr);
   DCHECK(ptr_addr >= kLowerMemoryLimit + kBlockHeaderSize);
-  DCHECK(ptr_addr < PmmMaxPhysicalAddress());
+  DCHECK(ptr_addr < g_max_phys_addr);
   DCHECK((ptr_addr & (kHeapAlignment - 1)) == 0);
 
   HeapBlockHeader* block = reinterpret_cast<HeapBlockHeader*>(ptr) - 1;
@@ -462,7 +462,7 @@ void Kfree(void* const ptr) {
   DCHECK(block->size >= kHeapAlignment);
   DCHECK((block->size & (kHeapAlignment - 1)) == 0);
   DCHECK(block->align_offset >= 0);
-  DCHECK(block->align_offset < kBlockHeaderSize + kHeapAlignment);
+  DCHECK(block->align_offset < kMinFrontSplitOffset);
   DCHECK((block->align_offset & (kHeapAlignment - 1)) == 0);
   DCHECK(ptr_addr >= kLowerMemoryLimit + kBlockHeaderSize +
                          static_cast<uintptr_t>(block->align_offset));
@@ -490,35 +490,65 @@ void Kfree(void* const ptr) {
   HeapCoalesceBlock(block);
 }
 
-}  // namespace protos
-
-#if !__STDC_HOSTED__
-void* operator new(const size_t size) {
-  if (size > INT64_MAX) {
+void* KmallocForNewNothrow(const size_t size, const size_t alignment) noexcept {
+  if (size > static_cast<size_t>(INT64_MAX) ||
+      alignment > static_cast<size_t>(kPageSize)) {
     return nullptr;
   }
-  return protos::Kmalloc(size);
+  return KmallocAligned(static_cast<int64_t>(size),
+                        static_cast<int64_t>(alignment));
+}
+
+void* KmallocForNew(const size_t size, const size_t alignment) {
+  void* const ptr = KmallocForNewNothrow(size, alignment);
+  CHECK(ptr != nullptr &&
+        "operator new: heap exhausted or alignment above kPageSize");
+  return ptr;
+}
+
+}  // namespace protos
+
+static_assert(static_cast<size_t>(protos::kHeapAlignment) ==
+              __STDCPP_DEFAULT_NEW_ALIGNMENT__);
+
+#if !__STDC_HOSTED__
+// Global allocation and deallocation functions. The throwing forms never
+// return nullptr; code that must survive an allocation failure uses the
+// `std::nothrow` forms (`new (std::nothrow) T`) or `Kmalloc`.
+void* operator new(const size_t size) {
+  return protos::KmallocForNew(size, protos::kHeapAlignment);
 }
 
 void* operator new[](const size_t size) {
-  if (size > INT64_MAX) {
-    return nullptr;
-  }
-  return protos::Kmalloc(size);
+  return protos::KmallocForNew(size, protos::kHeapAlignment);
 }
 
 void* operator new(const size_t size, const std::align_val_t alignment) {
-  if (size > INT64_MAX || static_cast<size_t>(alignment) > INT64_MAX) {
-    return nullptr;
-  }
-  return protos::KmallocAligned(size, static_cast<int64_t>(alignment));
+  return protos::KmallocForNew(size, static_cast<size_t>(alignment));
 }
 
 void* operator new[](const size_t size, const std::align_val_t alignment) {
-  if (size > INT64_MAX || static_cast<size_t>(alignment) > INT64_MAX) {
-    return nullptr;
-  }
-  return protos::KmallocAligned(size, static_cast<int64_t>(alignment));
+  return protos::KmallocForNew(size, static_cast<size_t>(alignment));
+}
+
+void* operator new(const size_t size, const std::nothrow_t&) noexcept {
+  return protos::KmallocForNewNothrow(size, protos::kHeapAlignment);
+}
+
+void* operator new[](const size_t size, const std::nothrow_t&) noexcept {
+  return protos::KmallocForNewNothrow(size, protos::kHeapAlignment);
+}
+
+void* operator new(const size_t size,                 //
+                   const std::align_val_t alignment,  //
+                   const std::nothrow_t&) noexcept {
+  return protos::KmallocForNewNothrow(size, static_cast<size_t>(alignment));
+}
+
+void* operator new[](const size_t size,                 //
+                     const std::align_val_t alignment,  //
+                     const std::nothrow_t&) noexcept {
+  return protos::KmallocForNewNothrow(size, static_cast<size_t>(alignment));
 }
 
 void operator delete(void* const ptr) noexcept { protos::Kfree(ptr); }
@@ -563,51 +593,25 @@ void operator delete[](void* const ptr,    //
   protos::Kfree(ptr);
 }
 
-extern "C" {
-// Itanium C++ ABI handler placed in vtable slots for pure virtual functions
-// (`= 0`); halts the kernel if an unimplemented pure virtual method is called.
-void __cxa_pure_virtual() { CHECK(false); }
-
-// Itanium C++ ABI DSO handle and atexit registration stub required by GCC for
-// file-scope objects with non-trivial destructors (such as the single global
-// `std::shared_ptr<TaskScheduler>` in `task.cpp`) under `-ffreestanding
-// -nostdlib`. The kernel never exits, so `__cxa_atexit` is a no-op returning 0.
-void* __dso_handle = nullptr;
-
-int __cxa_atexit(void (*const func)(void*),  //
-                 void* const arg,            //
-                 void* const dso_handle) noexcept {
-  (void)func;
-  (void)arg;
-  (void)dso_handle;
-  return 0;
+void operator delete(void* const ptr, const std::nothrow_t&) noexcept {
+  protos::Kfree(ptr);
 }
 
-// Weak freestanding `memset` implementation used when GCC synthesizes `memset`
-// calls for struct or array zero-initialization under `-ffreestanding`.
-[[gnu::weak, gnu::optimize("no-tree-loop-distribute-patterns")]] void* memset(
-    void* const dest, const int ch, const size_t count) {
-  uint8_t* const bytes = static_cast<uint8_t*>(dest);
-  const uint8_t value = static_cast<uint8_t>(ch);
-  for (size_t i = 0; i < count; ++i) {
-    bytes[i] = value;
-  }
-  return dest;
+void operator delete[](void* const ptr, const std::nothrow_t&) noexcept {
+  protos::Kfree(ptr);
 }
 
-// Forces `libstdc++` reference counting (`std::shared_ptr`) to always use
-// thread-safe atomic instructions (`lock xadd`) in freestanding kernel builds.
-char __libc_single_threaded = 0;
-}  // extern "C"
+void operator delete(void* const ptr,                   //
+                     const std::align_val_t alignment,  //
+                     const std::nothrow_t&) noexcept {
+  (void)alignment;
+  protos::Kfree(ptr);
+}
 
-namespace std {
-// `std::make_shared`'s control-block vtable (`_Sp_counted_ptr_inplace`)
-// references `_Sp_make_shared_tag::_S_eq` (normally provided by `libstdc++.a`)
-// as a cross-DSO fallback when `_M_get_deleter` checks whether a `type_info`
-// matches `_Sp_make_shared_tag` under `-fno-rtti`. Within a single static
-// kernel binary, `_M_get_deleter`'s fast-path pointer comparison against
-// `_Sp_make_shared_tag::_S_ti()` already succeeds, so returning `false` here
-// satisfies the linker without pulling in `libstdc++`.
-bool _Sp_make_shared_tag::_S_eq(const type_info&) noexcept { return false; }
-}  // namespace std
+void operator delete[](void* const ptr,                   //
+                       const std::align_val_t alignment,  //
+                       const std::nothrow_t&) noexcept {
+  (void)alignment;
+  protos::Kfree(ptr);
+}
 #endif  // !__STDC_HOSTED__

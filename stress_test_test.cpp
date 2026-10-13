@@ -5,11 +5,7 @@
 
 #include <atomic>
 #include <chrono>
-#include <cstddef>
 #include <cstdint>
-#include <cstdio>
-#include <cstdlib>
-#include <memory>
 #include <mutex>
 #include <string>
 #include <thread>
@@ -20,13 +16,185 @@
 namespace protos {
 namespace {
 
+// State of the fake LAPIC timers below.
+struct FakeLapicTimers {
+  std::mutex mutex;
+  uint32_t calibrated_count = 0;
+  // Initial counts programmed on each CPU, in order.
+  std::vector<std::vector<uint32_t>> programmed_counts;
+};
+
+FakeLapicTimers g_lapic_timers;
+
+// CPU whose work the fake SmpRunOnAllCpus() is running on this thread, or -1.
+thread_local int g_run_on_all_cpus_cpu = -1;
+
+static void ResetFakeLapicTimers(const uint32_t calibrated_count) {
+  const std::lock_guard<std::mutex> lock(g_lapic_timers.mutex);
+  g_lapic_timers.calibrated_count = calibrated_count;
+  g_lapic_timers.programmed_counts.clear();
+}
+
+static std::vector<uint32_t> ProgrammedTimerCounts(const int cpu) {
+  const std::lock_guard<std::mutex> lock(g_lapic_timers.mutex);
+  if (cpu >= static_cast<int>(g_lapic_timers.programmed_counts.size())) {
+    return {};
+  }
+  return g_lapic_timers.programmed_counts[cpu];
+}
+
+}  // namespace
+
+// Fakes of the smp.h LAPIC timer functions that only the stress test uses, so
+// scheduler_test_fakes.cpp doesn't provide them. SmpRunOnAllCpus() runs the
+// work of every CPU on the calling thread.
+uint32_t SmpCalibratedTimerInitialCount() {
+  const std::lock_guard<std::mutex> lock(g_lapic_timers.mutex);
+  return g_lapic_timers.calibrated_count;
+}
+
+void SmpSetLocalApicTimerInitialCount(const uint32_t initial_count) {
+  const int cpu =
+      (g_run_on_all_cpus_cpu >= 0) ? g_run_on_all_cpus_cpu : CurrentCpuId();
+  const std::lock_guard<std::mutex> lock(g_lapic_timers.mutex);
+  std::vector<std::vector<uint32_t>>& counts = g_lapic_timers.programmed_counts;
+  if (cpu >= static_cast<int>(counts.size())) {
+    counts.resize(cpu + 1);
+  }
+  counts[cpu].push_back(initial_count);
+}
+
+void SmpRunOnAllCpus(const SmpWorkFn work_fn, void* const context) {
+  CHECK(g_run_on_all_cpus_cpu < 0);
+  for (int cpu = 0; cpu < SmpCpuCount(); ++cpu) {
+    g_run_on_all_cpus_cpu = cpu;
+    work_fn(cpu, context);
+  }
+  g_run_on_all_cpus_cpu = -1;
+}
+
+namespace {
+
 namespace t = ::testing;
+
+constexpr uint32_t kFakeCalibratedTimerCount = 160000;
+constexpr uint32_t kFakeBoostedTimerCount = kFakeCalibratedTimerCount / 16;
+
+// Bound on each wait of the host runs. Larger than the default because
+// sanitizers and parallel test binaries slow the simulated CPUs down.
+constexpr uint64_t kHostWaitTimeoutTscCycles =
+    20 * kSelfTestWaitTimeoutTscCycles;
+
+// Host stand-in for `pause` in busy waits: lets the threads of the other
+// simulated CPUs run.
+static void YieldHostThread() { std::this_thread::yield(); }
+
+// Simulates the LAPIC timer while a task spins without yielding: every 32nd
+// call delivers a timer interrupt to the calling CPU, if its interrupts are
+// enabled.
+static void DeliverSimulatedTimerInterrupt() {
+  thread_local int calls = 0;
+  if (++calls % 32 != 0 || !IdtIsInitialized() || !AreInterruptsEnabled()) {
+    return;
+  }
+  InterruptFrame timer_frame = {};
+  timer_frame.vector = kVectorApicTimer;
+  timer_frame.rflags = kRflagsInterruptEnableBit | 0x2;
+  IdtDispatch(&timer_frame);
+}
+
+// Runs the idle loops of the simulated APs 1 .. cpu_count - 1, one host thread
+// each: delivers the wakeup IPIs sent to the AP and runs its tasks through
+// PollIdleCpu(). Create it after TaskInit().
+class SimulatedAps {
+ public:
+  // Returns once every AP thread is bound to its CPU. AP `delayed_cpu` waits
+  // for `start_delay` before its idle loop starts.
+  explicit SimulatedAps(const int cpu_count, const int delayed_cpu = 0,
+                        const std::chrono::milliseconds start_delay =
+                            std::chrono::milliseconds(0)) {
+    threads_.reserve(cpu_count - 1);
+    for (int cpu = 1; cpu < cpu_count; ++cpu) {
+      const std::chrono::milliseconds delay =
+          (cpu == delayed_cpu) ? start_delay : std::chrono::milliseconds(0);
+      threads_.emplace_back([this, cpu, delay]() { IdleLoop(cpu, delay); });
+    }
+    while (ready_.load(std::memory_order_acquire) < cpu_count - 1) {
+      std::this_thread::yield();
+    }
+  }
+
+  ~SimulatedAps() { Stop(); }
+
+  SimulatedAps(const SimulatedAps&) = delete;
+  SimulatedAps& operator=(const SimulatedAps&) = delete;
+
+  // Stops and joins the AP threads.
+  void Stop() {
+    stop_.store(true, std::memory_order_release);
+    for (std::thread& thread : threads_) {
+      thread.join();
+    }
+    threads_.clear();
+  }
+
+ private:
+  void IdleLoop(const int cpu, const std::chrono::milliseconds start_delay) {
+    BindCpuLocal(SmpGetCpuLocal(cpu));
+    SetInterruptsEnabledForTest(true);
+    ready_.fetch_add(1, std::memory_order_acq_rel);
+    std::this_thread::sleep_for(start_delay);
+
+    TaskScheduler* const scheduler = GetTaskScheduler();
+    int64_t handled_ipis = 0;
+    while (!stop_.load(std::memory_order_acquire)) {
+      const int64_t sent_ipis =
+          g_env.ipi_sent_count[cpu].load(std::memory_order_acquire);
+      if (sent_ipis > handled_ipis && IdtIsInitialized() &&
+          AreInterruptsEnabled()) {
+        handled_ipis = sent_ipis;
+        InterruptFrame ipi_frame = {};
+        ipi_frame.vector = kVectorWakeupIpi;
+        ipi_frame.rflags = kRflagsInterruptEnableBit | 0x2;
+        IdtDispatch(&ipi_frame);
+      }
+      if (scheduler == nullptr || !scheduler->PollIdleCpu(cpu)) {
+        std::this_thread::yield();
+      }
+    }
+    ResetCpuLocalForTest();
+  }
+
+  std::atomic<int> ready_{0};
+  std::atomic<bool> stop_{false};
+  std::vector<std::thread> threads_;
+};
+
+// Installs the host stress-test hooks and fake LAPIC timers. Every run uses a
+// fixed seed, so that a failing run can be reproduced.
+class StressTest : public t::Test {
+ protected:
+  void SetUp() override {
+    StressTestHooks hooks;
+    hooks.cpu_relax = YieldHostThread;
+    hooks.non_yielding_spin = DeliverSimulatedTimerInterrupt;
+    SetStressTestHooksForTest(hooks);
+    ResetFakeLapicTimers(kFakeCalibratedTimerCount);
+  }
+
+  void TearDown() override {
+    SetStressTestHooksForTest({});
+    TaskResetForTest();
+  }
+};
+
+using StressDeathTest = StressTest;
 
 static_assert(Prng64(0).state() != 0);
 static_assert(Prng64(1).state() != 0);
 static_assert(Prng64(1).state() != Prng64(2).state());
 
-TEST(StressTest, Prng64DeterminismDistinctSeedsAndSeedZeroNonZeroState) {
+TEST(Prng64Test, DeterminismDistinctSeedsAndSeedZeroNonZeroState) {
   Prng64 rng_zero_a(0);
   Prng64 rng_zero_b(0);
   EXPECT_THAT(rng_zero_a.state(), t::Ne(0u));
@@ -45,7 +213,7 @@ TEST(StressTest, Prng64DeterminismDistinctSeedsAndSeedZeroNonZeroState) {
   }
 }
 
-TEST(StressTest, Prng64ForkProducesIndependentDeterministicStreams) {
+TEST(Prng64Test, ForkProducesIndependentDeterministicStreams) {
   Prng64 base_a(0xCAFEBABE12345678ULL);
   Prng64 base_b(0xCAFEBABE12345678ULL);
 
@@ -71,7 +239,7 @@ TEST(StressTest, Prng64ForkProducesIndependentDeterministicStreams) {
   EXPECT_THAT(forked_1.NextU64(), t::Ne(forked_2.NextU64()));
 }
 
-TEST(StressTest, Prng64BoundedAndRangeHelpersRespectBoundsAndDistribution) {
+TEST(Prng64Test, BoundedAndRangeHelpersRespectBoundsAndDistribution) {
   Prng64 rng(0x13579BDF2468ACE0ULL);
 
   for (int i = 0; i < 64; ++i) {
@@ -119,7 +287,7 @@ TEST(StressTest, Prng64BoundedAndRangeHelpersRespectBoundsAndDistribution) {
   (void)full_range_val;
 }
 
-TEST(StressTest, Prng64NextPowerOfTwoAlignmentCoversAllValidPowersOfTwo) {
+TEST(Prng64Test, NextPowerOfTwoAlignmentCoversAllValidPowersOfTwo) {
   Prng64 rng(0x9E3779B97F4A7C15ULL);
 
   for (int i = 0; i < 32; ++i) {
@@ -145,37 +313,86 @@ TEST(StressTest, Prng64NextPowerOfTwoAlignmentCoversAllValidPowersOfTwo) {
   }
 }
 
-static std::atomic<int> g_hook_call_count{0};
+TEST(CpuMask128Test, FirstCpusContainsAndContainsAll) {
+  EXPECT_THAT(CpuMask128::FirstCpus(0), t::Eq(CpuMask128{}));
+  EXPECT_THAT(CpuMask128::FirstCpus(1), t::Eq(CpuMask128{0x1, 0}));
+  EXPECT_THAT(CpuMask128::FirstCpus(63), t::Eq(CpuMask128{~0ULL >> 1, 0}));
+  EXPECT_THAT(CpuMask128::FirstCpus(64), t::Eq(CpuMask128{~0ULL, 0}));
+  EXPECT_THAT(CpuMask128::FirstCpus(68), t::Eq(CpuMask128{~0ULL, 0xF}));
+  EXPECT_THAT(CpuMask128::FirstCpus(128), t::Eq(CpuMask128{~0ULL, ~0ULL}));
 
-static bool FailFourTimesThenSucceedHook(uint64_t* const out) {
-  const int call =
-      g_hook_call_count.fetch_add(1, std::memory_order_acq_rel) + 1;
-  if (call < 5) {
+  const CpuMask128 mask{0x5, 0x1};  // CPUs 0, 2 and 64.
+  EXPECT_TRUE(mask.Contains(0));
+  EXPECT_FALSE(mask.Contains(1));
+  EXPECT_TRUE(mask.Contains(2));
+  EXPECT_TRUE(mask.Contains(64));
+  EXPECT_FALSE(mask.Contains(65));
+  EXPECT_FALSE(mask.Contains(-1));
+  EXPECT_FALSE(mask.Contains(128));
+  EXPECT_TRUE(mask.ContainsAll(CpuMask128{0x4, 0x1}));
+  EXPECT_TRUE(mask.ContainsAll(CpuMask128{}));
+  EXPECT_FALSE(mask.ContainsAll(CpuMask128{0x2, 0}));
+  EXPECT_FALSE(mask.ContainsAll(CpuMask128{0x1, 0x2}));
+}
+
+TEST(CpuMask128Test, AtomicAddReportsNewCpusAndIgnoresOutOfRange) {
+  AtomicCpuMask128 mask;
+  EXPECT_TRUE(mask.Add(3));
+  EXPECT_FALSE(mask.Add(3));
+  EXPECT_TRUE(mask.Add(kMaxSupportedCpus - 1));
+  EXPECT_FALSE(mask.Add(-1));
+  EXPECT_FALSE(mask.Add(kMaxSupportedCpus));
+  const CpuMask128 loaded = mask.Load();
+  EXPECT_TRUE(loaded.Contains(3));
+  EXPECT_TRUE(loaded.Contains(kMaxSupportedCpus - 1));
+  EXPECT_THAT(
+      __builtin_popcountll(loaded.low) + __builtin_popcountll(loaded.high),
+      t::Eq(2));
+  mask.Clear();
+  EXPECT_THAT(mask.Load(), t::Eq(CpuMask128{}));
+}
+
+TEST(TscDeadlineTest, ExpiresOnceTheTimeoutHasElapsed) {
+  EXPECT_TRUE(TscDeadline(0).Expired());
+  // Timeouts above INT64_MAX never expire.
+  EXPECT_FALSE(TscDeadline(~0ULL).Expired());
+
+  const TscDeadline short_deadline(1000);
+  const TscDeadline long_deadline(kSelfTestWaitTimeoutTscCycles);
+  std::this_thread::sleep_for(std::chrono::milliseconds(1));
+  EXPECT_TRUE(short_deadline.Expired());
+  EXPECT_FALSE(long_deadline.Expired());
+}
+
+std::atomic<int> g_rdrand_attempts{0};
+
+static bool FailFourTimesThenSucceed(uint64_t* const out) {
+  if (g_rdrand_attempts.fetch_add(1, std::memory_order_relaxed) < 4) {
     return false;
   }
   *out = 0xA5A55A5AF00DCAFEULL;
   return true;
 }
 
-static bool AlwaysFailHook(uint64_t* const /*out*/) {
-  g_hook_call_count.fetch_add(1, std::memory_order_acq_rel);
+static bool AlwaysFail(uint64_t* const /*out*/) {
+  g_rdrand_attempts.fetch_add(1, std::memory_order_relaxed);
   return false;
 }
 
-TEST(StressTest, HardwareEntropyHelpersAndRdrandRetryFallback) {
+TEST_F(StressTest, HardwareEntropyHelpersAndRdrandRetryFallback) {
   SetupEnv(2);
 
   const uint64_t tsc1 = ReadTsc64();
   const uint64_t tsc2 = ReadTsc64();
   EXPECT_THAT(tsc2, t::Ge(tsc1));
 
-  // Verify MixEntropy64 avalanche behavior across single-bit input changes.
+  // Changing one input bit flips about half of the output bits.
   const uint64_t m0 = MixEntropy64(0x123456789ABCDEF0ULL, 1ULL);
   const uint64_t m1 = MixEntropy64(0x123456789ABCDEF0ULL, 2ULL);
   EXPECT_THAT(m0, t::Ne(m1));
   EXPECT_THAT(__builtin_popcountll(m0 ^ m1), t::AllOf(t::Ge(16), t::Le(48)));
 
-  // Test real hardware RDRAND / RDTSC entropy harvesting path.
+  // The real RDRAND (if the host CPU has it) and RDTSC.
   uint64_t hw_val = 0;
   if (CpuSupportsRdrand()) {
     EXPECT_TRUE(TryReadRdrand64(&hw_val));
@@ -186,9 +403,11 @@ TEST(StressTest, HardwareEntropyHelpersAndRdrandRetryFallback) {
   EXPECT_THAT(seed_b, t::Ne(0u));
   EXPECT_THAT(seed_a, t::Ne(seed_b));
 
-  // 1. Simulate CPU without RDRAND support: TryReadRdrand64 must return false
-  //    cleanly and HarvestHardwareEntropySeed must still return non-zero seeds.
-  SetRdrandHookForTest(false, nullptr);
+  // 1. Without RDRAND, TryReadRdrand64 fails cleanly and seeds are still
+  //    non-zero.
+  StressTestHooks no_rdrand;
+  no_rdrand.rdrand_supported = [] { return false; };
+  SetStressTestHooksForTest(no_rdrand);
   EXPECT_FALSE(CpuSupportsRdrand());
   uint64_t unsupported_out = 0xDEADBEEFULL;
   EXPECT_FALSE(TryReadRdrand64(&unsupported_out));
@@ -199,82 +418,99 @@ TEST(StressTest, HardwareEntropyHelpersAndRdrandRetryFallback) {
   EXPECT_THAT(fallback_seed_2, t::Ne(0u));
   EXPECT_THAT(fallback_seed_1, t::Ne(fallback_seed_2));
 
-  // 2. Simulate transient RDRAND FIFO exhaustion that succeeds on attempt 5.
-  g_hook_call_count.store(0, std::memory_order_relaxed);
-  SetRdrandHookForTest(true, FailFourTimesThenSucceedHook);
+  // 2. A transiently empty RDRAND FIFO is retried; attempt 5 succeeds.
+  StressTestHooks flaky_rdrand;
+  flaky_rdrand.rdrand_supported = [] { return true; };
+  flaky_rdrand.rdrand_attempt = FailFourTimesThenSucceed;
+  SetStressTestHooksForTest(flaky_rdrand);
+  g_rdrand_attempts.store(0, std::memory_order_relaxed);
   EXPECT_TRUE(CpuSupportsRdrand());
   uint64_t retry_out = 0;
   EXPECT_TRUE(TryReadRdrand64(&retry_out));
   EXPECT_THAT(retry_out, t::Eq(0xA5A55A5AF00DCAFEULL));
-  EXPECT_THAT(g_hook_call_count.load(), t::Eq(5));
+  EXPECT_THAT(g_rdrand_attempts.load(), t::Eq(5));
 
-  // 3. Simulate persistent RDRAND failure across all 10 retry attempts.
-  g_hook_call_count.store(0, std::memory_order_relaxed);
-  SetRdrandHookForTest(true, AlwaysFailHook);
+  // 3. RDRAND that never delivers gives up after 10 attempts.
+  StressTestHooks broken_rdrand;
+  broken_rdrand.rdrand_supported = [] { return true; };
+  broken_rdrand.rdrand_attempt = AlwaysFail;
+  SetStressTestHooksForTest(broken_rdrand);
+  g_rdrand_attempts.store(0, std::memory_order_relaxed);
   uint64_t exhausted_out = 0x1234ULL;
   EXPECT_FALSE(TryReadRdrand64(&exhausted_out));
   EXPECT_THAT(exhausted_out, t::Eq(0u));
-  EXPECT_THAT(g_hook_call_count.load(), t::Eq(10));
+  EXPECT_THAT(g_rdrand_attempts.load(), t::Eq(10));
 
-  ResetRdrandHookForTest();
-
-  // 4. Verify HarvestHardwareEntropySeed also works when CurrentCpuOrNull() is
-  //    unbound (nullptr).
+  // 4. HarvestHardwareEntropySeed also works without a bound CpuLocal.
   ResetCpuLocalForTest();
   EXPECT_THAT(CurrentCpuOrNull(), t::IsNull());
-  const uint64_t unbound_seed = HarvestHardwareEntropySeed(0x3333ULL);
-  EXPECT_THAT(unbound_seed, t::Ne(0u));
+  EXPECT_THAT(HarvestHardwareEntropySeed(0x3333ULL), t::Ne(0u));
   BindCpuLocal(&g_env.cpu_locals[0]);
 }
 
-TEST(StressTest, RandomizedTaskWeightDispatchWithMockScheduler) {
-  const std::shared_ptr<MockTaskScheduler> mock_sched =
-      std::make_shared<MockTaskScheduler>();
-  Prng64 rng(0x42424242ULL);
+TEST_F(StressTest, ResolveStressTestSeedKeepsNonZeroSeedsAndHarvestsForZero) {
+  SetupEnv(1);
+  EXPECT_THAT(ResolveStressTestSeed(1), t::Eq(1u));
+  EXPECT_THAT(ResolveStressTestSeed(0xFEEDFACECAFEBEEFULL),
+              t::Eq(0xFEEDFACECAFEBEEFULL));
 
-  std::vector<int64_t> observed_weights;
-  std::vector<int> observed_cpus;
+  const uint64_t harvested_a = ResolveStressTestSeed(0);
+  const uint64_t harvested_b = ResolveStressTestSeed(0);
+  EXPECT_THAT(harvested_a, t::Ne(0u));
+  EXPECT_THAT(harvested_b, t::Ne(0u));
+  EXPECT_THAT(harvested_a, t::Ne(harvested_b));
+}
 
-  EXPECT_CALL(*mock_sched, CreateTaskOnCpu)
-      .Times(16)
-      .WillRepeatedly([&](const TaskFn entry,    //
-                          void* const /*arg*/,   //
-                          const int64_t weight,  //
-                          const int target_cpu) -> Task* {
-        EXPECT_THAT(entry, t::NotNull());
-        observed_weights.push_back(weight);
-        observed_cpus.push_back(target_cpu);
-        return reinterpret_cast<Task*>(0x1000);
-      });
-  EXPECT_CALL(*mock_sched, Yield).Times(16);
+TEST_F(StressTest, ScopedLapicTimerBoostSpeedsUpAndRestoresEveryCpu) {
+  constexpr int kNumCpus = 3;
+  SetupEnv(kNumCpus);
 
-  for (int i = 0; i < 16; ++i) {
-    const int64_t weight = rng.NextRange(kMinTaskWeight, kMaxTaskWeight);
-    const int target_cpu = rng.NextIntRange(0, 3);
-    Task* const t = mock_sched->CreateTaskOnCpu([](void* const /*arg*/) {},  //
-                                                nullptr,                     //
-                                                weight,                      //
-                                                target_cpu);
-    EXPECT_THAT(t, t::NotNull());
-    mock_sched->Yield();
+  {
+    ScopedLapicTimerBoost boost(true);
+    for (int cpu = 0; cpu < kNumCpus; ++cpu) {
+      EXPECT_THAT(ProgrammedTimerCounts(cpu),
+                  t::ElementsAre(kFakeBoostedTimerCount));
+    }
+    boost.Restore();
+  }
+  // The destructor doesn't restore the counts a second time.
+  for (int cpu = 0; cpu < kNumCpus; ++cpu) {
+    EXPECT_THAT(
+        ProgrammedTimerCounts(cpu),
+        t::ElementsAre(kFakeBoostedTimerCount, kFakeCalibratedTimerCount));
   }
 
-  ASSERT_THAT(static_cast<int>(observed_weights.size()), t::Eq(16));
-  for (int i = 0; i < 16; ++i) {
-    EXPECT_THAT(observed_weights[i],
-                t::AllOf(t::Ge(kMinTaskWeight), t::Le(kMaxTaskWeight)));
-    EXPECT_THAT(observed_cpus[i], t::AllOf(t::Ge(0), t::Le(3)));
+  ResetFakeLapicTimers(kFakeCalibratedTimerCount);
+  {
+    const ScopedLapicTimerBoost boost(true);
+  }
+  EXPECT_THAT(
+      ProgrammedTimerCounts(kNumCpus - 1),
+      t::ElementsAre(kFakeBoostedTimerCount, kFakeCalibratedTimerCount));
+
+  // Neither a disabled boost nor a calibrated count too small to divide by 16
+  // reprograms any timer.
+  ResetFakeLapicTimers(kFakeCalibratedTimerCount);
+  {
+    const ScopedLapicTimerBoost boost(false);
+  }
+  ResetFakeLapicTimers(32);
+  {
+    const ScopedLapicTimerBoost boost(true);
+  }
+  for (int cpu = 0; cpu < kNumCpus; ++cpu) {
+    EXPECT_THAT(ProgrammedTimerCounts(cpu), t::IsEmpty());
   }
 }
 
-TEST(StressTest, SingleCpuRandomizedStressRestoresExactBaselines) {
+TEST_F(StressTest, SingleCpuRandomizedStressRestoresExactBaselines) {
   SetupEnv(1);
   TaskInit();
 
   const int64_t pmm_before = PmmFreeFrameCount();
   const int64_t heap_before = HeapTotalFreeBytes();
 
-  StressTestConfig config = {};
+  StressTestConfig config;
   config.seed = 0xABCDEF0123456789ULL;
   config.num_workers = 4;
   config.rounds_per_worker = 12;
@@ -282,19 +518,26 @@ TEST(StressTest, SingleCpuRandomizedStressRestoresExactBaselines) {
   config.max_heap_alloc_bytes = 1024;
   config.max_pmm_alloc_frames = 3;
   config.boost_lapic_timer = false;
-  config.log_to_console = false;
+  config.wait_timeout_tsc_cycles = kHostWaitTimeoutTscCycles;
 
   const StressTestStats stats = ExecuteRandomMultiCpuStress(config);
 
   EXPECT_THAT(stats.seed, t::Eq(config.seed));
   EXPECT_THAT(stats.cpu_count, t::Eq(1));
   EXPECT_THAT(stats.cpu_participation_mask, t::Eq(0x1u));
+  EXPECT_THAT(stats.cpu_participation_mask_high, t::Eq(0u));
   EXPECT_THAT(stats.cooperative_yields, t::Gt(0));
   EXPECT_THAT(stats.preemptive_spin_bursts, t::Gt(0));
   EXPECT_THAT(stats.timer_preemptions_observed, t::Gt(0));
+  EXPECT_THAT(stats.wakeup_ipis_sent, t::Eq(0));
+  EXPECT_THAT(stats.task_migrations_observed, t::Eq(0));
+  EXPECT_THAT(stats.cross_cpu_steals_verified, t::Eq(0));
   EXPECT_THAT(stats.child_tasks_joined, t::Gt(0));
   EXPECT_THAT(stats.child_tasks_detached, t::Gt(0));
   EXPECT_THAT(stats.zombies_reaped, t::Eq(stats.child_tasks_detached));
+  // The workers requested child tasks with both extreme weights.
+  EXPECT_THAT(stats.min_child_task_weight, t::Eq(kMinTaskWeight));
+  EXPECT_THAT(stats.max_child_task_weight, t::Eq(kMaxTaskWeight));
   EXPECT_THAT(stats.kmalloc_ops, t::Gt(0));
   EXPECT_THAT(stats.kmalloc_aligned_ops, t::Gt(0));
   EXPECT_THAT(stats.cpp_new_delete_ops, t::Gt(0));
@@ -308,55 +551,19 @@ TEST(StressTest, SingleCpuRandomizedStressRestoresExactBaselines) {
   EXPECT_THAT(stats.heap_free_after, t::Eq(heap_before));
   EXPECT_THAT(PmmFreeFrameCount(), t::Eq(pmm_before));
   EXPECT_THAT(HeapTotalFreeBytes(), t::Eq(heap_before));
-
-  TaskResetForTest();
+  EXPECT_THAT(ProgrammedTimerCounts(0), t::IsEmpty());
 }
 
-TEST(StressTest, MultiThreadedFourCpuRandomizedStressAndConsoleEntryPoint) {
+TEST_F(StressTest, FourCpuRandomizedStressAndConsoleEntryPoint) {
   constexpr int kNumCpus = 4;
   SetupEnv(kNumCpus);
   TaskInit();
 
   const int64_t pmm_before = PmmFreeFrameCount();
   const int64_t heap_before = HeapTotalFreeBytes();
+  SimulatedAps aps(kNumCpus);
 
-  std::atomic<int> ready_aps{0};
-  std::atomic<bool> stop_aps{false};
-  std::vector<std::thread> ap_threads;
-  ap_threads.reserve(kNumCpus - 1);
-
-  for (int cpu = 1; cpu < kNumCpus; ++cpu) {
-    ap_threads.emplace_back([cpu, &ready_aps, &stop_aps]() {
-      BindCpuLocal(SmpGetCpuLocal(cpu));
-      SetInterruptsEnabledForTest(true);
-      ready_aps.fetch_add(1, std::memory_order_acq_rel);
-
-      int64_t handled_ipis = 0;
-      const std::shared_ptr<TaskScheduler>& ap_sched = GetTaskScheduler();
-      while (!stop_aps.load(std::memory_order_acquire)) {
-        const int64_t sent_ipis =
-            g_env.ipi_sent_count[cpu].load(std::memory_order_acquire);
-        if (sent_ipis > handled_ipis && IdtIsInitialized() &&
-            AreInterruptsEnabled()) {
-          handled_ipis = sent_ipis;
-          InterruptFrame ipi_frame = {};
-          ipi_frame.vector = kVectorWakeupIpi;
-          ipi_frame.rflags = internal::kRflagsInterruptEnableBit;
-          IdtDispatch(&ipi_frame);
-        }
-        if (ap_sched == nullptr || !ap_sched->PollIdleCpu(cpu)) {
-          std::this_thread::yield();
-        }
-      }
-      ResetCpuLocalForTest();
-    });
-  }
-
-  while (ready_aps.load(std::memory_order_acquire) < (kNumCpus - 1)) {
-    std::this_thread::yield();
-  }
-
-  StressTestConfig config = {};
+  StressTestConfig config;
   config.seed = 0x55AA55AA12349876ULL;
   config.num_workers = 8;
   config.rounds_per_worker = 16;
@@ -364,21 +571,23 @@ TEST(StressTest, MultiThreadedFourCpuRandomizedStressAndConsoleEntryPoint) {
   config.max_heap_alloc_bytes = 2048;
   config.max_pmm_alloc_frames = 3;
   config.boost_lapic_timer = true;
-  config.log_to_console = false;
+  config.wait_timeout_tsc_cycles = kHostWaitTimeoutTscCycles;
 
   const StressTestStats stats = ExecuteRandomMultiCpuStress(config);
 
   EXPECT_THAT(stats.seed, t::Eq(config.seed));
   EXPECT_THAT(stats.cpu_count, t::Eq(kNumCpus));
-  EXPECT_THAT(stats.cpu_participation_mask & 0xFu, t::Eq(0xFu));
+  EXPECT_THAT(stats.cpu_participation_mask, t::Eq(0xFu));
   EXPECT_THAT(stats.cooperative_yields, t::Gt(0));
   EXPECT_THAT(stats.preemptive_spin_bursts, t::Gt(0));
   EXPECT_THAT(stats.timer_preemptions_observed, t::Gt(0));
   EXPECT_THAT(stats.wakeup_ipis_sent, t::Gt(0));
-  EXPECT_THAT(stats.task_migrations_observed, t::Gt(0));
+  EXPECT_THAT(stats.cross_cpu_steals_verified, t::Eq(kNumCpus - 1));
   EXPECT_THAT(stats.child_tasks_joined, t::Gt(0));
   EXPECT_THAT(stats.child_tasks_detached, t::Gt(0));
   EXPECT_THAT(stats.zombies_reaped, t::Eq(stats.child_tasks_detached));
+  EXPECT_THAT(stats.min_child_task_weight, t::Eq(kMinTaskWeight));
+  EXPECT_THAT(stats.max_child_task_weight, t::Eq(kMaxTaskWeight));
   EXPECT_THAT(stats.kmalloc_ops, t::Gt(0));
   EXPECT_THAT(stats.kmalloc_aligned_ops, t::Gt(0));
   EXPECT_THAT(stats.cpp_new_delete_ops, t::Gt(0));
@@ -390,56 +599,55 @@ TEST(StressTest, MultiThreadedFourCpuRandomizedStressAndConsoleEntryPoint) {
   EXPECT_THAT(stats.pmm_free_after, t::Eq(pmm_before));
   EXPECT_THAT(stats.heap_free_before, t::Eq(heap_before));
   EXPECT_THAT(stats.heap_free_after, t::Eq(heap_before));
-
-  // Also test the kernel_main entry point RunRandomMultiCpuStressTest with
-  // hardware-seeded entropy (seed_override == 0) and verify UART/VGA markers.
-  RunRandomMultiCpuStressTest(0);
-
-  stop_aps.store(true, std::memory_order_release);
-  for (std::thread& th : ap_threads) {
-    th.join();
+  // The run sped up the LAPIC timer of every CPU and restored it afterwards.
+  for (int cpu = 0; cpu < kNumCpus; ++cpu) {
+    EXPECT_THAT(
+        ProgrammedTimerCounts(cpu),
+        t::ElementsAre(kFakeBoostedTimerCount, kFakeCalibratedTimerCount))
+        << "CPU " << cpu;
   }
+
+  // The entry point that kernel_main runs: the default config, with console
+  // output.
+  RunRandomMultiCpuStressTest(0x5EED5EED12345678ULL);
+  aps.Stop();
 
   EXPECT_THAT(PmmFreeFrameCount(), t::Eq(pmm_before));
   EXPECT_THAT(HeapTotalFreeBytes(), t::Eq(heap_before));
-
-  {
-    const std::lock_guard<std::mutex> lock(g_env.log_mutex);
-    EXPECT_THAT(g_env.uart_log, t::HasSubstr("[STRESS] seed=0x"));
-    EXPECT_THAT(g_env.uart_log,
-                t::HasSubstr("[STRESS] random_multicpu_stress: PASS\n"));
-    EXPECT_THAT(g_env.uart_log, t::Not(t::HasSubstr("FAIL")));
-    EXPECT_THAT(g_env.vga_log,
-                t::HasSubstr("\r[STRESS] random_multicpu_stress: PASS #"));
-    EXPECT_THAT(g_env.vga_log, t::HasSubstr("seed=0x"));
-    EXPECT_THAT(g_env.vga_log, t::Not(t::HasSubstr("FAIL")));
-  }
-
-  TaskResetForTest();
+  const std::lock_guard<std::mutex> lock(g_env.log_mutex);
+  EXPECT_THAT(g_env.uart_log,
+              t::HasSubstr("[STRESS] seed=0x5EED5EED12345678\n"));
+  EXPECT_THAT(g_env.uart_log,
+              t::HasSubstr("[STRESS] random_multicpu_stress: PASS\n"));
+  EXPECT_THAT(g_env.uart_log, t::Not(t::HasSubstr("FAIL")));
+  EXPECT_THAT(g_env.vga_log,
+              t::HasSubstr("\r[STRESS] random_multicpu_stress: PASS #"));
+  EXPECT_THAT(g_env.vga_log, t::HasSubstr("seed=0x5EED5EED12345678"));
+  EXPECT_THAT(g_env.vga_log, t::Not(t::HasSubstr("FAIL")));
 }
 
-TEST(StressTest, MinimalConfigAndDelayedApFourCpuRendezvousBarrier) {
-  // 1. Minimal configuration on 1 CPU (num_workers = 1, rounds_per_worker = 1,
-  //    max_live_allocs_per_worker = 1) must exercise all 4 allocation families.
+TEST_F(StressTest, MinimalConfigOnOneCpuAndOnFourCpusWithALateAp) {
+  StressTestConfig config;
+  config.num_workers = 1;
+  config.rounds_per_worker = 1;
+  config.max_live_allocs_per_worker = 1;
+  config.max_heap_alloc_bytes = 64;
+  config.max_pmm_alloc_frames = 1;
+  config.boost_lapic_timer = false;
+  config.wait_timeout_tsc_cycles = kHostWaitTimeoutTscCycles;
+
+  // 1. One CPU: the single worker still uses all four allocation kinds.
   {
     SetupEnv(1);
     TaskInit();
-
     const int64_t pmm_before = PmmFreeFrameCount();
     const int64_t heap_before = HeapTotalFreeBytes();
 
-    StressTestConfig min_cfg = {};
-    min_cfg.seed = 0x1122334455667788ULL;
-    min_cfg.num_workers = 1;
-    min_cfg.rounds_per_worker = 1;
-    min_cfg.max_live_allocs_per_worker = 1;
-    min_cfg.max_heap_alloc_bytes = 64;
-    min_cfg.max_pmm_alloc_frames = 1;
-    min_cfg.boost_lapic_timer = false;
-    min_cfg.log_to_console = false;
+    config.seed = 0x1122334455667788ULL;
+    const StressTestStats stats = ExecuteRandomMultiCpuStress(config);
 
-    const StressTestStats stats = ExecuteRandomMultiCpuStress(min_cfg);
     EXPECT_THAT(stats.cpu_participation_mask, t::Eq(0x1u));
+    EXPECT_THAT(stats.timer_preemptions_observed, t::Gt(0));
     EXPECT_THAT(stats.kmalloc_ops, t::Ge(1));
     EXPECT_THAT(stats.kmalloc_aligned_ops, t::Ge(1));
     EXPECT_THAT(stats.cpp_new_delete_ops, t::Ge(1));
@@ -449,84 +657,28 @@ TEST(StressTest, MinimalConfigAndDelayedApFourCpuRendezvousBarrier) {
     EXPECT_THAT(stats.stack_canary_corruptions, t::Eq(0));
     EXPECT_THAT(stats.pmm_free_after, t::Eq(pmm_before));
     EXPECT_THAT(stats.heap_free_after, t::Eq(heap_before));
-
-    TaskResetForTest();
   }
 
-  // 2. Minimal configuration (num_workers = 1, rounds_per_worker = 1) on 4 CPUs
-  //    with a delayed AP thread (CPU 3 sleeping 15 ms before entering
-  //    PollIdleCpu) must still achieve full 4-CPU participation (0xF) and
-  //    migrations > 0 via the Pigeonhole Principle rendezvous barrier without
-  //    having its barrier task stolen and prematurely completed by CPU 0 or
-  //    other APs.
+  // 2. Four CPUs, one worker, and AP 3 starting its idle loop 15 ms late: the
+  //    final steal check keeps waking AP 3 until it has stolen its task, so
+  //    all four CPUs still take part.
   {
     constexpr int kNumCpus = 4;
     SetupEnv(kNumCpus);
     TaskInit();
-
     const int64_t pmm_before = PmmFreeFrameCount();
     const int64_t heap_before = HeapTotalFreeBytes();
+    SimulatedAps aps(kNumCpus, 3, std::chrono::milliseconds(15));
 
-    std::atomic<int> ready_aps{0};
-    std::atomic<bool> stop_aps{false};
-    std::vector<std::thread> ap_threads;
-    ap_threads.reserve(kNumCpus - 1);
-
-    for (int cpu = 1; cpu < kNumCpus; ++cpu) {
-      ap_threads.emplace_back([cpu, &ready_aps, &stop_aps]() {
-        BindCpuLocal(SmpGetCpuLocal(cpu));
-        SetInterruptsEnabledForTest(true);
-        ready_aps.fetch_add(1, std::memory_order_acq_rel);
-
-        if (cpu == 3) {
-          std::this_thread::sleep_for(std::chrono::milliseconds(15));
-        }
-
-        int64_t handled_ipis = 0;
-        const std::shared_ptr<TaskScheduler>& ap_sched = GetTaskScheduler();
-        while (!stop_aps.load(std::memory_order_acquire)) {
-          const int64_t sent_ipis =
-              g_env.ipi_sent_count[cpu].load(std::memory_order_acquire);
-          if (sent_ipis > handled_ipis && IdtIsInitialized() &&
-              AreInterruptsEnabled()) {
-            handled_ipis = sent_ipis;
-            InterruptFrame ipi_frame = {};
-            ipi_frame.vector = kVectorWakeupIpi;
-            ipi_frame.rflags = internal::kRflagsInterruptEnableBit;
-            IdtDispatch(&ipi_frame);
-          }
-          if (ap_sched == nullptr || !ap_sched->PollIdleCpu(cpu)) {
-            std::this_thread::yield();
-          }
-        }
-        ResetCpuLocalForTest();
-      });
-    }
-
-    while (ready_aps.load(std::memory_order_acquire) < (kNumCpus - 1)) {
-      std::this_thread::yield();
-    }
-
-    StressTestConfig delayed_cfg = {};
-    delayed_cfg.seed = 0xDEADC0DEBEEF1234ULL;
-    delayed_cfg.num_workers = 1;
-    delayed_cfg.rounds_per_worker = 1;
-    delayed_cfg.max_live_allocs_per_worker = 1;
-    delayed_cfg.max_heap_alloc_bytes = 128;
-    delayed_cfg.max_pmm_alloc_frames = 1;
-    delayed_cfg.boost_lapic_timer = false;
-    delayed_cfg.log_to_console = false;
-
-    const StressTestStats stats = ExecuteRandomMultiCpuStress(delayed_cfg);
-
-    stop_aps.store(true, std::memory_order_release);
-    for (std::thread& th : ap_threads) {
-      th.join();
-    }
+    config.seed = 0xDEADC0DEBEEF1234ULL;
+    config.max_heap_alloc_bytes = 128;
+    const StressTestStats stats = ExecuteRandomMultiCpuStress(config);
+    aps.Stop();
 
     EXPECT_THAT(stats.cpu_count, t::Eq(kNumCpus));
-    EXPECT_THAT(stats.cpu_participation_mask & 0xFu, t::Eq(0xFu));
-    EXPECT_THAT(stats.task_migrations_observed, t::Gt(0));
+    EXPECT_THAT(stats.cpu_participation_mask, t::Eq(0xFu));
+    EXPECT_THAT(stats.cross_cpu_steals_verified, t::Eq(kNumCpus - 1));
+    EXPECT_THAT(stats.timer_preemptions_observed, t::Gt(0));
     EXPECT_THAT(stats.kmalloc_ops, t::Ge(1));
     EXPECT_THAT(stats.kmalloc_aligned_ops, t::Ge(1));
     EXPECT_THAT(stats.cpp_new_delete_ops, t::Ge(1));
@@ -538,12 +690,46 @@ TEST(StressTest, MinimalConfigAndDelayedApFourCpuRendezvousBarrier) {
     EXPECT_THAT(stats.heap_free_after, t::Eq(heap_before));
     EXPECT_THAT(PmmFreeFrameCount(), t::Eq(pmm_before));
     EXPECT_THAT(HeapTotalFreeBytes(), t::Eq(heap_before));
-
-    TaskResetForTest();
   }
 }
 
-TEST(StressDeathTest, PreconditionViolationsTriggerDcheck) {
+TEST_F(StressTest, SupportsMoreThan64CpusUpTo128) {
+  for (const int num_cpus : {68, kMaxSupportedCpus}) {
+    SCOPED_TRACE(num_cpus);
+    SetupEnv(num_cpus);
+    TaskInit();
+    ASSERT_THAT(GetTaskScheduler(), t::NotNull());
+
+    const int64_t pmm_before = PmmFreeFrameCount();
+    const int64_t heap_before = HeapTotalFreeBytes();
+    SimulatedAps aps(num_cpus);
+
+    StressTestConfig config;
+    config.seed = 0x123456789ABCDEF0ULL ^ static_cast<uint64_t>(num_cpus);
+    config.num_workers = 8;
+    config.rounds_per_worker = 2;
+    config.max_live_allocs_per_worker = 2;
+    config.max_heap_alloc_bytes = 256;
+    config.max_pmm_alloc_frames = 1;
+    config.boost_lapic_timer = false;
+    config.wait_timeout_tsc_cycles = kHostWaitTimeoutTscCycles;
+
+    const StressTestStats stats = ExecuteRandomMultiCpuStress(config);
+    aps.Stop();
+
+    const CpuMask128 all_cpus = CpuMask128::FirstCpus(num_cpus);
+    EXPECT_THAT(stats.cpu_count, t::Eq(num_cpus));
+    EXPECT_THAT(stats.cpu_participation_mask, t::Eq(all_cpus.low));
+    EXPECT_THAT(stats.cpu_participation_mask_high, t::Eq(all_cpus.high));
+    EXPECT_THAT(stats.cross_cpu_steals_verified, t::Eq(num_cpus - 1));
+    EXPECT_THAT(stats.payload_corruptions, t::Eq(0));
+    EXPECT_THAT(stats.stack_canary_corruptions, t::Eq(0));
+    EXPECT_THAT(stats.pmm_free_after, t::Eq(pmm_before));
+    EXPECT_THAT(stats.heap_free_after, t::Eq(heap_before));
+  }
+}
+
+TEST_F(StressDeathTest, InvalidArgumentsAndConfigsCheckFail) {
   SetupEnv(1);
   TaskInit();
 
@@ -559,136 +745,47 @@ TEST(StressDeathTest, PreconditionViolationsTriggerDcheck) {
   EXPECT_DEATH(Prng64(1).NextPowerOfTwoAlignment(16, 15), "Check failed");
   EXPECT_DEATH(Prng64(1).NextPowerOfTwoAlignment(32, 16), "Check failed");
 
-  StressTestConfig bad_workers = {};
-  bad_workers.num_workers = -1;
-  EXPECT_DEATH(ExecuteRandomMultiCpuStress(bad_workers), "Check failed");
-
-  StressTestConfig bad_workers_high = {};
-  bad_workers_high.num_workers = 65;
-  EXPECT_DEATH(ExecuteRandomMultiCpuStress(bad_workers_high), "Check failed");
-
-  StressTestConfig bad_rounds = {};
-  bad_rounds.rounds_per_worker = 0;
-  EXPECT_DEATH(ExecuteRandomMultiCpuStress(bad_rounds), "Check failed");
-
-  StressTestConfig bad_rounds_high = {};
-  bad_rounds_high.rounds_per_worker = 4097;
-  EXPECT_DEATH(ExecuteRandomMultiCpuStress(bad_rounds_high), "Check failed");
-
-  StressTestConfig bad_slots = {};
-  bad_slots.max_live_allocs_per_worker = 0;
-  EXPECT_DEATH(ExecuteRandomMultiCpuStress(bad_slots), "Check failed");
-
-  StressTestConfig bad_slots_high = {};
-  bad_slots_high.max_live_allocs_per_worker = 9;
-  EXPECT_DEATH(ExecuteRandomMultiCpuStress(bad_slots_high), "Check failed");
-
-  StressTestConfig bad_heap = {};
-  bad_heap.max_heap_alloc_bytes = 8;
-  EXPECT_DEATH(ExecuteRandomMultiCpuStress(bad_heap), "Check failed");
-
-  StressTestConfig bad_heap_high = {};
-  bad_heap_high.max_heap_alloc_bytes = 16385;
-  EXPECT_DEATH(ExecuteRandomMultiCpuStress(bad_heap_high), "Check failed");
-
-  StressTestConfig bad_pmm = {};
-  bad_pmm.max_pmm_alloc_frames = 0;
-  EXPECT_DEATH(ExecuteRandomMultiCpuStress(bad_pmm), "Check failed");
-
-  StressTestConfig bad_pmm_high = {};
-  bad_pmm_high.max_pmm_alloc_frames = 9;
-  EXPECT_DEATH(ExecuteRandomMultiCpuStress(bad_pmm_high), "Check failed");
-
-  TaskResetForTest();
+  // Each config field just outside its valid range.
+  StressTestConfig config;
+  config.num_workers = -1;
+  EXPECT_DEATH(ExecuteRandomMultiCpuStress(config), "Check failed");
+  config = {};
+  config.num_workers = kMaxStressWorkers + 1;
+  EXPECT_DEATH(ExecuteRandomMultiCpuStress(config), "Check failed");
+  config = {};
+  config.rounds_per_worker = 0;
+  EXPECT_DEATH(ExecuteRandomMultiCpuStress(config), "Check failed");
+  config = {};
+  config.rounds_per_worker = kMaxStressRoundsPerWorker + 1;
+  EXPECT_DEATH(ExecuteRandomMultiCpuStress(config), "Check failed");
+  config = {};
+  config.max_live_allocs_per_worker = 0;
+  EXPECT_DEATH(ExecuteRandomMultiCpuStress(config), "Check failed");
+  config = {};
+  config.max_live_allocs_per_worker = kMaxStressLiveAllocsPerWorker + 1;
+  EXPECT_DEATH(ExecuteRandomMultiCpuStress(config), "Check failed");
+  config = {};
+  config.max_heap_alloc_bytes = kMinStressHeapAllocBytes - 1;
+  EXPECT_DEATH(ExecuteRandomMultiCpuStress(config), "Check failed");
+  config = {};
+  config.max_heap_alloc_bytes = kMaxStressHeapAllocBytes + 1;
+  EXPECT_DEATH(ExecuteRandomMultiCpuStress(config), "Check failed");
+  config = {};
+  config.max_pmm_alloc_frames = 0;
+  EXPECT_DEATH(ExecuteRandomMultiCpuStress(config), "Check failed");
+  config = {};
+  config.max_pmm_alloc_frames = kMaxStressPmmAllocFrames + 1;
+  EXPECT_DEATH(ExecuteRandomMultiCpuStress(config), "Check failed");
+  config = {};
+  config.wait_timeout_tsc_cycles = 0;
+  EXPECT_DEATH(ExecuteRandomMultiCpuStress(config), "Check failed");
 
   SetupEnv(kMaxSupportedCpus + 1);
   TaskInit();
-  StressTestConfig over_max_cpus = {};
-  over_max_cpus.num_workers = 1;
-  over_max_cpus.rounds_per_worker = 1;
-  EXPECT_DEATH(ExecuteRandomMultiCpuStress(over_max_cpus), "Check failed");
-  TaskResetForTest();
-}
-
-TEST(StressTest, ExecuteRandomMultiCpuStressSupportsGreaterThan64CpusUpTo128) {
-  for (const int num_cpus : {68, kMaxSupportedCpus}) {
-    SetupEnv(num_cpus);
-    TaskInit();
-    g_env.active_scheduler = GetTaskScheduler();
-    ASSERT_THAT(g_env.active_scheduler, t::NotNull());
-
-    const int64_t pmm_before = PmmFreeFrameCount();
-    const int64_t heap_before = HeapTotalFreeBytes();
-
-    std::atomic<bool> stop_aps{false};
-    std::atomic<int> ready_aps{0};
-    std::vector<std::thread> ap_threads;
-    ap_threads.reserve(num_cpus - 1);
-
-    for (int cpu = 1; cpu < num_cpus; ++cpu) {
-      ap_threads.emplace_back([cpu, &stop_aps, &ready_aps]() {
-        BindCpuLocal(&g_env.cpu_locals[cpu]);
-        SetInterruptsEnabledForTest(true);
-        ready_aps.fetch_add(1, std::memory_order_acq_rel);
-
-        int64_t handled_ipis = 0;
-        const std::shared_ptr<TaskScheduler>& ap_sched = GetTaskScheduler();
-        while (!stop_aps.load(std::memory_order_acquire)) {
-          const int64_t sent_ipis =
-              g_env.ipi_sent_count[cpu].load(std::memory_order_acquire);
-          if (sent_ipis > handled_ipis && IdtIsInitialized() &&
-              AreInterruptsEnabled()) {
-            handled_ipis = sent_ipis;
-            InterruptFrame ipi_frame = {};
-            ipi_frame.vector = kVectorWakeupIpi;
-            ipi_frame.rflags = internal::kRflagsInterruptEnableBit;
-            IdtDispatch(&ipi_frame);
-          }
-          if (ap_sched == nullptr || !ap_sched->PollIdleCpu(cpu)) {
-            std::this_thread::yield();
-          }
-        }
-        ResetCpuLocalForTest();
-      });
-    }
-
-    while (ready_aps.load(std::memory_order_acquire) < (num_cpus - 1)) {
-      std::this_thread::yield();
-    }
-
-    StressTestConfig cfg = {};
-    cfg.seed = 0x123456789ABCDEF0ULL ^ static_cast<uint64_t>(num_cpus);
-    cfg.num_workers = 8;
-    cfg.rounds_per_worker = 2;
-    cfg.max_live_allocs_per_worker = 2;
-    cfg.max_heap_alloc_bytes = 256;
-    cfg.max_pmm_alloc_frames = 1;
-    cfg.boost_lapic_timer = false;
-    cfg.log_to_console = false;
-
-    const StressTestStats stats = ExecuteRandomMultiCpuStress(cfg);
-
-    stop_aps.store(true, std::memory_order_release);
-    for (std::thread& th : ap_threads) {
-      th.join();
-    }
-
-    const uint64_t expected_high =
-        (num_cpus >= 128)
-            ? ~0ULL
-            : ((1ULL << static_cast<uint32_t>(num_cpus - 64)) - 1ULL);
-    EXPECT_THAT(stats.cpu_count, t::Eq(num_cpus));
-    EXPECT_THAT(stats.cpu_participation_mask, t::Eq(~0ULL));
-    EXPECT_THAT(stats.cpu_participation_mask_high & expected_high,
-                t::Eq(expected_high));
-    EXPECT_THAT(stats.task_migrations_observed, t::Gt(0));
-    EXPECT_THAT(stats.payload_corruptions, t::Eq(0));
-    EXPECT_THAT(stats.stack_canary_corruptions, t::Eq(0));
-    EXPECT_THAT(stats.pmm_free_after, t::Eq(pmm_before));
-    EXPECT_THAT(stats.heap_free_after, t::Eq(heap_before));
-
-    TaskResetForTest();
-  }
+  config = {};
+  config.num_workers = 1;
+  config.rounds_per_worker = 1;
+  EXPECT_DEATH(ExecuteRandomMultiCpuStress(config), "Check failed");
 }
 
 }  // namespace

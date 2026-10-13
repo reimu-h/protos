@@ -1,15 +1,65 @@
 #ifndef PROTOS_CORE_RUNQUEUE_SCHEDULER_H_
 #define PROTOS_CORE_RUNQUEUE_SCHEDULER_H_
 
+#include <cstdint>
 #include <memory>
 
 #include "task.h"
 
 namespace protos {
 
-// Creates the innermost core per-CPU weighted Red-Black Tree runqueue and
-// context-switch task scheduler layer.
+// Creates the innermost scheduler layer: one red-black tree runqueue per CPU,
+// ordered by weighted virtual runtime (`vruntime`), plus the low-level context
+// switch. It must be the innermost layer, because outer layers forward to it
+// and it never calls into an inner scheduler. On its own it implements only
+// part of the `TaskScheduler` contract in task.h and departs from it as
+// follows; outer layers (see `TaskInit()`) supply the rest:
+//
+// - `CreateTask()` always places the task on CPU 0, and `CreateTaskOnCpu()`
+//   never sends a wakeup IPI. Placement and wakeups belong to the
+//   work-stealing layer.
+// - `SetPreemptEnabled()` does nothing and `IsPreemptEnabled()` always returns
+//   true. The preemptive layer decides whether an interrupt may preempt.
+// - `ReapZombies()` reclaims nothing and returns 0. A task's stack is freed
+//   when it exits and its TCB when it is joined; the join-lifecycle layer
+//   keeps track of tasks that nobody joins.
+// - `Join()` busy-waits, yielding until the task has exited.
+// - `RunqueueLoad()` counts only the queued tasks that `StealTask()` may
+//   migrate: the running task, the idle tasks and the bootstrap task are
+//   excluded, so a CPU running one task with nothing queued reports 0. It
+//   returns 0 before `Init()`.
+// - `StealTask()` moves the leftmost stealable task of `src_cpu` and keeps its
+//   `vruntime` offset from `src_cpu`'s `min_vruntime`, rebased on `dst_cpu`'s.
+//
+// Boot contexts: `Init()` adopts the calling context (`kernel_main()` on the
+// BSP) as the bootstrap task and each AP's boot context (the idle loop in
+// `ApKernelEntry()`) as that AP's idle task. The bootstrap task is never
+// stolen, so it is always running on CPU 0 or queued there, and CPU 0 has no
+// idle task. An idle task runs only while its CPU has nothing queued. It is
+// not preempted by interrupts: the idle loop switches to queued work by calling
+// `PollIdleCpu()` each time it wakes up, and is resumed only when a task exits
+// while nothing else is queued on that CPU. Work that the idle loop performs
+// itself, such as `SmpRunOnAllCpus()` callbacks, therefore waits while tasks
+// run on that AP.
+//
+// Interrupts and threading: methods may be called on any CPU and disable local
+// interrupts internally where they touch per-CPU state. `OnTimerInterrupt()`,
+// `OnWakeupIpi()` and `PollIdleCpu()` do nothing before `Init()` or on an
+// unbound or offline CPU, and `PollIdleCpu(cpu_index)` does nothing unless
+// called on CPU `cpu_index`. `Yield()`, `Join()` and returning from a task
+// must not happen while an `IrqSpinLock` is held. `Init()` must run on the BSP
+// after `SmpInit()` (which binds the BSP's `CpuLocal`) and `IdtInit()`.
+//
+// Each task stack the core allocates has a canary at its lowest address. The
+// core CHECK-fails if a task overwrote it (overflowed its stack) when the task
+// is switched out or exits.
 std::shared_ptr<TaskScheduler> CreateCoreRunqueueScheduler();
+
+#if __STDC_HOSTED__
+// Returns the lowest address of the stack that the core allocated for `task`,
+// where the stack canary lives. For host unit tests only.
+uintptr_t CoreTaskStackBaseForTest(const Task* task);
+#endif
 
 }  // namespace protos
 

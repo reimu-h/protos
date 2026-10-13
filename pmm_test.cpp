@@ -6,8 +6,9 @@
 
 #include <atomic>
 #include <cstdint>
+#include <cstdio>
 #include <cstring>
-#include <memory>
+#include <ostream>
 #include <string>
 #include <thread>
 #include <vector>
@@ -33,16 +34,27 @@ asm(".globl g_kernel_start\n"
     ".set g_kernel_end, g_fake_ram + (20 * 4096)\n");
 
 namespace protos {
+
+void PrintTo(const PmmIntervalForTest& interval, std::ostream* const os) {
+  *os << "[0x" << std::hex << interval.start << ", 0x" << interval.end << ")"
+      << std::dec;
+}
+
 namespace {
 
 namespace t = ::testing;
 
 constexpr int64_t kFakeRamFrames = 4096;
 constexpr int64_t kFakeRamBytes = kFakeRamFrames * kPageSize;
+constexpr uint32_t kMemoryTypeReserved = 2;
 
 struct FakeEnvState {
   MultibootMemoryMap map = {};
   bool parse_ok = true;
+  int parse_calls = 0;
+  uint32_t parsed_magic = 0;
+  uint64_t parsed_info_addr = 0;
+  uintptr_t parsed_max_physical_addr = 0;
   bool fail_extend_map = false;
   int extend_map_calls = 0;
   uintptr_t last_extend_max_phys = 0;
@@ -83,40 +95,87 @@ static void ResetFakeEnv(const int64_t zero_frames = 256) {
   }
 }
 
+// Appends a region to the memory map that the fake parser hands to `PmmInit`.
 static void AddRegion(const uintptr_t base,  //
                       const int64_t length,  //
                       const uint32_t type) {
   const int idx = g_env.map.region_count;
   g_env.map.regions[idx] = {base, length, type};
   ++g_env.map.region_count;
-  g_env.map.total_ram_bytes += length;
-  if (type == kMemoryTypeAvailable) {
-    g_env.map.usable_ram_bytes += length;
-  } else {
-    g_env.map.reserved_ram_bytes += length;
-  }
 }
+
+// Returns a memory map with `regions`, as the Multiboot parser builds it.
+static MultibootMemoryMap MakeMemoryMap(
+    const std::vector<MemoryRegion>& regions) {
+  MultibootMemoryMap map = {};
+  for (const MemoryRegion& region : regions) {
+    map.regions[map.region_count] = region;
+    ++map.region_count;
+  }
+  return map;
+}
+
+// Anonymous host mapping at exactly `addr`, for tests whose fake physical
+// memory must lie at a specific low address. `ok()` is false if that range is
+// not available in the test process.
+class ScopedFixedMapping {
+ public:
+  ScopedFixedMapping(const uintptr_t addr, const int64_t bytes)
+      : bytes_(bytes) {
+#ifdef MAP_FIXED_NOREPLACE
+    constexpr int kFlags = MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED_NOREPLACE;
+#else
+    constexpr int kFlags = MAP_PRIVATE | MAP_ANONYMOUS;
+#endif
+    void* const mapped = mmap(reinterpret_cast<void*>(addr),  //
+                              bytes,                          //
+                              PROT_READ | PROT_WRITE,         //
+                              kFlags,                         //
+                              -1,                             //
+                              0);
+    if (mapped == MAP_FAILED) {
+      return;
+    }
+    // Kernels without MAP_FIXED_NOREPLACE treat the address as a hint.
+    if (mapped != reinterpret_cast<void*>(addr)) {
+      munmap(mapped, bytes);
+      return;
+    }
+    mapped_ = mapped;
+  }
+
+  ~ScopedFixedMapping() {
+    if (mapped_ != nullptr) {
+      munmap(mapped_, bytes_);
+    }
+  }
+
+  ScopedFixedMapping(const ScopedFixedMapping&) = delete;
+  ScopedFixedMapping& operator=(const ScopedFixedMapping&) = delete;
+
+  bool ok() const { return mapped_ != nullptr; }
+
+ private:
+  int64_t bytes_;
+  void* mapped_ = nullptr;
+};
 
 }  // namespace
 
+// Fake Multiboot parser: hands `PmmInit` the memory map prepared in `g_env`.
+// pmm_test does not link multiboot.cpp; multiboot_test covers the parser.
 bool MultibootParseMemoryMap(const uint32_t multiboot_magic,
                              const uint64_t multiboot_info_addr,
                              const uintptr_t max_physical_addr,
                              MultibootMemoryMap* const out_map) {
-  if (multiboot_magic != 0 || multiboot_info_addr != 0) {
-    return MultibootParseMemoryMapFromBuffer(
-        multiboot_magic, multiboot_info_addr, max_physical_addr, out_map);
-  }
+  ++g_env.parse_calls;
+  g_env.parsed_magic = multiboot_magic;
+  g_env.parsed_info_addr = multiboot_info_addr;
+  g_env.parsed_max_physical_addr = max_physical_addr;
   if (!g_env.parse_ok || out_map == nullptr) {
     return false;
   }
   *out_map = g_env.map;
-  return true;
-}
-
-bool PagingMapBootstrapRange(const uintptr_t phys_addr, const int64_t size) {
-  (void)phys_addr;
-  (void)size;
   return true;
 }
 
@@ -192,65 +251,76 @@ void VgaWriteDec(const uint64_t value) {
   g_env.vga_log.append(buf);
 }
 
-void VgaAttachFramebuffer(const uintptr_t fb_phys_addr,  //
-                          const int pitch,               //
-                          const int width,               //
-                          const int height,              //
-                          const int bpp) {
+bool VgaInitFramebuffer(const uintptr_t fb_phys_addr,  //
+                        const int pitch,               //
+                        const int width,               //
+                        const int height,              //
+                        const int bpp) {
   g_env.fb_attached = true;
   g_env.attached_fb_addr = fb_phys_addr;
   g_env.attached_fb_pitch = pitch;
   g_env.attached_fb_width = width;
   g_env.attached_fb_height = height;
   g_env.attached_fb_bpp = bpp;
+  return true;
 }
 
 namespace {
 
-TEST(PmmTest, InitFailureModesAndEmptyRegions) {
-  // Calling PmmAllocFrame before PmmInit succeeds must trigger DCHECK in debug
-  // builds and return 0 under NDEBUG.
+// Death tests match the exact failed expression, so that they fail if a
+// different check fires. Several of them rely on `DCHECK`s, which every build
+// of this project enables (no build defines NDEBUG).
+TEST(PmmDeathTest, AllocBeforeInitPanics) {
   ResetFakeEnv();
-#ifdef NDEBUG
-  EXPECT_THAT(PmmAllocFrame(), t::Eq(0u));
-#else
-  EXPECT_DEATH(PmmAllocFrame(), "Check failed");
-#endif
+  EXPECT_DEATH(PmmAllocFrame(), "Check failed: g_pmm_initialized at");
+}
 
-  // MultibootParseMemoryMap failure must cause PmmInit to panic via CHECK.
+TEST(PmmDeathTest, InitPanicsWithoutUsableMemory) {
+  // The bootloader's memory map cannot be parsed.
   ResetFakeEnv();
   g_env.parse_ok = false;
-  EXPECT_DEATH(PmmInit(0, 0), "Check failed");
+  EXPECT_DEATH(PmmInit(0, 0), "Check failed: MultibootParseMemoryMap\\(");
 
-  // Available RAM strictly below kLowerMemoryLimit (1 MiB) is completely
-  // excluded and must cause PmmInit to panic via CHECK.
+  // Available RAM strictly below kLowerMemoryLimit (1 MiB) is excluded.
   ResetFakeEnv();
   AddRegion(0, kLowerMemoryLimit, kMemoryTypeAvailable);
-  EXPECT_DEATH(PmmInit(0, 0), "Check failed");
+  EXPECT_DEATH(PmmInit(0, 0), "Check failed: g_usable_interval_count > 0 at");
 
-  // Sub-page available fragments (< kPageSize) or unaligned fragments that
-  // contain no complete page must be rejected via CHECK.
+  // Sub-page or unaligned fragments that contain no complete page.
   ResetFakeEnv();
   AddRegion(FrameAddr(20) + 1024, 2048, kMemoryTypeAvailable);
-  EXPECT_DEATH(PmmInit(0, 0), "Check failed");
+  EXPECT_DEATH(PmmInit(0, 0), "Check failed: g_usable_interval_count > 0 at");
 
-  // Available region completely covered by a non-available reserved region
-  // leaves zero usable frames and must panic via CHECK.
+  // An available region completely covered by a reserved region.
   ResetFakeEnv();
   AddRegion(FrameAddr(20), 8 * kPageSize, kMemoryTypeAvailable);
-  AddRegion(FrameAddr(20), 8 * kPageSize, 2);
-  EXPECT_DEATH(PmmInit(0, 0), "Check failed");
+  AddRegion(FrameAddr(20), 8 * kPageSize, kMemoryTypeReserved);
+  EXPECT_DEATH(PmmInit(0, 0), "Check failed: g_usable_interval_count > 0 at");
 
-  // Failure in PagingExtendIdentityMap must cause PmmInit to panic via CHECK.
+  // The identity map cannot be extended over usable RAM.
   ResetFakeEnv(64);
   g_env.fail_extend_map = true;
   AddRegion(FrameAddr(20), 16 * kPageSize, kMemoryTypeAvailable);
-  EXPECT_DEATH(PmmInit(0, 0), "Check failed");
+  EXPECT_DEATH(PmmInit(0, 0),
+               "Check failed: PagingExtendIdentityMap\\(g_max_managed_phys_addr"
+               "\\) at");
+}
+
+TEST(PmmTest, InitPassesMultibootArgumentsToParser) {
+  ResetFakeEnv(64);
+  AddRegion(FrameAddr(20), 8 * kPageSize, kMemoryTypeAvailable);
+  PmmInit(kMultiboot2Magic, 0x12345000);
+  EXPECT_THAT(g_env.parse_calls, t::Eq(1));
+  EXPECT_THAT(g_env.parsed_magic, t::Eq(kMultiboot2Magic));
+  EXPECT_THAT(g_env.parsed_info_addr, t::Eq(0x12345000u));
+  EXPECT_THAT(g_env.parsed_max_physical_addr,
+              t::Eq(kMaxCanonicalIdentityAddress));
+  EXPECT_THAT(PmmFreeFrameCount(), t::Eq(8));
+  EXPECT_FALSE(g_env.fb_attached);
 }
 
 TEST(PmmTest, InitCarvesReservedKernelMultibootAndFramebuffer) {
   ResetFakeEnv(140);
-  g_env.check_clean_frames = 140;
 
   // Available region spanning frames [0, 128) with unaligned sub-page edges on
   // both ends that must be rounded inward to [FrameAddr(0), FrameAddr(128)).
@@ -258,11 +328,11 @@ TEST(PmmTest, InitCarvesReservedKernelMultibootAndFramebuffer) {
 
   // Non-available region inside frames [30, 34) with unaligned edges that must
   // be rounded outward to carve out frames [30, 34).
-  AddRegion(FrameAddr(30) + 256, 3 * kPageSize, 2);
+  AddRegion(FrameAddr(30) + 256, 3 * kPageSize, kMemoryTypeReserved);
 
   // Trailing non-available region covering frames [120, 128) so that
   // PmmMaxPhysicalAddress() must be clamped downward to FrameAddr(120).
-  AddRegion(FrameAddr(120), 8 * kPageSize, 2);
+  AddRegion(FrameAddr(120), 8 * kPageSize, kMemoryTypeReserved);
 
   // Unaligned Multiboot info reservation touching frames 45 and 46 -> [45, 47).
   g_env.map.mb_reserved_start = FrameAddr(45) + 100;
@@ -279,6 +349,11 @@ TEST(PmmTest, InitCarvesReservedKernelMultibootAndFramebuffer) {
   g_env.map.fb_height = 6;
   g_env.map.fb_bpp = 32;
 
+  // Byte totals from the parser, which PmmInit only logs.
+  g_env.map.total_ram_bytes = 600 * 1024;
+  g_env.map.usable_ram_bytes = 512 * 1024;
+  g_env.map.reserved_ram_bytes = 88 * 1024;
+
   PmmInit(0, 0);
 
   // Verify framebuffer attachment and dual UART + VGA console logging.
@@ -290,15 +365,14 @@ TEST(PmmTest, InitCarvesReservedKernelMultibootAndFramebuffer) {
   EXPECT_THAT(g_env.attached_fb_bpp, t::Eq(32));
   EXPECT_THAT(g_env.uart_log, t::HasSubstr("[PMM] Framebuffer: addr="));
   EXPECT_THAT(g_env.uart_log, t::HasSubstr("[PMM] Kernel range: "));
-  EXPECT_THAT(g_env.uart_log, t::HasSubstr("[PMM] Total RAM: "));
+  EXPECT_THAT(g_env.uart_log,
+              t::HasSubstr("[PMM] Total RAM: 600 KiB, Usable RAM: 512 KiB, "
+                           "Reserved RAM: 88 KiB, Free 4KiB frames: 106\n"));
   EXPECT_THAT(g_env.vga_log, t::Eq(g_env.uart_log));
 
-  // Verify PagingExtendIdentityMap was called with the clamped max address
-  // BEFORE any FreeRunNode was written into high memory (`g_fake_ram`).
+  // Verify PagingExtendIdentityMap was called with the clamped max address.
   EXPECT_THAT(g_env.extend_map_calls, t::Eq(1));
   EXPECT_THAT(g_env.last_extend_max_phys, t::Eq(FrameAddr(120)));
-  EXPECT_THAT(g_env.free_frames_during_extend, t::Eq(0));
-  EXPECT_TRUE(g_env.fake_ram_clean_during_extend);
 
   // Expected surviving usable intervals:
   //   [0, 16)   -> 16 frames (before kernel [16, 20))
@@ -333,6 +407,111 @@ TEST(PmmTest, InitCarvesReservedKernelMultibootAndFramebuffer) {
   }
   EXPECT_THAT(PmmFreeFrameCount(), t::Eq(0));
   EXPECT_THAT(PmmAllocFrame(), t::Eq(0));
+}
+
+TEST(PmmTest, InitPopulatesRunsAboveBootstrapWindowOnlyAfterExtendingMap) {
+  if (FakeRamBase() < kBootstrapIdentityMapSize) {
+    GTEST_SKIP() << "g_fake_ram lies inside the 64 MiB bootstrap identity map "
+                    "(non-PIE build)";
+  }
+  ResetFakeEnv(140);
+  g_env.check_clean_frames = 140;
+  AddRegion(FrameAddr(0), 128 * kPageSize, kMemoryTypeAvailable);
+  PmmInit(0, 0);
+
+  // No free-run header may be written to RAM above the bootstrap window before
+  // `PagingExtendIdentityMap` has mapped it.
+  EXPECT_THAT(g_env.extend_map_calls, t::Eq(1));
+  EXPECT_THAT(g_env.free_frames_during_extend, t::Eq(0));
+  EXPECT_TRUE(g_env.fake_ram_clean_during_extend);
+  // Frames [0, 128) minus the kernel image at [16, 20).
+  EXPECT_THAT(PmmFreeFrameCount(), t::Eq(124));
+}
+
+TEST(PmmTest, InitCoalescesIntervalStraddlingBootstrapWindow) {
+  constexpr int64_t kLowFrames = 4;
+  constexpr int64_t kFrames = 8;
+  constexpr uintptr_t kBase =
+      kBootstrapIdentityMapSize - kLowFrames * kPageSize;
+  const ScopedFixedMapping mapping(kBase, kFrames * kPageSize);
+  if (!mapping.ok()) {
+    GTEST_SKIP() << "cannot map host memory at 0x" << std::hex << kBase;
+  }
+  ResetFakeEnv(0);
+  AddRegion(kBase, kFrames * kPageSize, kMemoryTypeAvailable);
+  PmmInit(0, 0);
+
+  // Only the frames below 64 MiB are free while the identity map is extended;
+  // the rest are added afterwards and merge with them into a single run.
+  EXPECT_THAT(g_env.free_frames_during_extend, t::Eq(kLowFrames));
+  EXPECT_THAT(PmmTotalUsableFrameCount(), t::Eq(kFrames));
+  EXPECT_THAT(PmmFreeFrameCount(), t::Eq(kFrames));
+  const uintptr_t whole_run = PmmAllocFrames(kFrames);
+  EXPECT_THAT(whole_run, t::Eq(kBase));
+  EXPECT_THAT(PmmFreeFrameCount(), t::Eq(0));
+  PmmFreeFrames(whole_run, kFrames);
+  EXPECT_THAT(PmmFreeFrameCount(), t::Eq(kFrames));
+}
+
+TEST(PmmTest, InitManagesUpperMemoryStartingAtOneMiB) {
+  constexpr int64_t kUpperFrames = 16;
+  const ScopedFixedMapping mapping(kLowerMemoryLimit, kUpperFrames * kPageSize);
+  if (!mapping.ok()) {
+    GTEST_SKIP() << "cannot map host memory at 1 MiB";
+  }
+  ResetFakeEnv(0);
+  // The map that the parser builds from Multiboot1 `mem_lower = 640` and
+  // `mem_upper = 64` (KiB).
+  AddRegion(0, 640 * 1024, kMemoryTypeAvailable);
+  AddRegion(kLowerMemoryLimit, kUpperFrames * kPageSize, kMemoryTypeAvailable);
+  PmmInit(0, 0);
+
+  EXPECT_THAT(PmmMaxPhysicalAddress(),
+              t::Eq(kLowerMemoryLimit + kUpperFrames * kPageSize));
+  EXPECT_THAT(PmmTotalUsableFrameCount(), t::Eq(kUpperFrames));
+  EXPECT_THAT(PmmFreeFrameCount(), t::Eq(kUpperFrames));
+  const uintptr_t allocated = PmmAllocFrames(kUpperFrames);
+  EXPECT_THAT(allocated, t::Eq(kLowerMemoryLimit));
+  PmmFreeFrames(allocated, kUpperFrames);
+}
+
+TEST(PmmTest,
+     PmmInitPreservesTotalUsableFramesAndMaxPhysWhenPagingAllocatesFrames) {
+  // Two disjoint usable runs inside the 64 MiB bootstrap window:
+  //   - 1 frame at [0x200000, 0x201000)
+  //   - 2 frames at [0x202000, 0x204000) (separated by a 1-frame hole)
+  // When `PagingExtendIdentityMap` allocates 2 contiguous frames during
+  // `PmmInit`, `PmmAllocFrames(2)` skips the 1-frame lower run and completely
+  // consumes the highest usable run `[0x202000, 0x204000)`. `PmmInit` must
+  // still preserve `PmmTotalUsableFrameCount() == 3` and
+  // `PmmMaxPhysicalAddress() == 0x204000` (so freeing `[0x202000, 0x204000)`
+  // succeeds instead of failing bounds checks against a shrunken max address).
+  constexpr uintptr_t kLowBase = 0x200000u;
+  constexpr uintptr_t kHighRunBase = kLowBase + 2 * kPageSize;
+  constexpr int64_t kLowRunFrames = 1;
+  constexpr int64_t kHighRunFrames = 2;
+  constexpr int64_t kTotalUsableFrames = kLowRunFrames + kHighRunFrames;
+  constexpr int64_t kMappedFrames = 4;
+  const ScopedFixedMapping mapping(kLowBase, kMappedFrames * kPageSize);
+  if (!mapping.ok()) {
+    GTEST_SKIP() << "cannot map host memory at 0x" << std::hex << kLowBase;
+  }
+  ResetFakeEnv(0);
+  AddRegion(kLowBase, kLowRunFrames * kPageSize, kMemoryTypeAvailable);
+  AddRegion(kHighRunBase, kHighRunFrames * kPageSize, kMemoryTypeAvailable);
+  g_env.alloc_frames_during_extend = kHighRunFrames;
+  PmmInit(0, 0);
+  EXPECT_THAT(g_env.allocated_during_extend, t::Eq(kHighRunBase));
+  EXPECT_THAT(PmmTotalUsableFrameCount(), t::Eq(kTotalUsableFrames));
+  EXPECT_THAT(PmmFreeFrameCount(), t::Eq(kLowRunFrames));
+  EXPECT_THAT(PmmMaxPhysicalAddress(),
+              t::Eq(kHighRunBase + kHighRunFrames * kPageSize));
+  EXPECT_THAT(PmmMaxFrameCount(),
+              t::Eq((kHighRunBase + kHighRunFrames * kPageSize) / kPageSize));
+  EXPECT_TRUE(
+      PmmRangeIsValidUsableRam(kHighRunBase, kHighRunFrames * kPageSize));
+  PmmFreeFrames(g_env.allocated_during_extend, kHighRunFrames);
+  EXPECT_THAT(PmmFreeFrameCount(), t::Eq(kTotalUsableFrames));
 }
 
 TEST(PmmTest, InitNormalizesOverlappingAndUnsortedAvailableRegions) {
@@ -440,7 +619,7 @@ TEST(PmmTest, LowestAddressFirstFitAndFindFirstAugmentedSelection) {
   EXPECT_THAT(PmmFreeFrameCount(), t::Eq(60));
 }
 
-TEST(PmmTest, RunSplittingAndExactFitWithoutPerFrameLoops) {
+TEST(PmmTest, AllocSplitsRunsAndExactFitRemovesRun) {
   ResetFakeEnv(64);
   AddRegion(FrameAddr(20), 20 * kPageSize, kMemoryTypeAvailable);
   PmmInit(0, 0);
@@ -556,7 +735,7 @@ TEST(PmmTest, NonContiguousRegionsNeverCoalesceAcrossReservedHoles) {
   // frame at [24, 25), producing three disjoint usable intervals:
   //   [12, 16) (4 frames), [20, 24) (4 frames), [25, 30) (5 frames).
   AddRegion(FrameAddr(12), 18 * kPageSize, kMemoryTypeAvailable);
-  AddRegion(FrameAddr(24), kPageSize, 2);
+  AddRegion(FrameAddr(24), kPageSize, kMemoryTypeReserved);
   PmmInit(0, 0);
   EXPECT_THAT(PmmTotalUsableFrameCount(), t::Eq(13));
 
@@ -585,6 +764,7 @@ TEST(PmmTest, OomHandling) {
   // Request exceeding total free frames must return 0 immediately.
   EXPECT_THAT(PmmAllocFrames(9), t::Eq(0));
   EXPECT_THAT(PmmAllocFrames(PmmMaxFrameCount() + 1), t::Eq(0));
+  EXPECT_THAT(PmmAllocFrames(INT64_MAX), t::Eq(0));
 
   // Fragment the 8 frames into two 3-frame free runs separated by a 2-frame
   // allocated barrier: total free frames = 6, max contiguous run = 3.
@@ -619,7 +799,7 @@ TEST(PmmTest, OomHandling) {
 TEST(PmmTest, RangeIsValidUsableRamValidation) {
   ResetFakeEnv(100);
   AddRegion(FrameAddr(10), 60 * kPageSize, kMemoryTypeAvailable);
-  AddRegion(FrameAddr(30), 2 * kPageSize, 2);
+  AddRegion(FrameAddr(30), 2 * kPageSize, kMemoryTypeReserved);
   g_env.map.mb_reserved_start = FrameAddr(40);
   g_env.map.mb_reserved_end = FrameAddr(42);
   g_env.map.mb1_mmap_reserved_start = FrameAddr(48);
@@ -732,46 +912,6 @@ TEST(PmmTest, HighFragmentationStressAndFullCoalescence) {
   EXPECT_THAT(PmmFreeFrameCount(), t::Eq(kArenaFrames));
 }
 
-TEST(PmmTest, InvalidAndDoubleFreeTriggerDcheck) {
-  ResetFakeEnv(64);
-  AddRegion(FrameAddr(20), 8 * kPageSize, kMemoryTypeAvailable);
-  PmmInit(0, 0);
-
-  const uintptr_t allocated = PmmAllocFrames(4);
-  ASSERT_THAT(allocated, t::Eq(FrameAddr(20)));
-
-#ifdef NDEBUG
-  EXPECT_THAT(PmmAllocFrames(0), t::Eq(0u));
-  EXPECT_THAT(PmmAllocFrames(-1), t::Eq(0u));
-  EXPECT_THAT(PmmAllocFrames(INT64_MIN), t::Eq(0u));
-  EXPECT_THAT(PmmFreeFrameCount(), t::Eq(4));
-  PmmFreeFrames(allocated, 4);
-  EXPECT_THAT(PmmFreeFrameCount(), t::Eq(8));
-#else
-  // Non-positive allocation frame counts must trigger DCHECK failures.
-  EXPECT_DEATH(PmmAllocFrames(0), "Check failed");
-  EXPECT_DEATH(PmmAllocFrames(-1), "Check failed");
-
-  // Null, unaligned, non-positive count, out-of-bounds, and reserved-range
-  // frees must trigger DCHECK failures.
-  EXPECT_DEATH(PmmFreeFrame(0), "Check failed");
-  EXPECT_DEATH(PmmFreeFrame(allocated + 64), "Check failed");
-  EXPECT_DEATH(PmmFreeFrames(allocated, 0), "Check failed");
-  EXPECT_DEATH(PmmFreeFrames(allocated, -2), "Check failed");
-  EXPECT_DEATH(PmmFreeFrame(PmmMaxPhysicalAddress()), "Check failed");
-  EXPECT_DEATH(PmmFreeFrame(FrameAddr(16)), "Check failed");
-
-  // Direct double-free of an already-free frame (FrameAddr(24) is still in the
-  // free tree) and partial overlap spanning allocated + free frames must
-  // trigger DCHECK failures.
-  EXPECT_DEATH(PmmFreeFrame(FrameAddr(24)), "Check failed");
-  EXPECT_DEATH(PmmFreeFrames(FrameAddr(22), 4), "Check failed");
-
-  PmmFreeFrames(allocated, 4);
-  EXPECT_DEATH(PmmFreeFrame(allocated), "Check failed");
-#endif
-}
-
 TEST(PmmTest, ConcurrentMultiThreadedAllocAndFreeStress) {
   ResetFakeEnv(2560);
   constexpr int64_t kArenaStartFrame = 32;
@@ -867,489 +1007,146 @@ TEST(PmmTest, ConcurrentMultiThreadedAllocAndFreeStress) {
   EXPECT_THAT(PmmFreeFrameCount(), t::Eq(kArenaFrames));
 }
 
-TEST(PmmTest, MultibootMemoryMapSaturatesByteTotalsWithoutSignedOverflow) {
-  ResetFakeEnv(64);
-  MultibootMemoryMap map = {};
-  constexpr uint64_t kHugeLen = static_cast<uint64_t>(INT64_MAX) + 4096ULL;
-
-  ASSERT_TRUE(
-      MultibootRecordMmapEntry(&map, 0x100000, kHugeLen, kMemoryTypeAvailable));
-  EXPECT_THAT(map.usable_ram_bytes, t::Eq(INT64_MAX));
-  EXPECT_THAT(map.total_ram_bytes, t::Eq(INT64_MAX));
-
-  ASSERT_TRUE(MultibootRecordMmapEntry(&map, 0x200000, kHugeLen, 2));
-  EXPECT_THAT(map.reserved_ram_bytes, t::Eq(INT64_MAX));
-  EXPECT_THAT(map.total_ram_bytes, t::Eq(INT64_MAX));
-}
-
-TEST(PmmTest,
-     MultibootParseMemoryMapCoalescesAndRejectsUncoalesceableOverflow) {
-  ResetFakeEnv(128);
-
-  struct [[gnu::packed]] SyntheticMb2Buffer {
-    uint32_t total_size;
-    uint32_t reserved;
-    uint32_t mmap_type;
-    uint32_t mmap_size;
-    uint32_t entry_size;
-    uint32_t entry_version;
-    struct [[gnu::packed]] Entry {
-      uint64_t addr;
-      uint64_t len;
-      uint32_t type;
-      uint32_t reserved;
-    } entries[kMaxMemoryRegions + 16];
-    uint32_t end_type;
-    uint32_t end_size;
-  };
-
-  const auto buf = std::make_unique<SyntheticMb2Buffer>();
-  std::memset(buf.get(), 0, sizeof(SyntheticMb2Buffer));
-  buf->total_size = sizeof(SyntheticMb2Buffer);
-  buf->mmap_type = 6;
-  buf->mmap_size = 16 + static_cast<uint32_t>(sizeof(buf->entries));
-  buf->entry_size = sizeof(SyntheticMb2Buffer::Entry);
-  buf->entry_version = 0;
-  buf->end_type = 0;
-  buf->end_size = 8;
-
-  // 1) Populate > kMaxMemoryRegions contiguous available slices in [20, 84)
-  // followed by a reserved region at frames [30, 34). Coalescing must merge the
-  // contiguous available slices so the trailing reserved region is preserved
-  // and carved out by PmmInit.
-  constexpr int kTotalEntries = kMaxMemoryRegions + 16;
-  for (int i = 0; i < kTotalEntries - 1; ++i) {
-    const uintptr_t base = FrameAddr(20) + (i % 64) * kPageSize;
-    buf->entries[i] = {base, kPageSize, kMemoryTypeAvailable, 0};
-  }
-  buf->entries[kTotalEntries - 1] = {FrameAddr(30), 4 * kPageSize, 2, 0};
-
-  const uintptr_t buf_addr = reinterpret_cast<uintptr_t>(buf.get());
-  PmmInit(0x36D76289, buf_addr);
-  // Frames [20, 84) = 64 frames minus reserved [30, 34) (4 frames) = 60 frames.
-  EXPECT_THAT(PmmTotalUsableFrameCount(), t::Eq(60));
-  EXPECT_FALSE(PmmRangeIsValidUsableRam(FrameAddr(30), kPageSize));
-
-  // 2) Populate > kMaxMemoryRegions disjoint regions that cannot be coalesced;
-  // MultibootParseMemoryMap must return false rather than silently dropping the
-  // trailing reserved region.
-  for (int i = 0; i < kTotalEntries; ++i) {
-    const uintptr_t base =
-        FrameAddr(20) + static_cast<uintptr_t>(i * 2) * kPageSize;
-    buf->entries[i] = {base, kPageSize, kMemoryTypeAvailable, 0};
-  }
-  MultibootMemoryMap parsed = {};
-  EXPECT_FALSE(
-      MultibootParseMemoryMap(0x36D76289, buf_addr, UINTPTR_MAX, &parsed));
-}
-
-TEST(PmmTest, Multiboot2MmapTagSizeExceedingTotalSize) {
-  ResetFakeEnv(64);
-
-  struct [[gnu::packed]] TruncatedMb2MmapBuffer {
-    uint32_t total_size;
-    uint32_t reserved;
-    uint32_t mmap_type;
-    uint32_t mmap_size;
-    uint32_t entry_size;
-    uint32_t entry_version;
-    uint64_t addr;
-    uint64_t len;
-    uint32_t type;
-    uint32_t entry_reserved;
-  };
-
-  constexpr int64_t kExactSize = sizeof(TruncatedMb2MmapBuffer);
-  const auto raw_mb2 = std::make_unique<uint8_t[]>(kExactSize);
-  std::memset(raw_mb2.get(), 0, kExactSize);
-  TruncatedMb2MmapBuffer* const mb2 =
-      reinterpret_cast<TruncatedMb2MmapBuffer*>(raw_mb2.get());
-  mb2->total_size = static_cast<uint32_t>(kExactSize);
-  mb2->mmap_type = 6;
-  mb2->mmap_size = 4096;  // Exceeds total_size - offset (40 bytes).
-  mb2->entry_size = 24;
-  mb2->entry_version = 0;
-  mb2->addr = FrameAddr(20);
-  mb2->len = 8 * kPageSize;
-  mb2->type = kMemoryTypeAvailable;
-
-  MultibootMemoryMap parsed = {};
-  EXPECT_FALSE(
-      MultibootParseMemoryMap(0x36D76289,                                  //
-                              reinterpret_cast<uintptr_t>(raw_mb2.get()),  //
-                              UINTPTR_MAX,                                 //
-                              &parsed));
-  EXPECT_THAT(parsed.region_count, t::Eq(0));
-
-  // Also verify Multiboot1 rejects an entry whose `size + 4` exceeds remaining
-  // `mmap_length` without overreading past the buffer.
-  struct [[gnu::packed]] Mb1HeaderOnly {
-    uint32_t flags;
-    uint32_t mem_lower;
-    uint32_t mem_upper;
-    uint32_t boot_device;
-    uint32_t cmdline;
-    uint32_t mods_count;
-    uint32_t mods_addr;
-    uint32_t syms[4];
-    uint32_t mmap_length;
-    uint32_t mmap_addr;
-  };
-  struct [[gnu::packed]] Mb1SingleEntry {
-    uint32_t size;
-    uint64_t addr;
-    uint64_t len;
-    uint32_t type;
-  };
-
-  const auto raw_mb1_entry = std::make_unique<Mb1SingleEntry>();
-  raw_mb1_entry->size = 1024;  // Exceeds mmap_length (24 bytes).
-  raw_mb1_entry->addr = FrameAddr(20);
-  raw_mb1_entry->len = 8 * kPageSize;
-  raw_mb1_entry->type = kMemoryTypeAvailable;
-
-  Mb1HeaderOnly mb1_info = {};
-  mb1_info.flags = 1u << 6;
-  mb1_info.mmap_length = sizeof(Mb1SingleEntry);
-  mb1_info.mmap_addr =
-      static_cast<uint32_t>(reinterpret_cast<uintptr_t>(raw_mb1_entry.get()));
-  if (reinterpret_cast<uintptr_t>(raw_mb1_entry.get()) <= UINT32_MAX) {
-    EXPECT_FALSE(
-        MultibootParseMemoryMap(0x2BADB002,                              //
-                                reinterpret_cast<uintptr_t>(&mb1_info),  //
-                                UINTPTR_MAX,                             //
-                                &parsed));
-  }
-}
-
-TEST(PmmTest, Multiboot2FramebufferTagValidatesPitchAndDimensions) {
-  ResetFakeEnv(64);
-
-  struct [[gnu::packed]] SyntheticMb2FbBuffer {
-    uint32_t total_size;
-    uint32_t reserved;
-    uint32_t mmap_type;
-    uint32_t mmap_size;
-    uint32_t entry_size;
-    uint32_t entry_version;
-    uint64_t addr;
-    uint64_t len;
-    uint32_t type;
-    uint32_t entry_reserved;
-    uint32_t fb_tag_type;
-    uint32_t fb_tag_size;
-    uint64_t fb_addr;
-    uint32_t fb_pitch;
-    uint32_t fb_width;
-    uint32_t fb_height;
-    uint8_t fb_bpp;
-    uint8_t fb_type;
-    uint16_t fb_reserved;
-    uint32_t end_type;
-    uint32_t end_size;
-  };
-
-  SyntheticMb2FbBuffer buf = {};
-  buf.total_size = sizeof(SyntheticMb2FbBuffer);
-  buf.mmap_type = 6;
-  buf.mmap_size = 40;
-  buf.entry_size = 24;
-  buf.entry_version = 0;
-  buf.addr = FrameAddr(20);
-  buf.len = 16 * kPageSize;
-  buf.type = kMemoryTypeAvailable;
-  buf.fb_tag_type = 8;
-  buf.fb_tag_size = 32;
-  buf.fb_addr = FrameAddr(80);
-  buf.fb_pitch = 640 * 4;
-  buf.fb_width = 640;
-  buf.fb_height = 480;
-  buf.fb_bpp = 32;
-  buf.fb_type = 1;
-  buf.end_type = 0;
-  buf.end_size = 8;
-
-  const uintptr_t buf_addr = reinterpret_cast<uintptr_t>(&buf);
-  MultibootMemoryMap parsed = {};
-
-  // 1) Valid 32-bpp and 24-bpp framebuffer tags are accepted.
-  ASSERT_TRUE(MultibootParseMemoryMap(kMultiboot2Magic,  //
-                                      buf_addr,          //
-                                      UINTPTR_MAX,       //
-                                      &parsed));
-  EXPECT_THAT(parsed.fb_addr, t::Eq(FrameAddr(80)));
-  EXPECT_THAT(parsed.fb_pitch, t::Eq(640 * 4));
-  EXPECT_THAT(parsed.fb_width, t::Eq(640));
-  EXPECT_THAT(parsed.fb_height, t::Eq(480));
-  EXPECT_THAT(parsed.fb_bpp, t::Eq(32));
-
-  buf.fb_bpp = 24;
-  buf.fb_pitch = 640 * 3;
-  ASSERT_TRUE(MultibootParseMemoryMap(kMultiboot2Magic,  //
-                                      buf_addr,          //
-                                      UINTPTR_MAX,       //
-                                      &parsed));
-  EXPECT_THAT(parsed.fb_addr, t::Eq(FrameAddr(80)));
-  EXPECT_THAT(parsed.fb_pitch, t::Eq(640 * 3));
-  EXPECT_THAT(parsed.fb_bpp, t::Eq(24));
-
-  // 2) pitch < width * (bpp / 8) is rejected for both 24-bpp and 32-bpp.
-  buf.fb_pitch = 640 * 3 - 1;
-  ASSERT_TRUE(MultibootParseMemoryMap(kMultiboot2Magic,  //
-                                      buf_addr,          //
-                                      UINTPTR_MAX,       //
-                                      &parsed));
-  EXPECT_THAT(parsed.fb_addr, t::Eq(0u));
-  EXPECT_THAT(parsed.fb_pitch, t::Eq(0));
-
-  buf.fb_bpp = 32;
-  buf.fb_pitch = 640 * 4 - 1;
-  ASSERT_TRUE(MultibootParseMemoryMap(kMultiboot2Magic,  //
-                                      buf_addr,          //
-                                      UINTPTR_MAX,       //
-                                      &parsed));
-  EXPECT_THAT(parsed.fb_addr, t::Eq(0u));
-
-  // 3) Zero width, zero height, or zero pitch is rejected.
-  buf.fb_pitch = 640 * 4;
-  buf.fb_width = 0;
-  ASSERT_TRUE(MultibootParseMemoryMap(kMultiboot2Magic,  //
-                                      buf_addr,          //
-                                      UINTPTR_MAX,       //
-                                      &parsed));
-  EXPECT_THAT(parsed.fb_addr, t::Eq(0u));
-
-  buf.fb_width = 640;
-  buf.fb_height = 0;
-  ASSERT_TRUE(MultibootParseMemoryMap(kMultiboot2Magic,  //
-                                      buf_addr,          //
-                                      UINTPTR_MAX,       //
-                                      &parsed));
-  EXPECT_THAT(parsed.fb_addr, t::Eq(0u));
-
-  // 4) Dimensions or pitch exceeding INT32_MAX are rejected.
-  constexpr uint32_t kOverInt32Max = static_cast<uint32_t>(INT32_MAX) + 1u;
-  buf.fb_height = 480;
-  buf.fb_pitch = kOverInt32Max;
-  ASSERT_TRUE(MultibootParseMemoryMap(kMultiboot2Magic,  //
-                                      buf_addr,          //
-                                      UINTPTR_MAX,       //
-                                      &parsed));
-  EXPECT_THAT(parsed.fb_addr, t::Eq(0u));
-
-  buf.fb_pitch = 640 * 4;
-  buf.fb_width = kOverInt32Max;
-  ASSERT_TRUE(MultibootParseMemoryMap(kMultiboot2Magic,  //
-                                      buf_addr,          //
-                                      UINTPTR_MAX,       //
-                                      &parsed));
-  EXPECT_THAT(parsed.fb_addr, t::Eq(0u));
-
-  buf.fb_width = 640;
-  buf.fb_height = kOverInt32Max;
-  ASSERT_TRUE(MultibootParseMemoryMap(kMultiboot2Magic,  //
-                                      buf_addr,          //
-                                      UINTPTR_MAX,       //
-                                      &parsed));
-  EXPECT_THAT(parsed.fb_addr, t::Eq(0u));
-}
-
-TEST(PmmTest, MultibootRecordMmapEntryBridgeEntriesMergeTransitively) {
-  ResetFakeEnv(64);
-  MultibootMemoryMap map = {};
-
-  constexpr int kPairs = 260;
-  for (int i = 0; i < kPairs; ++i) {
-    const uintptr_t even_base =
-        FrameAddr(20) + static_cast<uintptr_t>(2 * i) * kPageSize;
-    ASSERT_TRUE(MultibootRecordMmapEntry(&map,       //
-                                         even_base,  //
-                                         kPageSize,  //
-                                         kMemoryTypeAvailable));
-  }
-  EXPECT_THAT(map.region_count, t::Eq(kPairs));
-
-  for (int i = 0; i < kPairs; ++i) {
-    const uintptr_t odd_base =
-        FrameAddr(20) + static_cast<uintptr_t>(2 * i + 1) * kPageSize;
-    ASSERT_TRUE(MultibootRecordMmapEntry(&map,       //
-                                         odd_base,   //
-                                         kPageSize,  //
-                                         kMemoryTypeAvailable));
-  }
-  EXPECT_THAT(map.region_count, t::Eq(1));
-  EXPECT_THAT(map.regions[0].base, t::Eq(FrameAddr(20)));
-  EXPECT_THAT(map.regions[0].length, t::Eq(2 * kPairs * kPageSize));
-
-  // Verify TryMergeRegions does not merge and truncate when combined span
-  // exceeds INT64_MAX.
-  MultibootMemoryMap span_map = {};
-  constexpr uint64_t kMaxSpan = static_cast<uint64_t>(INT64_MAX);
-  ASSERT_TRUE(
-      MultibootRecordMmapEntry(&span_map, 0, kMaxSpan, kMemoryTypeAvailable));
-  ASSERT_TRUE(MultibootRecordMmapEntry(&span_map,  //
-                                       kMaxSpan,   //
-                                       kPageSize,  //
-                                       kMemoryTypeAvailable));
-  EXPECT_THAT(span_map.region_count, t::Eq(2));
-  EXPECT_THAT(span_map.regions[0].length, t::Eq(INT64_MAX));
-  EXPECT_THAT(span_map.regions[1].length, t::Eq(kPageSize));
-}
-
-TEST(PmmTest, AllocFramesBoundsAndNdebugNonPositiveCountSafety) {
+TEST(PmmDeathTest, InvalidAllocAndFreeArgumentsPanic) {
   ResetFakeEnv(64);
   AddRegion(FrameAddr(20), 8 * kPageSize, kMemoryTypeAvailable);
   PmmInit(0, 0);
-  ASSERT_THAT(PmmFreeFrameCount(), t::Eq(8));
 
-  EXPECT_THAT(PmmAllocFrames(9), t::Eq(0u));
-  EXPECT_THAT(PmmAllocFrames(INT64_MAX), t::Eq(0u));
-  EXPECT_THAT(PmmFreeFrameCount(), t::Eq(8));
+  const uintptr_t allocated = PmmAllocFrames(4);
+  ASSERT_THAT(allocated, t::Eq(FrameAddr(20)));
 
-#ifdef NDEBUG
-  EXPECT_THAT(PmmAllocFrames(0), t::Eq(0u));
-  EXPECT_THAT(PmmAllocFrames(-1), t::Eq(0u));
-  EXPECT_THAT(PmmAllocFrames(INT64_MIN), t::Eq(0u));
-  EXPECT_THAT(PmmFreeFrameCount(), t::Eq(8));
-#else
-  EXPECT_DEATH(PmmAllocFrames(0), "Check failed");
-  EXPECT_DEATH(PmmAllocFrames(-1), "Check failed");
-#endif
+  EXPECT_DEATH(PmmAllocFrames(0), "Check failed: count > 0 at");
+  EXPECT_DEATH(PmmAllocFrames(-1), "Check failed: count > 0 at");
+  EXPECT_DEATH(PmmFreeFrames(allocated, 0), "Check failed: count > 0 at");
+  EXPECT_DEATH(PmmFreeFrames(allocated, -2), "Check failed: count > 0 at");
+  EXPECT_DEATH(PmmFreeFrame(0),
+               "Check failed: base_addr >= kLowerMemoryLimit at");
+  EXPECT_DEATH(PmmFreeFrame(allocated + 64),
+               "Check failed: \\(base_addr & \\(kPageSize - 1\\)\\) == 0 at");
+  EXPECT_DEATH(PmmFreeFrame(PmmMaxPhysicalAddress()),
+               "Check failed: base_addr < g_max_managed_phys_addr at");
+  // A range that runs past the highest usable frame.
+  EXPECT_DEATH(PmmFreeFrames(FrameAddr(26), 4),
+               "Check failed: static_cast<uintptr_t>\\(count\\) <=");
+  // The kernel image at frames [16, 20) is not usable RAM.
+  EXPECT_DEATH(PmmFreeFrame(FrameAddr(16)),
+               "Check failed: PmmRangeIsValidUsableRamLocked\\(");
 }
 
-TEST(PmmTest, Multiboot1MemBasicFallbackUses1MiBBaseOffsetForMemUpper) {
+TEST(PmmDeathTest, DoubleAndOverlappingFreesPanic) {
   ResetFakeEnv(64);
+  AddRegion(FrameAddr(20), 8 * kPageSize, kMemoryTypeAvailable);
+  PmmInit(0, 0);
 
-  struct [[gnu::packed]] Mb1BasicHeader {
-    uint32_t flags;
-    uint32_t mem_lower;
-    uint32_t mem_upper;
-    uint32_t boot_device;
-    uint32_t cmdline;
-    uint32_t mods_count;
-    uint32_t mods_addr;
-    uint32_t syms[4];
-    uint32_t mmap_length;
-    uint32_t mmap_addr;
-  };
+  // Frames [20, 24) are allocated and [24, 28) form one free run.
+  const uintptr_t allocated = PmmAllocFrames(4);
+  ASSERT_THAT(allocated, t::Eq(FrameAddr(20)));
+  constexpr char kOverlapsNextRun[] =
+      "Check failed: next_check == nullptr \\|\\| "
+      "RunBaseAddress\\(next_check\\) "
+      ">= end_addr at";
+  constexpr char kOverlapsPrevRun[] =
+      "Check failed: prev_check == nullptr \\|\\| "
+      "RunEndAddress\\(prev_check\\) "
+      "<= base_addr at";
 
-  // 1) Verify MultibootParseMemoryMap with flags = kMultiboot1FlagMemBasic (1)
-  // and no mmap flag (1 << 6) records lower memory [0, mem_lower * 1024) and
-  // upper memory [0x100000, 0x100000 + mem_upper * 1024).
-  Mb1BasicHeader mb1 = {};
-  mb1.flags = kMultiboot1FlagMemBasic;
-  mb1.mem_lower = 640;
-  mb1.mem_upper = 64;  // 64 KiB = 16 frames above 1 MiB -> ends at 0x110000.
+  // Freeing the first frame of a free run, or a range that ends inside one,
+  // overlaps the following free run.
+  EXPECT_DEATH(PmmFreeFrame(FrameAddr(24)), kOverlapsNextRun);
+  EXPECT_DEATH(PmmFreeFrames(FrameAddr(22), 4), kOverlapsNextRun);
 
-  MultibootMemoryMap parsed = {};
-  ASSERT_TRUE(MultibootParseMemoryMap(kMultiboot1Magic,                   //
-                                      reinterpret_cast<uintptr_t>(&mb1),  //
-                                      UINTPTR_MAX,                        //
-                                      &parsed));
-  ASSERT_THAT(parsed.region_count, t::Eq(2));
-  EXPECT_THAT(parsed.regions[0].base, t::Eq(0u));
-  EXPECT_THAT(parsed.regions[0].length, t::Eq(640 * 1024));
-  EXPECT_THAT(parsed.regions[0].type, t::Eq(kMemoryTypeAvailable));
-  EXPECT_THAT(parsed.regions[1].base, t::Eq(0x100000u));
-  EXPECT_THAT(parsed.regions[1].length, t::Eq(64 * 1024));
+  // After freeing everything, [20, 28) is a single free run.
+  PmmFreeFrames(allocated, 4);
+  EXPECT_DEATH(PmmFreeFrame(allocated), kOverlapsNextRun);
+  // Freeing frames inside a free run overlaps the preceding free run.
+  EXPECT_DEATH(PmmFreeFrame(FrameAddr(22)), kOverlapsPrevRun);
+  EXPECT_DEATH(PmmFreeFrames(FrameAddr(27), 1), kOverlapsPrevRun);
+  EXPECT_THAT(PmmFreeFrameCount(), t::Eq(8));
+}
+
+TEST(PmmTest, CollectUsableIntervalsRoundsAvailableInwardAndReservedOutward) {
+  ResetFakeEnv(0);
+  const MultibootMemoryMap map = MakeMemoryMap({
+      // Available region with sub-page edges: rounded inward to whole pages.
+      {0x200000 - 512, 16 * kPageSize + 1024, kMemoryTypeAvailable},
+      // Reserved region with sub-page edges: every touched page is excluded.
+      {0x204000 + 256, 3 * kPageSize, kMemoryTypeReserved},
+  });
+  EXPECT_THAT(PmmCollectUsableIntervalsForTest(map),
+              t::ElementsAre(PmmIntervalForTest{0x200000, 0x204000},
+                             PmmIntervalForTest{0x208000, 0x210000}));
+}
+
+TEST(PmmTest, CollectUsableIntervalsMergesUnsortedOverlappingRegions) {
+  ResetFakeEnv(0);
+  constexpr uintptr_t kBase = 0x1000000;
+  // [40, 60), [24, 35), [30, 40) and [20, 24) pages merge into [20, 60);
+  // [70, 72) stays separate.
+  const MultibootMemoryMap map = MakeMemoryMap({
+      {kBase + 40 * kPageSize, 20 * kPageSize, kMemoryTypeAvailable},
+      {kBase + 70 * kPageSize, 2 * kPageSize, kMemoryTypeAvailable},
+      {kBase + 24 * kPageSize, 11 * kPageSize, kMemoryTypeAvailable},
+      {kBase + 30 * kPageSize, 10 * kPageSize, kMemoryTypeAvailable},
+      {kBase + 20 * kPageSize, 4 * kPageSize, kMemoryTypeAvailable},
+  });
   EXPECT_THAT(
-      parsed.regions[1].base + static_cast<uintptr_t>(parsed.regions[1].length),
-      t::Eq(0x100000u + static_cast<uintptr_t>(mb1.mem_upper) * 1024u));
-  EXPECT_THAT(parsed.regions[1].type, t::Eq(kMemoryTypeAvailable));
-
-  // Verify flags = 0 (neither mmap nor mem_basic) is rejected.
-  Mb1BasicHeader mb1_empty = {};
-  mb1_empty.flags = 0;
-  mb1_empty.mem_upper = 64;
-  MultibootMemoryMap empty_parsed = {};
-  EXPECT_FALSE(
-      MultibootParseMemoryMap(kMultiboot1Magic,                         //
-                              reinterpret_cast<uintptr_t>(&mb1_empty),  //
-                              UINTPTR_MAX,                              //
-                              &empty_parsed));
-
-  // 2) Map 64 KiB (16 frames) at 0x100000 in the host address space if
-  // unmapped and verify PmmInit(kMultiboot1Magic, &mb1) manages frames in
-  // [0x100000, 0x100000 + mem_upper * 1024).
-  constexpr uintptr_t kOneMiB = 0x100000u;
-  constexpr int64_t kUpperFrames = 16;
-  constexpr int64_t kUpperBytes = kUpperFrames * kPageSize;
-#ifdef MAP_FIXED_NOREPLACE
-  const int mmap_flags = MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED_NOREPLACE;
-#else
-  const int mmap_flags = MAP_PRIVATE | MAP_ANONYMOUS;
-#endif
-  void* const mapped = mmap(reinterpret_cast<void*>(kOneMiB),  //
-                            kUpperBytes,                       //
-                            PROT_READ | PROT_WRITE,            //
-                            mmap_flags,                        //
-                            -1,                                //
-                            0);
-  if (mapped == reinterpret_cast<void*>(kOneMiB)) {
-    PmmInit(kMultiboot1Magic, reinterpret_cast<uintptr_t>(&mb1));
-    EXPECT_THAT(PmmMaxPhysicalAddress(),
-                t::Eq(kOneMiB + static_cast<uintptr_t>(mb1.mem_upper) * 1024u));
-    EXPECT_THAT(PmmTotalUsableFrameCount(), t::Eq(kUpperFrames));
-    EXPECT_THAT(PmmFreeFrameCount(), t::Eq(kUpperFrames));
-    const uintptr_t allocated = PmmAllocFrames(kUpperFrames);
-    EXPECT_THAT(allocated, t::Eq(kOneMiB));
-    PmmFreeFrames(allocated, kUpperFrames);
-  }
-  if (mapped != MAP_FAILED) {
-    munmap(mapped, kUpperBytes);
-  }
+      PmmCollectUsableIntervalsForTest(map),
+      t::ElementsAre(
+          PmmIntervalForTest{kBase + 20 * kPageSize, kBase + 60 * kPageSize},
+          PmmIntervalForTest{kBase + 70 * kPageSize, kBase + 72 * kPageSize}));
 }
 
-TEST(PmmTest,
-     PmmInitPreservesTotalUsableFramesAndMaxPhysWhenPagingAllocatesFrames) {
-  ResetFakeEnv(64);
-  // Configure two disjoint usable runs inside the 64 MiB bootstrap window:
-  //   - 1 frame at [0x200000, 0x201000)
-  //   - 2 frames at [0x202000, 0x204000) (separated by a 1-frame hole)
-  // When `PagingExtendIdentityMap` allocates 2 contiguous frames during
-  // `PmmInit`, `PmmAllocFrames(2)` skips the 1-frame lower run and completely
-  // consumes the highest usable run `[0x202000, 0x204000)`. `PmmInit` must
-  // still preserve `PmmTotalUsableFrameCount() == 3` and
-  // `PmmMaxPhysicalAddress() == 0x204000` (so freeing `[0x202000, 0x204000)`
-  // succeeds instead of failing bounds checks against a shrunken max address).
-  constexpr uintptr_t kLowBase = 0x200000u;
-  constexpr uintptr_t kHighRunBase = kLowBase + 2 * kPageSize;
-  constexpr int64_t kLowRunFrames = 1;
-  constexpr int64_t kHighRunFrames = 2;
-  constexpr int64_t kTotalUsableFrames = kLowRunFrames + kHighRunFrames;
-  constexpr int64_t kMappedFrames = 4;
-  constexpr int64_t kMappedBytes = kMappedFrames * kPageSize;
-#ifdef MAP_FIXED_NOREPLACE
-  const int mmap_flags = MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED_NOREPLACE;
-#else
-  const int mmap_flags = MAP_PRIVATE | MAP_ANONYMOUS;
-#endif
-  void* const mapped = mmap(reinterpret_cast<void*>(kLowBase),  //
-                            kMappedBytes,                       //
-                            PROT_READ | PROT_WRITE,             //
-                            mmap_flags,                         //
-                            -1,                                 //
-                            0);
-  if (mapped == reinterpret_cast<void*>(kLowBase)) {
-    AddRegion(kLowBase, kLowRunFrames * kPageSize, kMemoryTypeAvailable);
-    AddRegion(kHighRunBase, kHighRunFrames * kPageSize, kMemoryTypeAvailable);
-    g_env.alloc_frames_during_extend = kHighRunFrames;
-    PmmInit(0, 0);
-    EXPECT_THAT(g_env.allocated_during_extend, t::Eq(kHighRunBase));
-    EXPECT_THAT(PmmTotalUsableFrameCount(), t::Eq(kTotalUsableFrames));
-    EXPECT_THAT(PmmFreeFrameCount(), t::Eq(kLowRunFrames));
-    EXPECT_THAT(PmmMaxPhysicalAddress(),
-                t::Eq(kHighRunBase + kHighRunFrames * kPageSize));
-    EXPECT_THAT(PmmMaxFrameCount(),
-                t::Eq((kHighRunBase + kHighRunFrames * kPageSize) / kPageSize));
-    EXPECT_TRUE(
-        PmmRangeIsValidUsableRam(kHighRunBase, kHighRunFrames * kPageSize));
-    PmmFreeFrames(g_env.allocated_during_extend, kHighRunFrames);
-    EXPECT_THAT(PmmFreeFrameCount(), t::Eq(kTotalUsableFrames));
-  }
-  if (mapped != MAP_FAILED) {
-    munmap(mapped, kMappedBytes);
-  }
+TEST(PmmTest, CollectUsableIntervalsClampsRegionsAtCanonicalLimit) {
+  ResetFakeEnv(0);
+  constexpr uintptr_t kTopBase = kMaxCanonicalIdentityAddress - 8 * kPageSize;
+  MultibootMemoryMap map = MakeMemoryMap({
+      // An available region that extends far past the canonical limit is
+      // clamped to it; one that starts at the limit is ignored.
+      {kTopBase, INT64_MAX, kMemoryTypeAvailable},
+      {kMaxCanonicalIdentityAddress, 16 * kPageSize, kMemoryTypeAvailable},
+      {0x200000, 16 * kPageSize, kMemoryTypeAvailable},
+      // Regions with a non-positive length are ignored.
+      {0x300000, -kPageSize, kMemoryTypeAvailable},
+      {0x204000, -kPageSize, kMemoryTypeReserved},
+      // A reserved region that starts at the limit is ignored.
+      {kMaxCanonicalIdentityAddress, INT64_MAX, kMemoryTypeReserved},
+  });
+  EXPECT_THAT(PmmCollectUsableIntervalsForTest(map),
+              t::ElementsAre(
+                  PmmIntervalForTest{0x200000, 0x210000},
+                  PmmIntervalForTest{kTopBase, kMaxCanonicalIdentityAddress}));
+
+  // A reserved region that extends past the canonical limit is clamped to it
+  // and excludes everything from its base up.
+  map.regions[map.region_count] = {0x208000, INT64_MAX, kMemoryTypeReserved};
+  ++map.region_count;
+  EXPECT_THAT(PmmCollectUsableIntervalsForTest(map),
+              t::ElementsAre(PmmIntervalForTest{0x200000, 0x208000}));
+}
+
+TEST(PmmTest, CollectUsableIntervalsCarvesLowMemoryKernelAndBootStructures) {
+  ResetFakeEnv(0);
+  MultibootMemoryMap map = MakeMemoryMap({
+      {0, 0x200000, kMemoryTypeAvailable},
+      {FrameAddr(0), 64 * kPageSize, kMemoryTypeAvailable},
+  });
+  map.mb_reserved_start = FrameAddr(30) + 8;
+  map.mb_reserved_end = FrameAddr(31) + 8;
+  map.mb1_mmap_reserved_start = FrameAddr(40);
+  map.mb1_mmap_reserved_end = FrameAddr(40) + 100;
+  map.fb_addr = FrameAddr(50);
+  map.fb_pitch = kPageSize;
+  map.fb_height = 3;
+  // Lower memory [0, 1 MiB), the kernel image [16, 20), the Multiboot info
+  // [30, 32), the Multiboot1 mmap buffer [40, 41) and the framebuffer [50, 53)
+  // are excluded.
+  EXPECT_THAT(PmmCollectUsableIntervalsForTest(map),
+              t::ElementsAre(PmmIntervalForTest{kLowerMemoryLimit, 0x200000},
+                             PmmIntervalForTest{FrameAddr(0), FrameAddr(16)},
+                             PmmIntervalForTest{FrameAddr(20), FrameAddr(30)},
+                             PmmIntervalForTest{FrameAddr(32), FrameAddr(40)},
+                             PmmIntervalForTest{FrameAddr(41), FrameAddr(50)},
+                             PmmIntervalForTest{FrameAddr(53), FrameAddr(64)}));
 }
 
 }  // namespace

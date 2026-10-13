@@ -13,44 +13,88 @@
 #include <thread>
 #include <vector>
 
+#include "core_runqueue_scheduler.h"
 #include "scheduler_test_support.h"
+#include "work_stealing_scheduler.h"
 
 namespace protos {
 namespace {
 
 namespace t = ::testing;
 
+// Returns the frame the CPU pushes when it interrupts code that runs with
+// interrupts enabled (RFLAGS.IF set; RFLAGS bit 1 always reads as 1).
+static InterruptFrame MakeInterruptFrame(const uint8_t vector) {
+  InterruptFrame frame = {};
+  frame.vector = vector;
+  frame.rflags = kRflagsInterruptEnableBit | 0x2ULL;
+  return frame;
+}
+
+static void SetFlagWorker(void* const arg) { *static_cast<bool*>(arg) = true; }
+
 // ============================================================================
 // Composed 4-Layer `TaskScheduler` Unit Tests (`TaskTest`)
 // ============================================================================
 
-TEST(TaskTest, InitSetsUpBootstrapTaskPerCpuIdleTasksAndIdtHandlers) {
-  SetupEnv(4);
+TEST(TaskTest, InitRegistersHandlersAndSetsUpBootstrapAndPerCpuIdleTasks) {
+  constexpr int kNumCpus = 4;
+  SetupEnv(kNumCpus);
   EXPECT_THAT(GetTaskScheduler(), t::IsNull());
 
   TaskInit();
-  const std::shared_ptr<TaskScheduler>& sched = GetTaskScheduler();
+  TaskScheduler* const sched = GetTaskScheduler();
   ASSERT_THAT(sched, t::NotNull());
   EXPECT_TRUE(IdtIsInitialized());
   EXPECT_THAT(IdtGetHandler(kVectorApicTimer), t::NotNull());
   EXPECT_THAT(IdtGetHandler(kVectorWakeupIpi), t::NotNull());
   EXPECT_TRUE(sched->IsPreemptEnabled());
 
+  // CPU 0 runs the bootstrap task (the calling thread); every AP runs its own
+  // idle task.
   Task* const bootstrap = sched->CurrentTask();
   ASSERT_THAT(bootstrap, t::NotNull());
+  std::vector<Task*> current_tasks = {bootstrap};
+  for (int c = 1; c < kNumCpus; ++c) {
+    BindCpuLocal(SmpGetCpuLocal(c));
+    Task* const idle = sched->CurrentTask();
+    BindCpuLocal(SmpGetCpuLocal(0));
+    ASSERT_THAT(idle, t::NotNull());
+    EXPECT_THAT(current_tasks, t::Not(t::Contains(idle)));
+    current_tasks.push_back(idle);
+  }
 
-  for (int c = 0; c < 4; ++c) {
+  for (int c = 0; c < kNumCpus; ++c) {
     EXPECT_THAT(sched->RunqueueLoad(c), t::Eq(0));
     EXPECT_FALSE(sched->PollIdleCpu(c));
   }
 
-  // Verify IDT dispatch for both 0x20 (APIC timer) and 0x21 (wakeup IPI).
-  InterruptFrame ipi_frame = {};
-  ipi_frame.vector = kVectorWakeupIpi;
-  ipi_frame.rflags = internal::kRflagsInterruptEnableBit;
+  // Both vectors dispatch (each with one EOI) and, with nothing runnable,
+  // leave the bootstrap task running.
+  InterruptFrame timer_frame = MakeInterruptFrame(kVectorApicTimer);
+  InterruptFrame ipi_frame = MakeInterruptFrame(kVectorWakeupIpi);
   const int64_t eoi_before = g_env.eoi_count.load();
+  IdtDispatch(&timer_frame);
   IdtDispatch(&ipi_frame);
-  EXPECT_THAT(g_env.eoi_count.load(), t::Eq(eoi_before + 1));
+  EXPECT_THAT(g_env.eoi_count.load(), t::Eq(eoi_before + 2));
+  EXPECT_THAT(sched->CurrentTask(), t::Eq(bootstrap));
+
+  // The wakeup IPI handler reaches the scheduler, and idle CPU 1's idle loop
+  // then polls it and runs the task queued there. (The calling thread briefly
+  // acts as CPU 1's idle loop.)
+  bool remote_ran = false;
+  Task* const remote =
+      sched->CreateTaskOnCpu(SetFlagWorker, &remote_ran, kDefaultTaskWeight, 1);
+  ASSERT_THAT(remote, t::NotNull());
+  EXPECT_THAT(g_env.ipi_sent_count[1].load(), t::Eq(1));
+  BindCpuLocal(SmpGetCpuLocal(1));
+  const int64_t eoi_before_ipi = g_env.eoi_count.load();
+  IdtDispatch(&ipi_frame);
+  EXPECT_THAT(g_env.eoi_count.load(), t::Eq(eoi_before_ipi + 1));
+  EXPECT_TRUE(sched->PollIdleCpu(1));
+  BindCpuLocal(SmpGetCpuLocal(0));
+  EXPECT_TRUE(remote_ran);
+  sched->Join(remote);
 
   TaskResetForTest();
   EXPECT_THAT(GetTaskScheduler(), t::IsNull());
@@ -58,9 +102,61 @@ TEST(TaskTest, InitSetsUpBootstrapTaskPerCpuIdleTasksAndIdtHandlers) {
   EXPECT_THAT(IdtGetHandler(kVectorWakeupIpi), t::IsNull());
 }
 
+TEST(TaskTest, PublishesTheSchedulerOnlyAfterInitToConcurrentReaders) {
+  constexpr int kNumCpus = 3;
+  SetupEnv(kNumCpus);
+
+  // AP threads poll GetTaskScheduler() while TaskInit() runs, the way the
+  // kernel's AP idle loops do. TSAN checks that publishing the scheduler is
+  // race-free and that readers see it fully initialized.
+  std::atomic<bool> stop_aps{false};
+  std::atomic<int> aps_saw_scheduler{0};
+  std::vector<std::thread> ap_threads;
+  for (int cpu = 1; cpu < kNumCpus; ++cpu) {
+    ap_threads.emplace_back([cpu, &stop_aps, &aps_saw_scheduler]() {
+      BindCpuLocal(SmpGetCpuLocal(cpu));
+      SetInterruptsEnabledForTest(true);
+      bool saw_scheduler = false;
+      while (!stop_aps.load(std::memory_order_acquire)) {
+        TaskScheduler* const ap_sched = GetTaskScheduler();
+        if (ap_sched != nullptr && !saw_scheduler) {
+          saw_scheduler = true;
+          aps_saw_scheduler.fetch_add(1, std::memory_order_acq_rel);
+        }
+        if (ap_sched == nullptr || !ap_sched->PollIdleCpu(cpu)) {
+          std::this_thread::yield();
+        }
+      }
+      ResetCpuLocalForTest();
+    });
+  }
+
+  TaskInit();
+  TaskScheduler* const sched = GetTaskScheduler();
+  ASSERT_THAT(sched, t::NotNull());
+  while (aps_saw_scheduler.load(std::memory_order_acquire) < kNumCpus - 1) {
+    std::this_thread::yield();
+  }
+
+  // The scheduler that the APs picked up runs tasks (on any CPU).
+  bool task_ran = false;
+  Task* const task = sched->CreateTaskOnCpu(SetFlagWorker,       //
+                                            &task_ran,           //
+                                            kDefaultTaskWeight,  //
+                                            kNumCpus - 1);
+  ASSERT_THAT(task, t::NotNull());
+  sched->Join(task);
+  EXPECT_TRUE(task_ran);
+
+  stop_aps.store(true, std::memory_order_release);
+  for (std::thread& th : ap_threads) {
+    th.join();
+  }
+  TaskResetForTest();
+}
+
 struct LifecycleTaskCtx {
   std::vector<int> trace;
-  bool explicit_exit = false;
   int task_index = 0;
   bool stack_aligned = false;
   Task* observed_task = nullptr;
@@ -70,7 +166,7 @@ static void LifecycleWorker(void* const raw_arg) {
   LifecycleTaskCtx* const ctx = static_cast<LifecycleTaskCtx*>(raw_arg);
   ASSERT_THAT(ctx, t::NotNull());
 
-  const std::shared_ptr<TaskScheduler>& sched = GetTaskScheduler();
+  TaskScheduler* const sched = GetTaskScheduler();
   alignas(16) uint64_t probe = 0;
   ctx->stack_aligned = ((reinterpret_cast<uintptr_t>(&probe) & 0xFu) == 0);
   ctx->observed_task = sched->CurrentTask();
@@ -84,18 +180,15 @@ static void LifecycleWorker(void* const raw_arg) {
 TEST(TaskTest, CreateYieldJoinAndImplicitExitLifecycle) {
   SetupEnv(1);
   TaskInit();
-  const std::shared_ptr<TaskScheduler>& sched = GetTaskScheduler();
+  TaskScheduler* const sched = GetTaskScheduler();
 
   const int64_t pmm_before = PmmFreeFrameCount();
   const int64_t heap_before = HeapTotalFreeBytes();
 
   LifecycleTaskCtx ctx_a;
   ctx_a.task_index = 1;
-  ctx_a.explicit_exit = false;
-
   LifecycleTaskCtx ctx_b;
   ctx_b.task_index = 2;
-  ctx_b.explicit_exit = true;
 
   Task* const task_a =
       sched->CreateTask(LifecycleWorker, &ctx_a, kDefaultTaskWeight);
@@ -105,6 +198,7 @@ TEST(TaskTest, CreateYieldJoinAndImplicitExitLifecycle) {
   ASSERT_THAT(task_b, t::NotNull());
   EXPECT_THAT(sched->RunqueueLoad(0), t::Eq(2));
 
+  // Both tasks exit by returning from their entry function.
   sched->Join(task_a);
   sched->Join(task_b);
 
@@ -138,7 +232,7 @@ static void WeightedShareWorker(void* const raw_arg) {
   WeightedShareTaskArg* const arg = static_cast<WeightedShareTaskArg*>(raw_arg);
   WeightedShareCtx* const shared = arg->shared;
   const int idx = arg->index;
-  const std::shared_ptr<TaskScheduler>& sched = GetTaskScheduler();
+  TaskScheduler* const sched = GetTaskScheduler();
 
   for (int i = 0; i < 8; ++i) {
     shared->dispatch_order.push_back(idx);
@@ -155,7 +249,7 @@ static void WeightedShareWorker(void* const raw_arg) {
 TEST(TaskTest, WeightedRbTreeVruntimeOrderingAndInverseWeightScaling) {
   SetupEnv(1);
   TaskInit();
-  const std::shared_ptr<TaskScheduler>& sched = GetTaskScheduler();
+  TaskScheduler* const sched = GetTaskScheduler();
 
   const int64_t pmm_before = PmmFreeFrameCount();
   const int64_t heap_before = HeapTotalFreeBytes();
@@ -224,7 +318,7 @@ struct MinVruntimeFloorCtx {
 
 static void NewbornFloorWorker(void* const raw_arg) {
   MinVruntimeFloorCtx* const ctx = static_cast<MinVruntimeFloorCtx*>(raw_arg);
-  const std::shared_ptr<TaskScheduler>& sched = GetTaskScheduler();
+  TaskScheduler* const sched = GetTaskScheduler();
   for (int i = 0; i < 4; ++i) {
     ctx->create_trace.push_back(2);
     sched->Yield();
@@ -233,7 +327,7 @@ static void NewbornFloorWorker(void* const raw_arg) {
 
 static void VeteranFloorWorker(void* const raw_arg) {
   MinVruntimeFloorCtx* const ctx = static_cast<MinVruntimeFloorCtx*>(raw_arg);
-  const std::shared_ptr<TaskScheduler>& sched = GetTaskScheduler();
+  TaskScheduler* const sched = GetTaskScheduler();
 
   // Advance CPU 0's min_vruntime by 10 slices before creating `newborn`.
   for (int i = 0; i < 10; ++i) {
@@ -250,7 +344,7 @@ static void VeteranFloorWorker(void* const raw_arg) {
 
 static void MigratedFloorWorker(void* const raw_arg) {
   MinVruntimeFloorCtx* const ctx = static_cast<MinVruntimeFloorCtx*>(raw_arg);
-  const std::shared_ptr<TaskScheduler>& sched = GetTaskScheduler();
+  TaskScheduler* const sched = GetTaskScheduler();
   for (int i = 0; i < 4; ++i) {
     ctx->migrate_trace.push_back(20);
     sched->Yield();
@@ -259,18 +353,17 @@ static void MigratedFloorWorker(void* const raw_arg) {
 
 static void LocalPeerFloorWorker(void* const raw_arg) {
   MinVruntimeFloorCtx* const ctx = static_cast<MinVruntimeFloorCtx*>(raw_arg);
-  const std::shared_ptr<TaskScheduler>& sched = GetTaskScheduler();
+  TaskScheduler* const sched = GetTaskScheduler();
   for (int i = 0; i < 4; ++i) {
     ctx->migrate_trace.push_back(10);
     sched->Yield();
   }
 }
 
-TEST(TaskTest,
-     MonotonicMinVruntimeFloorPreventsStarvationOnCreateWakeAndMigrate) {
+TEST(TaskTest, MonotonicMinVruntimeFloorPreventsStarvationOnCreateAndMigrate) {
   SetupEnv(2);
   TaskInit();
-  const std::shared_ptr<TaskScheduler>& sched = GetTaskScheduler();
+  TaskScheduler* const sched = GetTaskScheduler();
 
   const int64_t pmm_before = PmmFreeFrameCount();
   const int64_t heap_before = HeapTotalFreeBytes();
@@ -307,7 +400,7 @@ TEST(TaskTest,
   // (b) Work-stealing migration floor: create `remote_task` on CPU 1 (where
   //     min_vruntime == 0), then steal it onto CPU 0 (where min_vruntime > 0)
   //     and run it alongside `local_peer` on CPU 0. Because `StealTask(0, 1)`
-  //     normalizes `remote_task`'s vruntime to CPU 0's min_vruntime,
+  //     normalizes `remote_task`'s vruntime relative to CPU 0's min_vruntime,
   //     `remote_task` (20) interleaves with `local_peer` (10) instead of
   //     monopolizing CPU 0 for all 4 slices.
   Task* const remote_task =
@@ -347,7 +440,7 @@ TEST(TaskTest,
 TEST(TaskTest, LeastLoadedPlacementAndCrossCpuWakeupIpi) {
   SetupEnv(4);
   TaskInit();
-  const std::shared_ptr<TaskScheduler>& sched = GetTaskScheduler();
+  TaskScheduler* const sched = GetTaskScheduler();
 
   const int64_t pmm_before = PmmFreeFrameCount();
   const int64_t heap_before = HeapTotalFreeBytes();
@@ -391,22 +484,23 @@ TEST(TaskTest, LeastLoadedPlacementAndCrossCpuWakeupIpi) {
 
 static void YieldFourTimesWorker(void* const raw_arg) {
   int* const counter = static_cast<int*>(raw_arg);
-  const std::shared_ptr<TaskScheduler>& sched = GetTaskScheduler();
+  TaskScheduler* const sched = GetTaskScheduler();
   for (int i = 0; i < 4; ++i) {
     ++(*counter);
     sched->Yield();
   }
 }
 
-TEST(TaskTest, TaskJoinBlocksWhenTargetRunningAndImmediateWhenAlreadyExited) {
+TEST(TaskTest, JoinYieldsUntilTargetExitsAndDoesNotYieldForAnExitedTarget) {
   SetupEnv(1);
   TaskInit();
-  const std::shared_ptr<TaskScheduler>& sched = GetTaskScheduler();
+  TaskScheduler* const sched = GetTaskScheduler();
 
   const int64_t pmm_before = PmmFreeFrameCount();
   const int64_t heap_before = HeapTotalFreeBytes();
 
-  // Case 1: Target has not yet exited when Join is called.
+  // Case 1: Target has not yet exited when Join is called. Join keeps
+  // yielding (the bootstrap task stays runnable) until it has.
   int slices = 0;
   Task* const running_target =
       sched->CreateTask(YieldFourTimesWorker, &slices, kDefaultTaskWeight);
@@ -415,12 +509,11 @@ TEST(TaskTest, TaskJoinBlocksWhenTargetRunningAndImmediateWhenAlreadyExited) {
   EXPECT_THAT(PmmFreeFrameCount(), t::Eq(pmm_before));
   EXPECT_THAT(HeapTotalFreeBytes(), t::Eq(heap_before));
 
-  // Case 2: Target already exited before Join is called.
+  // Case 2: Target already exited (and its CPU switched away from it) before
+  // Join is called.
   bool finished = false;
-  Task* const exited_target = sched->CreateTask(
-      [](void* const arg) { *static_cast<bool*>(arg) = true; },  //
-      &finished,                                                 //
-      kDefaultTaskWeight);
+  Task* const exited_target =
+      sched->CreateTask(SetFlagWorker, &finished, kDefaultTaskWeight);
   while (!finished) {
     sched->Yield();
   }
@@ -443,19 +536,17 @@ TEST(TaskTest, TaskJoinBlocksWhenTargetRunningAndImmediateWhenAlreadyExited) {
   TaskResetForTest();
 }
 
-TEST(TaskTest, PostSwitchZombieReapingFreesStackOnIncomingContextAndReapsTcb) {
+TEST(TaskTest, ExitFreesStackOnSwitchAndDetachedTaskIsReapedLater) {
   SetupEnv(1);
   TaskInit();
-  const std::shared_ptr<TaskScheduler>& sched = GetTaskScheduler();
+  TaskScheduler* const sched = GetTaskScheduler();
 
   const int64_t pmm_before = PmmFreeFrameCount();
   const int64_t heap_before = HeapTotalFreeBytes();
 
   bool task_ran = false;
-  Task* const zombie = sched->CreateTask(
-      [](void* const arg) { *static_cast<bool*>(arg) = true; },  //
-      &task_ran,                                                 //
-      kDefaultTaskWeight);
+  Task* const zombie =
+      sched->CreateTask(SetFlagWorker, &task_ran, kDefaultTaskWeight);
   ASSERT_THAT(zombie, t::NotNull());
   // Stack frames and TCB are currently allocated.
   EXPECT_THAT(PmmFreeFrameCount(), t::Eq(pmm_before - kTaskStackFrames));
@@ -467,12 +558,95 @@ TEST(TaskTest, PostSwitchZombieReapingFreesStackOnIncomingContextAndReapsTcb) {
 
   // Immediately upon switching back to the bootstrap task, FinishContextSwitch
   // on the bootstrap stack MUST have already freed `zombie`'s kernel stack back
-  // to the PMM, while `zombie`'s TCB remains allocated until reaped.
+  // to the PMM, while `zombie`'s TCB remains allocated until reclaimed.
   EXPECT_THAT(PmmFreeFrameCount(), t::Eq(pmm_before));
   EXPECT_THAT(HeapTotalFreeBytes(), t::Lt(heap_before));
 
-  // Reap unjoined zombies via ReapZombies() and confirm TCB is freed.
+  // ReapZombies() leaves an exited task alone until it is detached: its owner
+  // may still join it.
+  EXPECT_THAT(sched->ReapZombies(), t::Eq(0));
+  EXPECT_THAT(HeapTotalFreeBytes(), t::Lt(heap_before));
+
+  // Once detached, ReapZombies() frees its TCB and join record.
+  sched->Detach(zombie);
   EXPECT_THAT(sched->ReapZombies(), t::Eq(1));
+  EXPECT_THAT(sched->ReapZombies(), t::Eq(0));
+  EXPECT_THAT(PmmFreeFrameCount(), t::Eq(pmm_before));
+  EXPECT_THAT(HeapTotalFreeBytes(), t::Eq(heap_before));
+
+  // A task detached before it exits is reaped after it exits.
+  bool detached_ran = false;
+  Task* const detached =
+      sched->CreateTask(SetFlagWorker, &detached_ran, kDefaultTaskWeight);
+  ASSERT_THAT(detached, t::NotNull());
+  sched->Detach(detached);
+  EXPECT_THAT(sched->ReapZombies(), t::Eq(0));
+  while (!detached_ran) {
+    sched->Yield();
+  }
+  EXPECT_THAT(sched->ReapZombies(), t::Eq(1));
+  EXPECT_THAT(PmmFreeFrameCount(), t::Eq(pmm_before));
+  EXPECT_THAT(HeapTotalFreeBytes(), t::Eq(heap_before));
+
+  TaskResetForTest();
+}
+
+struct ReaperCtx {
+  std::atomic<bool> stop{false};
+  std::atomic<int> passes{0};
+  std::atomic<int> reaped{0};
+};
+
+static void ReaperWorker(void* const raw_arg) {
+  ReaperCtx* const ctx = static_cast<ReaperCtx*>(raw_arg);
+  TaskScheduler* const sched = GetTaskScheduler();
+  while (!ctx->stop.load(std::memory_order_acquire)) {
+    ctx->reaped.fetch_add(sched->ReapZombies(), std::memory_order_acq_rel);
+    ctx->passes.fetch_add(1, std::memory_order_acq_rel);
+    sched->Yield();
+  }
+}
+
+TEST(TaskTest, ReaperTaskNeverReclaimsAnExitedTaskThatAwaitsJoin) {
+  SetupEnv(1);
+  TaskInit();
+  TaskScheduler* const sched = GetTaskScheduler();
+
+  const int64_t pmm_before = PmmFreeFrameCount();
+  const int64_t heap_before = HeapTotalFreeBytes();
+
+  // A periodic reaper task runs next to a joinable and a detached child.
+  ReaperCtx reaper_ctx;
+  Task* const reaper =
+      sched->CreateTask(ReaperWorker, &reaper_ctx, kDefaultTaskWeight);
+  bool joinable_ran = false;
+  bool detached_ran = false;
+  Task* const joinable =
+      sched->CreateTask(SetFlagWorker, &joinable_ran, kDefaultTaskWeight);
+  Task* const detached =
+      sched->CreateTask(SetFlagWorker, &detached_ran, kDefaultTaskWeight);
+  ASSERT_THAT(reaper, t::NotNull());
+  ASSERT_THAT(joinable, t::NotNull());
+  ASSERT_THAT(detached, t::NotNull());
+  sched->Detach(detached);
+
+  // Both children exit, then the reaper makes several more passes before the
+  // creator gets around to joining `joinable`.
+  while (!joinable_ran || !detached_ran) {
+    sched->Yield();
+  }
+  const int passes_after_exit = reaper_ctx.passes.load();
+  while (reaper_ctx.passes.load() < passes_after_exit + 3) {
+    sched->Yield();
+  }
+
+  // Only the detached child was reaped; `joinable` is still a valid handle.
+  EXPECT_THAT(reaper_ctx.reaped.load(), t::Eq(1));
+  sched->Join(joinable);
+
+  reaper_ctx.stop.store(true, std::memory_order_release);
+  sched->Join(reaper);
+  EXPECT_THAT(reaper_ctx.reaped.load(), t::Eq(1));
   EXPECT_THAT(sched->ReapZombies(), t::Eq(0));
   EXPECT_THAT(PmmFreeFrameCount(), t::Eq(pmm_before));
   EXPECT_THAT(HeapTotalFreeBytes(), t::Eq(heap_before));
@@ -496,19 +670,19 @@ static void PreemptTargetWorker(void* const raw_arg) {
 TEST(TaskTest, PreemptiveLocalApicTimerChargesVruntimeAndPreemptsWhenSafe) {
   SetupEnv(1);
   TaskInit();
-  const std::shared_ptr<TaskScheduler>& sched = GetTaskScheduler();
+  TaskScheduler* const sched = GetTaskScheduler();
 
   const int64_t pmm_before = PmmFreeFrameCount();
   const int64_t heap_before = HeapTotalFreeBytes();
 
+  // `worker` starts at the bootstrap task's vruntime, so it can only preempt
+  // the bootstrap task after a tick has charged the bootstrap task.
   PreemptTimerCtx ctx;
   Task* const worker =
       sched->CreateTask(PreemptTargetWorker, &ctx, kDefaultTaskWeight);
   ASSERT_THAT(worker, t::NotNull());
 
-  InterruptFrame timer_frame = {};
-  timer_frame.vector = kVectorApicTimer;
-  timer_frame.rflags = internal::kRflagsInterruptEnableBit;
+  InterruptFrame timer_frame = MakeInterruptFrame(kVectorApicTimer);
 
   // 1. When a spinlock is held, timer interrupt MUST NOT preempt
   //    mid-critical-section.
@@ -521,8 +695,7 @@ TEST(TaskTest, PreemptiveLocalApicTimerChargesVruntimeAndPreemptsWhenSafe) {
 
   // 2. When interrupts are disabled in the interrupted frame (IF == 0) or
   //    preemption is disabled, timer interrupt MUST NOT preempt.
-  InterruptFrame cli_timer_frame = {};
-  cli_timer_frame.vector = kVectorApicTimer;
+  InterruptFrame cli_timer_frame = MakeInterruptFrame(kVectorApicTimer);
   cli_timer_frame.rflags = 0x2ULL;  // RFLAGS.IF == 0
   IdtDispatch(&cli_timer_frame);
   EXPECT_FALSE(ctx.worker_ran);
@@ -533,8 +706,9 @@ TEST(TaskTest, PreemptiveLocalApicTimerChargesVruntimeAndPreemptsWhenSafe) {
   sched->SetPreemptEnabled(true);
 
   // 3. With preemption enabled and no spinlocks held, `IdtDispatch` sends EOI
-  //    *before* context switching, charges vruntime to `CurrentTask()`, and
-  //    preempts into `worker`!
+  //    *before* context switching, charges a tick of vruntime to the bootstrap
+  //    task (without that charge `worker` would not be ahead of it), and
+  //    preempts into `worker`.
   const int64_t eoi_before = g_env.eoi_count.load();
   IdtDispatch(&timer_frame);
 
@@ -564,7 +738,7 @@ struct MtStealTaskArg {
 static void MtStealWorker(void* const raw_arg) {
   MtStealTaskArg* const arg = static_cast<MtStealTaskArg*>(raw_arg);
   MtStealSharedCtx* const shared = arg->shared;
-  const std::shared_ptr<TaskScheduler>& sched = GetTaskScheduler();
+  TaskScheduler* const sched = GetTaskScheduler();
 
   for (int round = 0; round < 6; ++round) {
     const int cpu = CurrentCpuId();
@@ -592,7 +766,7 @@ TEST(TaskTest, ConcurrentMultiThreadedWorkStealingAndContentionUnderTsan) {
   constexpr int kNumTasks = 24;
   SetupEnv(kNumCpus);
   TaskInit();
-  const std::shared_ptr<TaskScheduler>& sched = GetTaskScheduler();
+  TaskScheduler* const sched = GetTaskScheduler();
   Task* const bootstrap = sched->CurrentTask();
 
   const int64_t pmm_before = PmmFreeFrameCount();
@@ -628,7 +802,7 @@ TEST(TaskTest, ConcurrentMultiThreadedWorkStealingAndContentionUnderTsan) {
       SetInterruptsEnabledForTest(true);
       ready_workers.fetch_add(1, std::memory_order_acq_rel);
 
-      const std::shared_ptr<TaskScheduler>& ap_sched = GetTaskScheduler();
+      TaskScheduler* const ap_sched = GetTaskScheduler();
       while (!stop_workers.load(std::memory_order_acquire)) {
         if (ap_sched == nullptr || !ap_sched->PollIdleCpu(cpu)) {
           std::this_thread::yield();
@@ -639,6 +813,14 @@ TEST(TaskTest, ConcurrentMultiThreadedWorkStealingAndContentionUnderTsan) {
   }
 
   while (ready_workers.load(std::memory_order_acquire) < (kNumCpus - 1)) {
+    std::this_thread::yield();
+  }
+
+  // Wait until an AP has stolen and run a slice before CPU 0 starts running
+  // the tasks itself. While the bootstrap task waits here, outside the
+  // scheduler, nothing runs on CPU 0, so the cross-CPU checks below don't
+  // depend on how the host schedules the AP threads.
+  while (shared.remote_executions.load(std::memory_order_acquire) == 0) {
     std::this_thread::yield();
   }
 
@@ -670,13 +852,28 @@ TEST(TaskTest, ConcurrentMultiThreadedWorkStealingAndContentionUnderTsan) {
   TaskResetForTest();
 }
 
+TEST(TaskTest, WorkStealingLayerForwardsDetachToItsInnerLayer) {
+  SetupEnv(2);
+  const auto mock_inner = std::make_shared<t::StrictMock<MockTaskScheduler>>();
+  const std::shared_ptr<TaskScheduler> sched =
+      CreateWorkStealingScheduler(mock_inner);
+  Task* const fake_task = reinterpret_cast<Task*>(0x3001);
+  Task* detached_task = nullptr;
+  EXPECT_CALL(*mock_inner, Detach).WillOnce([&](Task* const task) {
+    detached_task = task;
+  });
+  sched->Detach(fake_task);
+  EXPECT_THAT(detached_task, t::Eq(fake_task));
+}
+
 TEST(TaskDeathTest, PreconditionAndInvariantViolationsTriggerDcheck) {
   SetupEnv(2);
   TaskInit();
-  const std::shared_ptr<TaskScheduler>& sched = GetTaskScheduler();
+  TaskScheduler* const sched = GetTaskScheduler();
 
   // Invalid CreateTask / CreateTaskOnCpu arguments must trigger DCHECK.
-  EXPECT_DEATH(sched->CreateTask(nullptr), "Check failed");
+  EXPECT_DEATH(sched->CreateTask(nullptr, nullptr, kDefaultTaskWeight),
+               "Check failed");
   EXPECT_DEATH(sched->CreateTask(NoopTask, nullptr, 0), "Check failed");
   EXPECT_DEATH(sched->CreateTask(NoopTask, nullptr, -5), "Check failed");
   EXPECT_DEATH(sched->CreateTask(NoopTask, nullptr, kMaxTaskWeight + 1),
@@ -699,6 +896,23 @@ TEST(TaskDeathTest, PreconditionAndInvariantViolationsTriggerDcheck) {
   EXPECT_DEATH(sched->Join(nullptr), "Check failed");
   EXPECT_DEATH(sched->Join(sched->CurrentTask()), "Check failed");
 
+  // Using a handle after Detach() must trigger DCHECK.
+  Task* const task = sched->CreateTask(NoopTask, nullptr, kDefaultTaskWeight);
+  ASSERT_THAT(task, t::NotNull());
+  EXPECT_DEATH(
+      {
+        sched->Detach(task);
+        sched->Join(task);
+      },
+      "Check failed");
+  EXPECT_DEATH(
+      {
+        sched->Detach(task);
+        sched->Detach(task);
+      },
+      "Check failed");
+  sched->Join(task);
+
   // Yielding while holding an IrqSpinLock must trigger DCHECK.
   EXPECT_DEATH(
       {
@@ -709,6 +923,27 @@ TEST(TaskDeathTest, PreconditionAndInvariantViolationsTriggerDcheck) {
       "Check failed");
 
   TaskResetForTest();
+}
+
+TEST(TaskDeathTest, TaskInitRequiresTheIdtAndRunsOnlyOnce) {
+  SetupEnv(1);
+  TaskInit();
+  EXPECT_DEATH(TaskInit(), "Check failed");
+
+  TaskResetForTest();
+  IdtResetForTest();
+  EXPECT_DEATH(TaskInit(), "Check failed");
+  IdtInit();
+}
+
+TEST(TaskDeathTest, CoreLayerAloneDoesNotSupportDetach) {
+  SetupEnv(1);
+  const std::shared_ptr<TaskScheduler> core = CreateCoreRunqueueScheduler();
+  core->Init();
+  Task* const task = core->CreateTask(NoopTask, nullptr, kDefaultTaskWeight);
+  ASSERT_THAT(task, t::NotNull());
+  EXPECT_DEATH(core->Detach(task), "Check failed");
+  core->Join(task);
 }
 
 }  // namespace

@@ -17,8 +17,6 @@ namespace {
 
 namespace t = ::testing;
 
-constexpr int64_t kInitialHeapFrames = 256;
-constexpr int64_t kMinExpandFrames = 16;
 constexpr int64_t kFakeRamFrames = 4096;  // 16 MiB
 constexpr int64_t kFakeRamBytes = kFakeRamFrames * kPageSize;
 
@@ -29,10 +27,10 @@ struct FakePmmState {
   int64_t limit_frame = kFakeRamFrames;
   int64_t gap_frames = 0;
   bool force_oom = false;
-  uintptr_t max_phys_override = 0;
   std::vector<int64_t> scripted_start_frames;
   int alloc_call_count = 0;
   std::vector<int64_t> requested_counts;
+  int max_phys_call_count = 0;
 };
 
 IrqSpinLock g_fake_pmm_lock;
@@ -55,9 +53,7 @@ static void ResetFakePmm(const int64_t zero_frames = 512) {
 
 uintptr_t PmmMaxPhysicalAddress() {
   const IrqSpinLockGuard lock_guard(g_fake_pmm_lock);
-  if (g_pmm.max_phys_override != 0) {
-    return g_pmm.max_phys_override;
-  }
+  ++g_pmm.max_phys_call_count;
   return FakeRamBase() + kFakeRamBytes;
 }
 
@@ -455,14 +451,14 @@ TEST(HeapTest, MultiArenaExpansionContiguousAndNonContiguousIsolation) {
   Kfree(cross_arena);
 }
 
-TEST(HeapTest, OomAndNullFreeResilience) {
-  // OOM during HeapInit() panics via CHECK.
+TEST(HeapDeathTest, InitPanicsIfInitialArenaCannotBeAllocated) {
   ResetFakePmm();
   g_pmm.force_oom = true;
-  EXPECT_DEATH(HeapInit(), "Check failed");
+  EXPECT_DEATH(HeapInit(), "Check failed: arena_addr != 0 at");
+}
 
-  // Initialization succeeds once PMM frames are available.
-  g_pmm.force_oom = false;
+TEST(HeapTest, OomAndNullFreeResilience) {
+  ResetFakePmm();
   HeapInit();
   void* const recovered = Kmalloc(64);
   ASSERT_THAT(recovered, t::NotNull());
@@ -491,7 +487,7 @@ TEST(HeapTest, OomAndNullFreeResilience) {
   EXPECT_THAT(HeapTotalFreeBytes(), t::Eq(initial_free));
 }
 
-TEST(HeapDeathTest, InvalidOrDoubleFreeTriggersDcheck) {
+TEST(HeapDeathTest, InvalidOrDoubleFreePanics) {
   ResetFakePmm();
   HeapInit();
 
@@ -501,25 +497,155 @@ TEST(HeapDeathTest, InvalidOrDoubleFreeTriggersDcheck) {
   ASSERT_THAT(b, t::NotNull());
   std::memset(a, 0, 128);
 
-  // Negative Kmalloc size triggers DCHECK.
-  EXPECT_DEATH(Kmalloc(-1), "Check failed");
+  // A negative Kmalloc size violates a DCHECKed precondition.
+  EXPECT_DEATH(Kmalloc(-1), "Check failed: size >= 0 at");
 
-  // Out-of-bounds and misaligned pointers trigger DCHECK in Kfree.
-  EXPECT_DEATH(Kfree(reinterpret_cast<void*>(kLowerMemoryLimit)),
-               "Check failed");
+  // Out-of-bounds and misaligned pointers fail Kfree's DCHECKs.
+  EXPECT_DEATH(
+      Kfree(reinterpret_cast<void*>(kLowerMemoryLimit)),
+      "Check failed: ptr_addr >= kLowerMemoryLimit \\+ kBlockHeaderSize at");
   EXPECT_DEATH(Kfree(reinterpret_cast<void*>(PmmMaxPhysicalAddress())),
-               "Check failed");
-  EXPECT_DEATH(Kfree(a + 1), "Check failed");
-  EXPECT_DEATH(Kfree(a + 64), "Check failed");
+               "Check failed: ptr_addr < g_max_phys_addr at");
+  EXPECT_DEATH(
+      Kfree(a + 1),
+      "Check failed: \\(ptr_addr & \\(kHeapAlignment - 1\\)\\) == 0 at");
 
-  // Double-free of a standalone free block triggers DCHECK (`is_free == 0`).
+  // A pointer into the middle of a payload has no block header in front of it.
+  EXPECT_DEATH(Kfree(a + 64),
+               "Check failed: block->magic == kHeapBlockMagic at");
+
+  // Double free of a standalone free block fails the `is_free` CHECK.
   Kfree(b);
-  EXPECT_DEATH(Kfree(b), "Check failed");
+  EXPECT_DEATH(Kfree(b), "Check failed: block->is_free == 0 at");
 
-  // Double-free of an absorbed/coalesced block triggers DCHECK
-  // (`magic == kHeapBlockMagic`).
+  // Double free of a block whose header was absorbed by coalescing fails the
+  // `magic` CHECK.
   Kfree(a);
-  EXPECT_DEATH(Kfree(b), "Check failed");
+  EXPECT_DEATH(Kfree(b), "Check failed: block->magic == kHeapBlockMagic at");
+}
+
+TEST(HeapDeathTest, DoubleFreeOfHeaderShiftedBlockPanics) {
+  ResetFakePmm();
+  HeapInit();
+
+  // The arena is page aligned, so the first payload starts at arena + 64 and
+  // the free block after a 32-byte allocation has its payload at arena + 160.
+  // Aligning that payload to 64 bytes needs 32 bytes of padding, which is too
+  // small for a separate free block, so KmallocAligned shifts the header.
+  uint8_t* const first = static_cast<uint8_t*>(Kmalloc(32));
+  uint8_t* const shifted = static_cast<uint8_t*>(KmallocAligned(64, 64));
+  ASSERT_THAT(first, t::NotNull());
+  ASSERT_THAT(shifted, t::Eq(first + 128));
+
+  Kfree(shifted);
+  EXPECT_DEATH(Kfree(shifted),
+               "Check failed: block->magic == kHeapBlockMagic at");
+
+  // Still detected after the restored block coalesced with its predecessor.
+  Kfree(first);
+  EXPECT_DEATH(Kfree(shifted),
+               "Check failed: block->magic == kHeapBlockMagic at");
+  EXPECT_THAT(HeapTotalFreeBytes(), t::Eq(kInitialHeapFrames * kPageSize - 64));
+}
+
+TEST(HeapTest, OverAlignedExpansionReservesWorstCaseAlignmentPadding) {
+  struct Case {
+    int64_t alignment;
+    int64_t size;
+    int64_t expected_frames;
+  };
+  // Each size exactly fills whole frames together with one 64-byte header, so
+  // the new arena must also reserve `alignment - kHeapAlignment` bytes for
+  // aligning the payload, or it is a frame short.
+  constexpr Case kCases[] = {
+      {128, 17 * kPageSize - 64, 18},
+      {kPageSize, 16 * kPageSize - 64, 17},
+  };
+  for (const Case& c : kCases) {
+    SCOPED_TRACE(c.alignment);
+    ResetFakePmm(1024);
+    g_pmm.gap_frames = 1;
+    HeapInit();
+    // Exhaust the initial arena so that the request needs a new, separate one.
+    void* const arena1 = Kmalloc(HeapTotalFreeBytes());
+    ASSERT_THAT(arena1, t::NotNull());
+    ASSERT_THAT(HeapTotalFreeBytes(), t::Eq(0));
+
+    uint8_t* const aligned =
+        static_cast<uint8_t*>(KmallocAligned(c.size, c.alignment));
+    ASSERT_THAT(aligned, t::NotNull());
+    EXPECT_THAT(reinterpret_cast<uintptr_t>(aligned) & (c.alignment - 1),
+                t::Eq(0u));
+    EXPECT_THAT(g_pmm.requested_counts,
+                t::ElementsAre(kInitialHeapFrames, c.expected_frames));
+    std::memset(aligned, 0x5A, c.size);
+    Kfree(aligned);
+    Kfree(arena1);
+  }
+}
+
+TEST(HeapTest, OnlyHeapInitQueriesPmmMaxPhysicalAddress) {
+  ResetFakePmm();
+  HeapInit();
+  EXPECT_THAT(g_pmm.max_phys_call_count, t::Eq(1));
+
+  void* const small = Kmalloc(64);
+  void* const aligned = KmallocAligned(100, 512);
+  void* const expanding = Kmalloc(2 * kInitialHeapFrames * kPageSize);
+  ASSERT_THAT(small, t::NotNull());
+  ASSERT_THAT(aligned, t::NotNull());
+  ASSERT_THAT(expanding, t::NotNull());
+  EXPECT_THAT(Kmalloc(INT64_MAX), t::IsNull());
+  Kfree(small);
+  Kfree(aligned);
+  Kfree(expanding);
+
+  EXPECT_THAT(g_pmm.alloc_call_count, t::Eq(2));
+  EXPECT_THAT(g_pmm.max_phys_call_count, t::Eq(1));
+}
+
+TEST(HeapTest, KmallocForNewNothrowReturnsNullForUnsatisfiableRequests) {
+  ResetFakePmm();
+  HeapInit();
+  const int64_t initial_free = HeapTotalFreeBytes();
+
+  EXPECT_THAT(KmallocForNewNothrow(SIZE_MAX, kHeapAlignment), t::IsNull());
+  EXPECT_THAT(
+      KmallocForNewNothrow(static_cast<size_t>(INT64_MAX) + 1, kHeapAlignment),
+      t::IsNull());
+  EXPECT_THAT(KmallocForNewNothrow(64, 2 * kPageSize), t::IsNull());
+  EXPECT_THAT(KmallocForNewNothrow(64, SIZE_MAX), t::IsNull());
+  EXPECT_THAT(KmallocForNewNothrow(64, 24), t::IsNull());
+  g_pmm.force_oom = true;
+  EXPECT_THAT(KmallocForNewNothrow(initial_free + 64, kHeapAlignment),
+              t::IsNull());
+  g_pmm.force_oom = false;
+  EXPECT_THAT(HeapTotalFreeBytes(), t::Eq(initial_free));
+
+  void* const ptr = KmallocForNewNothrow(100, 256);
+  ASSERT_THAT(ptr, t::NotNull());
+  EXPECT_THAT(reinterpret_cast<uintptr_t>(ptr) & 255u, t::Eq(0u));
+  Kfree(ptr);
+  EXPECT_THAT(HeapTotalFreeBytes(), t::Eq(initial_free));
+}
+
+TEST(HeapDeathTest, KmallocForNewPanicsInsteadOfReturningNull) {
+  ResetFakePmm();
+  HeapInit();
+  void* const ptr = KmallocForNew(100, kHeapAlignment);
+  ASSERT_THAT(ptr, t::NotNull());
+  EXPECT_THAT(reinterpret_cast<uintptr_t>(ptr) & (kHeapAlignment - 1),
+              t::Eq(0u));
+  Kfree(ptr);
+
+  EXPECT_DEATH(KmallocForNew(SIZE_MAX, kHeapAlignment),
+               "operator new: heap exhausted");
+  EXPECT_DEATH(KmallocForNew(64, 2 * kPageSize),
+               "operator new: heap exhausted");
+  g_pmm.force_oom = true;
+  EXPECT_DEATH(
+      KmallocForNew(2 * kInitialHeapFrames * kPageSize, kHeapAlignment),
+      "operator new: heap exhausted");
 }
 
 TEST(HeapTest, HighFragmentationStressAndFullCoalescence) {
@@ -794,15 +920,15 @@ TEST(HeapTest, KmallocAlignedFrontSplitHeaderShiftAndCoalescing) {
               t::Eq(0u));
 
   // Next free block payload is at +64 + 32 + 64 = +160 (32 mod 64).
-  // Requesting 64-byte alignment requires offset = 32 bytes (< 80), exercising
-  // the header-shift path (`0 < offset < kMinFrontSplitOffset`).
+  // Requesting 64-byte alignment requires offset = 32 bytes, exercising the
+  // header-shift path (`0 < offset < kMinFrontSplitOffset`, 80 bytes).
   void* const aligned64_shifted = KmallocAligned(64, 64);
   ASSERT_THAT(aligned64_shifted, t::NotNull());
   EXPECT_THAT(reinterpret_cast<uintptr_t>(aligned64_shifted) & 63u, t::Eq(0u));
   std::memset(aligned64_shifted, 0x5A, 64);
 
-  // Requesting 4096-byte alignment requires a large offset (>= 80), exercising
-  // the front-split path (`offset >= kMinFrontSplitOffset`), which returns the
+  // Requesting 4096-byte alignment requires a large offset, exercising the
+  // front-split path (`offset >= kMinFrontSplitOffset`), which returns the
   // front padding block to `g_free_tree`.
   void* const aligned4096_front_split = KmallocAligned(128, kPageSize);
   ASSERT_THAT(aligned4096_front_split, t::NotNull());

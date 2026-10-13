@@ -18,6 +18,15 @@ namespace {
 
 namespace t = ::testing;
 
+// Returns the frame the CPU pushes when it interrupts code that runs with
+// interrupts enabled (RFLAGS.IF set; RFLAGS bit 1 always reads as 1).
+static InterruptFrame MakeInterruptFrame(const uint8_t vector) {
+  InterruptFrame frame = {};
+  frame.vector = vector;
+  frame.rflags = kRflagsInterruptEnableBit | 0x2ULL;
+  return frame;
+}
+
 TEST(PreemptiveSchedulerTest,
      DefaultPreemptStateTogglingAndInitResetsToEnabled) {
   SetupEnv(1);
@@ -55,30 +64,8 @@ TEST(PreemptiveSchedulerTest,
   const std::shared_ptr<TaskScheduler> sched =
       CreatePreemptiveScheduler(mock_inner);
 
-  // Case 1: frame == nullptr.
-  bool timer_null_called = false;
-  bool ipi_null_called = false;
-  EXPECT_CALL(*mock_inner, OnTimerInterrupt)
-      .WillOnce([&](InterruptFrame* const frame) {
-        EXPECT_THAT(frame, t::IsNull());
-        timer_null_called = true;
-      });
-  EXPECT_CALL(*mock_inner, OnWakeupIpi)
-      .WillOnce([&](InterruptFrame* const frame) {
-        EXPECT_THAT(frame, t::IsNull());
-        ipi_null_called = true;
-      });
-
-  sched->OnTimerInterrupt(nullptr);
-  sched->OnWakeupIpi(nullptr);
-  EXPECT_TRUE(timer_null_called);
-  EXPECT_TRUE(ipi_null_called);
-
-  // Case 2: frame != nullptr with frame->rflags == 0.
-  InterruptFrame zero_rflags_frame = {};
-  zero_rflags_frame.vector = kVectorApicTimer;
-  zero_rflags_frame.rflags = 0;
-
+  InterruptFrame timer_frame = MakeInterruptFrame(kVectorApicTimer);
+  InterruptFrame ipi_frame = MakeInterruptFrame(kVectorWakeupIpi);
   InterruptFrame* observed_timer_frame = nullptr;
   InterruptFrame* observed_ipi_frame = nullptr;
   EXPECT_CALL(*mock_inner, OnTimerInterrupt)
@@ -88,33 +75,83 @@ TEST(PreemptiveSchedulerTest,
       .WillOnce(
           [&](InterruptFrame* const frame) { observed_ipi_frame = frame; });
 
-  sched->OnTimerInterrupt(&zero_rflags_frame);
-  EXPECT_THAT(observed_timer_frame, t::Eq(&zero_rflags_frame));
+  sched->OnTimerInterrupt(&timer_frame);
+  EXPECT_THAT(observed_timer_frame, t::Eq(&timer_frame));
 
-  zero_rflags_frame.vector = kVectorWakeupIpi;
-  sched->OnWakeupIpi(&zero_rflags_frame);
-  EXPECT_THAT(observed_ipi_frame, t::Eq(&zero_rflags_frame));
+  sched->OnWakeupIpi(&ipi_frame);
+  EXPECT_THAT(observed_ipi_frame, t::Eq(&ipi_frame));
+}
 
-  // Case 3: frame != nullptr with kRflagsInterruptEnableBit set in rflags.
-  InterruptFrame enabled_frame = {};
-  enabled_frame.vector = kVectorApicTimer;
-  enabled_frame.rflags = internal::kRflagsInterruptEnableBit | 0x2ULL;
+TEST(PreemptiveSchedulerTest,
+     SuppressesInterruptsUnlessFrameShowsInterruptsWereEnabled) {
+  SetupEnv(1);
+  const auto mock_inner = std::make_shared<t::StrictMock<MockTaskScheduler>>();
+  const std::shared_ptr<TaskScheduler> sched =
+      CreatePreemptiveScheduler(mock_inner);
 
-  observed_timer_frame = nullptr;
-  observed_ipi_frame = nullptr;
+  // StrictMock verifies that none of these reach the inner layer: without a
+  // frame, or with RFLAGS.IF (bit 9) clear in the saved RFLAGS, the
+  // interrupted context can't be preempted.
+  sched->OnTimerInterrupt(nullptr);
+  sched->OnWakeupIpi(nullptr);
+
+  InterruptFrame cli_frame = MakeInterruptFrame(kVectorApicTimer);
+  constexpr uint64_t kRflagsWithIfClear[] = {
+      0x0ULL, 0x2ULL, 0x246ULL & ~kRflagsInterruptEnableBit};
+  for (const uint64_t rflags : kRflagsWithIfClear) {
+    cli_frame.rflags = rflags;
+    sched->OnTimerInterrupt(&cli_frame);
+    sched->OnWakeupIpi(&cli_frame);
+  }
+
+  // Setting IF (bit 9) in the saved RFLAGS allows forwarding.
+  cli_frame.rflags |= kRflagsInterruptEnableBit;
+  int forwarded = 0;
   EXPECT_CALL(*mock_inner, OnTimerInterrupt)
-      .WillOnce(
-          [&](InterruptFrame* const frame) { observed_timer_frame = frame; });
+      .WillOnce([&](InterruptFrame* const passed_frame) {
+        EXPECT_THAT(passed_frame, t::Eq(&cli_frame));
+        ++forwarded;
+      });
   EXPECT_CALL(*mock_inner, OnWakeupIpi)
-      .WillOnce(
-          [&](InterruptFrame* const frame) { observed_ipi_frame = frame; });
+      .WillOnce([&](InterruptFrame* const passed_frame) {
+        EXPECT_THAT(passed_frame, t::Eq(&cli_frame));
+        ++forwarded;
+      });
 
-  sched->OnTimerInterrupt(&enabled_frame);
-  EXPECT_THAT(observed_timer_frame, t::Eq(&enabled_frame));
+  sched->OnTimerInterrupt(&cli_frame);
+  sched->OnWakeupIpi(&cli_frame);
+  EXPECT_THAT(forwarded, t::Eq(2));
+}
 
-  enabled_frame.vector = kVectorWakeupIpi;
-  sched->OnWakeupIpi(&enabled_frame);
-  EXPECT_THAT(observed_ipi_frame, t::Eq(&enabled_frame));
+TEST(PreemptiveSchedulerTest,
+     DecidesFromSavedRflagsAndIgnoresCurrentInterruptFlag) {
+  SetupEnv(1);
+  const auto mock_inner = std::make_shared<t::StrictMock<MockTaskScheduler>>();
+  const std::shared_ptr<TaskScheduler> sched =
+      CreatePreemptiveScheduler(mock_inner);
+
+  // Inside an interrupt gate the CPU has cleared IF, so the current interrupt
+  // flag says nothing about the interrupted context. Simulate that: interrupts
+  // are disabled now, but the frame shows they were enabled when the interrupt
+  // arrived, so the interrupt is forwarded.
+  SetInterruptsEnabledForTest(false);
+  InterruptFrame frame = MakeInterruptFrame(kVectorApicTimer);
+  int forwarded = 0;
+  EXPECT_CALL(*mock_inner, OnTimerInterrupt)
+      .WillOnce([&](InterruptFrame* const passed_frame) {
+        EXPECT_THAT(passed_frame, t::Eq(&frame));
+        ++forwarded;
+      });
+  EXPECT_CALL(*mock_inner, OnWakeupIpi)
+      .WillOnce([&](InterruptFrame* const passed_frame) {
+        EXPECT_THAT(passed_frame, t::Eq(&frame));
+        ++forwarded;
+      });
+
+  sched->OnTimerInterrupt(&frame);
+  sched->OnWakeupIpi(&frame);
+  EXPECT_THAT(forwarded, t::Eq(2));
+  SetInterruptsEnabledForTest(true);
 }
 
 TEST(PreemptiveSchedulerTest, SuppressesInterruptsWhenPreemptDisabled) {
@@ -123,18 +160,15 @@ TEST(PreemptiveSchedulerTest, SuppressesInterruptsWhenPreemptDisabled) {
   const std::shared_ptr<TaskScheduler> sched =
       CreatePreemptiveScheduler(mock_inner);
 
-  InterruptFrame frame = {};
-  frame.vector = kVectorApicTimer;
-  frame.rflags = internal::kRflagsInterruptEnableBit;
+  InterruptFrame frame = MakeInterruptFrame(kVectorApicTimer);
 
   sched->SetPreemptEnabled(false);
   EXPECT_FALSE(sched->IsPreemptEnabled());
 
-  // StrictMock verifies zero calls to inner when preemption is disabled.
+  // StrictMock verifies zero calls to inner when preemption is disabled: the
+  // inner layers don't even see the tick (no vruntime accounting either).
   sched->OnTimerInterrupt(&frame);
-  sched->OnTimerInterrupt(nullptr);
   sched->OnWakeupIpi(&frame);
-  sched->OnWakeupIpi(nullptr);
 
   // Re-enabling preemption restores forwarding.
   sched->SetPreemptEnabled(true);
@@ -163,9 +197,7 @@ TEST(PreemptiveSchedulerTest, SuppressesInterruptsWhenCpuLocalIsNull) {
   const std::shared_ptr<TaskScheduler> sched =
       CreatePreemptiveScheduler(mock_inner);
 
-  InterruptFrame frame = {};
-  frame.vector = kVectorApicTimer;
-  frame.rflags = internal::kRflagsInterruptEnableBit;
+  InterruptFrame frame = MakeInterruptFrame(kVectorApicTimer);
 
   // Unbind CpuLocal on the current host thread.
   ResetCpuLocalForTest();
@@ -173,9 +205,7 @@ TEST(PreemptiveSchedulerTest, SuppressesInterruptsWhenCpuLocalIsNull) {
 
   // StrictMock verifies zero calls to inner when CurrentCpuOrNull() == nullptr.
   sched->OnTimerInterrupt(&frame);
-  sched->OnTimerInterrupt(nullptr);
   sched->OnWakeupIpi(&frame);
-  sched->OnWakeupIpi(nullptr);
 
   // Re-binding valid online CpuLocal restores forwarding.
   BindCpuLocal(&g_env.cpu_locals[0]);
@@ -202,9 +232,7 @@ TEST(PreemptiveSchedulerTest, SuppressesInterruptsWhenCurrentCpuIsOffline) {
   const std::shared_ptr<TaskScheduler> sched =
       CreatePreemptiveScheduler(mock_inner);
 
-  InterruptFrame frame = {};
-  frame.vector = kVectorApicTimer;
-  frame.rflags = internal::kRflagsInterruptEnableBit;
+  InterruptFrame frame = MakeInterruptFrame(kVectorApicTimer);
 
   g_env.cpu_locals[0].online = false;
   ASSERT_THAT(CurrentCpuOrNull(), t::NotNull());
@@ -212,9 +240,7 @@ TEST(PreemptiveSchedulerTest, SuppressesInterruptsWhenCurrentCpuIsOffline) {
 
   // StrictMock verifies zero calls to inner when CurrentCpu()->online == false.
   sched->OnTimerInterrupt(&frame);
-  sched->OnTimerInterrupt(nullptr);
   sched->OnWakeupIpi(&frame);
-  sched->OnWakeupIpi(nullptr);
 
   // Marking CPU online restores forwarding.
   g_env.cpu_locals[0].online = true;
@@ -242,9 +268,7 @@ TEST(PreemptiveSchedulerTest,
   const std::shared_ptr<TaskScheduler> sched =
       CreatePreemptiveScheduler(mock_inner);
 
-  InterruptFrame frame = {};
-  frame.vector = kVectorApicTimer;
-  frame.rflags = internal::kRflagsInterruptEnableBit;
+  InterruptFrame frame = MakeInterruptFrame(kVectorApicTimer);
 
   IrqSpinLock outer_lock;
   IrqSpinLock inner_lock;
@@ -252,13 +276,6 @@ TEST(PreemptiveSchedulerTest,
     const IrqSpinLockGuard outer_guard(outer_lock);
     sched->OnTimerInterrupt(&frame);
     sched->OnWakeupIpi(&frame);
-
-    // Even if the simulated interrupt flag were true while a lock is held on
-    // TopHeldLockSlot(), preemption must still be suppressed by the held lock.
-    SetInterruptsEnabledForTest(true);
-    sched->OnTimerInterrupt(&frame);
-    sched->OnWakeupIpi(&frame);
-    SetInterruptsEnabledForTest(false);
 
     {
       const IrqSpinLockGuard inner_guard(inner_lock);
@@ -286,82 +303,6 @@ TEST(PreemptiveSchedulerTest,
 
   sched->OnTimerInterrupt(&frame);
   sched->OnWakeupIpi(&frame);
-  EXPECT_THAT(forwarded, t::Eq(2));
-}
-
-TEST(PreemptiveSchedulerTest,
-     SuppressesInterruptsWhenHostInterruptFlagIsDisabled) {
-  SetupEnv(1);
-  const auto mock_inner = std::make_shared<t::StrictMock<MockTaskScheduler>>();
-  const std::shared_ptr<TaskScheduler> sched =
-      CreatePreemptiveScheduler(mock_inner);
-
-  InterruptFrame frame = {};
-  frame.vector = kVectorApicTimer;
-  frame.rflags = internal::kRflagsInterruptEnableBit;
-
-  SetInterruptsEnabledForTest(false);
-  EXPECT_FALSE(AreInterruptsEnabled());
-
-  // StrictMock verifies zero calls when simulated host interrupts are disabled.
-  sched->OnTimerInterrupt(&frame);
-  sched->OnTimerInterrupt(nullptr);
-  sched->OnWakeupIpi(&frame);
-  sched->OnWakeupIpi(nullptr);
-
-  SetInterruptsEnabledForTest(true);
-  int forwarded = 0;
-  EXPECT_CALL(*mock_inner, OnTimerInterrupt)
-      .WillOnce([&](InterruptFrame* const passed_frame) {
-        EXPECT_THAT(passed_frame, t::Eq(&frame));
-        ++forwarded;
-      });
-  EXPECT_CALL(*mock_inner, OnWakeupIpi)
-      .WillOnce([&](InterruptFrame* const passed_frame) {
-        EXPECT_THAT(passed_frame, t::Eq(&frame));
-        ++forwarded;
-      });
-
-  sched->OnTimerInterrupt(&frame);
-  sched->OnWakeupIpi(&frame);
-  EXPECT_THAT(forwarded, t::Eq(2));
-}
-
-TEST(PreemptiveSchedulerTest,
-     SuppressesInterruptsWhenFrameRflagsHasInterruptEnableBitCleared) {
-  SetupEnv(1);
-  const auto mock_inner = std::make_shared<t::StrictMock<MockTaskScheduler>>();
-  const std::shared_ptr<TaskScheduler> sched =
-      CreatePreemptiveScheduler(mock_inner);
-
-  // Non-zero rflags with IF (bit 9) == 0 must suppress preemption.
-  InterruptFrame cli_frame = {};
-  cli_frame.vector = kVectorApicTimer;
-  cli_frame.rflags = 0x2ULL;
-
-  sched->OnTimerInterrupt(&cli_frame);
-  sched->OnWakeupIpi(&cli_frame);
-
-  cli_frame.rflags = 0x246ULL & ~internal::kRflagsInterruptEnableBit;
-  sched->OnTimerInterrupt(&cli_frame);
-  sched->OnWakeupIpi(&cli_frame);
-
-  // Setting IF (bit 9) in rflags allows forwarding.
-  cli_frame.rflags |= internal::kRflagsInterruptEnableBit;
-  int forwarded = 0;
-  EXPECT_CALL(*mock_inner, OnTimerInterrupt)
-      .WillOnce([&](InterruptFrame* const passed_frame) {
-        EXPECT_THAT(passed_frame, t::Eq(&cli_frame));
-        ++forwarded;
-      });
-  EXPECT_CALL(*mock_inner, OnWakeupIpi)
-      .WillOnce([&](InterruptFrame* const passed_frame) {
-        EXPECT_THAT(passed_frame, t::Eq(&cli_frame));
-        ++forwarded;
-      });
-
-  sched->OnTimerInterrupt(&cli_frame);
-  sched->OnWakeupIpi(&cli_frame);
   EXPECT_THAT(forwarded, t::Eq(2));
 }
 
@@ -419,7 +360,15 @@ TEST(PreemptiveSchedulerTest,
   sched->Join(fake_task_a);
   EXPECT_THAT(joined_task, t::Eq(fake_task_a));
 
-  // 5. ReapZombies
+  // 5. Detach
+  Task* detached_task = nullptr;
+  EXPECT_CALL(*mock_inner, Detach).WillOnce([&](Task* const task) {
+    detached_task = task;
+  });
+  sched->Detach(fake_task_b);
+  EXPECT_THAT(detached_task, t::Eq(fake_task_b));
+
+  // 6. ReapZombies
   EXPECT_CALL(*mock_inner, ReapZombies).WillOnce([&]() { return 5; });
   EXPECT_THAT(sched->ReapZombies(), t::Eq(5));
 
@@ -479,35 +428,23 @@ TEST(PreemptiveSchedulerTest,
   std::atomic<int64_t> ipi_forwarded{0};
   std::atomic<bool> safety_violation{false};
 
+  // Checks the conditions that the preemptive layer guarantees for every
+  // forwarded interrupt.
+  const auto check_forwarded = [&](const InterruptFrame* const frame) {
+    const CpuLocal* const cpu = CurrentCpuOrNull();
+    if (cpu == nullptr || !cpu->online || HoldsAnyIrqSpinLock() ||
+        frame == nullptr || (frame->rflags & kRflagsInterruptEnableBit) == 0) {
+      safety_violation.store(true, std::memory_order_relaxed);
+    }
+  };
   EXPECT_CALL(*mock_inner, OnTimerInterrupt)
       .WillRepeatedly([&](InterruptFrame* const frame) {
-        const CpuLocal* const cpu = CurrentCpuOrNull();
-        if (cpu == nullptr || !cpu->online || !AreInterruptsEnabled()) {
-          safety_violation.store(true, std::memory_order_relaxed);
-        }
-        if (internal::TopHeldLock() != nullptr) {
-          safety_violation.store(true, std::memory_order_relaxed);
-        }
-        if (frame != nullptr && frame->rflags != 0 &&
-            (frame->rflags & internal::kRflagsInterruptEnableBit) == 0) {
-          safety_violation.store(true, std::memory_order_relaxed);
-        }
+        check_forwarded(frame);
         timer_forwarded.fetch_add(1, std::memory_order_relaxed);
       });
-
   EXPECT_CALL(*mock_inner, OnWakeupIpi)
       .WillRepeatedly([&](InterruptFrame* const frame) {
-        const CpuLocal* const cpu = CurrentCpuOrNull();
-        if (cpu == nullptr || !cpu->online || !AreInterruptsEnabled()) {
-          safety_violation.store(true, std::memory_order_relaxed);
-        }
-        if (internal::TopHeldLock() != nullptr) {
-          safety_violation.store(true, std::memory_order_relaxed);
-        }
-        if (frame != nullptr && frame->rflags != 0 &&
-            (frame->rflags & internal::kRflagsInterruptEnableBit) == 0) {
-          safety_violation.store(true, std::memory_order_relaxed);
-        }
+        check_forwarded(frame);
         ipi_forwarded.fetch_add(1, std::memory_order_relaxed);
       });
 
@@ -526,12 +463,8 @@ TEST(PreemptiveSchedulerTest,
         std::this_thread::yield();
       }
 
-      InterruptFrame safe_frame = {};
-      safe_frame.vector = kVectorApicTimer;
-      safe_frame.rflags = internal::kRflagsInterruptEnableBit;
-
-      InterruptFrame cli_frame = {};
-      cli_frame.vector = kVectorApicTimer;
+      InterruptFrame safe_frame = MakeInterruptFrame(kVectorApicTimer);
+      InterruptFrame cli_frame = MakeInterruptFrame(kVectorApicTimer);
       cli_frame.rflags = 0x2ULL;
 
       IrqSpinLock local_lock;
@@ -570,9 +503,7 @@ TEST(PreemptiveSchedulerTest,
   SetInterruptsEnabledForTest(true);
   sched->SetPreemptEnabled(true);
 
-  InterruptFrame final_frame = {};
-  final_frame.vector = kVectorApicTimer;
-  final_frame.rflags = internal::kRflagsInterruptEnableBit;
+  InterruptFrame final_frame = MakeInterruptFrame(kVectorApicTimer);
   sched->OnTimerInterrupt(&final_frame);
   sched->OnWakeupIpi(&final_frame);
 

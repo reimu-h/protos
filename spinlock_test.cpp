@@ -14,17 +14,39 @@ namespace {
 
 namespace t = ::testing;
 
-// Global constexpr instance to verify compile-time zero-initialization for
-// `.bss` compatibility.
+// `constinit` only compiles if `IrqSpinLock` is constant-initialized, i.e.
+// needs no runtime constructor, which kernel globals in `.bss` rely on.
 constinit IrqSpinLock g_static_spinlock;
 
-TEST(SpinLockTest, ConstexprInitAndBasicLockUnlock) {
+// Every test starts and ends on an unbound thread with (simulated) interrupts
+// enabled and no locks held.
+class SpinLockTest : public t::Test {
+ protected:
+  void SetUp() override {
+    ResetCpuLocalForTest();
+    SetInterruptsEnabledForTest(true);
+  }
+
+  void TearDown() override {
+    // A failed assertion can leave the thread bound to a `CpuLocal` on the
+    // test's stack, or holding locks.
+    ResetCpuLocalForTest();
+    EXPECT_FALSE(HoldsAnyIrqSpinLock());
+    *internal::TopHeldLockSlot() = nullptr;
+    SetInterruptsEnabledForTest(true);
+    // Reset the ticket counters so the zero-initialization checks in
+    // ConstinitInitAndBasicLockUnlock also hold under --gtest_repeat.
+    new (&g_static_spinlock) IrqSpinLock();
+  }
+};
+
+using SpinLockDeathTest = SpinLockTest;
+
+TEST_F(SpinLockTest, ConstinitInitAndBasicLockUnlock) {
   EXPECT_FALSE(g_static_spinlock.IsLocked());
   EXPECT_FALSE(g_static_spinlock.IsLockedByCurrentCpu());
   EXPECT_THAT(g_static_spinlock.NextTicket(), t::Eq(0));
   EXPECT_THAT(g_static_spinlock.ServingTicket(), t::Eq(0));
-
-  IrqSpinLock::SetInterruptsEnabledForTest(true);
   ASSERT_TRUE(AreInterruptsEnabled());
 
   g_static_spinlock.Lock();
@@ -40,12 +62,10 @@ TEST(SpinLockTest, ConstexprInitAndBasicLockUnlock) {
   EXPECT_TRUE(AreInterruptsEnabled());
   EXPECT_THAT(g_static_spinlock.NextTicket(), t::Eq(1));
   EXPECT_THAT(g_static_spinlock.ServingTicket(), t::Eq(1));
-  new (&g_static_spinlock) IrqSpinLock{};
 }
 
-TEST(SpinLockTest, ScopedGuardSupportsReferenceAndPointer) {
+TEST_F(SpinLockTest, ScopedGuardSupportsReferenceAndPointer) {
   IrqSpinLock lock;
-  SetInterruptsEnabledForTest(true);
 
   {
     const IrqSpinLockGuard guard(lock);
@@ -66,14 +86,13 @@ TEST(SpinLockTest, ScopedGuardSupportsReferenceAndPointer) {
   EXPECT_TRUE(AreInterruptsEnabled());
 }
 
-TEST(SpinLockTest, InterruptFlagSaveAndRestoreAcrossSingleAndNestedLocks) {
+TEST_F(SpinLockTest, InterruptFlagSaveAndRestoreAcrossSingleAndNestedLocks) {
   IrqSpinLock lock_a;
   IrqSpinLock lock_b;
   IrqSpinLock lock_c;
 
   // Case 1: Interrupts initially enabled -> disabled during nested critical
   // sections -> restored only when outermost lock is released.
-  SetInterruptsEnabledForTest(true);
   ASSERT_TRUE(AreInterruptsEnabled());
   {
     const IrqSpinLockGuard guard_a(lock_a);
@@ -105,12 +124,83 @@ TEST(SpinLockTest, InterruptFlagSaveAndRestoreAcrossSingleAndNestedLocks) {
     EXPECT_FALSE(AreInterruptsEnabled());
   }
   EXPECT_FALSE(AreInterruptsEnabled());
-
-  SetInterruptsEnabledForTest(true);
-  EXPECT_TRUE(AreInterruptsEnabled());
 }
 
-TEST(SpinLockTest, EnforcesStrictFifoTicketOrdering) {
+TEST_F(SpinLockTest, InterruptHelpersSaveDisableAndRestore) {
+  static_assert(kRflagsInterruptEnableBit == 0x200);
+
+  ASSERT_TRUE(AreInterruptsEnabled());
+  const bool outer_was_enabled = SaveAndDisableInterrupts();
+  EXPECT_TRUE(outer_was_enabled);
+  EXPECT_FALSE(AreInterruptsEnabled());
+
+  // Saving while disabled reports "disabled", and restoring that value keeps
+  // interrupts disabled until the outer restore.
+  const bool inner_was_enabled = SaveAndDisableInterrupts();
+  EXPECT_FALSE(inner_was_enabled);
+  RestoreInterrupts(inner_was_enabled);
+  EXPECT_FALSE(AreInterruptsEnabled());
+  RestoreInterrupts(outer_was_enabled);
+  EXPECT_TRUE(AreInterruptsEnabled());
+
+  {
+    const ScopedIrqDisable outer_guard;
+    EXPECT_FALSE(AreInterruptsEnabled());
+    {
+      const ScopedIrqDisable inner_guard;
+      EXPECT_FALSE(AreInterruptsEnabled());
+    }
+    EXPECT_FALSE(AreInterruptsEnabled());
+  }
+  EXPECT_TRUE(AreInterruptsEnabled());
+
+  SetInterruptsEnabledForTest(false);
+  {
+    const ScopedIrqDisable guard;
+    EXPECT_FALSE(AreInterruptsEnabled());
+  }
+  EXPECT_FALSE(AreInterruptsEnabled());
+}
+
+TEST_F(SpinLockTest, HoldsAnyIrqSpinLockAndIsLockedAcrossThreads) {
+  IrqSpinLock lock_a;
+  IrqSpinLock lock_b;
+
+  EXPECT_FALSE(HoldsAnyIrqSpinLock());
+  {
+    const IrqSpinLockGuard guard_a(lock_a);
+    EXPECT_TRUE(HoldsAnyIrqSpinLock());
+    {
+      const IrqSpinLockGuard guard_b(lock_b);
+      EXPECT_TRUE(HoldsAnyIrqSpinLock());
+    }
+    EXPECT_TRUE(HoldsAnyIrqSpinLock());
+  }
+  EXPECT_FALSE(HoldsAnyIrqSpinLock());
+
+  // A lock held by another thread is locked, but neither held by nor counted
+  // for this thread.
+  std::atomic<bool> holding{false};
+  std::atomic<bool> release{false};
+  std::thread holder([&lock_a, &holding, &release]() {
+    const IrqSpinLockGuard guard(lock_a);
+    holding.store(true, std::memory_order_release);
+    while (!release.load(std::memory_order_acquire)) {
+      std::this_thread::yield();
+    }
+  });
+  while (!holding.load(std::memory_order_acquire)) {
+    std::this_thread::yield();
+  }
+  EXPECT_TRUE(lock_a.IsLocked());
+  EXPECT_FALSE(lock_a.IsLockedByCurrentCpu());
+  EXPECT_FALSE(HoldsAnyIrqSpinLock());
+  release.store(true, std::memory_order_release);
+  holder.join();
+  EXPECT_FALSE(lock_a.IsLocked());
+}
+
+TEST_F(SpinLockTest, EnforcesStrictFifoTicketOrdering) {
   IrqSpinLock lock;
   constexpr int kNumWaiters = 6;
   std::vector<int> acquisition_order;
@@ -150,7 +240,7 @@ TEST(SpinLockTest, EnforcesStrictFifoTicketOrdering) {
   EXPECT_THAT(lock.ServingTicket(), t::Eq(kNumWaiters + 1));
 }
 
-TEST(SpinLockTest, MutualExclusionAndProgressUnderHighContention) {
+TEST_F(SpinLockTest, MutualExclusionAndProgressUnderHighContention) {
   IrqSpinLock lock;
   constexpr int kNumThreads = 8;
   constexpr int kIterationsPerThread = 1500;
@@ -214,7 +304,11 @@ TEST(SpinLockTest, MutualExclusionAndProgressUnderHighContention) {
   EXPECT_FALSE(lock.IsLocked());
 }
 
-TEST(SpinLockDeathTest, InvariantViolationsTriggerDcheck) {
+TEST_F(SpinLockDeathTest, InvariantViolationsTriggerDcheck) {
+#ifdef NDEBUG
+  // Without DCHECKs, these cases crash, hang, or silently succeed.
+  GTEST_SKIP() << "requires DCHECKs (built with NDEBUG)";
+#endif
   // Null pointer passed to IrqSpinLockGuard triggers DCHECK.
   EXPECT_DEATH(
       {
@@ -282,11 +376,34 @@ TEST(SpinLockDeathTest, InvariantViolationsTriggerDcheck) {
         other.join();
       },
       "Check failed");
+
+  // A CpuLocal whose id is out of range would make lock owner ids ambiguous.
+  EXPECT_DEATH(
+      {
+        alignas(64) CpuLocal cpu = {};
+        cpu.self = &cpu;
+        cpu.cpu_id = kMaxSupportedCpus;
+        BindCpuLocal(&cpu);
+        IrqSpinLock lock;
+        lock.Lock();
+      },
+      "Check failed");
 }
 
-TEST(SpinLockTest, OwnershipAndTopHeldLockTrackingWithCpuLocalBoundAndUnbound) {
-  ResetCpuLocalForTest();
-  SetInterruptsEnabledForTest(true);
+TEST_F(SpinLockTest, OwnerIdsOfBoundCpusAreDistinctFromUnboundAndUnowned) {
+  alignas(64) CpuLocal cpu = {};
+  cpu.self = &cpu;
+  for (const int cpu_id : {0, 1, kMaxSupportedCpus - 1}) {
+    cpu.cpu_id = cpu_id;
+    const uintptr_t owner = internal::OwnerIdForCpu(cpu);
+    EXPECT_THAT(owner, t::Eq(static_cast<uintptr_t>(cpu_id) + 1));
+    EXPECT_THAT(owner, t::Ne(uintptr_t{0}));
+    EXPECT_THAT(owner, t::Ne(internal::kUnboundCpuOwnerId));
+  }
+}
+
+TEST_F(SpinLockTest,
+       OwnershipAndTopHeldLockTrackingWithCpuLocalBoundAndUnbound) {
   ASSERT_THAT(CurrentCpuOrNull(), t::IsNull());
 
   IrqSpinLock lock_a;
@@ -358,6 +475,7 @@ TEST(SpinLockTest, OwnershipAndTopHeldLockTrackingWithCpuLocalBoundAndUnbound) {
   EXPECT_FALSE(lock_b.IsLockedByCurrentCpu());
   EXPECT_THAT(cpu2.top_held_lock, t::IsNull());
   EXPECT_THAT(internal::TopHeldLock(), t::IsNull());
+  EXPECT_FALSE(HoldsAnyIrqSpinLock());
   EXPECT_TRUE(AreInterruptsEnabled());
 
   SetInterruptsEnabledForTest(false);

@@ -155,14 +155,26 @@ static bool RecordMmapEntryImpl(MultibootMemoryMap* const out_map,  //
                                      : raw_length;
   const int64_t total_delta = static_cast<int64_t>(clamped_total);
 
-  out_map->total_ram_bytes =
-      SaturatingAddInt64(out_map->total_ram_bytes, total_delta);
-  if (type == kMemoryTypeAvailable) {
-    out_map->usable_ram_bytes =
-        SaturatingAddInt64(out_map->usable_ram_bytes, total_delta);
-  } else {
-    out_map->reserved_ram_bytes =
-        SaturatingAddInt64(out_map->reserved_ram_bytes, total_delta);
+  // The byte totals count RAM only: memory types 1 (available), 3 (ACPI
+  // reclaimable), 4 (ACPI NVS) and 5 (defective). Every other type is reserved
+  // address space that may be MMIO (QEMU, for example, reports a 12 GiB
+  // reserved window at 0xFD00000000), so total = usable + reserved RAM.
+  constexpr uint32_t kMemoryTypeAcpiReclaimable = 3;
+  constexpr uint32_t kMemoryTypeAcpiNvs = 4;
+  constexpr uint32_t kMemoryTypeDefective = 5;
+  const bool is_ram =
+      type == kMemoryTypeAvailable || type == kMemoryTypeAcpiReclaimable ||
+      type == kMemoryTypeAcpiNvs || type == kMemoryTypeDefective;
+  if (is_ram) {
+    out_map->total_ram_bytes =
+        SaturatingAddInt64(out_map->total_ram_bytes, total_delta);
+    if (type == kMemoryTypeAvailable) {
+      out_map->usable_ram_bytes =
+          SaturatingAddInt64(out_map->usable_ram_bytes, total_delta);
+    } else {
+      out_map->reserved_ram_bytes =
+          SaturatingAddInt64(out_map->reserved_ram_bytes, total_delta);
+    }
   }
 
   if (raw_base >= UINTPTR_MAX) {
@@ -446,10 +458,10 @@ bool MultibootRecordMmapEntry(MultibootMemoryMap* const out_map,  //
   return RecordMmapEntryImpl(out_map, raw_base, raw_length, type, false);
 }
 
-bool MultibootParseMemoryMapFromBuffer(const uint32_t multiboot_magic,
-                                       const uint64_t multiboot_info_addr,
-                                       const uintptr_t max_physical_addr,
-                                       MultibootMemoryMap* const out_map) {
+bool MultibootParseMemoryMapQuiet(const uint32_t multiboot_magic,
+                                  const uint64_t multiboot_info_addr,
+                                  const uintptr_t max_physical_addr,
+                                  MultibootMemoryMap* const out_map) {
   return ParseMemoryMapImpl(multiboot_magic,      //
                             multiboot_info_addr,  //
                             max_physical_addr,    //
@@ -457,10 +469,16 @@ bool MultibootParseMemoryMapFromBuffer(const uint32_t multiboot_magic,
                             false);
 }
 
-[[gnu::weak]] bool MultibootParseMemoryMap(const uint32_t multiboot_magic,
-                                           const uint64_t multiboot_info_addr,
-                                           const uintptr_t max_physical_addr,
-                                           MultibootMemoryMap* const out_map) {
+// pmm_test substitutes a fake for this function, so host builds define it as a
+// weak symbol. Kernel builds define it normally, where a second definition is a
+// link error.
+#if __STDC_HOSTED__
+[[gnu::weak]]
+#endif
+bool MultibootParseMemoryMap(const uint32_t multiboot_magic,
+                             const uint64_t multiboot_info_addr,
+                             const uintptr_t max_physical_addr,
+                             MultibootMemoryMap* const out_map) {
   return ParseMemoryMapImpl(multiboot_magic,      //
                             multiboot_info_addr,  //
                             max_physical_addr,    //

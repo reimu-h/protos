@@ -14,12 +14,12 @@ CompileFlags:
     - -ffreestanding
     - -fno-builtin
     - -fno-exceptions
-    - -fcheck-new
     - -fno-rtti
     - -mno-red-zone
     - -mgeneral-regs-only
     - -fno-stack-protector
     - -fno-pie
+    - -DPROTOS_SELFTEST=1
     - -Ibuild/include
 
 ---
