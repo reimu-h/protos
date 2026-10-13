@@ -11,7 +11,9 @@
 #include <thread>
 #include <vector>
 
+#include "forwarding_task_scheduler.h"
 #include "scheduler_test_support.h"
+#include "task_scheduler_internals.h"
 
 namespace protos {
 namespace {
@@ -52,7 +54,7 @@ TEST(PreemptiveSchedulerTest,
   int init_calls = 0;
   EXPECT_CALL(*mock_inner, Init).WillOnce([&]() { ++init_calls; });
 
-  sched->Init();
+  TaskSchedulerInternals::Init(*sched);
   EXPECT_THAT(init_calls, t::Eq(1));
   EXPECT_TRUE(sched->IsPreemptEnabled());
 }
@@ -75,10 +77,10 @@ TEST(PreemptiveSchedulerTest,
       .WillOnce(
           [&](InterruptFrame* const frame) { observed_ipi_frame = frame; });
 
-  sched->OnTimerInterrupt(&timer_frame);
+  TaskSchedulerInternals::OnTimerInterrupt(*sched, &timer_frame);
   EXPECT_THAT(observed_timer_frame, t::Eq(&timer_frame));
 
-  sched->OnWakeupIpi(&ipi_frame);
+  TaskSchedulerInternals::OnWakeupIpi(*sched, &ipi_frame);
   EXPECT_THAT(observed_ipi_frame, t::Eq(&ipi_frame));
 }
 
@@ -92,16 +94,16 @@ TEST(PreemptiveSchedulerTest,
   // StrictMock verifies that none of these reach the inner layer: without a
   // frame, or with RFLAGS.IF (bit 9) clear in the saved RFLAGS, the
   // interrupted context can't be preempted.
-  sched->OnTimerInterrupt(nullptr);
-  sched->OnWakeupIpi(nullptr);
+  TaskSchedulerInternals::OnTimerInterrupt(*sched, nullptr);
+  TaskSchedulerInternals::OnWakeupIpi(*sched, nullptr);
 
   InterruptFrame cli_frame = MakeInterruptFrame(kVectorApicTimer);
   constexpr uint64_t kRflagsWithIfClear[] = {
       0x0ULL, 0x2ULL, 0x246ULL & ~kRflagsInterruptEnableBit};
   for (const uint64_t rflags : kRflagsWithIfClear) {
     cli_frame.rflags = rflags;
-    sched->OnTimerInterrupt(&cli_frame);
-    sched->OnWakeupIpi(&cli_frame);
+    TaskSchedulerInternals::OnTimerInterrupt(*sched, &cli_frame);
+    TaskSchedulerInternals::OnWakeupIpi(*sched, &cli_frame);
   }
 
   // Setting IF (bit 9) in the saved RFLAGS allows forwarding.
@@ -118,8 +120,8 @@ TEST(PreemptiveSchedulerTest,
         ++forwarded;
       });
 
-  sched->OnTimerInterrupt(&cli_frame);
-  sched->OnWakeupIpi(&cli_frame);
+  TaskSchedulerInternals::OnTimerInterrupt(*sched, &cli_frame);
+  TaskSchedulerInternals::OnWakeupIpi(*sched, &cli_frame);
   EXPECT_THAT(forwarded, t::Eq(2));
 }
 
@@ -148,8 +150,8 @@ TEST(PreemptiveSchedulerTest,
         ++forwarded;
       });
 
-  sched->OnTimerInterrupt(&frame);
-  sched->OnWakeupIpi(&frame);
+  TaskSchedulerInternals::OnTimerInterrupt(*sched, &frame);
+  TaskSchedulerInternals::OnWakeupIpi(*sched, &frame);
   EXPECT_THAT(forwarded, t::Eq(2));
   SetInterruptsEnabledForTest(true);
 }
@@ -167,8 +169,8 @@ TEST(PreemptiveSchedulerTest, SuppressesInterruptsWhenPreemptDisabled) {
 
   // StrictMock verifies zero calls to inner when preemption is disabled: the
   // inner layers don't even see the tick (no vruntime accounting either).
-  sched->OnTimerInterrupt(&frame);
-  sched->OnWakeupIpi(&frame);
+  TaskSchedulerInternals::OnTimerInterrupt(*sched, &frame);
+  TaskSchedulerInternals::OnWakeupIpi(*sched, &frame);
 
   // Re-enabling preemption restores forwarding.
   sched->SetPreemptEnabled(true);
@@ -185,8 +187,8 @@ TEST(PreemptiveSchedulerTest, SuppressesInterruptsWhenPreemptDisabled) {
         ++ipi_calls;
       });
 
-  sched->OnTimerInterrupt(&frame);
-  sched->OnWakeupIpi(&frame);
+  TaskSchedulerInternals::OnTimerInterrupt(*sched, &frame);
+  TaskSchedulerInternals::OnWakeupIpi(*sched, &frame);
   EXPECT_THAT(timer_calls, t::Eq(1));
   EXPECT_THAT(ipi_calls, t::Eq(1));
 }
@@ -204,8 +206,8 @@ TEST(PreemptiveSchedulerTest, SuppressesInterruptsWhenCpuLocalIsNull) {
   EXPECT_THAT(CurrentCpuOrNull(), t::IsNull());
 
   // StrictMock verifies zero calls to inner when CurrentCpuOrNull() == nullptr.
-  sched->OnTimerInterrupt(&frame);
-  sched->OnWakeupIpi(&frame);
+  TaskSchedulerInternals::OnTimerInterrupt(*sched, &frame);
+  TaskSchedulerInternals::OnWakeupIpi(*sched, &frame);
 
   // Re-binding valid online CpuLocal restores forwarding.
   BindCpuLocal(&g_env.cpu_locals[0]);
@@ -221,8 +223,8 @@ TEST(PreemptiveSchedulerTest, SuppressesInterruptsWhenCpuLocalIsNull) {
         ++forwarded;
       });
 
-  sched->OnTimerInterrupt(&frame);
-  sched->OnWakeupIpi(&frame);
+  TaskSchedulerInternals::OnTimerInterrupt(*sched, &frame);
+  TaskSchedulerInternals::OnWakeupIpi(*sched, &frame);
   EXPECT_THAT(forwarded, t::Eq(2));
 }
 
@@ -239,8 +241,8 @@ TEST(PreemptiveSchedulerTest, SuppressesInterruptsWhenCurrentCpuIsOffline) {
   EXPECT_FALSE(CurrentCpu()->online);
 
   // StrictMock verifies zero calls to inner when CurrentCpu()->online == false.
-  sched->OnTimerInterrupt(&frame);
-  sched->OnWakeupIpi(&frame);
+  TaskSchedulerInternals::OnTimerInterrupt(*sched, &frame);
+  TaskSchedulerInternals::OnWakeupIpi(*sched, &frame);
 
   // Marking CPU online restores forwarding.
   g_env.cpu_locals[0].online = true;
@@ -256,8 +258,8 @@ TEST(PreemptiveSchedulerTest, SuppressesInterruptsWhenCurrentCpuIsOffline) {
         ++forwarded;
       });
 
-  sched->OnTimerInterrupt(&frame);
-  sched->OnWakeupIpi(&frame);
+  TaskSchedulerInternals::OnTimerInterrupt(*sched, &frame);
+  TaskSchedulerInternals::OnWakeupIpi(*sched, &frame);
   EXPECT_THAT(forwarded, t::Eq(2));
 }
 
@@ -274,18 +276,18 @@ TEST(PreemptiveSchedulerTest,
   IrqSpinLock inner_lock;
   {
     const IrqSpinLockGuard outer_guard(outer_lock);
-    sched->OnTimerInterrupt(&frame);
-    sched->OnWakeupIpi(&frame);
+    TaskSchedulerInternals::OnTimerInterrupt(*sched, &frame);
+    TaskSchedulerInternals::OnWakeupIpi(*sched, &frame);
 
     {
       const IrqSpinLockGuard inner_guard(inner_lock);
-      sched->OnTimerInterrupt(&frame);
-      sched->OnWakeupIpi(&frame);
+      TaskSchedulerInternals::OnTimerInterrupt(*sched, &frame);
+      TaskSchedulerInternals::OnWakeupIpi(*sched, &frame);
     }
 
     // Outer lock is still held after inner guard unlocks.
-    sched->OnTimerInterrupt(&frame);
-    sched->OnWakeupIpi(&frame);
+    TaskSchedulerInternals::OnTimerInterrupt(*sched, &frame);
+    TaskSchedulerInternals::OnWakeupIpi(*sched, &frame);
   }
 
   // Once all locks are released, forwarding succeeds.
@@ -301,117 +303,9 @@ TEST(PreemptiveSchedulerTest,
         ++forwarded;
       });
 
-  sched->OnTimerInterrupt(&frame);
-  sched->OnWakeupIpi(&frame);
+  TaskSchedulerInternals::OnTimerInterrupt(*sched, &frame);
+  TaskSchedulerInternals::OnWakeupIpi(*sched, &frame);
   EXPECT_THAT(forwarded, t::Eq(2));
-}
-
-TEST(PreemptiveSchedulerTest,
-     ForwardsAllTaskManagementAndSchedulingOperationsDirectlyToInner) {
-  SetupEnv(4);
-  const auto mock_inner = std::make_shared<t::StrictMock<MockTaskScheduler>>();
-  const std::shared_ptr<TaskScheduler> sched =
-      CreatePreemptiveScheduler(mock_inner);
-
-  Task* const fake_task_a = reinterpret_cast<Task*>(0x1001);
-  Task* const fake_task_b = reinterpret_cast<Task*>(0x1002);
-  Task* const fake_current = reinterpret_cast<Task*>(0x1003);
-  int dummy_arg_a = 11;
-  int dummy_arg_b = 22;
-
-  // 1. CreateTask
-  EXPECT_CALL(*mock_inner, CreateTask)
-      .WillOnce([&](const TaskFn entry, void* const arg, const int64_t weight) {
-        EXPECT_THAT(entry, t::Eq(&NoopTask));
-        EXPECT_THAT(arg, t::Eq(&dummy_arg_a));
-        EXPECT_THAT(weight, t::Eq(kDefaultTaskWeight * 2));
-        return fake_task_a;
-      });
-  EXPECT_THAT(sched->CreateTask(NoopTask, &dummy_arg_a, kDefaultTaskWeight * 2),
-              t::Eq(fake_task_a));
-
-  // 2. CreateTaskOnCpu
-  EXPECT_CALL(*mock_inner, CreateTaskOnCpu)
-      .WillOnce([&](const TaskFn entry,    //
-                    void* const arg,       //
-                    const int64_t weight,  //
-                    const int target_cpu) {
-        EXPECT_THAT(entry, t::Eq(&NoopTask));
-        EXPECT_THAT(arg, t::Eq(&dummy_arg_b));
-        EXPECT_THAT(weight, t::Eq(kDefaultTaskWeight / 2));
-        EXPECT_THAT(target_cpu, t::Eq(3));
-        return fake_task_b;
-      });
-  EXPECT_THAT(
-      sched->CreateTaskOnCpu(NoopTask, &dummy_arg_b, kDefaultTaskWeight / 2, 3),
-      t::Eq(fake_task_b));
-
-  // 3. Yield
-  int yield_calls = 0;
-  EXPECT_CALL(*mock_inner, Yield).WillOnce([&]() { ++yield_calls; });
-  sched->Yield();
-  EXPECT_THAT(yield_calls, t::Eq(1));
-
-  // 4. Join
-  Task* joined_task = nullptr;
-  EXPECT_CALL(*mock_inner, Join).WillOnce([&](Task* const task) {
-    joined_task = task;
-  });
-  sched->Join(fake_task_a);
-  EXPECT_THAT(joined_task, t::Eq(fake_task_a));
-
-  // 5. Detach
-  Task* detached_task = nullptr;
-  EXPECT_CALL(*mock_inner, Detach).WillOnce([&](Task* const task) {
-    detached_task = task;
-  });
-  sched->Detach(fake_task_b);
-  EXPECT_THAT(detached_task, t::Eq(fake_task_b));
-
-  // 6. ReapZombies
-  EXPECT_CALL(*mock_inner, ReapZombies).WillOnce([&]() { return 5; });
-  EXPECT_THAT(sched->ReapZombies(), t::Eq(5));
-
-  // 7. PollIdleCpu
-  EXPECT_CALL(*mock_inner, PollIdleCpu)
-      .WillOnce([&](const int cpu_index) {
-        EXPECT_THAT(cpu_index, t::Eq(2));
-        return true;
-      })
-      .WillOnce([&](const int cpu_index) {
-        EXPECT_THAT(cpu_index, t::Eq(1));
-        return false;
-      });
-  EXPECT_TRUE(sched->PollIdleCpu(2));
-  EXPECT_FALSE(sched->PollIdleCpu(1));
-
-  // 8. RunqueueLoad
-  EXPECT_CALL(*mock_inner, RunqueueLoad).WillOnce([&](const int cpu_index) {
-    EXPECT_THAT(cpu_index, t::Eq(3));
-    return 7;
-  });
-  EXPECT_THAT(sched->RunqueueLoad(3), t::Eq(7));
-
-  // 9. StealTask
-  EXPECT_CALL(*mock_inner, StealTask)
-      .WillOnce([&](const int dst_cpu, const int src_cpu) {
-        EXPECT_THAT(dst_cpu, t::Eq(0));
-        EXPECT_THAT(src_cpu, t::Eq(2));
-        return true;
-      })
-      .WillOnce([&](const int dst_cpu, const int src_cpu) {
-        EXPECT_THAT(dst_cpu, t::Eq(1));
-        EXPECT_THAT(src_cpu, t::Eq(3));
-        return false;
-      });
-  EXPECT_TRUE(sched->StealTask(0, 2));
-  EXPECT_FALSE(sched->StealTask(1, 3));
-
-  // 10. CurrentTask
-  EXPECT_CALL(*mock_inner, CurrentTask).WillOnce([&]() {
-    return fake_current;
-  });
-  EXPECT_THAT(sched->CurrentTask(), t::Eq(fake_current));
 }
 
 TEST(PreemptiveSchedulerTest,
@@ -474,15 +368,15 @@ TEST(PreemptiveSchedulerTest,
         sched->SetPreemptEnabled(enable);
         (void)sched->IsPreemptEnabled();
 
-        sched->OnTimerInterrupt(&safe_frame);
-        sched->OnWakeupIpi(&safe_frame);
-        sched->OnTimerInterrupt(&cli_frame);
-        sched->OnWakeupIpi(&cli_frame);
+        TaskSchedulerInternals::OnTimerInterrupt(*sched, &safe_frame);
+        TaskSchedulerInternals::OnWakeupIpi(*sched, &safe_frame);
+        TaskSchedulerInternals::OnTimerInterrupt(*sched, &cli_frame);
+        TaskSchedulerInternals::OnWakeupIpi(*sched, &cli_frame);
 
         {
           const IrqSpinLockGuard guard(local_lock);
-          sched->OnTimerInterrupt(&safe_frame);
-          sched->OnWakeupIpi(&safe_frame);
+          TaskSchedulerInternals::OnTimerInterrupt(*sched, &safe_frame);
+          TaskSchedulerInternals::OnWakeupIpi(*sched, &safe_frame);
         }
       }
 
@@ -504,8 +398,8 @@ TEST(PreemptiveSchedulerTest,
   sched->SetPreemptEnabled(true);
 
   InterruptFrame final_frame = MakeInterruptFrame(kVectorApicTimer);
-  sched->OnTimerInterrupt(&final_frame);
-  sched->OnWakeupIpi(&final_frame);
+  TaskSchedulerInternals::OnTimerInterrupt(*sched, &final_frame);
+  TaskSchedulerInternals::OnWakeupIpi(*sched, &final_frame);
 
   EXPECT_FALSE(safety_violation.load(std::memory_order_acquire));
   EXPECT_THAT(timer_forwarded.load(std::memory_order_acquire), t::Gt(0));
@@ -516,6 +410,157 @@ TEST(PreemptiveSchedulerDeathTest, NullInnerSchedulerTriggersDcheck) {
   SetupEnv(1);
   EXPECT_DEATH(CreatePreemptiveScheduler(nullptr), "Check failed");
 }
+
+// ForwardingTaskScheduler is header-only (forwarding_task_scheduler.h). It is
+// tested here because the preemptive layer inherits most of its methods from
+// it.
+TEST(ForwardingTaskSchedulerTest,
+     ForwardsEachCallToInnerOnceWithUnchangedArgumentsAndResult) {
+  const auto mock_inner = std::make_shared<t::StrictMock<MockTaskScheduler>>();
+  ForwardingTaskScheduler layer(mock_inner);
+  // Every expectation must be met by exactly one call, in the order below, and
+  // the StrictMock fails the test on any other call to the inner layer.
+  const t::InSequence in_sequence;
+
+  Task* const fake_task_a = reinterpret_cast<Task*>(0x1001);
+  Task* const fake_task_b = reinterpret_cast<Task*>(0x1002);
+  Task* const fake_current = reinterpret_cast<Task*>(0x1003);
+  int dummy_arg_a = 11;
+  int dummy_arg_b = 22;
+  InterruptFrame timer_frame = MakeInterruptFrame(kVectorApicTimer);
+  InterruptFrame ipi_frame = MakeInterruptFrame(kVectorWakeupIpi);
+
+  // Task API.
+  EXPECT_CALL(*mock_inner, CreateTask)
+      .WillOnce([&](const TaskFn entry, void* const arg, const int64_t weight) {
+        EXPECT_THAT(entry, t::Eq(&NoopTask));
+        EXPECT_THAT(arg, t::Eq(&dummy_arg_a));
+        EXPECT_THAT(weight, t::Eq(kDefaultTaskWeight * 2));
+        return fake_task_a;
+      });
+  EXPECT_THAT(layer.CreateTask(NoopTask, &dummy_arg_a, kDefaultTaskWeight * 2),
+              t::Eq(fake_task_a));
+
+  EXPECT_CALL(*mock_inner, CreateTaskOnCpu)
+      .WillOnce([&](const TaskFn entry,    //
+                    void* const arg,       //
+                    const int64_t weight,  //
+                    const int target_cpu) {
+        EXPECT_THAT(entry, t::Eq(&NoopTask));
+        EXPECT_THAT(arg, t::Eq(&dummy_arg_b));
+        EXPECT_THAT(weight, t::Eq(kDefaultTaskWeight / 2));
+        EXPECT_THAT(target_cpu, t::Eq(3));
+        return fake_task_b;
+      });
+  EXPECT_THAT(
+      layer.CreateTaskOnCpu(NoopTask, &dummy_arg_b, kDefaultTaskWeight / 2, 3),
+      t::Eq(fake_task_b));
+
+  EXPECT_CALL(*mock_inner, Yield);
+  layer.Yield();
+
+  EXPECT_CALL(*mock_inner, Join).WillOnce([&](Task* const task) {
+    EXPECT_THAT(task, t::Eq(fake_task_a));
+  });
+  layer.Join(fake_task_a);
+
+  EXPECT_CALL(*mock_inner, Detach).WillOnce([&](Task* const task) {
+    EXPECT_THAT(task, t::Eq(fake_task_b));
+  });
+  layer.Detach(fake_task_b);
+
+  EXPECT_CALL(*mock_inner, ReapZombies)
+      .WillOnce([]() { return 5; })
+      .WillOnce([]() { return 0; });
+  EXPECT_THAT(layer.ReapZombies(), t::Eq(5));
+  EXPECT_THAT(layer.ReapZombies(), t::Eq(0));
+
+  EXPECT_CALL(*mock_inner, SetPreemptEnabled)
+      .WillOnce([](const bool enabled) { EXPECT_FALSE(enabled); })
+      .WillOnce([](const bool enabled) { EXPECT_TRUE(enabled); });
+  layer.SetPreemptEnabled(false);
+  layer.SetPreemptEnabled(true);
+
+  EXPECT_CALL(*mock_inner, IsPreemptEnabled)
+      .WillOnce([]() { return false; })
+      .WillOnce([]() { return true; });
+  EXPECT_FALSE(layer.IsPreemptEnabled());
+  EXPECT_TRUE(layer.IsPreemptEnabled());
+
+  EXPECT_CALL(*mock_inner, CurrentTask).WillOnce([&]() {
+    return fake_current;
+  });
+  EXPECT_THAT(layer.CurrentTask(), t::Eq(fake_current));
+
+  // Scheduler internals.
+  EXPECT_CALL(*mock_inner, Init);
+  TaskSchedulerInternals::Init(layer);
+
+  EXPECT_CALL(*mock_inner, OnTimerInterrupt)
+      .WillOnce([&](InterruptFrame* const frame) {
+        EXPECT_THAT(frame, t::Eq(&timer_frame));
+      });
+  TaskSchedulerInternals::OnTimerInterrupt(layer, &timer_frame);
+
+  EXPECT_CALL(*mock_inner, OnWakeupIpi)
+      .WillOnce([&](InterruptFrame* const frame) {
+        EXPECT_THAT(frame, t::Eq(&ipi_frame));
+      });
+  TaskSchedulerInternals::OnWakeupIpi(layer, &ipi_frame);
+
+  EXPECT_CALL(*mock_inner, PollIdleCpu)
+      .WillOnce([](const int cpu_index) {
+        EXPECT_THAT(cpu_index, t::Eq(2));
+        return true;
+      })
+      .WillOnce([](const int cpu_index) {
+        EXPECT_THAT(cpu_index, t::Eq(1));
+        return false;
+      });
+  EXPECT_TRUE(TaskSchedulerInternals::PollIdleCpu(layer, 2));
+  EXPECT_FALSE(TaskSchedulerInternals::PollIdleCpu(layer, 1));
+
+  EXPECT_CALL(*mock_inner, RunqueueLoad).WillOnce([](const int cpu_index) {
+    EXPECT_THAT(cpu_index, t::Eq(3));
+    return 7;
+  });
+  EXPECT_THAT(TaskSchedulerInternals::RunqueueLoad(layer, 3), t::Eq(7));
+
+  EXPECT_CALL(*mock_inner, StealTask)
+      .WillOnce([](const int dst_cpu, const int src_cpu) {
+        EXPECT_THAT(dst_cpu, t::Eq(0));
+        EXPECT_THAT(src_cpu, t::Eq(2));
+        return true;
+      })
+      .WillOnce([](const int dst_cpu, const int src_cpu) {
+        EXPECT_THAT(dst_cpu, t::Eq(1));
+        EXPECT_THAT(src_cpu, t::Eq(3));
+        return false;
+      });
+  EXPECT_TRUE(TaskSchedulerInternals::StealTask(layer, 0, 2));
+  EXPECT_FALSE(TaskSchedulerInternals::StealTask(layer, 1, 3));
+}
+
+// The scheduler internals are private in `TaskScheduler` and protected in
+// `ForwardingTaskScheduler`, so only `TaskSchedulerInternals` can call them on
+// a scheduler. `MockTaskScheduler` mocks them in its public section, so the
+// same calls compile on it: only the access level rejects them. The checks
+// use concepts because an invalid expression in a requires-expression outside
+// a template is a compile error rather than `false`.
+template <typename Scheduler>
+concept CanCallInitDirectly =
+    requires(Scheduler& scheduler) { scheduler.Init(); };
+
+template <typename Scheduler>
+concept CanCallRunqueueLoadDirectly =
+    requires(const Scheduler& scheduler) { scheduler.RunqueueLoad(0); };
+
+static_assert(!CanCallInitDirectly<TaskScheduler>);
+static_assert(!CanCallRunqueueLoadDirectly<TaskScheduler>);
+static_assert(!CanCallInitDirectly<ForwardingTaskScheduler>);
+static_assert(!CanCallRunqueueLoadDirectly<ForwardingTaskScheduler>);
+static_assert(CanCallInitDirectly<MockTaskScheduler>);
+static_assert(CanCallRunqueueLoadDirectly<MockTaskScheduler>);
 
 }  // namespace
 }  // namespace protos

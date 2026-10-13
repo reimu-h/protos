@@ -11,6 +11,7 @@
 /* IA32_EFER MSR and its bits; NXE is reserved (WRMSR faults) unless CPUID
  * 0x80000001 reports EDX.NX. */
 .set MSR_IA32_EFER, 0xC0000080
+.set MSR_IA32_GS_BASE, 0xC0000101
 .set EFER_LME, (1 << 8)
 .set EFER_NXE, (1 << 11)
 .set CPUID_80000001_EDX_NX, (1 << 20)
@@ -461,9 +462,8 @@ ap_trampoline_end:
 .align 16
 .code64
 ap_long_mode_entry:
-    /* Switch to the permanent 64-bit GDT and IDT in kernel memory */
+    /* Switch to the permanent 64-bit GDT in kernel memory */
     lgdt [gdt64_pointer]
-    lidt [idt64_pointer]
 
     mov ax, 0x10
     mov ds, ax
@@ -471,6 +471,19 @@ ap_long_mode_entry:
     mov fs, ax
     mov gs, ax
     mov ss, ax
+
+    /* Bind this AP's CpuLocal: point IA32_GS_BASE at it (after the GS load
+     * above, which zeroes the base). This precedes loading the kernel IDT, so
+     * no C++ code, exception handlers included, ever runs on this AP with GS
+     * base 0. */
+    .extern g_ap_boot_cpu_local
+    mov ecx, MSR_IA32_GS_BASE
+    mov eax, dword ptr [g_ap_boot_cpu_local]
+    mov edx, dword ptr [g_ap_boot_cpu_local + 4]
+    wrmsr
+
+    /* Switch to the kernel IDT */
+    lidt [idt64_pointer]
 
     /* Load this AP's dedicated 64-bit stack pointer, reset RFLAGS, and load CPU slot index */
     .extern g_ap_boot_stack
@@ -558,54 +571,6 @@ isr_common_stub:
     add rsp, 16
     iretq
 
-/* =========================================================================
- * Kernel Task Context Switch & Entry Trampoline
- *
- * void TaskContextSwitch(uintptr_t* prev_rsp, uintptr_t next_rsp)
- *   rdi = &prev->rsp
- *   rsi = next->rsp
- *
- * Saves System V AMD64 ABI callee-saved registers (rbp, rbx, r12..r15) on
- * the outgoing stack, stores RSP into *prev_rsp, loads next_rsp into RSP,
- * restores callee-saved registers from the incoming stack, and returns to
- * the incoming task's saved RIP (Schedule() or TaskEntryTrampoline).
- * ========================================================================= */
-.align 16
-.global TaskContextSwitch
-.type TaskContextSwitch, @function
-TaskContextSwitch:
-    push rbp
-    push rbx
-    push r12
-    push r13
-    push r14
-    push r15
-
-    mov qword ptr [rdi], rsp
-    mov rsp, rsi
-
-    pop r15
-    pop r14
-    pop r13
-    pop r12
-    pop rbx
-    pop rbp
-    ret
-
-.align 16
-.global TaskEntryTrampoline
-.type TaskEntryTrampoline, @function
-TaskEntryTrampoline:
-    xor rbp, rbp
-    and rsp, -16
-    mov rdi, r12
-    .extern TaskStartupEntry
-    call TaskStartupEntry
-.Ltask_exit_halt:
-    cli
-    hlt
-    jmp .Ltask_exit_halt
-
 /* CPU Exceptions 0..31 (error code pushed by CPU on 8, 10..14, 17, 21, 29, 30) */
 ISR_NOERR_STUB 0
 ISR_NOERR_STUB 1
@@ -668,8 +633,10 @@ ISR_NOERR_STUB 31
  * 64-Bit Global Descriptor Table & IDT Pointer (Read-Only Data)
  * ========================================================================= */
 .section .rodata
-/* The preset Accessed bits (bit 40) keep segment register loads from writing
- * to this table, so it can live in read-only memory. */
+/* The boot GDT. Each CPU switches to the kernel GDT (gdt.cpp), which has the
+ * same code and data segments plus the CPU's TSS, before it loads the kernel
+ * IDT. The preset Accessed bits (bit 40) keep segment register loads from
+ * writing to this table, so it can live in read-only memory. */
 .align 16
 gdt64:
     .quad 0x0000000000000000    /* 0x00: Null Descriptor */
@@ -720,9 +687,22 @@ no_long_mode_message:
 
 
 /* =========================================================================
- * BSS Section: Page Tables (4 KiB aligned), IDT, and Kernel Stack
+ * BSS Section: Kernel Stack, Page Tables (4 KiB aligned), and IDT
  * ========================================================================= */
 .section .bss
+/* CPU 0's 16 KiB boot stack, directly above a 4 KiB guard page that GdtInit()
+ * unmaps, so that an overflow faults instead of overwriting the memory below.
+ * The page tables follow the stack top, out of an overflow's way. */
+.align 4096
+.global stack_guard
+stack_guard:
+    .skip 4096
+.global stack_bottom
+.global stack_top
+stack_bottom:
+    .skip 16384                 /* 16 KiB Kernel Stack */
+stack_top:
+
 .align 4096
 pml4_table:
     .skip 4096
@@ -734,12 +714,5 @@ pd_table:
 .align 16
 idt64:
     .skip 32 * 16
-
-.align 16
-.global stack_bottom
-.global stack_top
-stack_bottom:
-    .skip 16384                 /* 16 KiB Kernel Stack */
-stack_top:
 
 .section .note.GNU-stack,"",@progbits

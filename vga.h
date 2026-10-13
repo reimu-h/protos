@@ -34,9 +34,6 @@ int VgaGetCursorCol();
 // the cursor.
 void VgaPanicWrite(const char* str);
 
-// Base-10 decimal counterpart of VgaPanicWrite(), with the same restrictions.
-void VgaPanicWriteDec(uint64_t value);
-
 // Switches the console to a direct-color linear pixel framebuffer (such as the
 // UEFI GOP framebuffer from Multiboot2, for machines without the legacy 0xB8000
 // text mode), identity-maps it, and renders the current 80x25 text onto it with

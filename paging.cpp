@@ -29,6 +29,10 @@ constexpr uint64_t kPteGlobal = 1ULL << 8;
 constexpr uint64_t kPteNoExecute = 1ULL << 63;
 constexpr uint64_t kPteAddressMask = 0x000FFFFFFFFFF000ULL;
 constexpr uint64_t kHugePageAddressMask = 0x000FFFFFFFE00000ULL;
+// Marks a guard page (see `PagingUnmapGuardPage`): a not-present 4 KiB PTE
+// with this bit set, which keeps the page's physical address. The processor
+// ignores every bit of a not-present entry except Present.
+constexpr uint64_t kPteGuardPage = 1ULL << 9;
 
 IrqSpinLock g_paging_lock;
 
@@ -170,6 +174,9 @@ static bool MapHugePageRangeLocked(const uintptr_t phys_addr,  //
       const uintptr_t page_phys = addr + static_cast<uintptr_t>(i) * kPageSize;
       const uint64_t pte = pt[i];
       if ((pte & kPtePresent) == 0) {
+        if ((pte & kPteGuardPage) != 0) {
+          continue;
+        }
         pt[i] = page_phys | kPtePresent | kPteWritable;
         tlb_flush_needed = true;
       } else {
@@ -188,6 +195,92 @@ static bool MapHugePageRangeLocked(const uintptr_t phys_addr,  //
     WriteCr3(pml4_phys);
   }
   return true;
+}
+
+// Returns the PD entry for `addr` in the active page tables, or nullptr if the
+// PML4 or PDPT entry on the way to it is not present.
+static uint64_t* FindPdEntryLocked(const uintptr_t addr) {
+  const uintptr_t pml4_phys = ReadCr3();
+  if (pml4_phys == 0) {
+    return nullptr;
+  }
+  const int pml4_idx = (addr >> 39) & 0x1FF;
+  const int pdpt_idx = (addr >> 30) & 0x1FF;
+  const int pd_idx = (addr >> 21) & 0x1FF;
+
+  uint64_t* const pml4 = reinterpret_cast<uint64_t*>(pml4_phys);
+  if ((pml4[pml4_idx] & kPtePresent) == 0) {
+    return nullptr;
+  }
+  uint64_t* const pdpt =
+      reinterpret_cast<uint64_t*>(pml4[pml4_idx] & kPteAddressMask);
+  if ((pdpt[pdpt_idx] & kPtePresent) == 0) {
+    return nullptr;
+  }
+  uint64_t* const pd =
+      reinterpret_cast<uint64_t*>(pdpt[pdpt_idx] & kPteAddressMask);
+  return &pd[pd_idx];
+}
+
+// Returns the 4 KiB PT entry for `addr` if the PD entry `pde` points to a page
+// table, or nullptr if it maps a 2 MiB page or nothing.
+static uint64_t* FindPtEntry(const uint64_t pde, const uintptr_t addr) {
+  if ((pde & kPtePresent) == 0 || (pde & kPteHugePage) != 0) {
+    return nullptr;
+  }
+  uint64_t* const pt = reinterpret_cast<uint64_t*>(pde & kPteAddressMask);
+  return &pt[(addr >> 12) & 0x1FF];
+}
+
+// Returns the 4 KiB PT entry that maps `addr`, first splitting the 2 MiB page
+// that maps it into 512 4 KiB pages with identical attributes if necessary,
+// with a page table from `AllocZeroedPageTable(use_pmm)`. The split flushes the
+// TLB before the caller changes any of the 4 KiB pages, so that the TLB never
+// holds a 2 MiB and a 4 KiB translation with different attributes for the same
+// address (Intel SDM Vol. 3A, 4.10.2.3). Returns nullptr if `addr` is not
+// mapped or no page table is available for the split.
+static uint64_t* FindPtEntrySplittingLocked(const uintptr_t addr,
+                                            const bool use_pmm) {
+  uint64_t* const pde = FindPdEntryLocked(addr);
+  if (pde == nullptr || (*pde & kPtePresent) == 0) {
+    return nullptr;
+  }
+  if ((*pde & kPteHugePage) != 0) {
+    const uintptr_t pt_phys = AllocZeroedPageTable(use_pmm);
+    if (pt_phys == 0) {
+      return nullptr;
+    }
+    uint64_t* const pt = reinterpret_cast<uint64_t*>(pt_phys);
+    const uintptr_t huge_base = *pde & kHugePageAddressMask;
+    constexpr uint64_t kSharedFlags = kPtePresent | kPteWritable | kPteUser |
+                                      kPteWriteThrough | kPteCacheDisable |
+                                      kPteAccessed | kPteDirty | kPteGlobal |
+                                      kPteNoExecute;
+    const uint64_t page_flags =
+        (*pde & kSharedFlags) | (((*pde & kPdeHugePagePat) != 0) ? kPtePat : 0);
+    for (int i = 0; i < kEntriesPerPageTable; ++i) {
+      pt[i] = (huge_base + static_cast<uintptr_t>(i) * kPageSize) | page_flags;
+    }
+    *pde = pt_phys | kPtePresent | kPteWritable;
+    WriteCr3(ReadCr3());
+  }
+  return FindPtEntry(*pde, addr);
+}
+
+// Returns the PT entry of the guard page that starts at `addr`, or nullptr if
+// there is none.
+static uint64_t* FindGuardPtEntryLocked(const uintptr_t addr) {
+  if (addr >= kMaxCanonicalIdentityAddress) {
+    return nullptr;
+  }
+  const uint64_t* const pde = FindPdEntryLocked(addr);
+  uint64_t* const pte = (pde != nullptr) ? FindPtEntry(*pde, addr) : nullptr;
+  if (pte == nullptr ||
+      (*pte & (kPtePresent | kPteGuardPage)) != kPteGuardPage ||
+      (*pte & kPteAddressMask) != addr) {
+    return nullptr;
+  }
+  return pte;
 }
 
 }  // namespace
@@ -228,67 +321,48 @@ bool PagingMarkPageUncacheable(const uintptr_t phys_addr) {
   }
   // The TLB flushes below reach only the calling CPU (see paging.h).
   DCHECK(CurrentCpuOrNull() == nullptr);
-  const uintptr_t pml4_phys = ReadCr3();
-  if (pml4_phys == 0) {
-    return false;
-  }
-
-  const int pml4_idx = (phys_addr >> 39) & 0x1FF;
-  const int pdpt_idx = (phys_addr >> 30) & 0x1FF;
-  const int pd_idx = (phys_addr >> 21) & 0x1FF;
-  const int pt_idx = (phys_addr >> 12) & 0x1FF;
-
-  uint64_t* const pml4 = reinterpret_cast<uint64_t*>(pml4_phys);
-  if ((pml4[pml4_idx] & kPtePresent) == 0) {
-    return false;
-  }
-  uint64_t* const pdpt =
-      reinterpret_cast<uint64_t*>(pml4[pml4_idx] & kPteAddressMask);
-  if ((pdpt[pdpt_idx] & kPtePresent) == 0) {
-    return false;
-  }
-  uint64_t* const pd =
-      reinterpret_cast<uint64_t*>(pdpt[pdpt_idx] & kPteAddressMask);
-  const uint64_t pde = pd[pd_idx];
-  if ((pde & kPtePresent) == 0) {
-    return false;
-  }
-
-  if ((pde & kPteHugePage) != 0) {
-    // Split the 2 MiB page into 512 4 KiB pages with identical attributes and
-    // flush before changing any of them, so that the TLB never holds a 2 MiB
-    // and a 4 KiB translation with different attributes for the same address
-    // (Intel SDM Vol. 3A, 4.10.2.3).
-    const uintptr_t pt_phys = AllocZeroedPageTable(true);
-    if (pt_phys == 0) {
-      return false;
-    }
-    uint64_t* const pt = reinterpret_cast<uint64_t*>(pt_phys);
-    const uintptr_t huge_base = pde & kHugePageAddressMask;
-    constexpr uint64_t kSharedFlags = kPtePresent | kPteWritable | kPteUser |
-                                      kPteWriteThrough | kPteCacheDisable |
-                                      kPteAccessed | kPteDirty | kPteGlobal |
-                                      kPteNoExecute;
-    const uint64_t page_flags =
-        (pde & kSharedFlags) | (((pde & kPdeHugePagePat) != 0) ? kPtePat : 0);
-    for (int i = 0; i < kEntriesPerPageTable; ++i) {
-      pt[i] = (huge_base + static_cast<uintptr_t>(i) * kPageSize) | page_flags;
-    }
-    pd[pd_idx] = pt_phys | kPtePresent | kPteWritable;
-    WriteCr3(pml4_phys);
-  }
-
-  uint64_t* const pt =
-      reinterpret_cast<uint64_t*>(pd[pd_idx] & kPteAddressMask);
-  if ((pt[pt_idx] & kPtePresent) == 0) {
+  uint64_t* const pte = FindPtEntrySplittingLocked(phys_addr, true);
+  if (pte == nullptr || (*pte & kPtePresent) == 0) {
     return false;
   }
   constexpr uint64_t kUcFlags = kPteWriteThrough | kPteCacheDisable;
-  if ((pt[pt_idx] & kUcFlags) != kUcFlags) {
-    pt[pt_idx] |= kUcFlags;
-    WriteCr3(pml4_phys);
+  if ((*pte & kUcFlags) != kUcFlags) {
+    *pte |= kUcFlags;
+    WriteCr3(ReadCr3());
   }
   return true;
+}
+
+bool PagingUnmapGuardPage(const uintptr_t addr) {
+  const bool use_pmm = PmmIsInitialized();
+  const IrqSpinLockGuard lock_guard(g_paging_lock);
+  if ((addr & (static_cast<uintptr_t>(kPageSize) - 1)) != 0 || addr == 0 ||
+      addr >= kMaxCanonicalIdentityAddress) {
+    return false;
+  }
+  uint64_t* const pte = FindPtEntrySplittingLocked(addr, use_pmm);
+  if (pte == nullptr || (*pte & kPtePresent) == 0 ||
+      (*pte & kPteAddressMask) != addr) {
+    return false;
+  }
+  *pte = addr | kPteGuardPage;
+  WriteCr3(ReadCr3());
+  return true;
+}
+
+bool PagingRemapGuardPage(const uintptr_t addr) {
+  const IrqSpinLockGuard lock_guard(g_paging_lock);
+  uint64_t* const pte = FindGuardPtEntryLocked(addr);
+  if (pte == nullptr) {
+    return false;
+  }
+  *pte = addr | kPtePresent | kPteWritable;
+  return true;
+}
+
+bool PagingIsGuardPage(const uintptr_t addr) {
+  const IrqSpinLockGuard lock_guard(g_paging_lock);
+  return FindGuardPtEntryLocked(addr & kPteAddressMask) != nullptr;
 }
 
 bool PagingIsIdentityMapped(const uintptr_t addr) {

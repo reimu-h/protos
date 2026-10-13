@@ -5,10 +5,10 @@
 #include <sys/mman.h>
 
 #include <cstdint>
-#include <cstdio>
 #include <cstring>
 #include <memory>
 #include <string>
+#include <utility>
 #include <vector>
 
 #include "paging.h"
@@ -20,11 +20,7 @@ namespace {
 
 namespace t = ::testing;
 
-// Multiboot2 tag types and memory types that multiboot.h does not name.
-constexpr uint32_t kMb2TagTypeEnd = 0;
-constexpr uint32_t kMb2TagTypeMmap = 6;
-constexpr uint32_t kMb2TagTypeFramebuffer = 8;
-constexpr uint8_t kMb2FramebufferTypeRgb = 1;
+// Memory types that multiboot.h does not name.
 constexpr uint32_t kMemoryTypeReserved = 2;
 constexpr uint32_t kMemoryTypeAcpiReclaimable = 3;
 constexpr uint32_t kMemoryTypeAcpiNvs = 4;
@@ -34,10 +30,14 @@ constexpr int64_t kPageBytes = 4096;
 struct MapCall {
   uintptr_t phys_addr;
   int64_t size;
+
+  bool operator==(const MapCall&) const = default;
 };
 
 struct FakeEnvState {
   bool fail_bootstrap_map = false;
+  // 0-based index of the RecordingMapper() call that fails, or -1.
+  int fail_map_call = -1;
   std::vector<MapCall> map_calls;
   std::string uart_log;
   std::string vga_log;
@@ -47,22 +47,16 @@ FakeEnvState g_env;
 
 static void ResetFakeEnv() { g_env = FakeEnvState{}; }
 
-static void AppendHex(std::string* const log, const uint64_t value) {
-  char buf[32];
-  std::snprintf(buf,          //
-                sizeof(buf),  //
-                "0x%llx",     //
-                static_cast<unsigned long long>(value));
-  log->append(buf);
-}
-
-static void AppendDec(std::string* const log, const uint64_t value) {
-  char buf[32];
-  std::snprintf(buf,          //
-                sizeof(buf),  //
-                "%llu",       //
-                static_cast<unsigned long long>(value));
-  log->append(buf);
+// MultibootPhysicalMapper that treats host addresses as physical addresses,
+// records its calls in `g_env.map_calls` and fails call `g_env.fail_map_call`.
+static const void* RecordingMapper(const uintptr_t phys_addr,
+                                   const int64_t size) {
+  const int call = static_cast<int>(g_env.map_calls.size());
+  g_env.map_calls.push_back({phys_addr, size});
+  if (call == g_env.fail_map_call) {
+    return nullptr;
+  }
+  return reinterpret_cast<const void*>(phys_addr);
 }
 
 }  // namespace
@@ -72,71 +66,33 @@ bool PagingMapBootstrapRange(const uintptr_t phys_addr, const int64_t size) {
   return !g_env.fail_bootstrap_map;
 }
 
+// console.cpp prints through these.
 void UartWrite(const char* const str) { g_env.uart_log.append(str); }
-
-void UartWriteHex(const uint64_t value) { AppendHex(&g_env.uart_log, value); }
-
-void UartWriteDec(const uint64_t value) { AppendDec(&g_env.uart_log, value); }
 
 void VgaWrite(const char* const str) { g_env.vga_log.append(str); }
 
-void VgaWriteHex(const uint64_t value) { AppendHex(&g_env.vga_log, value); }
-
-void VgaWriteDec(const uint64_t value) { AppendDec(&g_env.vga_log, value); }
-
 namespace {
-
-struct [[gnu::packed]] Mb1Info {
-  uint32_t flags;
-  uint32_t mem_lower;
-  uint32_t mem_upper;
-  uint32_t boot_device;
-  uint32_t cmdline;
-  uint32_t mods_count;
-  uint32_t mods_addr;
-  uint32_t syms[4];
-  uint32_t mmap_length;
-  uint32_t mmap_addr;
-};
-
-struct [[gnu::packed]] Mb1MmapEntry {
-  uint32_t size;
-  uint64_t addr;
-  uint64_t len;
-  uint32_t type;
-};
-
-struct [[gnu::packed]] Mb2MmapEntry {
-  uint64_t addr;
-  uint64_t len;
-  uint32_t type;
-  uint32_t reserved;
-};
 
 // Multiboot2 information structure with one memory map tag of `kEntries`
 // entries followed by the end tag.
 template <int kEntries>
 struct [[gnu::packed]] Mb2MmapInfo {
-  uint32_t total_size;
-  uint32_t reserved;
-  uint32_t mmap_type;
-  uint32_t mmap_size;
-  uint32_t entry_size;
-  uint32_t entry_version;
-  Mb2MmapEntry entries[kEntries];
-  uint32_t end_type;
-  uint32_t end_size;
+  Multiboot2InfoHeader header;
+  Multiboot2TagMmap mmap;
+  Multiboot2MmapEntry entries[kEntries];
+  Multiboot2Tag end;
 };
 
 template <int kEntries>
 static void InitMb2MmapInfo(Mb2MmapInfo<kEntries>* const info) {
   std::memset(info, 0, sizeof(*info));
-  info->total_size = sizeof(*info);
-  info->mmap_type = kMb2TagTypeMmap;
-  info->mmap_size = 16 + static_cast<uint32_t>(sizeof(info->entries));
-  info->entry_size = sizeof(Mb2MmapEntry);
-  info->end_type = kMb2TagTypeEnd;
-  info->end_size = 8;
+  info->header.total_size = sizeof(*info);
+  info->mmap.type = kMultiboot2TagMmap;
+  info->mmap.size =
+      sizeof(Multiboot2TagMmap) + static_cast<uint32_t>(sizeof(info->entries));
+  info->mmap.entry_size = sizeof(Multiboot2MmapEntry);
+  info->end.type = kMultiboot2TagEnd;
+  info->end.size = sizeof(Multiboot2Tag);
 }
 
 static uintptr_t AddrOf(const void* const ptr) {
@@ -336,12 +292,12 @@ TEST(MultibootTest, Multiboot2ParseLogsEntriesAndReservesInfoBlock) {
   EXPECT_THAT(g_env.map_calls.back().size,
               t::Eq(static_cast<int64_t>(sizeof(info))));
 
-  EXPECT_THAT(g_env.uart_log, t::HasSubstr("[PMM] Multiboot magic=0x36d76289"));
+  EXPECT_THAT(g_env.uart_log, t::HasSubstr("[PMM] Multiboot magic=0x36D76289"));
   EXPECT_THAT(g_env.uart_log,
-              t::HasSubstr("[PMM] mmap entry: base=0x100000 len=0x7ee0000 "
+              t::HasSubstr("[PMM] mmap entry: base=0x100000 len=0x7EE0000 "
                            "type=1\n"));
   EXPECT_THAT(g_env.uart_log,
-              t::HasSubstr("[PMM] mmap entry: base=0x7fe0000 len=0x20000 "
+              t::HasSubstr("[PMM] mmap entry: base=0x7FE0000 len=0x20000 "
                            "type=4\n"));
   EXPECT_THAT(g_env.vga_log, t::Eq(g_env.uart_log));
 }
@@ -428,13 +384,9 @@ TEST(MultibootTest, ParseCoalescesEntriesAndRejectsUncoalesceableOverflow) {
 TEST(MultibootTest, Multiboot2MmapTagSizeExceedingTotalSizeIsRejected) {
   ResetFakeEnv();
   struct [[gnu::packed]] TruncatedMb2MmapInfo {
-    uint32_t total_size;
-    uint32_t reserved;
-    uint32_t mmap_type;
-    uint32_t mmap_size;
-    uint32_t entry_size;
-    uint32_t entry_version;
-    Mb2MmapEntry entry;
+    Multiboot2InfoHeader header;
+    Multiboot2TagMmap mmap;
+    Multiboot2MmapEntry entry;
   };
 
   constexpr int64_t kExactSize = sizeof(TruncatedMb2MmapInfo);
@@ -442,10 +394,10 @@ TEST(MultibootTest, Multiboot2MmapTagSizeExceedingTotalSizeIsRejected) {
   std::memset(raw_mb2.get(), 0, kExactSize);
   TruncatedMb2MmapInfo* const mb2 =
       reinterpret_cast<TruncatedMb2MmapInfo*>(raw_mb2.get());
-  mb2->total_size = static_cast<uint32_t>(kExactSize);
-  mb2->mmap_type = kMb2TagTypeMmap;
-  mb2->mmap_size = 4096;  // Exceeds total_size - offset (40 bytes).
-  mb2->entry_size = sizeof(Mb2MmapEntry);
+  mb2->header.total_size = static_cast<uint32_t>(kExactSize);
+  mb2->mmap.type = kMultiboot2TagMmap;
+  mb2->mmap.size = 4096;  // Exceeds total_size - offset (40 bytes).
+  mb2->mmap.entry_size = sizeof(Multiboot2MmapEntry);
   mb2->entry = {0x200000, 8 * kPageBytes, kMemoryTypeAvailable, 0};
 
   MultibootMemoryMap parsed = {};
@@ -463,18 +415,18 @@ TEST(MultibootTest, Multiboot1MmapParsesEntriesAndReservesInfoAndMmapBuffer) {
     GTEST_SKIP() << "cannot map host memory below 4 GiB (MAP_32BIT)";
   }
   constexpr int kEntries = 4;
-  Mb1MmapEntry* const entries =
-      reinterpret_cast<Mb1MmapEntry*>(buffer.EndMinus(kEntries * 24));
+  Multiboot1MmapEntry* const entries =
+      reinterpret_cast<Multiboot1MmapEntry*>(buffer.EndMinus(kEntries * 24));
   entries[0] = {20, 0x0, 0x9FC00, kMemoryTypeAvailable};
   entries[1] = {20, 0x100000, 0x7EE0000, kMemoryTypeAvailable};
   entries[2] = {20, 0x7FE0000, 0x20000, kMemoryTypeAcpiReclaimable};
   entries[3] = {20, 0xFD00000000, 3ULL << 32, kMemoryTypeReserved};
 
-  Mb1Info info = {};
+  Multiboot1Info info = {};
   info.flags = kMultiboot1FlagMmap | kMultiboot1FlagMemBasic;
   info.mem_lower = 639;
   info.mem_upper = 130048;
-  info.mmap_length = kEntries * sizeof(Mb1MmapEntry);
+  info.mmap_length = kEntries * sizeof(Multiboot1MmapEntry);
   info.mmap_addr = static_cast<uint32_t>(AddrOf(entries));
 
   MultibootMemoryMap parsed = {};
@@ -505,13 +457,13 @@ TEST(MultibootTest, Multiboot1MmapEntrySizeExceedingMmapLengthIsRejected) {
   }
   // The only entry ends right before an inaccessible page, so reading past
   // `mmap_length` would fault.
-  Mb1MmapEntry* const entry =
-      reinterpret_cast<Mb1MmapEntry*>(buffer.EndMinus(sizeof(Mb1MmapEntry)));
+  Multiboot1MmapEntry* const entry = reinterpret_cast<Multiboot1MmapEntry*>(
+      buffer.EndMinus(sizeof(Multiboot1MmapEntry)));
   *entry = {1024, 0x200000, 8 * kPageBytes, kMemoryTypeAvailable};
 
-  Mb1Info info = {};
+  Multiboot1Info info = {};
   info.flags = kMultiboot1FlagMmap;
-  info.mmap_length = sizeof(Mb1MmapEntry);
+  info.mmap_length = sizeof(Multiboot1MmapEntry);
   info.mmap_addr = static_cast<uint32_t>(AddrOf(entry));
 
   MultibootMemoryMap parsed = {};
@@ -526,7 +478,7 @@ TEST(MultibootTest, Multiboot1MemBasicFallbackUses1MiBBaseOffsetForMemUpper) {
   ResetFakeEnv();
   // Without the mmap flag, `mem_lower` describes `[0, mem_lower KiB)` and
   // `mem_upper` describes `[1 MiB, 1 MiB + mem_upper KiB)`.
-  Mb1Info mb1 = {};
+  Multiboot1Info mb1 = {};
   mb1.flags = kMultiboot1FlagMemBasic;
   mb1.mem_lower = 640;
   mb1.mem_upper = 64;
@@ -546,7 +498,7 @@ TEST(MultibootTest, Multiboot1MemBasicFallbackUses1MiBBaseOffsetForMemUpper) {
   EXPECT_THAT(parsed.mb1_mmap_reserved_end, t::Eq(0u));
 
   // Neither the mmap nor the mem_basic flag: no memory information.
-  Mb1Info mb1_empty = {};
+  Multiboot1Info mb1_empty = {};
   mb1_empty.mem_upper = 64;
   MultibootMemoryMap empty_parsed = {};
   EXPECT_FALSE(MultibootParseMemoryMap(kMultiboot1Magic,              //
@@ -558,43 +510,30 @@ TEST(MultibootTest, Multiboot1MemBasicFallbackUses1MiBBaseOffsetForMemUpper) {
 TEST(MultibootTest, Multiboot2FramebufferTagValidatesPitchAndDimensions) {
   ResetFakeEnv();
   struct [[gnu::packed]] Mb2FramebufferInfo {
-    uint32_t total_size;
-    uint32_t reserved;
-    uint32_t mmap_type;
-    uint32_t mmap_size;
-    uint32_t entry_size;
-    uint32_t entry_version;
-    Mb2MmapEntry entry;
-    uint32_t fb_tag_type;
-    uint32_t fb_tag_size;
-    uint64_t fb_addr;
-    uint32_t fb_pitch;
-    uint32_t fb_width;
-    uint32_t fb_height;
-    uint8_t fb_bpp;
-    uint8_t fb_type;
-    uint16_t fb_reserved;
-    uint32_t end_type;
-    uint32_t end_size;
+    Multiboot2InfoHeader header;
+    Multiboot2TagMmap mmap;
+    Multiboot2MmapEntry entry;
+    Multiboot2TagFramebuffer fb;
+    Multiboot2Tag end;
   };
   constexpr uintptr_t kFbAddr = 0xFD000000;
 
   Mb2FramebufferInfo buf = {};
-  buf.total_size = sizeof(Mb2FramebufferInfo);
-  buf.mmap_type = kMb2TagTypeMmap;
-  buf.mmap_size = 16 + sizeof(Mb2MmapEntry);
-  buf.entry_size = sizeof(Mb2MmapEntry);
+  buf.header.total_size = sizeof(Mb2FramebufferInfo);
+  buf.mmap.type = kMultiboot2TagMmap;
+  buf.mmap.size = sizeof(Multiboot2TagMmap) + sizeof(Multiboot2MmapEntry);
+  buf.mmap.entry_size = sizeof(Multiboot2MmapEntry);
   buf.entry = {0x200000, 16 * kPageBytes, kMemoryTypeAvailable, 0};
-  buf.fb_tag_type = kMb2TagTypeFramebuffer;
-  buf.fb_tag_size = 32;
-  buf.fb_addr = kFbAddr;
-  buf.fb_pitch = 640 * 4;
-  buf.fb_width = 640;
-  buf.fb_height = 480;
-  buf.fb_bpp = 32;
-  buf.fb_type = kMb2FramebufferTypeRgb;
-  buf.end_type = kMb2TagTypeEnd;
-  buf.end_size = 8;
+  buf.fb.type = kMultiboot2TagFramebuffer;
+  buf.fb.size = sizeof(Multiboot2TagFramebuffer);
+  buf.fb.framebuffer_addr = kFbAddr;
+  buf.fb.framebuffer_pitch = 640 * 4;
+  buf.fb.framebuffer_width = 640;
+  buf.fb.framebuffer_height = 480;
+  buf.fb.framebuffer_bpp = 32;
+  buf.fb.framebuffer_type = kMultiboot2FramebufferTypeRgb;
+  buf.end.type = kMultiboot2TagEnd;
+  buf.end.size = sizeof(Multiboot2Tag);
 
   const uintptr_t buf_addr = AddrOf(&buf);
   MultibootMemoryMap parsed = {};
@@ -613,57 +552,196 @@ TEST(MultibootTest, Multiboot2FramebufferTagValidatesPitchAndDimensions) {
   EXPECT_THAT(parsed.fb_height, t::Eq(480));
   EXPECT_THAT(parsed.fb_bpp, t::Eq(32));
 
-  buf.fb_bpp = 24;
-  buf.fb_pitch = 640 * 3;
+  buf.fb.framebuffer_bpp = 24;
+  buf.fb.framebuffer_pitch = 640 * 3;
   ASSERT_TRUE(parse());
   EXPECT_THAT(parsed.fb_addr, t::Eq(kFbAddr));
   EXPECT_THAT(parsed.fb_pitch, t::Eq(640 * 3));
   EXPECT_THAT(parsed.fb_bpp, t::Eq(24));
 
   // pitch < width * (bpp / 8) is rejected for both 24-bpp and 32-bpp.
-  buf.fb_pitch = 640 * 3 - 1;
+  buf.fb.framebuffer_pitch = 640 * 3 - 1;
   ASSERT_TRUE(parse());
   EXPECT_THAT(parsed.fb_addr, t::Eq(0u));
   EXPECT_THAT(parsed.fb_pitch, t::Eq(0));
 
-  buf.fb_bpp = 32;
-  buf.fb_pitch = 640 * 4 - 1;
+  buf.fb.framebuffer_bpp = 32;
+  buf.fb.framebuffer_pitch = 640 * 4 - 1;
   ASSERT_TRUE(parse());
   EXPECT_THAT(parsed.fb_addr, t::Eq(0u));
 
   // Zero width or height is rejected.
-  buf.fb_pitch = 640 * 4;
-  buf.fb_width = 0;
+  buf.fb.framebuffer_pitch = 640 * 4;
+  buf.fb.framebuffer_width = 0;
   ASSERT_TRUE(parse());
   EXPECT_THAT(parsed.fb_addr, t::Eq(0u));
 
-  buf.fb_width = 640;
-  buf.fb_height = 0;
+  buf.fb.framebuffer_width = 640;
+  buf.fb.framebuffer_height = 0;
   ASSERT_TRUE(parse());
   EXPECT_THAT(parsed.fb_addr, t::Eq(0u));
 
   // Dimensions or pitch exceeding INT32_MAX are rejected.
   constexpr uint32_t kOverInt32Max = static_cast<uint32_t>(INT32_MAX) + 1u;
-  buf.fb_height = 480;
-  buf.fb_pitch = kOverInt32Max;
+  buf.fb.framebuffer_height = 480;
+  buf.fb.framebuffer_pitch = kOverInt32Max;
   ASSERT_TRUE(parse());
   EXPECT_THAT(parsed.fb_addr, t::Eq(0u));
 
-  buf.fb_pitch = 640 * 4;
-  buf.fb_width = kOverInt32Max;
+  buf.fb.framebuffer_pitch = 640 * 4;
+  buf.fb.framebuffer_width = kOverInt32Max;
   ASSERT_TRUE(parse());
   EXPECT_THAT(parsed.fb_addr, t::Eq(0u));
 
-  buf.fb_width = 640;
-  buf.fb_height = kOverInt32Max;
+  buf.fb.framebuffer_width = 640;
+  buf.fb.framebuffer_height = kOverInt32Max;
   ASSERT_TRUE(parse());
   EXPECT_THAT(parsed.fb_addr, t::Eq(0u));
 
   // Non-RGB framebuffers (e.g. EGA text mode) are ignored.
-  buf.fb_height = 480;
-  buf.fb_type = 2;
+  buf.fb.framebuffer_height = 480;
+  buf.fb.framebuffer_type = 2;
   ASSERT_TRUE(parse());
   EXPECT_THAT(parsed.fb_addr, t::Eq(0u));
+}
+
+// Writes a Multiboot2 tag header at `offset` in `info`.
+static void PutTag(uint8_t* const info, const int64_t offset,
+                   const uint32_t type, const uint32_t size) {
+  const Multiboot2Tag tag = {type, size};
+  std::memcpy(info + offset, &tag, sizeof(tag));
+}
+
+// Returns the (type, offset) of every tag that Multiboot2TagIterator visits.
+static std::vector<std::pair<uint32_t, int64_t>> VisitTags(
+    const uint8_t* const info, const int64_t total_size) {
+  std::vector<std::pair<uint32_t, int64_t>> visited;
+  for (Multiboot2TagIterator it(info, total_size); !it.Done(); it.Next()) {
+    EXPECT_THAT(
+        &it.tag(),
+        t::Eq(reinterpret_cast<const Multiboot2Tag*>(info + it.offset())));
+    visited.emplace_back(it.tag().type, it.offset());
+  }
+  return visited;
+}
+
+TEST(MultibootTest, Multiboot2TagIteratorVisitsTagsAtEightByteAlignedOffsets) {
+  alignas(8) uint8_t info[80] = {};
+  PutTag(info, 8, kMultiboot2TagMmap, 12);
+  PutTag(info, 24, kMultiboot2TagAcpiOld, 8);
+  PutTag(info, 32, kMultiboot2TagFramebuffer, 17);
+  PutTag(info, 56, kMultiboot2TagEnd, 8);
+  // Not visited: it follows the end tag.
+  PutTag(info, 64, kMultiboot2TagAcpiNew, 16);
+
+  EXPECT_THAT(VisitTags(info, sizeof(info)),
+              t::ElementsAre(t::Pair(kMultiboot2TagMmap, 8),
+                             t::Pair(kMultiboot2TagAcpiOld, 24),
+                             t::Pair(kMultiboot2TagFramebuffer, 32)));
+}
+
+TEST(MultibootTest, Multiboot2TagIteratorStopsAtMalformedTagsAndTotalSize) {
+  alignas(8) uint8_t info[40] = {};
+  PutTag(info, 8, kMultiboot2TagMmap, 16);
+
+  // A tag smaller than its header ends the walk.
+  PutTag(info, 24, kMultiboot2TagAcpiOld, 7);
+  EXPECT_THAT(VisitTags(info, 40),
+              t::ElementsAre(t::Pair(kMultiboot2TagMmap, 8)));
+  // So does a tag that extends past `total_size`.
+  PutTag(info, 24, kMultiboot2TagAcpiOld, 17);
+  EXPECT_THAT(VisitTags(info, 40),
+              t::ElementsAre(t::Pair(kMultiboot2TagMmap, 8)));
+
+  // Without an end tag, the walk ends at `total_size`, also when fewer bytes
+  // than a tag header are left.
+  PutTag(info, 24, kMultiboot2TagAcpiOld, 16);
+  EXPECT_THAT(VisitTags(info, 40),
+              t::ElementsAre(t::Pair(kMultiboot2TagMmap, 8),
+                             t::Pair(kMultiboot2TagAcpiOld, 24)));
+  EXPECT_THAT(VisitTags(info, 30),
+              t::ElementsAre(t::Pair(kMultiboot2TagMmap, 8)));
+
+  // A structure that ends after its fixed header has no tags, and an iterator
+  // that is done stays done.
+  EXPECT_THAT(VisitTags(info, sizeof(Multiboot2InfoHeader)), t::IsEmpty());
+  Multiboot2TagIterator it(info, 24);
+  ASSERT_FALSE(it.Done());
+  it.Next();
+  EXPECT_TRUE(it.Done());
+  it.Next();
+  EXPECT_TRUE(it.Done());
+}
+
+TEST(MultibootTest, Multiboot2MapInfoMapsTheHeaderAndThenTheWholeStructure) {
+  ResetFakeEnv();
+  alignas(8) uint8_t info[48] = {};
+  const Multiboot2InfoHeader header = {sizeof(info), 0};
+  std::memcpy(info, &header, sizeof(header));
+  const uintptr_t info_addr = AddrOf(info);
+
+  int64_t total_size = -1;
+  EXPECT_THAT(Multiboot2MapInfo(info_addr, kMaxCanonicalIdentityAddress,
+                                &RecordingMapper, &total_size),
+              t::Eq(info));
+  EXPECT_THAT(total_size, t::Eq(48));
+  EXPECT_THAT(g_env.map_calls,
+              t::ElementsAre(MapCall{info_addr, sizeof(Multiboot2InfoHeader)},
+                             MapCall{info_addr, 48}));
+
+  // The structure may end exactly at `max_physical_addr`.
+  EXPECT_THAT(Multiboot2MapInfo(info_addr,         //
+                                info_addr + 48,    //
+                                &RecordingMapper,  //
+                                &total_size),
+              t::Eq(info));
+}
+
+TEST(MultibootTest, Multiboot2MapInfoRejectsBadAddressesSizesAndMapFailures) {
+  ResetFakeEnv();
+  alignas(8) uint8_t info[48] = {};
+  const uintptr_t info_addr = AddrOf(info);
+  const auto set_total_size = [&info](const uint32_t total_size) {
+    const Multiboot2InfoHeader header = {total_size, 0};
+    std::memcpy(info, &header, sizeof(header));
+  };
+  const auto map_info = [](const uintptr_t addr,
+                           const uintptr_t max_physical_addr) {
+    int64_t total_size = -1;
+    const uint8_t* const mapped = Multiboot2MapInfo(
+        addr, max_physical_addr, &RecordingMapper, &total_size);
+    EXPECT_THAT(total_size, t::Eq(mapped == nullptr ? 0 : 48));
+    return mapped;
+  };
+  set_total_size(sizeof(info));
+
+  // Bad addresses are rejected before anything is mapped: 0, at or above
+  // `max_physical_addr`, or with a header that does not end below it.
+  EXPECT_THAT(map_info(0, kMaxCanonicalIdentityAddress), t::IsNull());
+  EXPECT_THAT(map_info(info_addr, info_addr), t::IsNull());
+  EXPECT_THAT(map_info(info_addr, info_addr + 7), t::IsNull());
+  EXPECT_THAT(g_env.map_calls, t::IsEmpty());
+
+  // So are sizes smaller than the header, larger than
+  // `kMaxMultibootStructureBytes`, or reaching past `max_physical_addr`.
+  set_total_size(7);
+  EXPECT_THAT(map_info(info_addr, kMaxCanonicalIdentityAddress), t::IsNull());
+  set_total_size(static_cast<uint32_t>(kMaxMultibootStructureBytes) + 1);
+  EXPECT_THAT(map_info(info_addr, kMaxCanonicalIdentityAddress), t::IsNull());
+  set_total_size(sizeof(info));
+  EXPECT_THAT(map_info(info_addr, info_addr + 47), t::IsNull());
+
+  // Either mapping can fail.
+  g_env.map_calls.clear();
+  g_env.fail_map_call = 0;
+  EXPECT_THAT(map_info(info_addr, kMaxCanonicalIdentityAddress), t::IsNull());
+  g_env.map_calls.clear();
+  g_env.fail_map_call = 1;
+  EXPECT_THAT(map_info(info_addr, kMaxCanonicalIdentityAddress), t::IsNull());
+  EXPECT_THAT(g_env.map_calls, t::SizeIs(2));
+  g_env.map_calls.clear();
+  g_env.fail_map_call = -1;
+  EXPECT_THAT(map_info(info_addr, kMaxCanonicalIdentityAddress), t::Eq(info));
 }
 
 }  // namespace

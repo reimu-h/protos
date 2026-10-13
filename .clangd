@@ -30,3 +30,15 @@ CompileFlags:
     - -isystem
     - build/include
 
+---
+# Without a compilation database, clangd compiles each file in its own
+# directory. Files in selftest/ include headers by their path from the
+# repository root and need build/include relative to their directory.
+If:
+  PathMatch: selftest/.*
+CompileFlags:
+  Add:
+    - -iquote
+    - ..
+    - -isystem
+    - ../build/include

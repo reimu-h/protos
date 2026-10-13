@@ -59,7 +59,7 @@ UEFI_TIMEOUT_SECS="${UEFI_TIMEOUT_SECS:-90}"
 MIN_STRESS_PASSES="${MIN_STRESS_PASSES:-3}"
 
 EXPECTED_STRING="Hello, x86-64 Kernel World!"
-COMPLETION_MARKER="[TEST] ALL MEMORY TESTS PASSED"
+COMPLETION_MARKER="[TEST] ALL BOOT SELF-TESTS PASSED"
 STRESS_MARKER="[STRESS] random_multicpu_stress: PASS"
 # Any test failure line contains "FAIL"; kernel panics (failed CHECKs and
 # unhandled CPU exceptions) print "[FATAL]".

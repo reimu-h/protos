@@ -9,6 +9,7 @@
 #include "idt.h"
 #include "join_lifecycle_scheduler.h"
 #include "preemptive_scheduler.h"
+#include "task_scheduler_internals.h"
 #include "work_stealing_scheduler.h"
 
 namespace protos {
@@ -27,14 +28,14 @@ std::atomic<TaskScheduler*> g_task_scheduler{nullptr};
 static void ApicTimerInterruptHandler(InterruptFrame* const frame) {
   TaskScheduler* const scheduler = GetTaskScheduler();
   if (scheduler != nullptr) {
-    scheduler->OnTimerInterrupt(frame);
+    TaskSchedulerInternals::OnTimerInterrupt(*scheduler, frame);
   }
 }
 
 static void WakeupIpiInterruptHandler(InterruptFrame* const frame) {
   TaskScheduler* const scheduler = GetTaskScheduler();
   if (scheduler != nullptr) {
-    scheduler->OnWakeupIpi(frame);
+    TaskSchedulerInternals::OnWakeupIpi(*scheduler, frame);
   }
 }
 
@@ -45,15 +46,21 @@ void TaskInit() {
   CHECK(GetTaskScheduler() == nullptr);
 
   std::shared_ptr<TaskScheduler> scheduler =
-      CreatePreemptiveScheduler(CreateJoinLifecycleScheduler(
+      CreateJoinLifecycleScheduler(CreatePreemptiveScheduler(
           CreateWorkStealingScheduler(CreateCoreRunqueueScheduler())));
-  scheduler->Init();
+  TaskSchedulerInternals::Init(*scheduler);
   TaskScheduler* const published = scheduler.get();
   g_task_scheduler_owner = std::move(scheduler);
   g_task_scheduler.store(published, std::memory_order_release);
 
   IdtRegisterHandler(kVectorApicTimer, ApicTimerInterruptHandler);
   IdtRegisterHandler(kVectorWakeupIpi, WakeupIpiInterruptHandler);
+}
+
+bool TaskPollIdleCpu(const int cpu_index) {
+  TaskScheduler* const scheduler = GetTaskScheduler();
+  return scheduler != nullptr &&
+         TaskSchedulerInternals::PollIdleCpu(*scheduler, cpu_index);
 }
 
 TaskScheduler* GetTaskScheduler() {

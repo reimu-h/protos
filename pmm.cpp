@@ -3,11 +3,11 @@
 #include <cstdint>
 
 #include "check.h"
+#include "console.h"
 #include "multiboot.h"
 #include "paging.h"
 #include "rbtree.h"
 #include "spinlock.h"
-#include "uart.h"
 #include "vga.h"
 
 extern "C" {
@@ -352,21 +352,6 @@ static void CarveExcludedRange(const uintptr_t base, const int64_t length) {
   }
 }
 
-static void ConsoleWrite(const char* const str) {
-  UartWrite(str);
-  VgaWrite(str);
-}
-
-static void ConsoleWriteHex(const uint64_t value) {
-  UartWriteHex(value);
-  VgaWriteHex(value);
-}
-
-static void ConsoleWriteDec(const uint64_t value) {
-  UartWriteDec(value);
-  VgaWriteDec(value);
-}
-
 static bool PmmRangeIsValidUsableRamLocked(const uintptr_t addr,
                                            const int64_t size) {
   if (!g_pmm_initialized || size <= 0 || addr < kLowerMemoryLimit ||
@@ -619,6 +604,11 @@ void PmmFreeFrame(const uintptr_t frame_addr) {
 }
 
 uintptr_t PmmMaxPhysicalAddress() { return g_max_managed_phys_addr; }
+
+bool PmmIsInitialized() {
+  const IrqSpinLockGuard lock_guard(g_pmm_lock);
+  return g_pmm_initialized;
+}
 
 int64_t PmmMaxFrameCount() { return g_max_frames; }
 

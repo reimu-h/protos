@@ -195,10 +195,6 @@ void UartPanicWrite(const char* const str) {
   AppendLog(&g_env.uart_panic_log, str);
 }
 
-void UartPanicWriteDec(const uint64_t value) {
-  AppendLogFormatted(&g_env.uart_panic_log, "%llu", value);
-}
-
 void VgaWrite(const char* const str) { AppendLog(&g_env.vga_log, str); }
 
 void VgaWriteHex(const uint64_t value) {
@@ -211,10 +207,6 @@ void VgaWriteDec(const uint64_t value) {
 
 void VgaPanicWrite(const char* const str) {
   AppendLog(&g_env.vga_panic_log, str);
-}
-
-void VgaPanicWriteDec(const uint64_t value) {
-  AppendLogFormatted(&g_env.vga_panic_log, "%llu", value);
 }
 
 }  // namespace protos

@@ -45,23 +45,45 @@ using TaskFn = void (*)(void* arg);
 // - The handle is invalid once Join() returns or Detach() is called. Its TCB
 //   may be reused for a new task with the same `Task*` value.
 
-// Abstract composable task scheduler interface.
+// Kernel task scheduler. `TaskInit()` creates the scheduler and
+// `GetTaskScheduler()` returns it.
 //
-// Implementations follow the decorator/layered composition pattern: each class
-// implements `TaskScheduler` with a single scheduling responsibility and wraps
-// an inner `std::shared_ptr<TaskScheduler>` (with the innermost base layer
-// managing per-CPU runqueues and low-level context switching). The comments
-// below describe the scheduler composed by `TaskInit()`; a layer used on its
-// own may implement only part of this contract (for example, joining and
-// detaching are tracked by the join lifecycle layer).
+// Each online CPU runs its queued tasks in order of weighted virtual runtime
+// (proportional-share scheduling; see `kDefaultTaskWeight`). A CPU switches
+// tasks when the running task yields or exits and, while preemption is
+// enabled, on timer interrupts and wakeup IPIs. CPUs that run out of queued
+// tasks take tasks queued on busier CPUs.
+//
+// The methods form two sections: the public task API, which task code calls,
+// and the private scheduler internals, which only task.cpp, the scheduler
+// layers and their tests call, through `TaskSchedulerInternals`.
+//
+// `TaskInit()` composes the scheduler from layers, each of which implements
+// this interface and has a single scheduling responsibility. Each layer but
+// the innermost one wraps the next layer inward (see `ForwardingTaskScheduler`
+// in forwarding_task_scheduler.h). The innermost layer
+// (core_runqueue_scheduler.h) manages the per-CPU runqueues and switches
+// contexts. The outermost layer, the join lifecycle layer
+// (join_lifecycle_scheduler.h), implements the task lifecycle methods
+// `Detach()` and `ReapZombies()` on top of `Join()`. The layers below it
+// forward these two methods inward to the core, which PANICs in them, so below
+// the join lifecycle layer a task is reclaimed only when it is joined, and
+// each task created through an inner layer must be joined exactly once.
+//
+// The method comments describe the composed scheduler; a layer used on its
+// own may implement only part of the contract (see each layer's header). A
+// method that a layer can't implement because another layer is responsible
+// for it calls PANIC() (check.h) with a message that names the method, the
+// layer and the layer that handles it.
 class TaskScheduler {
  public:
   virtual ~TaskScheduler() = default;
 
-  // Initializes the scheduler layer and any wrapped inner layers. Must be
-  // called once, on the BSP (CPU 0), after SMP bring-up and before any other
-  // method.
-  virtual void Init() = 0;
+  // Task API
+  // --------
+  //
+  // Task code calls these methods on the scheduler that `GetTaskScheduler()`
+  // returns.
 
   // Creates a task that runs `entry(arg)` on its own 16-byte-aligned 16 KiB
   // kernel stack with proportional-share `weight`
@@ -113,6 +135,54 @@ class TaskScheduler {
   // it has the same calling restrictions as Join().
   virtual int ReapZombies() = 0;
 
+  // Enables or disables scheduling on timer interrupts and wakeup IPIs.
+  //
+  // The flag is global (it applies to every CPU at once) and does not nest:
+  // code that disables it temporarily must save and restore the previous
+  // value. While it is disabled, the scheduler ignores timer interrupts and
+  // wakeup IPIs entirely: besides not preempting, ticks charge no virtual
+  // runtime and idle CPUs don't steal work on ticks or IPIs, so a CPU-bound
+  // task that runs in that window is favored afterwards. This differs from
+  // Linux's per-CPU, nesting `preempt_disable()`.
+  virtual void SetPreemptEnabled(bool enabled) = 0;
+
+  // Returns `true` if interrupt-driven scheduling is currently enabled.
+  virtual bool IsPreemptEnabled() const = 0;
+
+  // Returns the opaque `Task*` currently executing on the calling CPU in O(1).
+  virtual Task* CurrentTask() const = 0;
+
+ private:
+  // Scheduler internals
+  // -------------------
+  //
+  // These methods are private: only the friend class `TaskSchedulerInternals`
+  // (task_scheduler_internals.h) can call them. task.cpp (`TaskInit()`, the
+  // timer and wakeup IPI handlers and `TaskPollIdleCpu()`), the scheduler
+  // layers and the scheduler tests call them through it; task code must not
+  // call them. The layers still implement them by overriding them: access
+  // levels don't restrict overriding.
+  friend class TaskSchedulerInternals;
+
+  // Initializes the scheduler layer and any wrapped inner layers. Must be
+  // called once, on the BSP (CPU 0), after SMP bring-up and before any other
+  // method.
+  virtual void Init() = 0;
+
+  // Handles a Local APIC timer interrupt (`kVectorApicTimer = 0x20`) on the
+  // calling CPU. `frame` is the interrupted context. Acts only if preemption
+  // is enabled, the interrupted context had interrupts enabled (`frame` is
+  // non-null and has RFLAGS.IF set) and holds no `IrqSpinLock`: then charges a
+  // tick of virtual runtime to the interrupted task and switches to a runnable
+  // task with lower `vruntime`, if any.
+  virtual void OnTimerInterrupt(InterruptFrame* frame) = 0;
+
+  // Handles a cross-CPU wakeup/reschedule IPI (`kVectorWakeupIpi = 0x21`) on
+  // the calling CPU. Under the same conditions as OnTimerInterrupt(), switches
+  // to an eligible runnable task (or wakes an idle CPU), without charging
+  // virtual runtime.
+  virtual void OnWakeupIpi(InterruptFrame* frame) = 0;
+
   // Polls and dispatches runnable (or stolen) work on idle CPU `cpu_index`.
   // Returns `true` if a runnable task was switched in, or `false` if no work
   // was available.
@@ -131,45 +201,20 @@ class TaskScheduler {
   // `dst_cpu`'s min_vruntime. Returns `true` if `dst_cpu` already had runnable
   // work or a task was moved.
   virtual bool StealTask(int dst_cpu, int src_cpu) = 0;
-
-  // Enables or disables scheduling on timer interrupts and wakeup IPIs.
-  //
-  // The flag is global (it applies to every CPU at once) and does not nest:
-  // code that disables it temporarily must save and restore the previous
-  // value. While it is disabled, OnTimerInterrupt() and OnWakeupIpi() do
-  // nothing at all: besides not preempting, ticks charge no virtual runtime
-  // and idle CPUs don't steal work on ticks or IPIs, so a CPU-bound task that
-  // runs in that window is favored afterwards. This differs from Linux's
-  // per-CPU, nesting `preempt_disable()`.
-  virtual void SetPreemptEnabled(bool enabled) = 0;
-
-  // Returns `true` if interrupt-driven scheduling is currently enabled.
-  virtual bool IsPreemptEnabled() const = 0;
-
-  // Handles a Local APIC timer interrupt (`kVectorApicTimer = 0x20`) on the
-  // calling CPU. `frame` is the interrupted context. Acts only if preemption
-  // is enabled, the interrupted context had interrupts enabled (`frame` is
-  // non-null and has RFLAGS.IF set) and holds no `IrqSpinLock`: then charges a
-  // tick of virtual runtime to the interrupted task and switches to a runnable
-  // task with lower `vruntime`, if any.
-  virtual void OnTimerInterrupt(InterruptFrame* frame) = 0;
-
-  // Handles a cross-CPU wakeup/reschedule IPI (`kVectorWakeupIpi = 0x21`) on
-  // the calling CPU. Under the same conditions as OnTimerInterrupt(), switches
-  // to an eligible runnable task (or wakes an idle CPU), without charging
-  // virtual runtime.
-  virtual void OnWakeupIpi(InterruptFrame* frame) = 0;
-
-  // Returns the opaque `Task*` currently executing on the calling CPU in O(1).
-  virtual Task* CurrentTask() const = 0;
 };
 
-// Composes the scheduler layers (preemptive -> join lifecycle -> work stealing
+// Composes the scheduler layers (join lifecycle -> preemptive -> work stealing
 // -> core runqueues), initializes them and registers the timer and wakeup IPI
 // handlers. Must be called exactly once, on the BSP, after IdtInit(),
 // PmmInit(), HeapInit() and SmpInit(). CHECK-fails if the IDT is not
 // initialized or a scheduler already exists.
 void TaskInit();
+
+// Polls and dispatches runnable (or stolen) work on idle CPU `cpu_index`. The
+// idle loop of each AP (`ApKernelEntry()`) calls it on that CPU each time it
+// wakes up. Returns `true` if a runnable task was switched in, or `false` if
+// no work was available or `TaskInit()` has not run yet.
+bool TaskPollIdleCpu(int cpu_index);
 
 // Returns the scheduler created by `TaskInit()`, or `nullptr` before
 // `TaskInit()`. Safe to call from any CPU, including from interrupt handlers

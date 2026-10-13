@@ -50,6 +50,9 @@ constexpr uintptr_t kLowerMemoryLimit = 0x100000;
 // and gets overwritten. Booting with modules requires reserving them first.
 void PmmInit(uint32_t multiboot_magic, uint64_t multiboot_info_addr);
 
+// Returns true once `PmmInit` has set up the frame allocator.
+bool PmmIsInitialized();
+
 // Allocates `count` contiguous 4 KiB physical frames (`count > 0`, `DCHECK`)
 // from the lowest-addressed free run that is large enough and returns the base
 // physical address, or 0 if no contiguous run of `count` frames is available.

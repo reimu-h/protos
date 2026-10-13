@@ -10,6 +10,8 @@
 #include <thread>
 #include <vector>
 
+#include "check.h"
+#include "gdt.h"
 #include "idt_host_fakes.h"
 #include "smp.h"
 #include "uart.h"
@@ -46,16 +48,6 @@ static void WritePanicOutput(const PanicConsole console,
   }
 }
 
-static void WritePanicOutputDec(const PanicConsole console,
-                                const uint64_t value) {
-  char buf[32];
-  std::snprintf(buf,          //
-                sizeof(buf),  //
-                "%llu",       //
-                static_cast<unsigned long long>(value));
-  WritePanicOutput(console, buf);
-}
-
 }  // namespace
 
 void SmpSendLocalApicEoi() {
@@ -66,16 +58,8 @@ void UartPanicWrite(const char* const str) {
   WritePanicOutput(PanicConsole::kUart, str);
 }
 
-void UartPanicWriteDec(const uint64_t value) {
-  WritePanicOutputDec(PanicConsole::kUart, value);
-}
-
 void VgaPanicWrite(const char* const str) {
   WritePanicOutput(PanicConsole::kVga, str);
-}
-
-void VgaPanicWriteDec(const uint64_t value) {
-  WritePanicOutputDec(PanicConsole::kVga, value);
 }
 
 namespace {
@@ -147,7 +131,10 @@ TEST(IdtTest, IdtInitPopulatesAll256EntriesAndLoadsIdtr) {
     const IdtGateDescriptor* const gate = IdtGetGate(v);
     ASSERT_THAT(gate, t::NotNull());
     EXPECT_THAT(gate->selector, t::Eq(kIdtKernelCodeSelector));
-    EXPECT_THAT(gate->ist, t::Eq(0u));
+    if (v != kVectorDoubleFault && v != kVectorNmi &&
+        v != kVectorMachineCheck) {
+      EXPECT_THAT(gate->ist, t::Eq(0u)) << "vector " << v;
+    }
     EXPECT_THAT(gate->type_attr, t::Eq(kIdtInterruptGateAttr));
     EXPECT_THAT(gate->reserved, t::Eq(0u));
     EXPECT_THAT(IdtDecodeGateOffset(*gate), t::Eq(g_isr_stub_table[v]));
@@ -156,6 +143,18 @@ TEST(IdtTest, IdtInitPopulatesAll256EntriesAndLoadsIdtr) {
 
   IdtLoad();
   EXPECT_THAT(IdtGetHostLoadCountForTest(), t::Eq(2));
+}
+
+TEST(IdtTest, DoubleFaultNmiAndMachineCheckRunOnIstStacksOfTheirOwn) {
+  ResetEnv();
+  IdtInit();
+  EXPECT_THAT(IdtGetGate(kVectorDoubleFault)->ist, t::Eq(kIstDoubleFault));
+  EXPECT_THAT(IdtGetGate(kVectorNmi)->ist, t::Eq(kIstNmi));
+  EXPECT_THAT(IdtGetGate(kVectorMachineCheck)->ist, t::Eq(kIstMachineCheck));
+  // Distinct slots among the ones that every CPU's TSS fills in.
+  EXPECT_THAT((std::vector<int>{kIstDoubleFault, kIstNmi, kIstMachineCheck}),
+              t::UnorderedElementsAre(1, 2, 3));
+  EXPECT_THAT(kIstStackCount, t::Eq(3));
 }
 
 TEST(IdtTest, DispatchHandlesNmiCustomExceptionHandlersAndFrameMutations) {
@@ -494,6 +493,23 @@ TEST(IdtTest, EnterPanicLetsOnlyTheFirstCpuPrint) {
   EXPECT_THAT(internal::EnterPanic(&owner, &depth, owner_token),
               t::Eq(internal::PanicRole::kSilent));
   EXPECT_THAT(owner.load(), t::Eq(owner_token));
+}
+
+// In host builds, PANIC() and failed CHECKs (check.h) print one line to stderr
+// and exit with status 134 instead of taking the kernel panic path.
+TEST(IdtDeathTest, PanicAndFailedCheckPrintFatalMessageAndExit) {
+  constexpr const char* kPanicMessage =
+      "^\\[FATAL\\] Layer::Method\\(\\) is not supported: handled elsewhere at "
+      ".*idt_test\\.cpp:[0-9]+\n$";
+  EXPECT_EXIT(PANIC("Layer::Method() is not supported: handled elsewhere"),  //
+              t::ExitedWithCode(134),                                        //
+              kPanicMessage);
+
+  const bool invariant_holds = false;
+  constexpr const char* kCheckMessage =
+      "^\\[FATAL\\] Check failed: invariant_holds at "
+      ".*idt_test\\.cpp:[0-9]+\n$";
+  EXPECT_EXIT(CHECK(invariant_holds), t::ExitedWithCode(134), kCheckMessage);
 }
 
 TEST(IdtDeathTest, PreconditionViolationsTriggerDcheck) {

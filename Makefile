@@ -8,12 +8,17 @@ BUILD_DIR := build
 WERROR ?= 1
 WERROR_FLAG := $(if $(filter 1,$(WERROR)),-Werror)
 
-# Link the boot self-tests (memory_tests.cpp, stress_test.cpp) into the kernel
-# and run them from kernel_main. With SELFTEST=0 the kernel initializes and then
-# idles. `make run-boot-test`/`make test` require SELFTEST=1.
+# Link the self-tests in selftest/ into the kernel and run them from
+# kernel_main (RunSelfTests() in selftest/selftest.h): the boot self-tests,
+# which end with "[TEST] ALL BOOT SELF-TESTS PASSED", then the multi-CPU stress
+# test in a loop. With SELFTEST=0 the kernel initializes and then idles.
+# `make run-boot-test`/`make test` require SELFTEST=1.
 SELFTEST ?= 1
 
 ASFLAGS := --64
+# Sources include project headers by their path from the repository root (for
+# example "selftest/stress.h"), also from files in subdirectories.
+PROJECT_INCLUDE_FLAGS := -iquote .
 # The kernel is freestanding but uses a few header-only parts of libstdc++
 # (<atomic>, <memory>, <new>, <type_traits>, <utility>). Their freestanding
 # subset is too small, so $(FREESTANDING_CXX_CONFIG) below wraps the host
@@ -27,9 +32,9 @@ CXXFLAGS := -m64 -masm=intel -std=c++20 -O2 -Wall -Wextra $(WERROR_FLAG) \
             -fno-exceptions -fno-rtti -mno-red-zone \
             -mgeneral-regs-only -fno-stack-protector -fno-pie \
             -DPROTOS_SELFTEST=$(if $(filter 1,$(SELFTEST)),1,0) \
-            -I$(BUILD_DIR)/include
+            $(PROJECT_INCLUDE_FLAGS) -I$(BUILD_DIR)/include
 
-TEST_COMMON_CXXFLAGS := -std=c++20 -Wall -Wextra $(WERROR_FLAG) -MMD -MP
+TEST_COMMON_CXXFLAGS := -std=c++20 -Wall -Wextra $(WERROR_FLAG) $(PROJECT_INCLUDE_FLAGS) -MMD -MP
 TEST_COMMON_LDFLAGS := -lgmock_main -lgmock -lgtest -pthread
 
 TEST_BUILD_MODES := debug opt
@@ -51,9 +56,15 @@ TEST_SAN_ENV_ubsan := UBSAN_OPTIONS=print_stacktrace=1:halt_on_error=1
 TEST_SAN_ENV_lsan := LSAN_OPTIONS=print_suppressions=0
 TEST_SAN_ENV_tsan := TSAN_OPTIONS=halt_on_error=1
 
-# stress_test.cpp is kernel code (the stress workload), not a unit test.
-HOST_TEST_SRCS := $(filter-out stress_test.cpp,$(sort $(wildcard *_test.cpp)))
-HOST_TESTS := $(patsubst %.cpp,%,$(HOST_TEST_SRCS))
+# Unit tests: every *_test.cpp file in the root and in selftest/. A test is
+# named after its file without the directory (selftest/stress_test.cpp is
+# stress_test), so test file names must be unique.
+HOST_TEST_SRCS := $(sort $(wildcard *_test.cpp selftest/*_test.cpp))
+HOST_TESTS := $(notdir $(basename $(HOST_TEST_SRCS)))
+ifneq ($(words $(HOST_TESTS)),$(words $(sort $(HOST_TESTS))))
+$(error Unit test file names must be unique: $(HOST_TEST_SRCS))
+endif
+$(foreach src,$(HOST_TEST_SRCS),$(eval HOST_TEST_SRC_$(notdir $(basename $(src))) := $(src)))
 TASK_LAYER_SRCS := \
     core_runqueue_scheduler.cpp \
     work_stealing_scheduler.cpp \
@@ -61,6 +72,8 @@ TASK_LAYER_SRCS := \
     preemptive_scheduler.cpp
 
 TASK_LAYER_HDRS := \
+    forwarding_task_scheduler.h \
+    task_scheduler_internals.h \
     core_runqueue_scheduler.h \
     work_stealing_scheduler.h \
     join_lifecycle_scheduler.h \
@@ -70,61 +83,80 @@ TASK_LAYER_HDRS := \
 # symbols (boot.S's ISR stub table, the CR2 register).
 IDT_TEST_SRCS := idt.cpp idt_host_fakes.cpp
 
+TEST_EXTRA_SRCS_console_test := console.cpp
 TEST_EXTRA_SRCS_cxx_runtime_test := cxx_runtime.cpp
+TEST_EXTRA_SRCS_gdt_test := gdt.cpp
 TEST_EXTRA_SRCS_heap_test := heap.cpp
 TEST_EXTRA_SRCS_idt_test := $(IDT_TEST_SRCS)
-TEST_EXTRA_SRCS_multiboot_test := multiboot.cpp
-TEST_EXTRA_SRCS_pmm_test := pmm.cpp
-TEST_EXTRA_SRCS_smp_test := smp.cpp $(IDT_TEST_SRCS)
+TEST_EXTRA_SRCS_multiboot_test := multiboot.cpp console.cpp
+TEST_EXTRA_SRCS_pmm_test := pmm.cpp console.cpp
+TEST_EXTRA_SRCS_random_test := random.cpp
+TEST_EXTRA_SRCS_selftest_test := selftest/selftest.cpp
+TEST_EXTRA_SRCS_smp_test := smp.cpp smp_hardware_fake.cpp gdt.cpp multiboot.cpp console.cpp $(IDT_TEST_SRCS)
 TEST_EXTRA_SRCS_vga_test := vga.cpp
 # Host fakes for the scheduler tests (see scheduler_test_support.h). Tests that
-# link the real idt.cpp and task.cpp must not link the IDT/task fakes.
+# link the real idt.cpp and task.cpp must not link the IDT/task fakes. Tests
+# that link core_runqueue_scheduler.cpp also link its context switch
+# (context_switch.S).
 SCHED_TEST_FAKES := scheduler_test_fakes.cpp
 SCHED_TEST_IDT_TASK_FAKES := scheduler_test_idt_task_fakes.cpp
-TEST_EXTRA_SRCS_core_runqueue_scheduler_test := core_runqueue_scheduler.cpp $(SCHED_TEST_FAKES) $(SCHED_TEST_IDT_TASK_FAKES)
-TEST_EXTRA_SRCS_work_stealing_scheduler_test := work_stealing_scheduler.cpp core_runqueue_scheduler.cpp $(SCHED_TEST_FAKES) $(SCHED_TEST_IDT_TASK_FAKES)
+TEST_EXTRA_SRCS_core_runqueue_scheduler_test := core_runqueue_scheduler.cpp context_switch.S $(SCHED_TEST_FAKES) $(SCHED_TEST_IDT_TASK_FAKES)
+TEST_EXTRA_SRCS_work_stealing_scheduler_test := work_stealing_scheduler.cpp core_runqueue_scheduler.cpp context_switch.S $(SCHED_TEST_FAKES) $(SCHED_TEST_IDT_TASK_FAKES)
 TEST_EXTRA_SRCS_join_lifecycle_scheduler_test := join_lifecycle_scheduler.cpp $(SCHED_TEST_FAKES) $(SCHED_TEST_IDT_TASK_FAKES)
 TEST_EXTRA_SRCS_preemptive_scheduler_test := preemptive_scheduler.cpp $(SCHED_TEST_FAKES) $(SCHED_TEST_IDT_TASK_FAKES)
-TEST_EXTRA_SRCS_task_test := $(TASK_LAYER_SRCS) task.cpp $(IDT_TEST_SRCS) $(SCHED_TEST_FAKES)
-TEST_EXTRA_SRCS_stress_test_test := stress_test.cpp $(TASK_LAYER_SRCS) task.cpp $(IDT_TEST_SRCS) $(SCHED_TEST_FAKES)
+TEST_EXTRA_SRCS_task_test := $(TASK_LAYER_SRCS) context_switch.S task.cpp $(IDT_TEST_SRCS) $(SCHED_TEST_FAKES)
+TEST_EXTRA_SRCS_stress_test := selftest/stress.cpp random.cpp $(TASK_LAYER_SRCS) context_switch.S task.cpp $(IDT_TEST_SRCS) $(SCHED_TEST_FAKES)
 
-SELFTEST_SRCS := memory_tests.cpp stress_test.cpp
+SELFTEST_SRCS := selftest/selftest.cpp selftest/boot_selftest.cpp selftest/stress.cpp
 
 CXX_SRCS := \
     uart.cpp \
     vga.cpp \
+    console.cpp \
     idt.cpp \
+    gdt.cpp \
     multiboot.cpp \
     paging.cpp \
     pmm.cpp \
     heap.cpp \
     cxx_runtime.cpp \
     smp.cpp \
+    smp_hardware.cpp \
     $(TASK_LAYER_SRCS) \
     task.cpp \
+    random.cpp \
     $(if $(filter 1,$(SELFTEST)),$(SELFTEST_SRCS)) \
     kernel.cpp
 
 CXX_HDRS := \
     check.h \
+    format.h \
+    interrupts.h \
     spinlock.h \
     uart.h \
     vga.h \
+    console.h \
     idt.h \
+    gdt.h \
     multiboot.h \
     paging.h \
     pmm.h \
     heap.h \
     cxx_runtime.h \
     smp.h \
+    smp_hardware.h \
     task.h \
     $(TASK_LAYER_HDRS) \
     rbtree.h \
-    memory_tests.h \
-    stress_test.h
+    random.h \
+    selftest/selftest.h \
+    selftest/boot_selftest.h \
+    selftest/stress.h
 
+ASM_SRCS := boot.S context_switch.S
+ASM_OBJS := $(patsubst %.S,$(BUILD_DIR)/%.o,$(ASM_SRCS))
 CXX_OBJS := $(patsubst %.cpp,$(BUILD_DIR)/%.o,$(CXX_SRCS))
-OBJS := $(BUILD_DIR)/boot.o $(CXX_OBJS)
+OBJS := $(ASM_OBJS) $(CXX_OBJS)
 FREESTANDING_CXX_CONFIG := $(BUILD_DIR)/include/bits/c++config.h
 # Records the kernel build configuration so that changing flags (e.g. WERROR or
 # SELFTEST) rebuilds the kernel.
@@ -217,7 +249,7 @@ endif
 
 QEMU_RUN_FLAGS ?= -smp 4 -m 256M -serial mon:stdio
 
-.PHONY: all clean test unit-test test-host docker-build docker-test run run-boot-test FORCE test-rbtree test-spinlock test-heap test-idt test-pmm test-smp test-core-runqueue-scheduler test-work-stealing-scheduler test-join-lifecycle-scheduler test-preemptive-scheduler test-task test-stress_test test-stress
+.PHONY: all clean test unit-test test-host docker-build docker-test run run-boot-test FORCE test-rbtree test-spinlock test-heap test-idt test-gdt test-pmm test-smp test-core-runqueue-scheduler test-work-stealing-scheduler test-join-lifecycle-scheduler test-preemptive-scheduler test-task test-stress
 
 ifeq ($(USE_DOCKER),1)
 all: $(DOCKER_STAMP)
@@ -244,10 +276,11 @@ FORCE:
 $(KERNEL_CONFIG_STAMP): FORCE | $(BUILD_DIR)
 	@echo '$(KERNEL_CONFIG)' | cmp -s - $@ || echo '$(KERNEL_CONFIG)' > $@
 
-$(BUILD_DIR)/boot.o: boot.S $(KERNEL_CONFIG_STAMP) $(DOCKER_DEPS) | $(BUILD_DIR)
+$(BUILD_DIR)/%.o: %.S $(KERNEL_CONFIG_STAMP) $(DOCKER_DEPS) | $(BUILD_DIR)
 	$(DOCKER_RUN) $(AS) $(ASFLAGS) $< -o $@
 
 $(BUILD_DIR)/%.o: %.cpp $(CXX_HDRS) $(FREESTANDING_CXX_CONFIG) $(KERNEL_CONFIG_STAMP) $(DOCKER_DEPS) | $(BUILD_DIR)
+	@mkdir -p $(@D)
 	$(DOCKER_RUN) $(CXX) $(CXXFLAGS) -c $< -o $@
 
 $(BUILD_DIR)/kernel.bin: $(OBJS) linker.ld $(KERNEL_CONFIG_STAMP) $(DOCKER_DEPS) | $(BUILD_DIR)
@@ -273,9 +306,9 @@ $(KERNEL_MB1_ISO): $(BUILD_DIR)/kernel.bin Makefile $(DOCKER_DEPS) | $(BUILD_DIR
 
 # $(call DEFINE_HOST_TEST_VARIANT,test_name,build_mode,san_mode)
 define DEFINE_HOST_TEST_VARIANT
-$(BUILD_DIR)/$(1)_$(2)_$(3): $(1).cpp $$(TEST_EXTRA_SRCS_$(1)) $$(DOCKER_DEPS) | $(BUILD_DIR)
+$(BUILD_DIR)/$(1)_$(2)_$(3): $(HOST_TEST_SRC_$(1)) $$(TEST_EXTRA_SRCS_$(1)) $$(DOCKER_DEPS) | $(BUILD_DIR)
 	$$(DOCKER_RUN) $$(CXX) $$(TEST_COMMON_CXXFLAGS) $$(TEST_BUILD_FLAGS_$(2)) $$(TEST_SAN_FLAGS_$(3)) \
-		$(1).cpp $$(TEST_EXTRA_SRCS_$(1)) $$(TEST_SAN_FLAGS_$(3)) $$(TEST_COMMON_LDFLAGS) -o $$@
+		$(HOST_TEST_SRC_$(1)) $$(TEST_EXTRA_SRCS_$(1)) $$(TEST_SAN_FLAGS_$(3)) $$(TEST_COMMON_LDFLAGS) -o $$@
 
 .PHONY: run-$(1)-$(2)-$(3)
 run-$(1)-$(2)-$(3): $(BUILD_DIR)/$(1)_$(2)_$(3)
@@ -305,6 +338,7 @@ test-rbtree: test-rbtree_test
 test-spinlock: test-spinlock_test
 test-heap: test-heap_test
 test-idt: test-idt_test
+test-gdt: test-gdt_test
 test-pmm: test-pmm_test
 test-smp: test-smp_test
 test-core-runqueue-scheduler: test-core_runqueue_scheduler_test
@@ -312,8 +346,7 @@ test-work-stealing-scheduler: test-work_stealing_scheduler_test
 test-join-lifecycle-scheduler: test-join_lifecycle_scheduler_test
 test-preemptive-scheduler: test-preemptive_scheduler_test
 test-task: test-task_test
-test-stress_test: test-stress_test_test
-test-stress: test-stress_test_test
+test-stress: test-stress_test
 
 ifeq ($(USE_DOCKER),1)
 unit-test: $(DOCKER_STAMP)

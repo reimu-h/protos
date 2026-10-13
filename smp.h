@@ -8,14 +8,21 @@
 #include <type_traits>
 
 #include "check.h"
+#include "gdt.h"
+#include "interrupts.h"
 
 namespace protos {
 
-// Number of 4 KiB physical frames allocated per Application Processor stack
+// Number of 4 KiB physical frames of each Application Processor's kernel stack
 // (4 * 4 KiB = 16 KiB per AP).
 constexpr int64_t kApStackFrames = 4;
 // Size in bytes of each CPU's kernel stack (16 KiB).
 constexpr int64_t kApStackSize = kApStackFrames * 4096;
+// Number of 4 KiB frames that SmpInit() allocates for each AP: its kernel
+// stack, then its IST stacks (gdt.h), each directly above an unmapped 4 KiB
+// guard page.
+constexpr int64_t kApStackBlockFrames =
+    (1 + kApStackFrames) + kIstStackCount * (1 + kIstStackFrames);
 // Default physical base address of the x86 Local APIC MMIO registers.
 constexpr uintptr_t kDefaultLocalApicPhysAddr = 0xFEE00000;
 // Physical address below 1 MiB where the 16-bit real-mode AP startup
@@ -59,6 +66,7 @@ struct CpuInfo {
 };
 
 class IrqSpinLock;
+class SmpHardware;
 
 // Cache-line-aligned per-CPU runtime state bound to `IA32_GS_BASE` on bare
 // metal (`gs:[0]`) and a `thread_local` pointer in host unit tests.
@@ -81,7 +89,8 @@ namespace internal {
 
 #if !__STDC_HOSTED__
 // Set once the BSP has bound its `CpuLocal`. Before that, IA32_GS_BASE is 0
-// and `gs:[0]` would read physical address 0.
+// and `gs:[0]` would read physical address 0. APs start only afterwards, and
+// the startup trampoline binds theirs before they run any C++ code.
 inline std::atomic<bool> g_cpu_local_bound{false};
 #else
 // Host tests run scheduler tasks on their own stacks, and a task can resume on
@@ -102,7 +111,9 @@ inline std::atomic<bool> g_cpu_local_bound{false};
 // Binds `cpu` as the calling CPU's (or host thread's) active `CpuLocal` state
 // (`IA32_GS_BASE` MSR `0xC0000101` on bare metal, `thread_local` pointer on
 // host). Validates `cpu != nullptr`, `cpu->self == cpu`, and `cpu->cpu_id >= 0`
-// with `DCHECK`.
+// with `DCHECK`. Only the BSP calls it in the kernel: APs get their
+// `IA32_GS_BASE` from the startup trampoline (see `g_ap_boot_cpu_local` in
+// smp_hardware.h).
 inline void BindCpuLocal(CpuLocal* const cpu) {
   DCHECK(cpu != nullptr);
   DCHECK(cpu->self == cpu);
@@ -121,10 +132,10 @@ inline void BindCpuLocal(CpuLocal* const cpu) {
 // Returns the calling CPU's `CpuLocal*` if bound and valid, or `nullptr` if no
 // `CpuLocal` has been bound yet. On bare metal, "bound" is tracked globally:
 // once the BSP has bound its `CpuLocal`, every CPU trusts its own `gs:[0]`.
-// That is safe because ApKernelEntry() binds before an AP loads the kernel IDT
-// or takes a lock; until then the AP runs only boot.S code, whose exception
-// stubs do not call into C++. The panic path, which can run before that point,
-// uses CurrentCpuOrNullForPanic() instead.
+// That is safe because the startup trampoline programs an AP's `IA32_GS_BASE`
+// before it loads the kernel IDT or calls any C++ code, so no C++ code (an
+// exception handler or the panic path included) ever runs on an AP whose GS
+// base is still 0.
 inline CpuLocal* CurrentCpuOrNull() {
 #if !__STDC_HOSTED__
   if (!internal::g_cpu_local_bound.load(std::memory_order_acquire)) {
@@ -142,26 +153,6 @@ inline CpuLocal* CurrentCpuOrNull() {
     return cpu;
   }
   return nullptr;
-#endif
-}
-
-// Like CurrentCpuOrNull(), but reads the calling CPU's IA32_GS_BASE MSR
-// instead of relying on the global "bound" flag, so it also returns `nullptr`
-// on an AP that has not called BindCpuLocal() yet (boot.S leaves its GS base
-// at 0). Slower (`rdmsr`); meant for the panic path.
-inline CpuLocal* CurrentCpuOrNullForPanic() {
-#if !__STDC_HOSTED__
-  uint32_t low = 0;
-  uint32_t high = 0;
-  asm volatile("rdmsr" : "=a"(low), "=d"(high) : "c"(kMsrIa32GsBase));
-  CpuLocal* const cpu =
-      reinterpret_cast<CpuLocal*>((static_cast<uint64_t>(high) << 32) | low);
-  if (cpu != nullptr && cpu->self == cpu) {
-    return cpu;
-  }
-  return nullptr;
-#else
-  return CurrentCpuOrNull();
 #endif
 }
 
@@ -201,6 +192,13 @@ struct SmpTopology {
   int ignored_cpu_count = 0;
   std::unique_ptr<CpuInfo[]> cpus;
 };
+
+// Installs `hardware` (non-null) as the machine that the functions below act
+// on, and resets all SMP state. The kernel installs CreateKernelSmpHardware()
+// once, before SmpInit(); host tests install a FakeSmpHardware
+// (smp_hardware_fake.h). Every other function in this header that touches
+// hardware or physical memory requires it.
+void SmpSetHardware(std::shared_ptr<SmpHardware> hardware);
 
 // Scans 16-byte-aligned physical addresses in `[range_start, range_start +
 // range_length)` (`range_start != 0`, `range_length > 0`) for a valid ACPI
@@ -281,18 +279,20 @@ uint32_t CalibrateApicTimerCount(
 
 // Discovers all CPUs, initializes the BSP Local APIC (in x2APIC mode when the
 // CPU supports it, otherwise in xAPIC mode) and `CpuLocal` state, and
-// calibrates the Local APIC timer against PIT channel 2 (or, failing that,
-// from the timer clock that CPUID reports, or with
-// `kFallbackApicTimerInitialCount` and a warning). The BSP's Local APIC ID
-// register, not CPUID, identifies its MADT entry. Then allocates a 16 KiB stack
-// per AP from the PMM and starts the APs one by one with INIT-SIPI-SIPI through
-// the real-mode trampoline at 0x8000. Each AP enters 64-bit Long Mode, binds
-// its `CpuLocal` via `IA32_GS_BASE`, loads the 256-entry IDT, starts its
-// periodic Local APIC timer, and parks in a maskable `sti; hlt` idle loop. An
-// AP that does not report in within the startup timeout, or whose APIC ID is
-// not addressable in xAPIC mode, is left out of the topology (and of
-// `SmpCpuCount()`). Finally enables interrupts on the BSP (`sti`). Panics via
-// `CHECK` if topology discovery, MMIO mapping, or stack allocation fails.
+// calibrates the Local APIC timer and the TSC against PIT channel 2 (or,
+// failing that, takes the timer clock that CPUID reports, or
+// `kFallbackApicTimerInitialCount` with a warning). The BSP's Local APIC ID
+// register, not CPUID, identifies its MADT entry. Then allocates each AP's
+// stacks from the PMM (`kApStackBlockFrames`), unmaps their guard pages, and
+// starts the APs one by one with INIT-SIPI-SIPI through the real-mode
+// trampoline at 0x8000. Each AP enters 64-bit Long Mode, binds its `CpuLocal`
+// via `IA32_GS_BASE`, loads the kernel GDT and its TSS (`GdtLoadForCpu()`) and
+// then the 256-entry IDT, starts its periodic Local APIC timer, and parks in a
+// maskable `sti; hlt` idle loop. An AP that does not report in within the
+// startup timeout, or whose APIC ID is not addressable in xAPIC mode, is left
+// out of the topology (and of `SmpCpuCount()`). Finally enables interrupts on
+// the BSP (`sti`). Requires `SmpSetHardware()`. Panics via `CHECK` if topology
+// discovery, MMIO mapping, stack allocation, or unmapping a guard page fails.
 void SmpInit(uint32_t multiboot_magic, uint64_t multiboot_info_addr);
 
 // Returns the total number of CPUs discovered during `SmpInit`. Validates with
@@ -311,6 +311,48 @@ const CpuInfo* SmpGetCpuInfo(int index);
 // `cpu_index`. Validates with `DCHECK` that `SmpInit` has completed and
 // `0 <= cpu_index < SmpCpuCount()`.
 CpuLocal* SmpGetCpuLocal(int cpu_index);
+
+// Per-CPU helpers for code that a context switch can migrate to another CPU
+// (the schedulers). A task that is switched out can resume on another CPU in
+// the kernel, or on another host thread in unit tests (where `CpuLocal` and the
+// interrupt flag are `thread_local`), so per-CPU state must be re-read after
+// every switch instead of being reused from before it. The accessors stay out
+// of line so that the compiler cannot carry a CPU id, `CpuLocal` pointer, or
+// TLS address computed before a switch across it.
+
+// Returns the calling CPU's `CpuLocal`, or nullptr if none is bound. Local
+// interrupts must be disabled (`DCHECK`), and the caller must keep them
+// disabled while it uses the result, so that it cannot migrate.
+[[gnu::noinline]] inline CpuLocal* CurrentCpuOrNullIrqsOff() {
+  DCHECK(!AreInterruptsEnabled());
+  return CurrentCpuOrNull();
+}
+
+// Returns the calling CPU's index, under the rules of
+// `CurrentCpuOrNullIrqsOff()`. Requires a bound `CpuLocal` (`DCHECK`).
+[[gnu::noinline]] inline int CurrentCpuIdIrqsOff() {
+  DCHECK(!AreInterruptsEnabled());
+  return CurrentCpuId();
+}
+
+// Returns the calling CPU's index, or -1 if no `CpuLocal` is bound. Disables
+// local interrupts while it reads the index; once it returns, the caller may
+// already run on another CPU unless it keeps interrupts disabled itself.
+inline int CurrentCpuIdOrUnbound() {
+  const ScopedIrqDisable irq_disable;
+  const CpuLocal* const cpu = CurrentCpuOrNullIrqsOff();
+  return (cpu != nullptr) ? cpu->cpu_id : -1;
+}
+
+// Returns true if `0 <= cpu_index < cpu_count` and `SmpGetCpuLocal(cpu_index)`
+// is a `CpuLocal` marked online.
+inline bool IsCpuOnline(const int cpu_index, const int cpu_count) {
+  if (cpu_index < 0 || cpu_index >= cpu_count) {
+    return false;
+  }
+  const CpuLocal* const local = SmpGetCpuLocal(cpu_index);
+  return local != nullptr && local->online;
+}
 
 // Returns the physical base address of the Local APIC MMIO region discovered
 // during `SmpInit`. Validates with `DCHECK` that `SmpInit` has completed.
@@ -370,35 +412,8 @@ void SmpRunOnAllCpus(SmpWorkFn work_fn, void* context);
 void SmpStopOtherCpusForPanic();
 
 #if __STDC_HOSTED__
-// Host unit-test hooks for overriding hardware AP bring-up behavior, 32-bit
-// ACPI table pointer base, and simulated PIT/APIC timer calibration ticks.
-using SmpHostApBootSimFn = bool (*)(int cpu_index, CpuInfo* cpu_info);
-using SmpHostCpuidFn = void (*)(uint32_t leaf,     //
-                                uint32_t subleaf,  //
-                                uint32_t* eax,     //
-                                uint32_t* ebx,     //
-                                uint32_t* ecx,     //
-                                uint32_t* edx);
-using SmpHostReadMsrFn = uint64_t (*)(uint32_t msr);
-using SmpHostWriteMsrFn = void (*)(uint32_t msr, uint64_t value);
-
-// Resets all SMP state and the CPUID/MSR hooks, and configures the simulated
-// firmware: the BSP's APIC ID (used as both its CPUID initial APIC ID and, in
-// xAPIC mode, its Local APIC ID), the BIOS scan ranges, and the high 32 bits
-// of 32-bit ACPI table pointers.
-void SmpSetHostTestHooks(uint32_t bsp_apic_id,     //
-                         uintptr_t ebda_base,      //
-                         uintptr_t bios_rom_base,  //
-                         uintptr_t acpi32_arena,   //
-                         SmpHostApBootSimFn sim_fn);
-// Installs CPUID/MSR hooks, which `SmpInit` uses to detect x2APIC support and,
-// in x2APIC mode, to enable the BSP's Local APIC and read its APIC ID. Also
-// sets the current x2APIC mode for the Local APIC helpers below.
-void SmpSetHostHardwareHooksForTest(bool x2apic_mode,              //
-                                    SmpHostCpuidFn cpuid_fn,       //
-                                    SmpHostReadMsrFn read_msr_fn,  //
-                                    SmpHostWriteMsrFn write_msr_fn);
-// Wrappers around internal helpers of `SmpDiscoverTopology`.
+// Host unit-test wrappers around internal helpers of `SmpDiscoverTopology` and
+// `SmpInit`; they read through the installed `SmpHardware`.
 uintptr_t SmpFindRsdpInMultiboot2ForTest(uintptr_t multiboot_info_addr,
                                          uintptr_t max_physical_addr);
 bool SmpParseRsdpForTest(uintptr_t rsdp_addr,          //
@@ -406,15 +421,6 @@ bool SmpParseRsdpForTest(uintptr_t rsdp_addr,          //
                          uintptr_t* out_rsdt_addr,     //
                          uintptr_t* out_xsdt_addr);
 uint32_t SmpReadCpuidInitialApicIdForTest();
-uint32_t SmpReadLapicIdForTest(uintptr_t lapic_base);
-void SmpEnableLocalApicForTest(uintptr_t lapic_base);
-void SmpLapicWriteForTest(uintptr_t lapic_base, int reg_offset, uint32_t value);
-void SmpLapicSendIpiCommandForTest(uintptr_t lapic_base,  //
-                                   uint32_t apic_id,      //
-                                   uint32_t icr_low);
-void SmpSetHostTimerCalibrationTicksForTest(uint64_t elapsed_apic_ticks);
-int64_t SmpGetHostEoiCountForTest();
-void SmpResetHostEoiCountForTest();
 #endif
 
 }  // namespace protos

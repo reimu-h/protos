@@ -10,7 +10,8 @@ constexpr int kIdtEntryCount = 256;
 // Number of architectural CPU exception vectors (0..31).
 constexpr int kCpuExceptionCount = 32;
 
-// 64-bit Kernel Code Segment selector in `gdt64` (`boot.S`).
+// 64-bit Kernel Code Segment selector, the same in boot.S's `gdt64` and in the
+// kernel GDT (`kGdtKernelCodeSelector` in gdt.h).
 constexpr uint16_t kIdtKernelCodeSelector = 0x08;
 
 // Gate type/attribute bytes (`P=1`, `S=0`):
@@ -133,7 +134,10 @@ const char* IdtExceptionMnemonic(int vector);
 
 // Populates all 256 entries of the 64-bit IDT with 64-bit interrupt gate
 // descriptors pointing to `g_isr_stub_table[0..255]` and loads `IDTR` on the
-// calling CPU (BSP) via `IdtLoad()`.
+// calling CPU (BSP) via `IdtLoad()`. The gates of #DF, NMI and #MC switch to
+// the IST stacks `kIstDoubleFault`, `kIstNmi` and `kIstMachineCheck` (gdt.h),
+// so every CPU must load its TSS (`GdtLoadForCpu()`) before it loads the IDT;
+// all other gates run on the interrupted stack (IST 0).
 void IdtInit();
 
 // Loads the 256-entry 64-bit IDT into the calling CPU's `IDTR` via `lidt`.

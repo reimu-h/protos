@@ -6,9 +6,11 @@
 #include <utility>
 
 #include "check.h"
+#include "forwarding_task_scheduler.h"
 #include "idt.h"
 #include "smp.h"
 #include "spinlock.h"
+#include "task_scheduler_internals.h"
 
 namespace protos {
 namespace {
@@ -29,40 +31,9 @@ constexpr int kInterruptStealMinDonorLoad = 2;
 // bounds a steal to O(cpu_count) load reads.
 constexpr int kMaxStealAttempts = 3;
 
-// Returns the calling CPU's `CpuLocal`, or nullptr if none is bound. Callers
-// must keep local interrupts disabled while they use the result, so that they
-// cannot migrate; kept out of line for the reason given in
-// core_runqueue_scheduler.cpp.
-[[gnu::noinline]] static CpuLocal* GetCurrentCpuOrNull() {
-  DCHECK(!AreInterruptsEnabled());
-  return CurrentCpuOrNull();
-}
-
-// Returns the calling CPU's index, or -1 if no `CpuLocal` is bound.
-static int CurrentCpuIndexOrUnbound() {
-  const bool saved_irq = SaveAndDisableInterrupts();
-  const CpuLocal* const cpu = GetCurrentCpuOrNull();
-  const int cpu_index = (cpu != nullptr) ? cpu->cpu_id : -1;
-  RestoreInterrupts(saved_irq);
-  return cpu_index;
-}
-
-static bool IsCpuOnline(const int cpu_index, const int cpu_count) {
-  if (cpu_index < 0 || cpu_index >= cpu_count) {
-    return false;
-  }
-  const CpuLocal* const local = SmpGetCpuLocal(cpu_index);
-  return local != nullptr && local->online;
-}
-
-class WorkStealingTaskScheduler final : public TaskScheduler {
+class WorkStealingTaskScheduler final : public ForwardingTaskScheduler {
  public:
-  explicit WorkStealingTaskScheduler(std::shared_ptr<TaskScheduler> inner)
-      : inner_(std::move(inner)) {
-    DCHECK(inner_ != nullptr);
-  }
-
-  void Init() override { inner_->Init(); }
+  using ForwardingTaskScheduler::ForwardingTaskScheduler;
 
   Task* CreateTask(const TaskFn entry,  //
                    void* const arg,     //
@@ -83,7 +54,7 @@ class WorkStealingTaskScheduler final : public TaskScheduler {
     DCHECK(target_cpu >= 0 && target_cpu < cpu_count);
     DCHECK(IsCpuOnline(target_cpu, cpu_count));
 
-    Task* const task = inner_->CreateTaskOnCpu(entry, arg, weight, target_cpu);
+    Task* const task = inner().CreateTaskOnCpu(entry, arg, weight, target_cpu);
     SendWakeupIpiIfRemote(target_cpu);
     return task;
   }
@@ -92,15 +63,11 @@ class WorkStealingTaskScheduler final : public TaskScheduler {
     const bool saved_irq = SaveAndDisableInterrupts();
     StealIfLocalQueueEmpty(kIdleStealMinDonorLoad);
     RestoreInterrupts(saved_irq);
-    inner_->Yield();
+    inner().Yield();
   }
 
-  void Join(Task* const task) override { inner_->Join(task); }
-
-  void Detach(Task* const task) override { inner_->Detach(task); }
-
-  int ReapZombies() override { return inner_->ReapZombies(); }
-
+ private:
+  // Scheduler internals:
   bool PollIdleCpu(const int cpu_index) override {
     const bool saved_irq = SaveAndDisableInterrupts();
     const bool dispatched = PollIdleCpuIrqsOff(cpu_index);
@@ -108,59 +75,42 @@ class WorkStealingTaskScheduler final : public TaskScheduler {
     return dispatched;
   }
 
-  int RunqueueLoad(const int cpu_index) const override {
-    return inner_->RunqueueLoad(cpu_index);
-  }
-
-  bool StealTask(const int dst_cpu, const int src_cpu) override {
-    return inner_->StealTask(dst_cpu, src_cpu);
-  }
-
-  void SetPreemptEnabled(const bool enabled) override {
-    inner_->SetPreemptEnabled(enabled);
-  }
-
-  bool IsPreemptEnabled() const override { return inner_->IsPreemptEnabled(); }
-
   void OnTimerInterrupt(InterruptFrame* const frame) override {
     const bool saved_irq = SaveAndDisableInterrupts();
     StealIfLocalQueueEmpty(kInterruptStealMinDonorLoad);
     RestoreInterrupts(saved_irq);
-    inner_->OnTimerInterrupt(frame);
+    TaskSchedulerInternals::OnTimerInterrupt(inner(), frame);
   }
 
   void OnWakeupIpi(InterruptFrame* const frame) override {
     const bool saved_irq = SaveAndDisableInterrupts();
     StealIfLocalQueueEmpty(kInterruptStealMinDonorLoad);
     RestoreInterrupts(saved_irq);
-    inner_->OnWakeupIpi(frame);
+    TaskSchedulerInternals::OnWakeupIpi(inner(), frame);
   }
 
-  Task* CurrentTask() const override { return inner_->CurrentTask(); }
-
- private:
   // Body of `PollIdleCpu()`, called with local interrupts disabled. Steals
   // work only for the calling CPU, so that a stolen task never lands on a
   // remote CPU that nobody wakes up.
   bool PollIdleCpuIrqsOff(const int cpu_index) {
-    const CpuLocal* const cpu = GetCurrentCpuOrNull();
+    const CpuLocal* const cpu = CurrentCpuOrNullIrqsOff();
     if (cpu == nullptr || !cpu->online || cpu->cpu_id != cpu_index) {
       return false;
     }
-    if (inner_->RunqueueLoad(cpu_index) == 0 &&
+    if (TaskSchedulerInternals::RunqueueLoad(inner(), cpu_index) == 0 &&
         !TryStealForCpu(cpu_index, kIdleStealMinDonorLoad)) {
       return false;
     }
-    return inner_->PollIdleCpu(cpu_index);
+    return TaskSchedulerInternals::PollIdleCpu(inner(), cpu_index);
   }
 
   // With local interrupts disabled: if the calling CPU is online and has
   // nothing queued, steals one task for it from a donor with at least
   // `min_donor_load` queued tasks.
   void StealIfLocalQueueEmpty(const int min_donor_load) {
-    const CpuLocal* const cpu = GetCurrentCpuOrNull();
+    const CpuLocal* const cpu = CurrentCpuOrNullIrqsOff();
     if (cpu != nullptr && cpu->online &&
-        inner_->RunqueueLoad(cpu->cpu_id) == 0) {
+        TaskSchedulerInternals::RunqueueLoad(inner(), cpu->cpu_id) == 0) {
       (void)TryStealForCpu(cpu->cpu_id, min_donor_load);
     }
   }
@@ -171,14 +121,15 @@ class WorkStealingTaskScheduler final : public TaskScheduler {
   int SelectLeastLoadedCpu() const {
     const int cpu_count = SmpCpuCount();
     DCHECK(cpu_count >= 1);
-    const int local_cpu = CurrentCpuIndexOrUnbound();
+    const int local_cpu = CurrentCpuIdOrUnbound();
     int best_cpu = 0;
     int best_load = INT_MAX;
     for (int cpu = 0; cpu < cpu_count; ++cpu) {
       if (!IsCpuOnline(cpu, cpu_count)) {
         continue;
       }
-      const int load = inner_->RunqueueLoad(cpu) + ((cpu == local_cpu) ? 1 : 0);
+      const int load = TaskSchedulerInternals::RunqueueLoad(inner(), cpu) +
+                       ((cpu == local_cpu) ? 1 : 0);
       if (load < best_load) {
         best_load = load;
         best_cpu = cpu;
@@ -188,7 +139,7 @@ class WorkStealingTaskScheduler final : public TaskScheduler {
   }
 
   static void SendWakeupIpiIfRemote(const int target_cpu) {
-    if (target_cpu != CurrentCpuIndexOrUnbound()) {
+    if (target_cpu != CurrentCpuIdOrUnbound()) {
       SmpSendIpi(target_cpu, kVectorWakeupIpi);
     }
   }
@@ -216,7 +167,7 @@ class WorkStealingTaskScheduler final : public TaskScheduler {
         if (cpu == dst_cpu || !IsCpuOnline(cpu, cpu_count)) {
           continue;
         }
-        const int load = inner_->RunqueueLoad(cpu);
+        const int load = TaskSchedulerInternals::RunqueueLoad(inner(), cpu);
         const bool already_tried =
             (load > prev_load) || (load == prev_load && cpu <= prev_src);
         if (already_tried) {
@@ -232,14 +183,12 @@ class WorkStealingTaskScheduler final : public TaskScheduler {
       }
       prev_load = best_load;
       prev_src = best_src;
-      if (inner_->StealTask(dst_cpu, best_src)) {
+      if (TaskSchedulerInternals::StealTask(inner(), dst_cpu, best_src)) {
         return true;
       }
     }
     return false;
   }
-
-  const std::shared_ptr<TaskScheduler> inner_;
 };
 
 }  // namespace

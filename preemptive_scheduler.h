@@ -7,12 +7,18 @@
 
 namespace protos {
 
-// Creates the outermost preemptive interrupt task scheduler layer wrapping
-// `inner`. It owns the global preemption flag (SetPreemptEnabled() and
-// IsPreemptEnabled() are not forwarded) and forwards OnTimerInterrupt() and
-// OnWakeupIpi() only when the interrupted context may be preempted (see
-// TaskScheduler::OnTimerInterrupt()). All other methods are forwarded to
-// `inner`.
+// Creates the preemptive interrupt task scheduler layer wrapping `inner`, which
+// must be non-null. It overrides:
+//
+// - `SetPreemptEnabled()` and `IsPreemptEnabled()`, which it does not forward:
+//   the layer owns the global preemption flag.
+// - `OnTimerInterrupt()` and `OnWakeupIpi()`, which it forwards only when the
+//   interrupted context may be preempted (see
+//   `TaskScheduler::OnTimerInterrupt()`).
+// - `Init()`, to re-enable preemption before it forwards.
+//
+// Every other method is inherited from `ForwardingTaskScheduler` and forwarded
+// to `inner` unchanged.
 std::shared_ptr<TaskScheduler> CreatePreemptiveScheduler(
     std::shared_ptr<TaskScheduler> inner);
 

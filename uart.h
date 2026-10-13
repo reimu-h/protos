@@ -20,8 +20,6 @@ void UartWriteDec(uint64_t value);
 // that owns the panic, with interrupts disabled. It does not take the UART
 // lock, which a stopped CPU may hold.
 void UartPanicWrite(const char* str);
-// Base-10 decimal counterpart of UartPanicWrite(), with the same restrictions.
-void UartPanicWriteDec(uint64_t value);
 
 }  // namespace protos
 

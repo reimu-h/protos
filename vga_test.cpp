@@ -56,8 +56,6 @@ void UartWriteDec(const uint64_t value) { AppendFormatted("%llu", value); }
 
 void UartPanicWrite(const char* const str) { UartWrite(str); }
 
-void UartPanicWriteDec(const uint64_t value) { UartWriteDec(value); }
-
 namespace {
 
 constexpr int kConsoleCols = 80;

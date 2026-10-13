@@ -13,26 +13,14 @@
 #include <vector>
 
 #include "core_runqueue_scheduler.h"
+#include "forwarding_task_scheduler.h"
 #include "scheduler_test_support.h"
+#include "task_scheduler_internals.h"
 
 namespace protos {
 namespace {
 
 namespace t = ::testing;
-
-TEST(WorkStealingSchedulerTest, InitDelegatesToInnerScheduler) {
-  SetupEnv(2);
-  const auto mock_inner = std::make_shared<t::StrictMock<MockTaskScheduler>>();
-  const std::shared_ptr<TaskScheduler> sched =
-      CreateWorkStealingScheduler(mock_inner);
-  ASSERT_THAT(sched, t::NotNull());
-
-  int init_calls = 0;
-  EXPECT_CALL(*mock_inner, Init).WillOnce([&]() { ++init_calls; });
-
-  sched->Init();
-  EXPECT_THAT(init_calls, t::Eq(1));
-}
 
 TEST(WorkStealingSchedulerTest,
      CreateTaskSelectsMinimumLoadOnlineCpuBreaksTiesAndSendsRemoteWakeupIpi) {
@@ -352,15 +340,15 @@ TEST(WorkStealingSchedulerTest,
   //    out-of-range one, returns false without touching mock_inner: a task
   //    stolen for a remote CPU could sit on that halted CPU until its next
   //    timer tick. So do an unbound and an offline calling CPU.
-  EXPECT_FALSE(sched->PollIdleCpu(-1));
-  EXPECT_FALSE(sched->PollIdleCpu(2));
-  EXPECT_FALSE(sched->PollIdleCpu(4));
-  EXPECT_FALSE(sched->PollIdleCpu(99));
+  EXPECT_FALSE(TaskSchedulerInternals::PollIdleCpu(*sched, -1));
+  EXPECT_FALSE(TaskSchedulerInternals::PollIdleCpu(*sched, 2));
+  EXPECT_FALSE(TaskSchedulerInternals::PollIdleCpu(*sched, 4));
+  EXPECT_FALSE(TaskSchedulerInternals::PollIdleCpu(*sched, 99));
   ResetCpuLocalForTest();
-  EXPECT_FALSE(sched->PollIdleCpu(0));
+  EXPECT_FALSE(TaskSchedulerInternals::PollIdleCpu(*sched, 0));
   BindCpuLocal(SmpGetCpuLocal(2));
   g_env.cpu_locals[2].online = false;
-  EXPECT_FALSE(sched->PollIdleCpu(2));
+  EXPECT_FALSE(TaskSchedulerInternals::PollIdleCpu(*sched, 2));
   g_env.cpu_locals[2].online = true;
 
   // 2. On CPU 2, when inner->RunqueueLoad(2) > 0, delegates directly to
@@ -376,7 +364,7 @@ TEST(WorkStealingSchedulerTest,
     EXPECT_FALSE(AreInterruptsEnabled());
     return true;
   });
-  EXPECT_TRUE(sched->PollIdleCpu(2));
+  EXPECT_TRUE(TaskSchedulerInternals::PollIdleCpu(*sched, 2));
   EXPECT_TRUE(AreInterruptsEnabled());
 }
 
@@ -417,7 +405,7 @@ TEST(
     return true;
   });
 
-  EXPECT_TRUE(sched->PollIdleCpu(2));
+  EXPECT_TRUE(TaskSchedulerInternals::PollIdleCpu(*sched, 2));
   EXPECT_THAT(steal_attempts,
               t::ElementsAre(std::make_pair(2, 1), std::make_pair(2, 3)));
   EXPECT_THAT(polled_cpu, t::Eq(2));
@@ -437,7 +425,7 @@ TEST(
         return false;
       });
 
-  EXPECT_FALSE(sched->PollIdleCpu(2));
+  EXPECT_FALSE(TaskSchedulerInternals::PollIdleCpu(*sched, 2));
   // Tie between CPU 0 (load 2) and CPU 3 (load 2) breaks toward lower cpu_id 0.
   EXPECT_THAT(steal_attempts,
               t::ElementsAre(std::make_pair(2, 1), std::make_pair(2, 0),
@@ -449,7 +437,7 @@ TEST(
   loads[1] = 0;
   loads[2] = 0;
   loads[3] = 0;
-  EXPECT_FALSE(sched->PollIdleCpu(2));
+  EXPECT_FALSE(TaskSchedulerInternals::PollIdleCpu(*sched, 2));
 }
 
 TEST(WorkStealingSchedulerTest, StealTriesAtMostThreeDonorsBusiestFirst) {
@@ -473,7 +461,7 @@ TEST(WorkStealingSchedulerTest, StealTriesAtMostThreeDonorsBusiestFirst) {
         return false;
       });
 
-  EXPECT_FALSE(sched->PollIdleCpu(0));
+  EXPECT_FALSE(TaskSchedulerInternals::PollIdleCpu(*sched, 0));
   EXPECT_THAT(tried_donors, t::ElementsAre(2, 4, 6));
 }
 
@@ -512,7 +500,7 @@ TEST(WorkStealingSchedulerTest,
         sequence.push_back("OnTimerInterrupt");
       });
 
-  sched->OnTimerInterrupt(&timer_frame);
+  TaskSchedulerInternals::OnTimerInterrupt(*sched, &timer_frame);
   EXPECT_THAT(sequence, t::ElementsAre("TimerSteal", "OnTimerInterrupt"));
 
   sequence.clear();
@@ -530,7 +518,7 @@ TEST(WorkStealingSchedulerTest,
         sequence.push_back("OnWakeupIpi");
       });
 
-  sched->OnWakeupIpi(&ipi_frame);
+  TaskSchedulerInternals::OnWakeupIpi(*sched, &ipi_frame);
   EXPECT_THAT(sequence, t::ElementsAre("IpiSteal", "OnWakeupIpi"));
 
   // 2. When no donor has more than one queued task, forwards without
@@ -550,8 +538,8 @@ TEST(WorkStealingSchedulerTest,
         EXPECT_THAT(frame, t::Eq(&ipi_frame));
       });
 
-  sched->OnTimerInterrupt(&timer_frame);
-  sched->OnWakeupIpi(&ipi_frame);
+  TaskSchedulerInternals::OnTimerInterrupt(*sched, &timer_frame);
+  TaskSchedulerInternals::OnWakeupIpi(*sched, &ipi_frame);
 
   // 3. When local RunqueueLoad > 0: forwards directly without stealing.
   EXPECT_CALL(*mock_inner, RunqueueLoad).WillRepeatedly([&](const int cpu) {
@@ -567,8 +555,8 @@ TEST(WorkStealingSchedulerTest,
         EXPECT_THAT(frame, t::Eq(&ipi_frame));
       });
 
-  sched->OnTimerInterrupt(&timer_frame);
-  sched->OnWakeupIpi(&ipi_frame);
+  TaskSchedulerInternals::OnTimerInterrupt(*sched, &timer_frame);
+  TaskSchedulerInternals::OnWakeupIpi(*sched, &ipi_frame);
 
   // 4. When current CPU is offline: forwards directly without querying load or
   //    stealing.
@@ -582,8 +570,8 @@ TEST(WorkStealingSchedulerTest,
         EXPECT_THAT(frame, t::Eq(&ipi_frame));
       });
 
-  sched->OnTimerInterrupt(&timer_frame);
-  sched->OnWakeupIpi(&ipi_frame);
+  TaskSchedulerInternals::OnTimerInterrupt(*sched, &timer_frame);
+  TaskSchedulerInternals::OnWakeupIpi(*sched, &ipi_frame);
   g_env.cpu_locals[0].online = true;
 
   // 5. When CurrentCpuOrNull() == nullptr: forwards directly without querying
@@ -598,64 +586,8 @@ TEST(WorkStealingSchedulerTest,
         EXPECT_THAT(frame, t::Eq(&ipi_frame));
       });
 
-  sched->OnTimerInterrupt(&timer_frame);
-  sched->OnWakeupIpi(&ipi_frame);
-}
-
-TEST(WorkStealingSchedulerTest, DirectForwardingMethodsDelegateToInner) {
-  SetupEnv(4);
-  const auto mock_inner = std::make_shared<t::StrictMock<MockTaskScheduler>>();
-  const std::shared_ptr<TaskScheduler> sched =
-      CreateWorkStealingScheduler(mock_inner);
-
-  Task* const fake_task = reinterpret_cast<Task*>(0x3001);
-
-  // Join
-  Task* joined_task = nullptr;
-  EXPECT_CALL(*mock_inner, Join).WillOnce([&](Task* const task) {
-    joined_task = task;
-  });
-  sched->Join(fake_task);
-  EXPECT_THAT(joined_task, t::Eq(fake_task));
-
-  // ReapZombies
-  EXPECT_CALL(*mock_inner, ReapZombies).WillOnce([&]() { return 5; });
-  EXPECT_THAT(sched->ReapZombies(), t::Eq(5));
-
-  // RunqueueLoad
-  EXPECT_CALL(*mock_inner, RunqueueLoad).WillOnce([&](const int cpu_index) {
-    EXPECT_THAT(cpu_index, t::Eq(3));
-    return 7;
-  });
-  EXPECT_THAT(sched->RunqueueLoad(3), t::Eq(7));
-
-  // StealTask
-  EXPECT_CALL(*mock_inner, StealTask)
-      .WillOnce([&](const int dst_cpu, const int src_cpu) {
-        EXPECT_THAT(dst_cpu, t::Eq(1));
-        EXPECT_THAT(src_cpu, t::Eq(2));
-        return true;
-      });
-  EXPECT_TRUE(sched->StealTask(1, 2));
-
-  // SetPreemptEnabled & IsPreemptEnabled
-  std::vector<bool> preempt_states;
-  EXPECT_CALL(*mock_inner, SetPreemptEnabled)
-      .WillOnce([&](const bool enabled) { preempt_states.push_back(enabled); })
-      .WillOnce([&](const bool enabled) { preempt_states.push_back(enabled); });
-  sched->SetPreemptEnabled(false);
-  sched->SetPreemptEnabled(true);
-  EXPECT_THAT(preempt_states, t::ElementsAre(false, true));
-
-  EXPECT_CALL(*mock_inner, IsPreemptEnabled)
-      .WillOnce([&]() { return false; })
-      .WillOnce([&]() { return true; });
-  EXPECT_FALSE(sched->IsPreemptEnabled());
-  EXPECT_TRUE(sched->IsPreemptEnabled());
-
-  // CurrentTask
-  EXPECT_CALL(*mock_inner, CurrentTask).WillOnce([&]() { return fake_task; });
-  EXPECT_THAT(sched->CurrentTask(), t::Eq(fake_task));
+  TaskSchedulerInternals::OnTimerInterrupt(*sched, &timer_frame);
+  TaskSchedulerInternals::OnWakeupIpi(*sched, &ipi_frame);
 }
 
 TEST(WorkStealingSchedulerDeathTest, PreconditionViolationsTriggerDcheck) {
@@ -724,70 +656,37 @@ TEST(WorkStealingSchedulerTest,
   ipi_frame.rflags = kRflagsInterruptEnableBit;
 
   // The core accepts these before Init(); stealing must not change that.
-  EXPECT_THAT(sched->RunqueueLoad(0), t::Eq(0));
+  EXPECT_THAT(TaskSchedulerInternals::RunqueueLoad(*sched, 0), t::Eq(0));
   for (int cpu = 0; cpu < 4; ++cpu) {
     BindCpuLocal(SmpGetCpuLocal(cpu));
-    EXPECT_FALSE(sched->PollIdleCpu(cpu));
-    sched->OnTimerInterrupt(&timer_frame);
-    sched->OnWakeupIpi(&ipi_frame);
+    EXPECT_FALSE(TaskSchedulerInternals::PollIdleCpu(*sched, cpu));
+    TaskSchedulerInternals::OnTimerInterrupt(*sched, &timer_frame);
+    TaskSchedulerInternals::OnWakeupIpi(*sched, &ipi_frame);
   }
   BindCpuLocal(SmpGetCpuLocal(0));
 
-  sched->Init();
-  EXPECT_FALSE(sched->PollIdleCpu(0));
+  TaskSchedulerInternals::Init(*sched);
+  EXPECT_FALSE(TaskSchedulerInternals::PollIdleCpu(*sched, 0));
 }
 
-class ForwardingSpyTaskScheduler final : public TaskScheduler {
+// Forwards every call to the wrapped layer and counts the StealTask() calls
+// that take a task from CPU 0.
+class ForwardingSpyTaskScheduler final : public ForwardingTaskScheduler {
  public:
-  explicit ForwardingSpyTaskScheduler(std::shared_ptr<TaskScheduler> inner)
-      : inner_(std::move(inner)) {}
-
-  void Init() override { inner_->Init(); }
-  Task* CreateTask(const TaskFn entry,  //
-                   void* const arg,     //
-                   const int64_t weight) override {
-    return inner_->CreateTask(entry, arg, weight);
-  }
-  Task* CreateTaskOnCpu(const TaskFn entry,    //
-                        void* const arg,       //
-                        const int64_t weight,  //
-                        const int target_cpu) override {
-    return inner_->CreateTaskOnCpu(entry, arg, weight, target_cpu);
-  }
-  void Yield() override { inner_->Yield(); }
-  void Join(Task* const task) override { inner_->Join(task); }
-  void Detach(Task* const task) override { inner_->Detach(task); }
-  int ReapZombies() override { return inner_->ReapZombies(); }
-  bool PollIdleCpu(const int cpu_index) override {
-    return inner_->PollIdleCpu(cpu_index);
-  }
-  int RunqueueLoad(const int cpu_index) const override {
-    return inner_->RunqueueLoad(cpu_index);
-  }
-  bool StealTask(const int dst_cpu, const int src_cpu) override {
-    if (src_cpu == 0) {
-      steal_from_cpu0_calls_.fetch_add(1, std::memory_order_acq_rel);
-    }
-    return inner_->StealTask(dst_cpu, src_cpu);
-  }
-  void SetPreemptEnabled(const bool enabled) override {
-    inner_->SetPreemptEnabled(enabled);
-  }
-  bool IsPreemptEnabled() const override { return inner_->IsPreemptEnabled(); }
-  void OnTimerInterrupt(InterruptFrame* const frame) override {
-    inner_->OnTimerInterrupt(frame);
-  }
-  void OnWakeupIpi(InterruptFrame* const frame) override {
-    inner_->OnWakeupIpi(frame);
-  }
-  Task* CurrentTask() const override { return inner_->CurrentTask(); }
+  using ForwardingTaskScheduler::ForwardingTaskScheduler;
 
   int StealFromCpu0Calls() const {
     return steal_from_cpu0_calls_.load(std::memory_order_acquire);
   }
 
  private:
-  const std::shared_ptr<TaskScheduler> inner_;
+  bool StealTask(const int dst_cpu, const int src_cpu) override {
+    if (src_cpu == 0) {
+      steal_from_cpu0_calls_.fetch_add(1, std::memory_order_acq_rel);
+    }
+    return TaskSchedulerInternals::StealTask(inner(), dst_cpu, src_cpu);
+  }
+
   std::atomic<int> steal_from_cpu0_calls_{0};
 };
 
@@ -810,13 +709,14 @@ static void BootstrapOnlyQueuedProbeWorker(void* const raw_arg) {
   BootstrapLoadProbeCtx* const ctx =
       static_cast<BootstrapLoadProbeCtx*>(raw_arg);
   // The bootstrap task cannot be stolen, so RunqueueLoad(0) excludes it.
-  ctx->cpu0_load_with_only_bootstrap_queued = ctx->sched->RunqueueLoad(0);
+  ctx->cpu0_load_with_only_bootstrap_queued =
+      TaskSchedulerInternals::RunqueueLoad(*ctx->sched, 0);
 
   // Idle APs polling for work must see RunqueueLoad(0) == 0 and must not call
   // StealTask(ap, 0).
   for (int ap = 1; ap < 4; ++ap) {
     BindCpuLocal(SmpGetCpuLocal(ap));
-    if (ctx->sched->PollIdleCpu(ap)) {
+    if (TaskSchedulerInternals::PollIdleCpu(*ctx->sched, ap)) {
       ++ctx->ap_polls_dispatched_with_only_bootstrap_queued;
     }
   }
@@ -840,9 +740,11 @@ static void QueuedBehindBootstrapHelperWorker(void* const raw_arg) {
 static void BootstrapAtHeadProbeWorker(void* const raw_arg) {
   BootstrapLoadProbeCtx* const ctx =
       static_cast<BootstrapLoadProbeCtx*>(raw_arg);
-  ctx->cpu0_load_with_helper_queued = ctx->sched->RunqueueLoad(0);
+  ctx->cpu0_load_with_helper_queued =
+      TaskSchedulerInternals::RunqueueLoad(*ctx->sched, 0);
   BindCpuLocal(SmpGetCpuLocal(1));
-  ctx->ap1_poll_with_helper_queued = ctx->sched->PollIdleCpu(1);
+  ctx->ap1_poll_with_helper_queued =
+      TaskSchedulerInternals::PollIdleCpu(*ctx->sched, 1);
   BindCpuLocal(SmpGetCpuLocal(0));
   ctx->steal_calls_with_helper_queued = ctx->spy->StealFromCpu0Calls();
 }
@@ -857,7 +759,7 @@ TEST(WorkStealingSchedulerTest,
   const std::shared_ptr<TaskScheduler> core = CreateCoreRunqueueScheduler();
   const auto spy = std::make_shared<ForwardingSpyTaskScheduler>(core);
   const std::shared_ptr<TaskScheduler> sched = CreateWorkStealingScheduler(spy);
-  sched->Init();
+  TaskSchedulerInternals::Init(*sched);
   Task* const bootstrap = sched->CurrentTask();
 
   BootstrapLoadProbeCtx ctx;
@@ -914,7 +816,7 @@ TEST(WorkStealingSchedulerTest,
       sched->CreateTaskOnCpu(CountRunsWorker, &runs, kDefaultTaskWeight, 1);
   ASSERT_THAT(ap1_task, t::NotNull());
   BindCpuLocal(SmpGetCpuLocal(1));
-  EXPECT_TRUE(sched->PollIdleCpu(1));
+  EXPECT_TRUE(TaskSchedulerInternals::PollIdleCpu(*sched, 1));
   BindCpuLocal(SmpGetCpuLocal(0));
   EXPECT_THAT(runs, t::Eq(1));
   sched->Join(ap1_task);
@@ -946,7 +848,7 @@ static void MtStealWorker(void* const raw_arg) {
       ctx->remote_slices.fetch_add(1, std::memory_order_acq_rel);
     }
     if ((round % 3) == 2) {
-      ctx->sched->OnTimerInterrupt(&timer_frame);
+      TaskSchedulerInternals::OnTimerInterrupt(*ctx->sched, &timer_frame);
     }
     ctx->sched->Yield();
   }
@@ -963,7 +865,7 @@ TEST(WorkStealingSchedulerTest,
 
   const std::shared_ptr<TaskScheduler> sched =
       CreateWorkStealingScheduler(CreateCoreRunqueueScheduler());
-  sched->Init();
+  TaskSchedulerInternals::Init(*sched);
   Task* const bootstrap = sched->CurrentTask();
 
   MtStealCtx ctx;
@@ -991,11 +893,12 @@ TEST(WorkStealingSchedulerTest,
           ipi_frame.vector = kVectorWakeupIpi;
           ipi_frame.rflags = kRflagsInterruptEnableBit;
           SetInterruptsEnabledForTest(false);
-          sched->OnWakeupIpi(&ipi_frame);
+          TaskSchedulerInternals::OnWakeupIpi(*sched, &ipi_frame);
           SetInterruptsEnabledForTest(true);
         }
         SetInterruptsEnabledForTest(false);
-        const bool dispatched = sched->PollIdleCpu(cpu);
+        const bool dispatched =
+            TaskSchedulerInternals::PollIdleCpu(*sched, cpu);
         SetInterruptsEnabledForTest(true);
         if (!dispatched) {
           std::this_thread::yield();
@@ -1036,7 +939,7 @@ TEST(WorkStealingSchedulerTest,
   EXPECT_THAT(CurrentCpuId(), t::Eq(0));
   EXPECT_THAT(sched->CurrentTask(), t::Eq(bootstrap));
   for (int c = 0; c < kNumCpus; ++c) {
-    EXPECT_THAT(sched->RunqueueLoad(c), t::Eq(0));
+    EXPECT_THAT(TaskSchedulerInternals::RunqueueLoad(*sched, c), t::Eq(0));
   }
   EXPECT_THAT(PmmFreeFrameCount(), t::Eq(pmm_before));
   EXPECT_THAT(HeapTotalFreeBytes(), t::Eq(heap_before));

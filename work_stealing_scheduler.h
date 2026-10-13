@@ -11,7 +11,9 @@ namespace protos {
 // `inner` must be non-null and must provide the core layer's `RunqueueLoad()`
 // and `StealTask()` semantics (see core_runqueue_scheduler.h), so in practice
 // this layer wraps `CreateCoreRunqueueScheduler()` directly, inside the
-// join-lifecycle and preemptive layers (see `TaskInit()`). It adds:
+// preemptive and join-lifecycle layers (see `TaskInit()`). It overrides
+// `CreateTask()`, `CreateTaskOnCpu()`, `Yield()`, `PollIdleCpu()`,
+// `OnTimerInterrupt()` and `OnWakeupIpi()` to add:
 //
 // - Placement: `CreateTask()` picks the online CPU with the smallest
 //   `RunqueueLoad()`, counting the calling CPU as one task busier because it
@@ -26,9 +28,9 @@ namespace protos {
 //   CPU may be busy with a task that `RunqueueLoad()` does not count. Each
 //   steal tries at most a few donors, busiest first.
 //
-// Every other method, and every call after the stealing step, is forwarded to
-// `inner` unchanged; in particular, `inner` decides whether an interrupt
-// preempts the running task.
+// Every other method is inherited from `ForwardingTaskScheduler`, and every
+// call after the stealing step is forwarded to `inner` unchanged; in
+// particular, `inner` decides whether an interrupt preempts the running task.
 //
 // Interrupts and threading: the layer reads the calling CPU only with local
 // interrupts disabled. `PollIdleCpu(cpu_index)` does nothing and returns false

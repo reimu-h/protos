@@ -2,6 +2,7 @@
 
 #include <cstdint>
 
+#include "format.h"
 #include "spinlock.h"
 
 namespace protos {
@@ -52,25 +53,6 @@ static void UartWriteLocked(const char* const str) {
   }
 }
 
-static void UartWriteDecLocked(const uint64_t value) {
-  if (value == 0) {
-    UartPutcLocked('0');
-    return;
-  }
-  char buffer[20];
-  int count = 0;
-  uint64_t remaining = value;
-  while (remaining > 0) {
-    buffer[count] = '0' + (remaining % 10);
-    remaining /= 10;
-    ++count;
-  }
-  while (count > 0) {
-    --count;
-    UartPutcLocked(buffer[count]);
-  }
-}
-
 }  // namespace
 
 void UartInit() {
@@ -98,34 +80,15 @@ void UartWrite(const char* const str) {
 }
 
 void UartWriteHex(const uint64_t value) {
-  const IrqSpinLockGuard lock_guard(g_uart_lock);
-  constexpr const char* kHexDigits = "0123456789ABCDEF";
-  UartWriteLocked("0x");
-  if (value == 0) {
-    UartPutcLocked('0');
-    return;
-  }
-  char buffer[16];
-  int count = 0;
-  uint64_t remaining = value;
-  while (remaining > 0) {
-    buffer[count] = kHexDigits[remaining & 0xF];
-    remaining >>= 4;
-    ++count;
-  }
-  while (count > 0) {
-    --count;
-    UartPutcLocked(buffer[count]);
-  }
+  char buffer[kFormatHexBufferSize];
+  UartWrite(FormatHex(value, buffer));
 }
 
 void UartWriteDec(const uint64_t value) {
-  const IrqSpinLockGuard lock_guard(g_uart_lock);
-  UartWriteDecLocked(value);
+  char buffer[kFormatDecBufferSize];
+  UartWrite(FormatDec(value, buffer));
 }
 
 void UartPanicWrite(const char* const str) { UartWriteLocked(str); }
-
-void UartPanicWriteDec(const uint64_t value) { UartWriteDecLocked(value); }
 
 }  // namespace protos

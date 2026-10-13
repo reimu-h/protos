@@ -49,6 +49,9 @@ inline PanicRole EnterPanic(std::atomic<uint64_t>* const owner,  //
 [[noreturn]] void KernelCheckFailure(const char* expr,  //
                                      const char* file,  //
                                      int line);
+
+// Kernel implementation of Panic(), part of the panic path in idt.cpp.
+[[noreturn]] void KernelPanic(const char* message, const char* file, int line);
 #endif
 
 // Reports a failed CHECK as "[FATAL] Check failed: <expr> at <file>:<line>".
@@ -67,6 +70,20 @@ inline PanicRole EnterPanic(std::atomic<uint64_t>* const owner,  //
 #endif
 }
 
+// Reports a PANIC() as "[FATAL] <message> at <file>:<line>", in the same way
+// as CheckFailure().
+[[noreturn]] inline void Panic(const char* const message,  //
+                               const char* const file,     //
+                               const int line) {
+#if __STDC_HOSTED__
+  std::fprintf(stderr, "[FATAL] %s at %s:%d\n", message, file, line);
+  std::fflush(stderr);
+  std::_Exit(134);
+#else
+  KernelPanic(message, file, line);
+#endif
+}
+
 }  // namespace internal
 }  // namespace protos
 
@@ -76,6 +93,10 @@ inline PanicRole EnterPanic(std::atomic<uint64_t>* const owner,  //
       ::protos::internal::CheckFailure(#condition, __FILE__, __LINE__); \
     }                                                                   \
   } while (false)
+
+// Unconditionally crashes with "[FATAL] <message> at <file>:<line>", like a
+// failed CHECK. `message` must be a string literal.
+#define PANIC(message) ::protos::internal::Panic("" message, __FILE__, __LINE__)
 
 #if defined(NDEBUG)
 #define DCHECK(condition)                        \

@@ -3,7 +3,7 @@
 
 // Shared fixtures for the scheduler unit tests (core_runqueue_scheduler_test,
 // work_stealing_scheduler_test, join_lifecycle_scheduler_test,
-// preemptive_scheduler_test, task_test and stress_test_test).
+// preemptive_scheduler_test, task_test and stress_test).
 //
 // The scheduler code calls into other kernel modules. These tests replace the
 // modules with host fakes whose state lives in `g_env`. The fakes are plain
@@ -15,7 +15,7 @@
 //   uart.cpp or vga.cpp.
 // - scheduler_test_idt_task_fakes.cpp fakes the parts of idt.h and task.h
 //   that SetupEnv() and the scheduler layers use. Only tests that link
-//   neither idt.cpp nor task.cpp use it; task_test and stress_test_test link
+//   neither idt.cpp nor task.cpp use it; task_test and stress_test link
 //   the real modules instead.
 // A test that links both a fake and the real module fails to link with a
 // duplicate symbol error rather than silently using one of them.
@@ -144,6 +144,8 @@ inline void ResetTestEnv() { SetupEnv(1); }
 
 inline void NoopTask(void* const /*arg*/) {}
 
+// Mocks every `TaskScheduler` method. It mocks the private scheduler internals
+// in its public section too, so that tests can set expectations on them.
 class MockTaskScheduler : public TaskScheduler {
  public:
   MOCK_METHOD(void, Init, (), (override));

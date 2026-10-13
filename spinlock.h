@@ -8,21 +8,16 @@
 #endif
 
 #include "check.h"
+#include "interrupts.h"
 #include "smp.h"
 
 namespace protos {
 
 class IrqSpinLock;
 
-// RFLAGS.IF (bit 9): maskable interrupts are enabled while it is set.
-inline constexpr uint64_t kRflagsInterruptEnableBit = 1ULL << 9;
-
-// Implementation details of the interrupt helpers and `IrqSpinLock` below.
-// Other code should use the public functions instead.
+// Implementation details of `IrqSpinLock` below. Other code should use the
+// public functions instead.
 namespace internal {
-
-// Older call sites spell it `internal::kRflagsInterruptEnableBit`.
-using ::protos::kRflagsInterruptEnableBit;
 
 // In the kernel, the `IrqSpinLock` owner id of a CPU without a bound
 // `CpuLocal` (host threads use a per-thread token instead). Bound CPUs use
@@ -40,99 +35,30 @@ inline uintptr_t OwnerIdForCpu(const CpuLocal& cpu) {
 // Top of the held-lock stack of the CPU that runs without a bound `CpuLocal`.
 inline IrqSpinLock* g_bootstrap_top_lock = nullptr;
 
-inline bool LocalAreInterruptsEnabled() {
-  uint64_t rflags = 0;
-  asm volatile(
-      "pushfq\n\t"
-      "pop %0"
-      : "=r"(rflags)
-      :
-      : "memory");
-  return (rflags & kRflagsInterruptEnableBit) != 0;
-}
-
-inline bool LocalSaveAndDisableInterrupts() {
-  uint64_t rflags = 0;
-  asm volatile(
-      "pushfq\n\t"
-      "pop %0\n\t"
-      "cli"
-      : "=r"(rflags)
-      :
-      : "memory", "cc");
-  return (rflags & kRflagsInterruptEnableBit) != 0;
-}
-
-inline void LocalRestoreInterrupts(const bool previously_enabled) {
-  if (previously_enabled) {
-    asm volatile("sti" : : : "memory", "cc");
-  }
-}
-
 // Lock ownership and the held-lock stack are per CPU and live in the CPU's
-// bound `CpuLocal`. Only the BSP runs unbound: from boot until `SmpInit()`
-// binds its `CpuLocal`, it uses `kUnboundCpuOwnerId` and
+// bound `CpuLocal`. APs bind theirs in the startup trampoline (boot.S) before
+// they run any C++ code, so only the BSP runs unbound: from boot until
+// `SmpInit()` binds its `CpuLocal`, it uses `kUnboundCpuOwnerId` and
 // `g_bootstrap_top_lock`, and it must release every lock taken in that phase
 // before binding (checked in `TopHeldLockSlot()`).
-//
-// APs must not take an `IrqSpinLock`, directly or through helpers such as
-// `UartWrite()`, before `ApKernelEntry()` binds their `CpuLocal`: by then the
-// BSP has bound, so `CurrentCpuOrNull()` on such an AP reads `gs:[0]` through a
-// GS base of 0, which faults or yields garbage. When it yields no `CpuLocal`,
-// the DCHECKs on the unbound paths below catch the violation.
 inline uintptr_t CurrentOwnerId() {
   const CpuLocal* const cpu = CurrentCpuOrNull();
-  if (cpu != nullptr) {
-    return OwnerIdForCpu(*cpu);
-  }
-  DCHECK(!g_cpu_local_bound.load(std::memory_order_relaxed));
-  return kUnboundCpuOwnerId;
+  return (cpu != nullptr) ? OwnerIdForCpu(*cpu) : kUnboundCpuOwnerId;
 }
 
 inline IrqSpinLock** TopHeldLockSlot() {
   CpuLocal* const cpu = CurrentCpuOrNull();
-  if (cpu != nullptr) {
-    DCHECK(g_bootstrap_top_lock == nullptr);
-    return &cpu->top_held_lock;
+  if (cpu == nullptr) {
+    return &g_bootstrap_top_lock;
   }
-  DCHECK(!g_cpu_local_bound.load(std::memory_order_relaxed));
-  return &g_bootstrap_top_lock;
+  DCHECK(g_bootstrap_top_lock == nullptr);
+  return &cpu->top_held_lock;
 }
 #else
-// Host builds simulate the per-CPU state with `thread_local` variables, and
-// host scheduler tests run tasks as fibers that can resume on a different OS
-// thread after a context switch. The accessors below must therefore compute
-// the address of their `thread_local` anew on every call, never reusing one
-// computed before a switch (GCC treats the thread pointer as constant within a
-// function). `[[gnu::noinline]]` keeps the address computation out of the
-// callers, and the empty `asm volatile` with a memory operand stops GCC from
-// inferring that the function is pure and merging calls across a switch.
-// (`[[gnu::noipa]]` would state both, but Clang doesn't support it.)
-[[gnu::noinline]] inline bool* HostInterruptEnabledSlot() {
-  thread_local bool interrupts_enabled = true;
-  asm volatile("" : "+m"(interrupts_enabled));
-  return &interrupts_enabled;
-}
-
-inline bool LocalAreInterruptsEnabled() { return *HostInterruptEnabledSlot(); }
-
-inline void LocalSetInterruptsEnabledForTest(const bool enabled) {
-  *HostInterruptEnabledSlot() = enabled;
-}
-
-inline bool LocalSaveAndDisableInterrupts() {
-  bool* const slot = HostInterruptEnabledSlot();
-  const bool previously_enabled = *slot;
-  *slot = false;
-  return previously_enabled;
-}
-
-inline void LocalRestoreInterrupts(const bool previously_enabled) {
-  if (previously_enabled) {
-    *HostInterruptEnabledSlot() = true;
-  }
-}
-
+// Host threads without a bound `CpuLocal` keep their owner token and held-lock
+// stack in `thread_local` variables. Like `HostInterruptEnabledSlot()`
+// (interrupts.h), these accessors stay out of line and recompute the
+// `thread_local` address on every call.
 [[gnu::noinline]] inline uintptr_t CurrentOwnerId() {
   const CpuLocal* const cpu = CurrentCpuOrNull();
   if (cpu != nullptr) {
@@ -168,50 +94,10 @@ inline IrqSpinLock* TopHeldLock() {
 
 }  // namespace internal
 
-// Returns true if maskable interrupts are enabled on the calling CPU (in host
-// builds: simulated as enabled on the calling thread).
-inline bool AreInterruptsEnabled() {
-  return internal::LocalAreInterruptsEnabled();
-}
-
-// Disables maskable interrupts on the calling CPU and returns whether they were
-// enabled, to be passed to the matching `RestoreInterrupts()`.
-inline bool SaveAndDisableInterrupts() {
-  return internal::LocalSaveAndDisableInterrupts();
-}
-
-// Re-enables maskable interrupts if `previously_enabled`, the result of the
-// matching `SaveAndDisableInterrupts()`; otherwise leaves them disabled.
-inline void RestoreInterrupts(const bool previously_enabled) {
-  internal::LocalRestoreInterrupts(previously_enabled);
-}
-
-// Disables maskable interrupts for the lifetime of the guard and then restores
-// the previous state.
-class ScopedIrqDisable {
- public:
-  ScopedIrqDisable() : previously_enabled_(SaveAndDisableInterrupts()) {}
-  ~ScopedIrqDisable() { RestoreInterrupts(previously_enabled_); }
-
-  ScopedIrqDisable(const ScopedIrqDisable&) = delete;
-  ScopedIrqDisable& operator=(const ScopedIrqDisable&) = delete;
-
- private:
-  const bool previously_enabled_;
-};
-
 // Returns true if the calling CPU (in host builds: thread or bound `CpuLocal`)
 // holds at least one `IrqSpinLock`, e.g. to assert that no spinlock is held
 // across a context switch.
 inline bool HoldsAnyIrqSpinLock() { return internal::TopHeldLock() != nullptr; }
-
-#if __STDC_HOSTED__
-// Sets the simulated interrupt-enable flag of the calling host thread (tests
-// only).
-inline void SetInterruptsEnabledForTest(const bool enabled) {
-  internal::LocalSetInterruptsEnabledForTest(enabled);
-}
-#endif
 
 // Interrupt-safe FIFO ticket spinlock.
 //

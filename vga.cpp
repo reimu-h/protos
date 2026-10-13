@@ -2,6 +2,7 @@
 
 #include <cstdint>
 
+#include "format.h"
 #include "paging.h"
 #include "spinlock.h"
 #include "uart.h"
@@ -318,27 +319,6 @@ static void VgaWriteLocked(const char* const str) {
   UpdateCursor();
 }
 
-static void VgaWriteDecLocked(const uint64_t value) {
-  if (value == 0) {
-    VgaPutcLocked('0');
-    UpdateCursor();
-    return;
-  }
-  char buffer[20];
-  int count = 0;
-  uint64_t remaining = value;
-  while (remaining > 0) {
-    buffer[count] = '0' + (remaining % 10);
-    remaining /= 10;
-    ++count;
-  }
-  while (count > 0) {
-    --count;
-    VgaPutcLocked(buffer[count]);
-  }
-  UpdateCursor();
-}
-
 }  // namespace
 
 void VgaClear() {
@@ -365,35 +345,13 @@ void VgaWrite(const char* const str) {
 }
 
 void VgaWriteHex(const uint64_t value) {
-  const IrqSpinLockGuard lock_guard(g_vga_lock);
-  constexpr const char* kHexDigits = "0123456789ABCDEF";
-  if (value == 0) {
-    VgaPutcLocked('0');
-    VgaPutcLocked('x');
-    VgaPutcLocked('0');
-    UpdateCursor();
-    return;
-  }
-  VgaPutcLocked('0');
-  VgaPutcLocked('x');
-  char buffer[16];
-  int count = 0;
-  uint64_t remaining = value;
-  while (remaining > 0) {
-    buffer[count] = kHexDigits[remaining & 0xF];
-    remaining >>= 4;
-    ++count;
-  }
-  while (count > 0) {
-    --count;
-    VgaPutcLocked(buffer[count]);
-  }
-  UpdateCursor();
+  char buffer[kFormatHexBufferSize];
+  VgaWrite(FormatHex(value, buffer));
 }
 
 void VgaWriteDec(const uint64_t value) {
-  const IrqSpinLockGuard lock_guard(g_vga_lock);
-  VgaWriteDecLocked(value);
+  char buffer[kFormatDecBufferSize];
+  VgaWrite(FormatDec(value, buffer));
 }
 
 int VgaGetCursorRow() {
@@ -448,19 +406,6 @@ void VgaPanicWrite(const char* const str) {
   g_cursor_row = row;
   g_cursor_col = col;
   UpdateCursor();
-}
-
-void VgaPanicWriteDec(const uint64_t value) {
-  char buffer[21];
-  int pos = static_cast<int>(sizeof(buffer)) - 1;
-  buffer[pos] = '\0';
-  uint64_t remaining = value;
-  do {
-    --pos;
-    buffer[pos] = static_cast<char>('0' + (remaining % 10));
-    remaining /= 10;
-  } while (remaining > 0);
-  VgaPanicWrite(&buffer[pos]);
 }
 
 bool VgaInitFramebuffer(const uintptr_t fb_phys_addr,  //

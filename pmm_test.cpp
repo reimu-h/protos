@@ -6,7 +6,6 @@
 
 #include <atomic>
 #include <cstdint>
-#include <cstdio>
 #include <cstring>
 #include <ostream>
 #include <string>
@@ -211,45 +210,10 @@ bool PagingExtendIdentityMap(const uintptr_t max_physical_addr) {
 
 uintptr_t PagingIdentityMappedLimit() { return g_env.identity_mapped_limit; }
 
+// console.cpp prints through these.
 void UartWrite(const char* const str) { g_env.uart_log.append(str); }
 
-void UartWriteHex(const uint64_t value) {
-  char buf[32];
-  std::snprintf(buf,          //
-                sizeof(buf),  //
-                "0x%llx",     //
-                static_cast<unsigned long long>(value));
-  g_env.uart_log.append(buf);
-}
-
-void UartWriteDec(const uint64_t value) {
-  char buf[32];
-  std::snprintf(buf,          //
-                sizeof(buf),  //
-                "%llu",       //
-                static_cast<unsigned long long>(value));
-  g_env.uart_log.append(buf);
-}
-
 void VgaWrite(const char* const str) { g_env.vga_log.append(str); }
-
-void VgaWriteHex(const uint64_t value) {
-  char buf[32];
-  std::snprintf(buf,          //
-                sizeof(buf),  //
-                "0x%llx",     //
-                static_cast<unsigned long long>(value));
-  g_env.vga_log.append(buf);
-}
-
-void VgaWriteDec(const uint64_t value) {
-  char buf[32];
-  std::snprintf(buf,          //
-                sizeof(buf),  //
-                "%llu",       //
-                static_cast<unsigned long long>(value));
-  g_env.vga_log.append(buf);
-}
 
 bool VgaInitFramebuffer(const uintptr_t fb_phys_addr,  //
                         const int pitch,               //
@@ -309,7 +273,9 @@ TEST(PmmDeathTest, InitPanicsWithoutUsableMemory) {
 TEST(PmmTest, InitPassesMultibootArgumentsToParser) {
   ResetFakeEnv(64);
   AddRegion(FrameAddr(20), 8 * kPageSize, kMemoryTypeAvailable);
+  EXPECT_FALSE(PmmIsInitialized());
   PmmInit(kMultiboot2Magic, 0x12345000);
+  EXPECT_TRUE(PmmIsInitialized());
   EXPECT_THAT(g_env.parse_calls, t::Eq(1));
   EXPECT_THAT(g_env.parsed_magic, t::Eq(kMultiboot2Magic));
   EXPECT_THAT(g_env.parsed_info_addr, t::Eq(0x12345000u));

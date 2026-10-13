@@ -31,47 +31,12 @@ struct Task;
 extern "C" void TaskStartupEntry(Task* curr);
 }  // namespace protos
 
+// The context switch (context_switch.S, which the host tests link as well). In
+// sanitizer builds, Schedule() wraps each switch in fiber-switch annotations.
 extern "C" {
 void TaskContextSwitch(uintptr_t* prev_rsp, uintptr_t next_rsp);
 void TaskEntryTrampoline();
 }
-
-#if __STDC_HOSTED__
-asm(".text\n"
-    ".intel_syntax noprefix\n"
-    ".align 16\n"
-    ".global TaskContextSwitch\n"
-    ".type TaskContextSwitch, @function\n"
-    "TaskContextSwitch:\n"
-    "  push rbp\n"
-    "  push rbx\n"
-    "  push r12\n"
-    "  push r13\n"
-    "  push r14\n"
-    "  push r15\n"
-    "  mov qword ptr [rdi], rsp\n"
-    "  mov rsp, rsi\n"
-    "  pop r15\n"
-    "  pop r14\n"
-    "  pop r13\n"
-    "  pop r12\n"
-    "  pop rbx\n"
-    "  pop rbp\n"
-    "  ret\n"
-    "\n"
-    ".align 16\n"
-    ".global TaskEntryTrampoline\n"
-    ".type TaskEntryTrampoline, @function\n"
-    "TaskEntryTrampoline:\n"
-    "  xor rbp, rbp\n"
-    "  and rsp, -16\n"
-    "  mov rdi, r12\n"
-    "  call TaskStartupEntry\n"
-    ".Lhost_task_exit_spin:\n"
-    "  pause\n"
-    "  jmp .Lhost_task_exit_spin\n"
-    ".att_syntax prefix\n");
-#endif
 
 namespace protos {
 
@@ -160,6 +125,8 @@ using TaskRunqueueTree =
 // Initial stack frame layout popped by `TaskContextSwitch` when dispatching a
 // newly created task into `TaskEntryTrampoline`. `r12` holds `Task*` so
 // `TaskEntryTrampoline` passes it to `TaskStartupEntry(Task* curr)` in `rdi`.
+// The fields up to `rip` follow the pop order in context_switch.S, which pops
+// six callee-saved registers and then returns.
 struct InitialSwitchFrame {
   uint64_t r15;
   uint64_t r14;
@@ -171,6 +138,8 @@ struct InitialSwitchFrame {
   uint64_t pad_zero;
 };
 static_assert(sizeof(InitialSwitchFrame) == 64);
+static_assert(offsetof(InitialSwitchFrame, r12) == 3 * sizeof(uint64_t));
+static_assert(offsetof(InitialSwitchFrame, rip) == 6 * sizeof(uint64_t));
 
 // Written at the lowest address (`stack_base`) of every stack the core
 // allocates and CHECKed by `FinishContextSwitch()` each time the task is
@@ -198,31 +167,12 @@ struct alignas(64) CpuRunqueue {
   std::atomic<bool> in_schedule{false};
 };
 
-// A task that is switched out can resume on another CPU in the kernel, or on
-// another host thread in unit tests (where `CpuLocal` and the interrupt flag
-// are `thread_local`), so per-CPU state must be re-read after every
-// `TaskContextSwitch()` instead of being reused from before it. These
-// accessors, and the scheduler functions that can switch tasks, stay out of
-// line so that the compiler cannot carry a CPU id, `CpuLocal` pointer, or TLS
-// address computed before a switch across it. Callers must keep local
-// interrupts disabled while they use the result, so that they cannot migrate.
-[[gnu::noinline]] static int GetCurrentCpuId() {
-  DCHECK(!AreInterruptsEnabled());
-  return CurrentCpuId();
-}
-
-[[gnu::noinline]] static CpuLocal* GetCurrentCpuOrNull() {
-  DCHECK(!AreInterruptsEnabled());
-  return CurrentCpuOrNull();
-}
-
-static bool IsCpuOnline(const int cpu_index, const int cpu_count) {
-  if (cpu_index < 0 || cpu_index >= cpu_count) {
-    return false;
-  }
-  const CpuLocal* const local = SmpGetCpuLocal(cpu_index);
-  return local != nullptr && local->online;
-}
+// A task that is switched out can resume on another CPU, so per-CPU state is
+// re-read after every `TaskContextSwitch()` through the out-of-line accessors
+// `CurrentCpuIdIrqsOff()` and `CurrentCpuOrNullIrqsOff()` (smp.h). The
+// scheduler functions that can switch tasks stay out of line too, so that the
+// compiler cannot carry a CPU id, `CpuLocal` pointer, or TLS address computed
+// before a switch across it.
 
 static int64_t ComputeWeightedVruntimeDelta(const int64_t delta_exec,
                                             const int64_t weight) {
@@ -385,84 +335,6 @@ class CoreRunqueueTaskScheduler final : public TaskScheduler {
     DestroyTaskSanitizerState(&bootstrap_task_);
   }
 
-  void Init() override {
-    DCHECK(!initialized_.load(std::memory_order_acquire));
-    DCHECK(IdtIsInitialized());
-    const ScopedIrqDisable irq_guard;
-
-    const int cpu_count = SmpCpuCount();
-    CHECK(cpu_count >= 1);
-    CHECK(SmpOnlineCpuCount() == cpu_count);
-    cpu_count_ = cpu_count;
-
-    runqueues_.reset(new CpuRunqueue[cpu_count]);
-    CHECK(runqueues_ != nullptr);
-    idle_tasks_.reset(new Task[cpu_count]);
-    CHECK(idle_tasks_ != nullptr);
-
-    // `SmpInit()` binds the BSP's `CpuLocal`, and `Init()` must run on the BSP.
-    CHECK(GetCurrentCpuOrNull() != nullptr);
-    CHECK(GetCurrentCpuId() == 0);
-
-    for (int i = 0; i < cpu_count; ++i) {
-      runqueues_[i].cpu_id = i;
-    }
-
-    // Adopt the calling context (`kernel_main()` on the BSP's boot stack) as
-    // the bootstrap task. `StealTask()` never migrates it, so it is always
-    // either running on CPU 0 or queued there. CPU 0 therefore needs no idle
-    // task: its runqueue is never empty when another task exits on it.
-    // `idle_tasks_[0]` is unused.
-    CpuLocal* const bsp_local = SmpGetCpuLocal(0);
-    CHECK(bsp_local != nullptr);
-    bootstrap_task_.owner = this;
-    bootstrap_task_.id = 0;
-    bootstrap_task_.stack_base = bsp_local->stack_base;
-    bootstrap_task_.stack_top = bsp_local->stack_top;
-    bootstrap_task_.stack_frames = kTaskStackFrames;
-    bootstrap_task_.weight = kDefaultTaskWeight;
-    bootstrap_task_.vruntime = 0;
-    bootstrap_task_.enqueue_seq = 0;
-    bootstrap_task_.state.store(TaskState::kRunning, std::memory_order_relaxed);
-    bootstrap_task_.running_cpu.store(0, std::memory_order_relaxed);
-    bootstrap_task_.is_idle = false;
-    bootstrap_task_.is_bootstrap = true;
-    bootstrap_task_.owns_stack = false;
-    bootstrap_task_.has_custom_stack = false;
-    RefreshNativeTaskSanitizerState(&bootstrap_task_);
-    runqueues_[0].current_task = &bootstrap_task_;
-
-    // Adopt each AP's boot context, the idle loop in `ApKernelEntry()` that is
-    // already running on the AP's stack, as that AP's idle task.
-    for (int i = 1; i < cpu_count; ++i) {
-      CpuLocal* const cpu_local = SmpGetCpuLocal(i);
-      CHECK(cpu_local != nullptr);
-      CHECK(cpu_local->online);
-
-      Task& idle = idle_tasks_[i];
-      idle.owner = this;
-      idle.id = i + 1;
-      idle.stack_base = cpu_local->stack_base;
-      idle.stack_top = cpu_local->stack_top;
-      idle.stack_frames = kApStackFrames;
-      idle.weight = kDefaultTaskWeight;
-      idle.vruntime = 0;
-      idle.enqueue_seq = 0;
-      idle.state.store(TaskState::kRunning, std::memory_order_relaxed);
-      idle.running_cpu.store(i, std::memory_order_relaxed);
-      idle.is_idle = true;
-      idle.is_bootstrap = false;
-      idle.owns_stack = false;
-      idle.has_custom_stack = false;
-
-      runqueues_[i].idle_task = &idle;
-      runqueues_[i].current_task = &idle;
-    }
-
-    next_task_id_.store(cpu_count + 1, std::memory_order_relaxed);
-    initialized_.store(true, std::memory_order_release);
-  }
-
   Task* CreateTask(const TaskFn entry,  //
                    void* const arg,     //
                    const int64_t weight) override {
@@ -527,7 +399,7 @@ class CoreRunqueueTaskScheduler final : public TaskScheduler {
 
     {
       const ScopedIrqDisable irq_guard;
-      const int cpu_id = GetCurrentCpuId();
+      const int cpu_id = CurrentCpuIdIrqsOff();
       DCHECK(cpu_id >= 0 && cpu_id < cpu_count_);
       CpuRunqueue& rq = runqueues_[cpu_id];
       if (rq.in_schedule.load(std::memory_order_acquire)) {
@@ -574,14 +446,114 @@ class CoreRunqueueTaskScheduler final : public TaskScheduler {
     Kfree(task);
   }
 
-  // Unsupported: detached tasks are tracked by the join lifecycle layer, which
-  // reclaims them in its ReapZombies() by calling this layer's Join(). This
-  // layer only frees a task in Join().
-  void Detach(Task* const /*task*/) override { CHECK(false); }
+  // The core keeps no join records, so it can't detach tasks or reap them.
+  void Detach(Task* const /*task*/) override {
+    PANIC(
+        "CoreRunqueueTaskScheduler::Detach() is not supported: detaching is "
+        "handled by the join lifecycle layer");
+  }
 
   int ReapZombies() override {
+    PANIC(
+        "CoreRunqueueTaskScheduler::ReapZombies() is not supported: reaping "
+        "zombies is handled by the join lifecycle layer");
+  }
+
+  void SetPreemptEnabled(const bool /*enabled*/) override {}
+  bool IsPreemptEnabled() const override { return true; }
+
+  [[gnu::noinline]] Task* CurrentTask() const override {
     DCHECK(initialized_.load(std::memory_order_acquire));
-    return 0;
+    const ScopedIrqDisable irq_guard;
+    const int cpu_id = CurrentCpuIdIrqsOff();
+    DCHECK(cpu_id >= 0 && cpu_id < cpu_count_);
+    CpuRunqueue& rq = runqueues_[cpu_id];
+    const IrqSpinLockGuard lock_guard(rq.lock);
+    Task* const curr = rq.current_task;
+    DCHECK(curr != nullptr);
+    return curr;
+  }
+
+ private:
+  friend void protos::TaskStartupEntry(Task* curr);
+
+  // Scheduler internals:
+  void Init() override {
+    DCHECK(!initialized_.load(std::memory_order_acquire));
+    DCHECK(IdtIsInitialized());
+    const ScopedIrqDisable irq_guard;
+
+    const int cpu_count = SmpCpuCount();
+    CHECK(cpu_count >= 1);
+    CHECK(SmpOnlineCpuCount() == cpu_count);
+    cpu_count_ = cpu_count;
+
+    runqueues_.reset(new CpuRunqueue[cpu_count]);
+    CHECK(runqueues_ != nullptr);
+    idle_tasks_.reset(new Task[cpu_count]);
+    CHECK(idle_tasks_ != nullptr);
+
+    // `SmpInit()` binds the BSP's `CpuLocal`, and `Init()` must run on the BSP.
+    CHECK(CurrentCpuOrNullIrqsOff() != nullptr);
+    CHECK(CurrentCpuIdIrqsOff() == 0);
+
+    for (int i = 0; i < cpu_count; ++i) {
+      runqueues_[i].cpu_id = i;
+    }
+
+    // Adopt the calling context (`kernel_main()` on the BSP's boot stack) as
+    // the bootstrap task. `StealTask()` never migrates it, so it is always
+    // either running on CPU 0 or queued there. CPU 0 therefore needs no idle
+    // task: its runqueue is never empty when another task exits on it.
+    // `idle_tasks_[0]` is unused.
+    CpuLocal* const bsp_local = SmpGetCpuLocal(0);
+    CHECK(bsp_local != nullptr);
+    bootstrap_task_.owner = this;
+    bootstrap_task_.id = 0;
+    bootstrap_task_.stack_base = bsp_local->stack_base;
+    bootstrap_task_.stack_top = bsp_local->stack_top;
+    bootstrap_task_.stack_frames = kTaskStackFrames;
+    bootstrap_task_.weight = kDefaultTaskWeight;
+    bootstrap_task_.vruntime = 0;
+    bootstrap_task_.enqueue_seq = 0;
+    bootstrap_task_.state.store(TaskState::kRunning, std::memory_order_relaxed);
+    bootstrap_task_.running_cpu.store(0, std::memory_order_relaxed);
+    bootstrap_task_.is_idle = false;
+    bootstrap_task_.is_bootstrap = true;
+    bootstrap_task_.owns_stack = false;
+    bootstrap_task_.has_custom_stack = false;
+    RefreshNativeTaskSanitizerState(&bootstrap_task_);
+    runqueues_[0].current_task = &bootstrap_task_;
+
+    // Adopt each AP's boot context, the idle loop in `ApKernelEntry()` that is
+    // already running on the AP's stack, as that AP's idle task.
+    for (int i = 1; i < cpu_count; ++i) {
+      CpuLocal* const cpu_local = SmpGetCpuLocal(i);
+      CHECK(cpu_local != nullptr);
+      CHECK(cpu_local->online);
+
+      Task& idle = idle_tasks_[i];
+      idle.owner = this;
+      idle.id = i + 1;
+      idle.stack_base = cpu_local->stack_base;
+      idle.stack_top = cpu_local->stack_top;
+      idle.stack_frames = kApStackFrames;
+      idle.weight = kDefaultTaskWeight;
+      idle.vruntime = 0;
+      idle.enqueue_seq = 0;
+      idle.state.store(TaskState::kRunning, std::memory_order_relaxed);
+      idle.running_cpu.store(i, std::memory_order_relaxed);
+      idle.is_idle = true;
+      idle.is_bootstrap = false;
+      idle.owns_stack = false;
+      idle.has_custom_stack = false;
+
+      runqueues_[i].idle_task = &idle;
+      runqueues_[i].current_task = &idle;
+    }
+
+    next_task_id_.store(cpu_count + 1, std::memory_order_relaxed);
+    initialized_.store(true, std::memory_order_release);
   }
 
   bool PollIdleCpu(const int cpu_index) override {
@@ -591,7 +563,7 @@ class CoreRunqueueTaskScheduler final : public TaskScheduler {
     }
     {
       const ScopedIrqDisable irq_guard;
-      const CpuLocal* const cpu = GetCurrentCpuOrNull();
+      const CpuLocal* const cpu = CurrentCpuOrNullIrqsOff();
       if (cpu == nullptr || !cpu->online || cpu->cpu_id != cpu_index) {
         return false;
       }
@@ -667,9 +639,6 @@ class CoreRunqueueTaskScheduler final : public TaskScheduler {
     return true;
   }
 
-  void SetPreemptEnabled(const bool /*enabled*/) override {}
-  bool IsPreemptEnabled() const override { return true; }
-
   void OnTimerInterrupt(InterruptFrame* const /*frame*/) override {
     PreemptFromInterrupt(/*charge_tick=*/true);
   }
@@ -677,21 +646,6 @@ class CoreRunqueueTaskScheduler final : public TaskScheduler {
   void OnWakeupIpi(InterruptFrame* const /*frame*/) override {
     PreemptFromInterrupt(/*charge_tick=*/false);
   }
-
-  [[gnu::noinline]] Task* CurrentTask() const override {
-    DCHECK(initialized_.load(std::memory_order_acquire));
-    const ScopedIrqDisable irq_guard;
-    const int cpu_id = GetCurrentCpuId();
-    DCHECK(cpu_id >= 0 && cpu_id < cpu_count_);
-    CpuRunqueue& rq = runqueues_[cpu_id];
-    const IrqSpinLockGuard lock_guard(rq.lock);
-    Task* const curr = rq.current_task;
-    DCHECK(curr != nullptr);
-    return curr;
-  }
-
- private:
-  friend void protos::TaskStartupEntry(Task* curr);
 
   // Shared body of `OnTimerInterrupt()` (`charge_tick`) and `OnWakeupIpi()`.
   // Optionally charges one tick of virtual runtime to the running task, then
@@ -706,7 +660,7 @@ class CoreRunqueueTaskScheduler final : public TaskScheduler {
       return;
     }
     const ScopedIrqDisable irq_guard;
-    const CpuLocal* const cpu = GetCurrentCpuOrNull();
+    const CpuLocal* const cpu = CurrentCpuOrNullIrqsOff();
     if (cpu == nullptr || !cpu->online) {
       return;
     }
@@ -762,7 +716,7 @@ class CoreRunqueueTaskScheduler final : public TaskScheduler {
     DCHECK(!AreInterruptsEnabled());
     DCHECK(!HoldsAnyIrqSpinLock());
 
-    const int cpu_id = GetCurrentCpuId();
+    const int cpu_id = CurrentCpuIdIrqsOff();
     DCHECK(cpu_id >= 0 && cpu_id < cpu_count_);
     CpuRunqueue& rq = runqueues_[cpu_id];
     DCHECK(rq.in_schedule.load(std::memory_order_acquire));
@@ -849,7 +803,7 @@ class CoreRunqueueTaskScheduler final : public TaskScheduler {
   [[gnu::noinline]] bool Schedule(const TaskState outgoing_state) {
     // Keep local interrupts disabled across the entire `Schedule()` call—not
     // just while `rq.lock` is held—for three reasons:
-    // 1. Before `rq.lock` is acquired: `GetCurrentCpuId()` is read before
+    // 1. Before `rq.lock` is acquired: `CurrentCpuIdIrqsOff()` is read before
     //    `lock_guard` locks `rq.lock`. If an interrupt fired in between, the
     //    ISR could preempt this task and another CPU could steal it, leaving
     //    `cpu_id` and `rq` pointing to the old CPU's runqueue.
@@ -873,7 +827,7 @@ class CoreRunqueueTaskScheduler final : public TaskScheduler {
     uintptr_t* prev_rsp_ptr = nullptr;
     uintptr_t next_rsp_val = 0;
     {
-      const int cpu_id = GetCurrentCpuId();
+      const int cpu_id = CurrentCpuIdIrqsOff();
       DCHECK(cpu_id >= 0 && cpu_id < cpu_count_);
       CpuRunqueue& rq = runqueues_[cpu_id];
       const IrqSpinLockGuard lock_guard(rq.lock);
@@ -959,7 +913,7 @@ class CoreRunqueueTaskScheduler final : public TaskScheduler {
     //    resumed on a different CPU (or, in host tests, a different thread).
     //    Any pre-switch per-CPU state (such as `cpu_id` or `rq`) is invalid
     //    after this point; the code below and `FinishContextSwitch()` re-query
-    //    it through the out-of-line `GetCurrentCpuId()` on the CPU that
+    //    it through the out-of-line `CurrentCpuIdIrqsOff()` on the CPU that
     //    resumed `prev`. Do not cache per-CPU or `thread_local` addresses
     //    across the switch, and keep this function out of line.
 
@@ -977,7 +931,7 @@ class CoreRunqueueTaskScheduler final : public TaskScheduler {
     DCHECK(!AreInterruptsEnabled());
     {
       DCHECK(!HoldsAnyIrqSpinLock());
-      const int resumed_cpu_id = GetCurrentCpuId();
+      const int resumed_cpu_id = CurrentCpuIdIrqsOff();
       DCHECK(resumed_cpu_id >= 0 && resumed_cpu_id < cpu_count_);
       DCHECK(prev->running_cpu.load(std::memory_order_relaxed) ==
              resumed_cpu_id);

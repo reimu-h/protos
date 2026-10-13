@@ -11,19 +11,24 @@ namespace protos {
 // Creates the innermost scheduler layer: one red-black tree runqueue per CPU,
 // ordered by weighted virtual runtime (`vruntime`), plus the low-level context
 // switch. It must be the innermost layer, because outer layers forward to it
-// and it never calls into an inner scheduler. On its own it implements only
-// part of the `TaskScheduler` contract in task.h and departs from it as
-// follows; outer layers (see `TaskInit()`) supply the rest:
+// and it never calls into an inner scheduler: it implements every
+// `TaskScheduler` method itself. On its own it implements only part of the
+// contract described in task.h and departs from it as follows; outer layers
+// (see `TaskInit()`) supply the rest:
 //
 // - `CreateTask()` always places the task on CPU 0, and `CreateTaskOnCpu()`
 //   never sends a wakeup IPI. Placement and wakeups belong to the
 //   work-stealing layer.
 // - `SetPreemptEnabled()` does nothing and `IsPreemptEnabled()` always returns
 //   true. The preemptive layer decides whether an interrupt may preempt.
-// - `ReapZombies()` reclaims nothing and returns 0. A task's stack is freed
-//   when it exits and its TCB when it is joined; the join-lifecycle layer
-//   keeps track of tasks that nobody joins.
-// - `Join()` busy-waits, yielding until the task has exited.
+// - `Join()` busy-waits, yielding until the task has exited, and then frees
+//   its TCB; there are no join records. The core frees a task's stack when the
+//   task exits, but its TCB only in `Join()`, and does not keep track of tasks
+//   that nobody joins (the join-lifecycle layer does).
+// - `Detach()` and `ReapZombies()` are not supported: without join records
+//   the core can't reclaim a task that nobody joins, so both crash with a
+//   PANIC() message that names the join lifecycle layer, which implements
+//   them.
 // - `RunqueueLoad()` counts only the queued tasks that `StealTask()` may
 //   migrate: the running task, the idle tasks and the bootstrap task are
 //   excluded, so a CPU running one task with nothing queued reports 0. It

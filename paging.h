@@ -20,7 +20,13 @@ constexpr uintptr_t kMaxCanonicalIdentityAddress = 0x0000800000000000ULL;
 // add translations, which other CPUs cannot have cached, so they are safe on
 // any CPU. (They also set missing write-enable bits, but every entry these
 // functions and boot.S create is already writable.) `PagingMarkPageUncacheable`
-// changes existing translations and is restricted to early boot.
+// and `PagingUnmapGuardPage` change existing translations and are restricted to
+// early boot.
+//
+// Guard pages: `PagingUnmapGuardPage` unmaps the 4 KiB page below a stack, so
+// that a stack overflow faults instead of overwriting the memory below it. The
+// mapping functions leave guard pages unmapped, even inside the ranges they are
+// asked to map; only `PagingRemapGuardPage` maps one again.
 
 // Identity-maps all 2 MiB huge pages overlapping `[phys_addr, phys_addr +
 // size)` using the pre-reserved bootstrap page-table pool in `.bss` (safe to
@@ -52,6 +58,26 @@ bool PagingExtendIdentityMap(uintptr_t max_physical_addr);
 // It must therefore run on the BSP before `SmpInit` binds per-CPU state and
 // starts the APs; this is `DCHECK`ed with `CurrentCpuOrNull() == nullptr`.
 bool PagingMarkPageUncacheable(uintptr_t phys_addr);
+
+// Unmaps the identity-mapped 4 KiB page at page-aligned `addr` as a guard page,
+// splitting the enclosing 2 MiB huge page into 512 4 KiB pages if necessary.
+// The page table for the split comes from the PMM once `PmmInit` has run, and
+// from the bootstrap pool before. Returns false if `addr` is not page-aligned,
+// lies in physical page 0 or beyond the canonical identity range, is not
+// identity-mapped, or if no page table is available for the split.
+//
+// Only the calling CPU's TLB is flushed, so other CPUs could still reach the
+// page through stale translations. It must therefore run before `SmpInit`
+// starts the APs.
+bool PagingUnmapGuardPage(uintptr_t addr);
+
+// Maps the guard page at `addr` again (identity, writable), for example before
+// its frame goes back to the PMM. Returns false if `addr` is not the start of a
+// guard page. This only adds a translation, so it is safe on any CPU.
+bool PagingRemapGuardPage(uintptr_t addr);
+
+// Returns true if `addr` lies in a guard page.
+bool PagingIsGuardPage(uintptr_t addr);
 
 // Walks the active CR3 page tables and returns true if `addr` is mapped as an
 // identity-mapped (`virtual == physical`) writable page.

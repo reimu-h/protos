@@ -13,6 +13,7 @@
 #include <vector>
 
 #include "scheduler_test_support.h"
+#include "task_scheduler_internals.h"
 
 namespace protos {
 namespace {
@@ -76,7 +77,7 @@ TEST(JoinLifecycleSchedulerTest, InitClearsAllJoinRecordsAndDelegatesToInner) {
   // Init() must free every join record and forward to inner->Init().
   int init_calls = 0;
   EXPECT_CALL(*mock_inner, Init).WillOnce([&]() { ++init_calls; });
-  sched->Init();
+  TaskSchedulerInternals::Init(*sched);
   EXPECT_THAT(init_calls, t::Eq(1));
   EXPECT_THAT(HeapTotalFreeBytes(), t::Eq(heap_before));
 
@@ -591,103 +592,13 @@ TEST(JoinLifecycleSchedulerTest,
   EXPECT_THAT(HeapTotalFreeBytes(), t::Eq(heap_before));
 }
 
-// 9. Direct forwarding of Yield, PollIdleCpu, RunqueueLoad, StealTask,
-//    SetPreemptEnabled, IsPreemptEnabled, OnTimerInterrupt, OnWakeupIpi, and
-//    CurrentTask to inner.
-TEST(JoinLifecycleSchedulerTest, DirectlyForwardsPassThroughMethodsToInner) {
-  ResetTestEnv();
-  const auto mock_inner = std::make_shared<t::StrictMock<MockTaskScheduler>>();
-  const std::shared_ptr<TaskScheduler> sched =
-      CreateJoinLifecycleScheduler(mock_inner);
-
-  // Yield
-  int yield_calls = 0;
-  EXPECT_CALL(*mock_inner, Yield).WillOnce([&]() { ++yield_calls; });
-  sched->Yield();
-  EXPECT_THAT(yield_calls, t::Eq(1));
-
-  // PollIdleCpu
-  EXPECT_CALL(*mock_inner, PollIdleCpu)
-      .WillOnce([&](const int cpu_index) {
-        EXPECT_THAT(cpu_index, t::Eq(2));
-        return true;
-      })
-      .WillOnce([&](const int cpu_index) {
-        EXPECT_THAT(cpu_index, t::Eq(0));
-        return false;
-      });
-  EXPECT_TRUE(sched->PollIdleCpu(2));
-  EXPECT_FALSE(sched->PollIdleCpu(0));
-
-  // RunqueueLoad
-  EXPECT_CALL(*mock_inner, RunqueueLoad).WillOnce([&](const int cpu_index) {
-    EXPECT_THAT(cpu_index, t::Eq(3));
-    return 7;
-  });
-  EXPECT_THAT(sched->RunqueueLoad(3), t::Eq(7));
-
-  // StealTask
-  EXPECT_CALL(*mock_inner, StealTask)
-      .WillOnce([&](const int dst_cpu, const int src_cpu) {
-        EXPECT_THAT(dst_cpu, t::Eq(1));
-        EXPECT_THAT(src_cpu, t::Eq(3));
-        return true;
-      })
-      .WillOnce([&](const int dst_cpu, const int src_cpu) {
-        EXPECT_THAT(dst_cpu, t::Eq(0));
-        EXPECT_THAT(src_cpu, t::Eq(2));
-        return false;
-      });
-  EXPECT_TRUE(sched->StealTask(1, 3));
-  EXPECT_FALSE(sched->StealTask(0, 2));
-
-  // SetPreemptEnabled & IsPreemptEnabled
-  bool preempt_state = true;
-  EXPECT_CALL(*mock_inner, SetPreemptEnabled)
-      .WillRepeatedly([&](const bool enabled) { preempt_state = enabled; });
-  EXPECT_CALL(*mock_inner, IsPreemptEnabled).WillRepeatedly([&]() {
-    return preempt_state;
-  });
-  sched->SetPreemptEnabled(false);
-  EXPECT_FALSE(sched->IsPreemptEnabled());
-  sched->SetPreemptEnabled(true);
-  EXPECT_TRUE(sched->IsPreemptEnabled());
-
-  // OnTimerInterrupt & OnWakeupIpi
-  InterruptFrame timer_frame = {};
-  timer_frame.vector = kVectorApicTimer;
-  InterruptFrame ipi_frame = {};
-  ipi_frame.vector = kVectorWakeupIpi;
-  InterruptFrame* observed_timer_frame = nullptr;
-  InterruptFrame* observed_ipi_frame = nullptr;
-
-  EXPECT_CALL(*mock_inner, OnTimerInterrupt)
-      .WillOnce(
-          [&](InterruptFrame* const frame) { observed_timer_frame = frame; });
-  EXPECT_CALL(*mock_inner, OnWakeupIpi)
-      .WillOnce(
-          [&](InterruptFrame* const frame) { observed_ipi_frame = frame; });
-
-  sched->OnTimerInterrupt(&timer_frame);
-  EXPECT_THAT(observed_timer_frame, t::Eq(&timer_frame));
-  sched->OnWakeupIpi(&ipi_frame);
-  EXPECT_THAT(observed_ipi_frame, t::Eq(&ipi_frame));
-
-  // CurrentTask
-  Task* const expected_current = FakeTaskPtr(99);
-  EXPECT_CALL(*mock_inner, CurrentTask).WillOnce([&]() {
-    return expected_current;
-  });
-  EXPECT_THAT(sched->CurrentTask(), t::Eq(expected_current));
-}
-
-// 10. DCHECK death tests (JoinLifecycleSchedulerDeathTest) verifying
-//     preconditions: null inner in CreateJoinLifecycleScheduler, null entry in
-//     CreateTask/CreateTaskOnCpu, null task in Join, CurrentTask() == nullptr
-//     in Join, self-join (Join(self)), joining or detaching an unknown Task*,
-//     calling Join while holding an IrqSpinLock, joining a detached task,
-//     detaching twice, detaching a task that is being joined, returning from a
-//     task while holding an IrqSpinLock, and double-joining.
+// 9. DCHECK death tests (JoinLifecycleSchedulerDeathTest) verifying
+//    preconditions: null inner in CreateJoinLifecycleScheduler, null entry in
+//    CreateTask/CreateTaskOnCpu, null task in Join, CurrentTask() == nullptr
+//    in Join, self-join (Join(self)), joining or detaching an unknown Task*,
+//    calling Join while holding an IrqSpinLock, joining a detached task,
+//    detaching twice, detaching a task that is being joined, returning from a
+//    task while holding an IrqSpinLock, and double-joining.
 TEST(JoinLifecycleSchedulerDeathTest, PreconditionViolationsTriggerDcheck) {
   ResetTestEnv();
 
@@ -795,7 +706,7 @@ TEST(JoinLifecycleSchedulerDeathTest, PreconditionViolationsTriggerDcheck) {
   EXPECT_DEATH(sched->Join(target_task), "Check failed");
 }
 
-// 11. A task that runs to completion on the creating CPU before the inner
+// 10. A task that runs to completion on the creating CPU before the inner
 //     CreateTask*() call returns (as a synchronous inner layer would do) must
 //     not wait for its record to be finalized, which would deadlock: the
 //     creator finalizes the record only after the inner call returns.
@@ -812,7 +723,7 @@ TEST(JoinLifecycleSchedulerTest,
   Task* const sync_task_2 = FakeTaskPtr(3);
   int callback_runs = 0;
 
-  // The newly created task runs to completion inside inner_->CreateTask*()
+  // The newly created task runs to completion inside inner().CreateTask*()
   // BEFORE it returns.
   EXPECT_CALL(*mock_inner, CreateTask)
       .WillOnce(
@@ -859,7 +770,7 @@ TEST(JoinLifecycleSchedulerTest,
   EXPECT_THAT(HeapTotalFreeBytes(), t::Eq(heap_before));
 }
 
-// 12. OOM during AllocateJoinRecord returns nullptr cleanly without invoking
+// 11. OOM during AllocateJoinRecord returns nullptr cleanly without invoking
 //     inner->CreateTask or inner->CreateTaskOnCpu, and a task that starts on
 //     another CPU waits for FinalizeJoinRecord before running its user
 //     function.
@@ -898,7 +809,7 @@ TEST(JoinLifecycleSchedulerTest,
                     void* const arg,           //
                     const int64_t /*weight*/,  //
                     const int /*target_cpu*/) {
-        // Interrupts must be disabled across inner_->CreateTaskOnCpu +
+        // Interrupts must be disabled across inner().CreateTaskOnCpu +
         // FinalizeJoinRecord.
         EXPECT_FALSE(AreInterruptsEnabled());
         remote_thread = std::thread([entry, arg, &child_entered_inner]() {
@@ -936,6 +847,89 @@ TEST(JoinLifecycleSchedulerTest,
   });
   sched->Join(remote_task);
   EXPECT_THAT(HeapTotalFreeBytes(), t::Eq(heap_before));
+}
+
+// 12. Yield(), SetPreemptEnabled(), IsPreemptEnabled(), CurrentTask() and the
+//     scheduler internals other than Init() (OnTimerInterrupt(),
+//     OnWakeupIpi(), PollIdleCpu(), RunqueueLoad() and StealTask()) are
+//     forwarded to inner once each, with unchanged arguments and result.
+TEST(JoinLifecycleSchedulerTest,
+     ForwardsOtherMethodsToInnerOnceWithUnchangedArgumentsAndResult) {
+  ResetTestEnv();
+  const auto mock_inner = std::make_shared<t::StrictMock<MockTaskScheduler>>();
+  const std::shared_ptr<TaskScheduler> sched =
+      CreateJoinLifecycleScheduler(mock_inner);
+  // Every expectation must be met by exactly one call, in the order below, and
+  // the StrictMock fails the test on any other call to the inner layer.
+  const t::InSequence in_sequence;
+
+  Task* const fake_current = FakeTaskPtr(80);
+  InterruptFrame timer_frame = {};
+  InterruptFrame ipi_frame = {};
+
+  EXPECT_CALL(*mock_inner, Yield);
+  sched->Yield();
+
+  EXPECT_CALL(*mock_inner, SetPreemptEnabled)
+      .WillOnce([](const bool enabled) { EXPECT_FALSE(enabled); })
+      .WillOnce([](const bool enabled) { EXPECT_TRUE(enabled); });
+  sched->SetPreemptEnabled(false);
+  sched->SetPreemptEnabled(true);
+
+  EXPECT_CALL(*mock_inner, IsPreemptEnabled)
+      .WillOnce([]() { return false; })
+      .WillOnce([]() { return true; });
+  EXPECT_FALSE(sched->IsPreemptEnabled());
+  EXPECT_TRUE(sched->IsPreemptEnabled());
+
+  EXPECT_CALL(*mock_inner, CurrentTask).WillOnce([&]() {
+    return fake_current;
+  });
+  EXPECT_THAT(sched->CurrentTask(), t::Eq(fake_current));
+
+  EXPECT_CALL(*mock_inner, OnTimerInterrupt)
+      .WillOnce([&](InterruptFrame* const frame) {
+        EXPECT_THAT(frame, t::Eq(&timer_frame));
+      });
+  TaskSchedulerInternals::OnTimerInterrupt(*sched, &timer_frame);
+
+  EXPECT_CALL(*mock_inner, OnWakeupIpi)
+      .WillOnce([&](InterruptFrame* const frame) {
+        EXPECT_THAT(frame, t::Eq(&ipi_frame));
+      });
+  TaskSchedulerInternals::OnWakeupIpi(*sched, &ipi_frame);
+
+  EXPECT_CALL(*mock_inner, PollIdleCpu)
+      .WillOnce([](const int cpu_index) {
+        EXPECT_THAT(cpu_index, t::Eq(2));
+        return true;
+      })
+      .WillOnce([](const int cpu_index) {
+        EXPECT_THAT(cpu_index, t::Eq(1));
+        return false;
+      });
+  EXPECT_TRUE(TaskSchedulerInternals::PollIdleCpu(*sched, 2));
+  EXPECT_FALSE(TaskSchedulerInternals::PollIdleCpu(*sched, 1));
+
+  EXPECT_CALL(*mock_inner, RunqueueLoad).WillOnce([](const int cpu_index) {
+    EXPECT_THAT(cpu_index, t::Eq(3));
+    return 7;
+  });
+  EXPECT_THAT(TaskSchedulerInternals::RunqueueLoad(*sched, 3), t::Eq(7));
+
+  EXPECT_CALL(*mock_inner, StealTask)
+      .WillOnce([](const int dst_cpu, const int src_cpu) {
+        EXPECT_THAT(dst_cpu, t::Eq(0));
+        EXPECT_THAT(src_cpu, t::Eq(2));
+        return true;
+      })
+      .WillOnce([](const int dst_cpu, const int src_cpu) {
+        EXPECT_THAT(dst_cpu, t::Eq(1));
+        EXPECT_THAT(src_cpu, t::Eq(3));
+        return false;
+      });
+  EXPECT_TRUE(TaskSchedulerInternals::StealTask(*sched, 0, 2));
+  EXPECT_FALSE(TaskSchedulerInternals::StealTask(*sched, 1, 3));
 }
 
 }  // namespace

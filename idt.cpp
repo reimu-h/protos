@@ -8,6 +8,8 @@
 #endif
 
 #include "check.h"
+#include "format.h"
+#include "gdt.h"
 #include "smp.h"
 #include "uart.h"
 #include "vga.h"
@@ -47,12 +49,28 @@ static bool IsValidGateTypeAttr(const uint8_t type_attr) {
          (gate_type == 0x0Eu || gate_type == 0x0Fu);
 }
 
-// Kernel panic path, shared by unhandled CPU exceptions and failed CHECKs
-// (internal::KernelCheckFailure()). The first CPU to panic owns the panic: it
-// stops the other CPUs (SmpStopOtherCpusForPanic()) and then prints without
-// taking the console locks, which a stopped CPU may hold. A nested panic on
-// that CPU prints to the UART only, and every other panicking CPU halts
-// without printing (see internal::EnterPanic()).
+// Returns the IST slot (gdt.h) whose stack `vector` runs on, or 0 for the
+// interrupted stack.
+static uint8_t IstSlotForVector(const int vector) {
+  switch (vector) {
+    case kVectorDoubleFault:
+      return kIstDoubleFault;
+    case kVectorNmi:
+      return kIstNmi;
+    case kVectorMachineCheck:
+      return kIstMachineCheck;
+    default:
+      return 0;
+  }
+}
+
+// Kernel panic path, shared by unhandled CPU exceptions, failed CHECKs
+// (internal::KernelCheckFailure()) and PANIC() (internal::KernelPanic()). The
+// first CPU to panic owns the panic: it stops the other CPUs
+// (SmpStopOtherCpusForPanic()) and then prints without taking the console
+// locks, which a stopped CPU may hold. A nested panic on that CPU prints to the
+// UART only, and every other panicking CPU halts without printing (see
+// internal::EnterPanic()).
 
 // Consoles the panic path prints to.
 enum class PanicOutput {
@@ -65,8 +83,9 @@ enum class PanicOutput {
 std::atomic<uint64_t> g_panic_owner{0};
 int g_panic_depth = 0;
 // Panic token of a CPU that has not bound a CpuLocal yet (CpuLocal addresses
-// are 64-byte aligned, so none equals it). Only one such CPU runs at a time:
-// the BSP before SmpInit(), or an AP inside BindCpuLocal().
+// are 64-byte aligned, so none equals it). Only the BSP runs unbound, before
+// SmpInit(): the startup trampoline binds an AP's CpuLocal before the AP runs
+// any C++ code.
 constexpr uint64_t kUnboundCpuPanicToken = 1;
 #endif
 
@@ -78,36 +97,13 @@ static void PanicWriteStr(const PanicOutput output, const char* const str) {
 }
 
 static void PanicWriteDec(const PanicOutput output, const uint64_t value) {
-  UartPanicWriteDec(value);
-  if (output == PanicOutput::kUartAndVga) {
-    VgaPanicWriteDec(value);
-  }
+  char buffer[kFormatDecBufferSize];
+  PanicWriteStr(output, FormatDec(value, buffer));
 }
 
 static void PanicWriteHex(const PanicOutput output, const uint64_t value) {
-  constexpr const char* kHexDigits = "0123456789ABCDEF";
-  char buf[19];
-  buf[0] = '0';
-  buf[1] = 'x';
-  if (value == 0) {
-    buf[2] = '0';
-    buf[3] = '\0';
-    PanicWriteStr(output, buf);
-    return;
-  }
-  char rev[16];
-  int count = 0;
-  uint64_t remaining = value;
-  while (remaining > 0) {
-    rev[count] = kHexDigits[remaining & 0xFu];
-    remaining >>= 4;
-    ++count;
-  }
-  for (int i = 0; i < count; ++i) {
-    buf[2 + i] = rev[count - 1 - i];
-  }
-  buf[2 + count] = '\0';
-  PanicWriteStr(output, buf);
+  char buffer[kFormatHexBufferSize];
+  PanicWriteStr(output, FormatHex(value, buffer));
 }
 
 [[noreturn]] static void PanicHalt() {
@@ -127,7 +123,7 @@ static void PanicWriteHex(const PanicOutput output, const uint64_t value) {
 static PanicOutput BeginPanic() {
 #if !__STDC_HOSTED__
   asm volatile("cli" : : : "memory", "cc");
-  const CpuLocal* const cpu = CurrentCpuOrNullForPanic();
+  const CpuLocal* const cpu = CurrentCpuOrNull();
   const uint64_t token = (cpu != nullptr) ? reinterpret_cast<uintptr_t>(cpu)
                                           : kUnboundCpuPanicToken;
   switch (internal::EnterPanic(&g_panic_owner, &g_panic_depth, token)) {
@@ -146,21 +142,39 @@ static PanicOutput BeginPanic() {
 #endif
 }
 
-}  // namespace
-
 #if !__STDC_HOSTED__
-[[noreturn]] void internal::KernelCheckFailure(const char* const expr,
-                                               const char* const file,
-                                               const int line) {
+// Prints "[FATAL] <prefix><message> at <file>:<line>" on the panic path and
+// halts. Shared by internal::KernelCheckFailure() and internal::KernelPanic().
+[[noreturn]] static void PanicWithMessage(const char* const prefix,
+                                          const char* const message,
+                                          const char* const file,
+                                          const int line) {
   const PanicOutput output = BeginPanic();
-  PanicWriteStr(output, "[FATAL] Check failed: ");
-  PanicWriteStr(output, expr);
+  PanicWriteStr(output, "[FATAL] ");
+  PanicWriteStr(output, prefix);
+  PanicWriteStr(output, message);
   PanicWriteStr(output, " at ");
   PanicWriteStr(output, file);
   PanicWriteStr(output, ":");
   PanicWriteDec(output, (line > 0) ? static_cast<uint64_t>(line) : 0);
   PanicWriteStr(output, "\n");
   PanicHalt();
+}
+#endif
+
+}  // namespace
+
+#if !__STDC_HOSTED__
+[[noreturn]] void internal::KernelCheckFailure(const char* const expr,
+                                               const char* const file,
+                                               const int line) {
+  PanicWithMessage("Check failed: ", expr, file, line);
+}
+
+[[noreturn]] void internal::KernelPanic(const char* const message,
+                                        const char* const file,
+                                        const int line) {
+  PanicWithMessage("", message, file, line);
 }
 #endif
 
@@ -173,7 +187,7 @@ namespace {
   const PanicOutput output = BeginPanic();
   const int vector = static_cast<int>(frame->vector);
   const char* const mnemonic = IdtExceptionMnemonic(vector);
-  const CpuLocal* const cpu = CurrentCpuOrNullForPanic();
+  const CpuLocal* const cpu = CurrentCpuOrNull();
 
   PanicWriteStr(output, "[FATAL] Unhandled CPU exception ");
   PanicWriteDec(output, frame->vector);
@@ -265,7 +279,7 @@ void IdtInit() {
     g_handlers[v].store(nullptr, std::memory_order_relaxed);
     g_idt[v] = IdtEncodeGate(g_isr_stub_table[v],     //
                              kIdtKernelCodeSelector,  //
-                             0,                       //
+                             IstSlotForVector(v),     //
                              kIdtInterruptGateAttr);
   }
   g_idt_pointer.limit = static_cast<uint16_t>(sizeof(g_idt) - 1);

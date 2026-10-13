@@ -13,9 +13,8 @@
 #include <thread>
 #include <vector>
 
-#include "core_runqueue_scheduler.h"
 #include "scheduler_test_support.h"
-#include "work_stealing_scheduler.h"
+#include "task_scheduler_internals.h"
 
 namespace protos {
 namespace {
@@ -41,6 +40,7 @@ TEST(TaskTest, InitRegistersHandlersAndSetsUpBootstrapAndPerCpuIdleTasks) {
   constexpr int kNumCpus = 4;
   SetupEnv(kNumCpus);
   EXPECT_THAT(GetTaskScheduler(), t::IsNull());
+  EXPECT_FALSE(TaskPollIdleCpu(0));
 
   TaskInit();
   TaskScheduler* const sched = GetTaskScheduler();
@@ -48,6 +48,12 @@ TEST(TaskTest, InitRegistersHandlersAndSetsUpBootstrapAndPerCpuIdleTasks) {
   EXPECT_TRUE(IdtIsInitialized());
   EXPECT_THAT(IdtGetHandler(kVectorApicTimer), t::NotNull());
   EXPECT_THAT(IdtGetHandler(kVectorWakeupIpi), t::NotNull());
+  EXPECT_TRUE(sched->IsPreemptEnabled());
+
+  // The published scheduler disables and re-enables preemption.
+  sched->SetPreemptEnabled(false);
+  EXPECT_FALSE(sched->IsPreemptEnabled());
+  sched->SetPreemptEnabled(true);
   EXPECT_TRUE(sched->IsPreemptEnabled());
 
   // CPU 0 runs the bootstrap task (the calling thread); every AP runs its own
@@ -65,8 +71,8 @@ TEST(TaskTest, InitRegistersHandlersAndSetsUpBootstrapAndPerCpuIdleTasks) {
   }
 
   for (int c = 0; c < kNumCpus; ++c) {
-    EXPECT_THAT(sched->RunqueueLoad(c), t::Eq(0));
-    EXPECT_FALSE(sched->PollIdleCpu(c));
+    EXPECT_THAT(TaskSchedulerInternals::RunqueueLoad(*sched, c), t::Eq(0));
+    EXPECT_FALSE(TaskPollIdleCpu(c));
   }
 
   // Both vectors dispatch (each with one EOI) and, with nothing runnable,
@@ -91,7 +97,7 @@ TEST(TaskTest, InitRegistersHandlersAndSetsUpBootstrapAndPerCpuIdleTasks) {
   const int64_t eoi_before_ipi = g_env.eoi_count.load();
   IdtDispatch(&ipi_frame);
   EXPECT_THAT(g_env.eoi_count.load(), t::Eq(eoi_before_ipi + 1));
-  EXPECT_TRUE(sched->PollIdleCpu(1));
+  EXPECT_TRUE(TaskPollIdleCpu(1));
   BindCpuLocal(SmpGetCpuLocal(0));
   EXPECT_TRUE(remote_ran);
   sched->Join(remote);
@@ -106,9 +112,10 @@ TEST(TaskTest, PublishesTheSchedulerOnlyAfterInitToConcurrentReaders) {
   constexpr int kNumCpus = 3;
   SetupEnv(kNumCpus);
 
-  // AP threads poll GetTaskScheduler() while TaskInit() runs, the way the
-  // kernel's AP idle loops do. TSAN checks that publishing the scheduler is
-  // race-free and that readers see it fully initialized.
+  // AP threads call GetTaskScheduler() and TaskPollIdleCpu() while TaskInit()
+  // runs, the way the kernel's tasks and AP idle loops do. TSAN checks that
+  // publishing the scheduler is race-free and that readers see it fully
+  // initialized.
   std::atomic<bool> stop_aps{false};
   std::atomic<int> aps_saw_scheduler{0};
   std::vector<std::thread> ap_threads;
@@ -123,7 +130,7 @@ TEST(TaskTest, PublishesTheSchedulerOnlyAfterInitToConcurrentReaders) {
           saw_scheduler = true;
           aps_saw_scheduler.fetch_add(1, std::memory_order_acq_rel);
         }
-        if (ap_sched == nullptr || !ap_sched->PollIdleCpu(cpu)) {
+        if (!TaskPollIdleCpu(cpu)) {
           std::this_thread::yield();
         }
       }
@@ -196,7 +203,7 @@ TEST(TaskTest, CreateYieldJoinAndImplicitExitLifecycle) {
       sched->CreateTask(LifecycleWorker, &ctx_b, kDefaultTaskWeight);
   ASSERT_THAT(task_a, t::NotNull());
   ASSERT_THAT(task_b, t::NotNull());
-  EXPECT_THAT(sched->RunqueueLoad(0), t::Eq(2));
+  EXPECT_THAT(TaskSchedulerInternals::RunqueueLoad(*sched, 0), t::Eq(2));
 
   // Both tasks exit by returning from their entry function.
   sched->Join(task_a);
@@ -210,7 +217,7 @@ TEST(TaskTest, CreateYieldJoinAndImplicitExitLifecycle) {
   EXPECT_THAT(ctx_a.trace, t::ElementsAre(10, 11, 12));
   EXPECT_THAT(ctx_b.trace, t::ElementsAre(20, 21, 22));
 
-  EXPECT_THAT(sched->RunqueueLoad(0), t::Eq(0));
+  EXPECT_THAT(TaskSchedulerInternals::RunqueueLoad(*sched, 0), t::Eq(0));
   EXPECT_THAT(PmmFreeFrameCount(), t::Eq(pmm_before));
   EXPECT_THAT(HeapTotalFreeBytes(), t::Eq(heap_before));
 
@@ -405,11 +412,11 @@ TEST(TaskTest, MonotonicMinVruntimeFloorPreventsStarvationOnCreateAndMigrate) {
   //     monopolizing CPU 0 for all 4 slices.
   Task* const remote_task =
       sched->CreateTaskOnCpu(MigratedFloorWorker, &ctx, kDefaultTaskWeight, 1);
-  EXPECT_THAT(sched->RunqueueLoad(1), t::Eq(1));
-  EXPECT_THAT(sched->RunqueueLoad(0), t::Eq(0));
-  EXPECT_TRUE(sched->StealTask(0, 1));
-  EXPECT_THAT(sched->RunqueueLoad(1), t::Eq(0));
-  EXPECT_THAT(sched->RunqueueLoad(0), t::Eq(1));
+  EXPECT_THAT(TaskSchedulerInternals::RunqueueLoad(*sched, 1), t::Eq(1));
+  EXPECT_THAT(TaskSchedulerInternals::RunqueueLoad(*sched, 0), t::Eq(0));
+  EXPECT_TRUE(TaskSchedulerInternals::StealTask(*sched, 0, 1));
+  EXPECT_THAT(TaskSchedulerInternals::RunqueueLoad(*sched, 1), t::Eq(0));
+  EXPECT_THAT(TaskSchedulerInternals::RunqueueLoad(*sched, 0), t::Eq(1));
 
   Task* const local_peer =
       sched->CreateTaskOnCpu(LocalPeerFloorWorker, &ctx, kDefaultTaskWeight, 0);
@@ -456,7 +463,7 @@ TEST(TaskTest, LeastLoadedPlacementAndCrossCpuWakeupIpi) {
   }
 
   for (int c = 0; c < 4; ++c) {
-    EXPECT_THAT(sched->RunqueueLoad(c), t::Eq(2));
+    EXPECT_THAT(TaskSchedulerInternals::RunqueueLoad(*sched, c), t::Eq(2));
   }
 
   // Enqueuing on local CPU 0 must not send a self-IPI; enqueuing on remote
@@ -474,7 +481,7 @@ TEST(TaskTest, LeastLoadedPlacementAndCrossCpuWakeupIpi) {
   }
 
   for (int c = 0; c < 4; ++c) {
-    EXPECT_THAT(sched->RunqueueLoad(c), t::Eq(0));
+    EXPECT_THAT(TaskSchedulerInternals::RunqueueLoad(*sched, c), t::Eq(0));
   }
   EXPECT_THAT(PmmFreeFrameCount(), t::Eq(pmm_before));
   EXPECT_THAT(HeapTotalFreeBytes(), t::Eq(heap_before));
@@ -789,7 +796,8 @@ TEST(TaskTest, ConcurrentMultiThreadedWorkStealingAndContentionUnderTsan) {
     ASSERT_THAT(t, t::NotNull());
     tasks.push_back(t);
   }
-  EXPECT_THAT(sched->RunqueueLoad(0), t::Eq(kNumTasks));
+  EXPECT_THAT(TaskSchedulerInternals::RunqueueLoad(*sched, 0),
+              t::Eq(kNumTasks));
 
   std::atomic<int> ready_workers{0};
   std::atomic<bool> stop_workers{false};
@@ -802,9 +810,8 @@ TEST(TaskTest, ConcurrentMultiThreadedWorkStealingAndContentionUnderTsan) {
       SetInterruptsEnabledForTest(true);
       ready_workers.fetch_add(1, std::memory_order_acq_rel);
 
-      TaskScheduler* const ap_sched = GetTaskScheduler();
       while (!stop_workers.load(std::memory_order_acquire)) {
-        if (ap_sched == nullptr || !ap_sched->PollIdleCpu(cpu)) {
+        if (!TaskPollIdleCpu(cpu)) {
           std::this_thread::yield();
         }
       }
@@ -852,20 +859,6 @@ TEST(TaskTest, ConcurrentMultiThreadedWorkStealingAndContentionUnderTsan) {
   TaskResetForTest();
 }
 
-TEST(TaskTest, WorkStealingLayerForwardsDetachToItsInnerLayer) {
-  SetupEnv(2);
-  const auto mock_inner = std::make_shared<t::StrictMock<MockTaskScheduler>>();
-  const std::shared_ptr<TaskScheduler> sched =
-      CreateWorkStealingScheduler(mock_inner);
-  Task* const fake_task = reinterpret_cast<Task*>(0x3001);
-  Task* detached_task = nullptr;
-  EXPECT_CALL(*mock_inner, Detach).WillOnce([&](Task* const task) {
-    detached_task = task;
-  });
-  sched->Detach(fake_task);
-  EXPECT_THAT(detached_task, t::Eq(fake_task));
-}
-
 TEST(TaskDeathTest, PreconditionAndInvariantViolationsTriggerDcheck) {
   SetupEnv(2);
   TaskInit();
@@ -883,14 +876,6 @@ TEST(TaskDeathTest, PreconditionAndInvariantViolationsTriggerDcheck) {
       "Check failed");
   EXPECT_DEATH(sched->CreateTaskOnCpu(NoopTask, nullptr, kDefaultTaskWeight, 2),
                "Check failed");
-
-  // Out-of-bounds CPU index queries must trigger DCHECK.
-  EXPECT_DEATH(sched->RunqueueLoad(-1), "Check failed");
-  EXPECT_DEATH(sched->RunqueueLoad(2), "Check failed");
-  EXPECT_DEATH(sched->StealTask(-1, 0), "Check failed");
-  EXPECT_DEATH(sched->StealTask(2, 0), "Check failed");
-  EXPECT_DEATH(sched->StealTask(0, -1), "Check failed");
-  EXPECT_DEATH(sched->StealTask(0, 2), "Check failed");
 
   // Invalid Join calls must trigger DCHECK.
   EXPECT_DEATH(sched->Join(nullptr), "Check failed");
@@ -934,16 +919,6 @@ TEST(TaskDeathTest, TaskInitRequiresTheIdtAndRunsOnlyOnce) {
   IdtResetForTest();
   EXPECT_DEATH(TaskInit(), "Check failed");
   IdtInit();
-}
-
-TEST(TaskDeathTest, CoreLayerAloneDoesNotSupportDetach) {
-  SetupEnv(1);
-  const std::shared_ptr<TaskScheduler> core = CreateCoreRunqueueScheduler();
-  core->Init();
-  Task* const task = core->CreateTask(NoopTask, nullptr, kDefaultTaskWeight);
-  ASSERT_THAT(task, t::NotNull());
-  EXPECT_DEATH(core->Detach(task), "Check failed");
-  core->Join(task);
 }
 
 }  // namespace

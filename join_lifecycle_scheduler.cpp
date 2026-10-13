@@ -10,10 +10,12 @@
 #endif
 
 #include "check.h"
+#include "forwarding_task_scheduler.h"
 #include "heap.h"
 #include "rbtree.h"
 #include "smp.h"
 #include "spinlock.h"
+#include "task_scheduler_internals.h"
 
 namespace protos {
 namespace {
@@ -114,11 +116,12 @@ class TaskJoinRecordList {
   TaskJoinRecord* tail_ = nullptr;
 };
 
-// Join lifecycle layer: tracks every task created through it, so that the task
-// can be joined (Join()) or detached and later reclaimed (Detach() and
-// ReapZombies()). The inner layers provide the primitive "wait until the task
-// has fully exited, then free its TCB" (inner Join()); this layer decides when
-// that is safe to call.
+// Join lifecycle layer (the outermost layer): tracks every task created through
+// it, so that the task can be joined (Join()) or detached and later reclaimed
+// (Detach() and ReapZombies()). The inner layers provide the primitive "wait
+// until the task has fully exited, then free its TCB" (inner Join()); this
+// layer decides when that is safe to call. It forwards every other method to
+// the inner layers unchanged.
 //
 // Each task gets a TaskJoinRecord, which goes through these steps:
 //
@@ -166,25 +169,18 @@ class TaskJoinRecordList {
 //   finds a stale record.
 // - `joiner` is non-null only while Join() waits. A record is never both
 //   detached and joined.
-class JoinLifecycleTaskScheduler final : public TaskScheduler {
+class JoinLifecycleTaskScheduler final : public ForwardingTaskScheduler {
  public:
-  explicit JoinLifecycleTaskScheduler(std::shared_ptr<TaskScheduler> inner)
-      : inner_(std::move(inner)) {
-    DCHECK(inner_ != nullptr);
-  }
+  using ForwardingTaskScheduler::ForwardingTaskScheduler;
 
   ~JoinLifecycleTaskScheduler() override { ClearAllRecords(); }
 
-  void Init() override {
-    ClearAllRecords();
-    inner_->Init();
-  }
-
+  // Task API:
   Task* CreateTask(const TaskFn entry,  //
                    void* const arg,     //
                    const int64_t weight) override {
     return CreateWithJoinRecord(entry, arg, [&](TaskJoinRecord* const rec) {
-      return inner_->CreateTask(&TaskEntryWrapper, rec, weight);
+      return inner().CreateTask(&TaskEntryWrapper, rec, weight);
     });
   }
 
@@ -193,18 +189,16 @@ class JoinLifecycleTaskScheduler final : public TaskScheduler {
                         const int64_t weight,  //
                         const int target_cpu) override {
     return CreateWithJoinRecord(entry, arg, [&](TaskJoinRecord* const rec) {
-      return inner_->CreateTaskOnCpu(&TaskEntryWrapper,  //
+      return inner().CreateTaskOnCpu(&TaskEntryWrapper,  //
                                      rec,                //
                                      weight,             //
                                      target_cpu);
     });
   }
 
-  void Yield() override { inner_->Yield(); }
-
   void Join(Task* const task) override {
     DCHECK(task != nullptr);
-    Task* const self = inner_->CurrentTask();
+    Task* const self = inner().CurrentTask();
     DCHECK(self != nullptr);
     DCHECK(task != self);
     DCHECK(!HoldsAnyIrqSpinLock());
@@ -222,7 +216,7 @@ class JoinLifecycleTaskScheduler final : public TaskScheduler {
     // inner layers lets the task run on this CPU, and lets this CPU steal it
     // if it is stuck in another CPU's runqueue.
     while (!IsRecordExited(rec)) {
-      inner_->Yield();
+      inner().Yield();
       CpuRelax();
     }
 
@@ -235,7 +229,7 @@ class JoinLifecycleTaskScheduler final : public TaskScheduler {
     }
     FreeJoinRecord(rec);
     // Waits for the task to finish switching away (step 4), then frees it.
-    inner_->Join(task);
+    inner().Join(task);
   }
 
   void Detach(Task* const task) override {
@@ -267,45 +261,18 @@ class JoinLifecycleTaskScheduler final : public TaskScheduler {
       TaskJoinRecord* const next = rec->next;
       Task* const task = rec->task;
       FreeJoinRecord(rec);
-      inner_->Join(task);
+      inner().Join(task);
       ++count;
       rec = next;
     }
     return count;
   }
 
-  bool PollIdleCpu(const int cpu_index) override {
-    return inner_->PollIdleCpu(cpu_index);
-  }
-
-  int RunqueueLoad(const int cpu_index) const override {
-    return inner_->RunqueueLoad(cpu_index);
-  }
-
-  bool StealTask(const int dst_cpu, const int src_cpu) override {
-    return inner_->StealTask(dst_cpu, src_cpu);
-  }
-
-  void SetPreemptEnabled(const bool enabled) override {
-    inner_->SetPreemptEnabled(enabled);
-  }
-
-  bool IsPreemptEnabled() const override { return inner_->IsPreemptEnabled(); }
-
-  void OnTimerInterrupt(InterruptFrame* const frame) override {
-    inner_->OnTimerInterrupt(frame);
-  }
-
-  void OnWakeupIpi(InterruptFrame* const frame) override {
-    inner_->OnWakeupIpi(frame);
-  }
-
-  Task* CurrentTask() const override { return inner_->CurrentTask(); }
-
  private:
-  static int CurrentCpuIdOrUnbound() {
-    const CpuLocal* const cpu = CurrentCpuOrNull();
-    return (cpu != nullptr) ? cpu->cpu_id : -1;
+  // Scheduler internals:
+  void Init() override {
+    ClearAllRecords();
+    TaskSchedulerInternals::Init(inner());
   }
 
   // Steps 1 and 2 of the class comment. `create_inner(rec)` creates the task
@@ -452,7 +419,6 @@ class JoinLifecycleTaskScheduler final : public TaskScheduler {
     return rec->exited;
   }
 
-  const std::shared_ptr<TaskScheduler> inner_;
   IrqSpinLock join_lock_;
   TaskJoinRecordTree task_tree_;
   // Records that are not on `zombies_`.

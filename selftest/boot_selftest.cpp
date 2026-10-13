@@ -1,4 +1,4 @@
-#include "memory_tests.h"
+#include "selftest/boot_selftest.h"
 
 #include <atomic>
 #include <cstdint>
@@ -6,15 +6,17 @@
 #include <new>
 
 #include "check.h"
+#include "format.h"
+#include "gdt.h"
 #include "heap.h"
 #include "idt.h"
 #include "multiboot.h"
 #include "paging.h"
 #include "pmm.h"
 #include "rbtree.h"
+#include "selftest/stress.h"
 #include "smp.h"
 #include "spinlock.h"
-#include "stress_test.h"
 #include "task.h"
 #include "uart.h"
 #include "vga.h"
@@ -125,7 +127,7 @@ class XorDevice final : public PolymorphicBase {
 // The suite runs after the boot log has filled about half of the 25-row VGA
 // text screen, and each VGA line it added would bring the greeting on row 0
 // (which test_boot.sh checks) closer to scrolling off. The VGA console only
-// gets the one-line summary of RunBootVerificationSuite().
+// gets the one-line summary of RunBootSelfTests().
 static void LogTestResult(const char* const test_name, const bool passed) {
   UartWrite("[TEST] ");
   UartWrite(test_name);
@@ -176,18 +178,9 @@ class LineBuffer {
     return *this;
   }
 
-  LineBuffer& AppendDec(uint64_t value) {
-    char digits[20];
-    int count = 0;
-    do {
-      digits[count++] = static_cast<char>('0' + value % 10);
-      value /= 10;
-    } while (value != 0);
-    while (count > 0 && len_ + 1 < kCapacity) {
-      buf_[len_++] = digits[--count];
-    }
-    buf_[len_] = '\0';
-    return *this;
+  LineBuffer& AppendDec(const uint64_t value) {
+    char digits[kFormatDecBufferSize];
+    return Append(FormatDec(value, digits));
   }
 
   const char* c_str() const { return buf_; }
@@ -793,47 +786,32 @@ static bool TestMultibootMmapEdgeCases() {
   SELFTEST_EXPECT(map->regions[0].length == 3 * kPageSize);
 
   struct [[gnu::packed]] SyntheticMb2FbBuffer {
-    uint32_t total_size;
-    uint32_t reserved;
-    uint32_t mmap_type;
-    uint32_t mmap_size;
-    uint32_t entry_size;
-    uint32_t entry_version;
-    uint64_t addr;
-    uint64_t len;
-    uint32_t type;
-    uint32_t entry_reserved;
-    uint32_t fb_tag_type;
-    uint32_t fb_tag_size;
-    uint64_t fb_addr;
-    uint32_t fb_pitch;
-    uint32_t fb_width;
-    uint32_t fb_height;
-    uint8_t fb_bpp;
-    uint8_t fb_type;
-    uint16_t fb_reserved;
-    uint32_t end_type;
-    uint32_t end_size;
+    Multiboot2InfoHeader header;
+    Multiboot2TagMmap mmap_tag;
+    Multiboot2MmapEntry mmap_entry;
+    Multiboot2TagFramebuffer fb_tag;
+    Multiboot2Tag end_tag;
   };
 
   SyntheticMb2FbBuffer fb_buf = {};
-  fb_buf.total_size = sizeof(SyntheticMb2FbBuffer);
-  fb_buf.mmap_type = 6;
-  fb_buf.mmap_size = 40;
-  fb_buf.entry_size = 24;
-  fb_buf.addr = 0x200000;
-  fb_buf.len = 4 * kPageSize;
-  fb_buf.type = kMemoryTypeAvailable;
-  fb_buf.fb_tag_type = 8;
-  fb_buf.fb_tag_size = 32;
-  fb_buf.fb_addr = 0x300000;
-  fb_buf.fb_pitch = 640 * 4 - 1;
-  fb_buf.fb_width = 640;
-  fb_buf.fb_height = 480;
-  fb_buf.fb_bpp = 32;
-  fb_buf.fb_type = 1;
-  fb_buf.end_type = 0;
-  fb_buf.end_size = 8;
+  fb_buf.header.total_size = sizeof(SyntheticMb2FbBuffer);
+  fb_buf.mmap_tag.type = kMultiboot2TagMmap;
+  fb_buf.mmap_tag.size =
+      sizeof(Multiboot2TagMmap) + sizeof(Multiboot2MmapEntry);
+  fb_buf.mmap_tag.entry_size = sizeof(Multiboot2MmapEntry);
+  fb_buf.mmap_entry.addr = 0x200000;
+  fb_buf.mmap_entry.len = 4 * kPageSize;
+  fb_buf.mmap_entry.type = kMemoryTypeAvailable;
+  fb_buf.fb_tag.type = kMultiboot2TagFramebuffer;
+  fb_buf.fb_tag.size = sizeof(Multiboot2TagFramebuffer);
+  fb_buf.fb_tag.framebuffer_addr = 0x300000;
+  fb_buf.fb_tag.framebuffer_pitch = 640 * 4 - 1;
+  fb_buf.fb_tag.framebuffer_width = 640;
+  fb_buf.fb_tag.framebuffer_height = 480;
+  fb_buf.fb_tag.framebuffer_bpp = 32;
+  fb_buf.fb_tag.framebuffer_type = kMultiboot2FramebufferTypeRgb;
+  fb_buf.end_tag.type = kMultiboot2TagEnd;
+  fb_buf.end_tag.size = sizeof(Multiboot2Tag);
 
   const uintptr_t fb_buf_addr = reinterpret_cast<uintptr_t>(&fb_buf);
   constexpr uint32_t kOverInt32Max = static_cast<uint32_t>(INT32_MAX) + 1u;
@@ -845,11 +823,11 @@ static bool TestMultibootMmapEdgeCases() {
   };
   SELFTEST_EXPECT(parse_fb_buf());
   SELFTEST_EXPECT(map->fb_addr == 0);
-  fb_buf.fb_pitch = kOverInt32Max;
+  fb_buf.fb_tag.framebuffer_pitch = kOverInt32Max;
   SELFTEST_EXPECT(parse_fb_buf());
   SELFTEST_EXPECT(map->fb_addr == 0);
-  fb_buf.fb_pitch = 640 * 4;
-  fb_buf.fb_width = 0;
+  fb_buf.fb_tag.framebuffer_pitch = 640 * 4;
+  fb_buf.fb_tag.framebuffer_width = 0;
   SELFTEST_EXPECT(parse_fb_buf());
   SELFTEST_EXPECT(map->fb_addr == 0);
 
@@ -1033,6 +1011,18 @@ static uint64_t ReadCr0ForSmpVerify() {
   return cr0;
 }
 
+static uint16_t ReadTaskRegisterForSmpVerify() {
+  uint16_t selector = 0;
+  asm volatile("str %0" : "=r"(selector));
+  return selector;
+}
+
+static GdtPointer ReadGdtrForSmpVerify() {
+  GdtPointer gdtr = {};
+  asm volatile("sgdt [%0]" : : "r"(&gdtr) : "memory");
+  return gdtr;
+}
+
 static uint64_t ReadEferForSmpVerify() {
   constexpr uint32_t kMsrIa32Efer = 0xC0000080u;
   uint32_t low = 0;
@@ -1068,6 +1058,7 @@ static void SmpAllCpuStartupVerifyWorker(const int cpu_index,
   constexpr uint64_t kEferNoExecuteEnable = 1ULL << 11;
   const CpuLocal* const local = CurrentCpu();
   const CpuInfo* const info = SmpGetCpuInfo(cpu_index);
+  const GdtPointer gdtr = ReadGdtrForSmpVerify();
   if (local == nullptr || info == nullptr ||
       local != SmpGetCpuLocal(cpu_index) || local->self != local ||
       ReadGsBaseMsrForSmpVerify() != reinterpret_cast<uintptr_t>(local) ||
@@ -1075,7 +1066,10 @@ static void SmpAllCpuStartupVerifyWorker(const int cpu_index,
       ((ReadEferForSmpVerify() & kEferNoExecuteEnable) != 0) !=
           CpuSupportsNxForSmpVerify() ||
       CurrentCpuId() != cpu_index || local->cpu_id != cpu_index ||
-      local->apic_id != info->apic_id || info->apic_id == kInvalidX2ApicId) {
+      local->apic_id != info->apic_id || info->apic_id == kInvalidX2ApicId ||
+      gdtr.base != GdtGetPointer().base ||
+      gdtr.limit != GdtGetPointer().limit ||
+      ReadTaskRegisterForSmpVerify() != GdtTssSelector(cpu_index)) {
     ctx->failed.store(true, std::memory_order_release);
     return;
   }
@@ -1103,6 +1097,38 @@ static bool VerifySmpAllCpuStartupAndGsBase() {
   SELFTEST_EXPECT(ctx.mask_low.load(std::memory_order_acquire) == expected.low);
   SELFTEST_EXPECT(ctx.mask_high.load(std::memory_order_acquire) ==
                   expected.high);
+  return true;
+}
+
+// Returns true if the stack that starts at `stack_base` is mapped and sits
+// directly above a guard page, which stays unmapped when its whole 2 MiB
+// region is identity-mapped again.
+static bool VerifyStackGuardPage(const uintptr_t stack_base) {
+  const uintptr_t guard_page = stack_base - kPageSize;
+  const uintptr_t region = guard_page & ~(kHugePageSize - 1);
+  return SELFTEST_OK(PagingIsIdentityMapped(stack_base)) &&
+         SELFTEST_OK(PagingIsGuardPage(guard_page)) &&
+         SELFTEST_OK(!PagingIsIdentityMapped(guard_page)) &&
+         SELFTEST_OK(PagingEnsureIdentityMappedRange(region, kHugePageSize)) &&
+         SELFTEST_OK(PagingIsGuardPage(guard_page));
+}
+
+// Verifies that CPU `cpu_index`'s kernel stack and the IST stacks in its TSS
+// each sit above a guard page.
+static bool VerifyCpuStackGuardPages(const int cpu_index) {
+  const CpuInfo* const info = SmpGetCpuInfo(cpu_index);
+  const TaskStateSegment* const tss = GdtGetTss(cpu_index);
+  SELFTEST_EXPECT(VerifyStackGuardPage(info->stack_base));
+  for (int i = 0; i < kIstStackCount; ++i) {
+    const uintptr_t ist_stack_top = tss->ist[i];
+    SELFTEST_EXPECT(ist_stack_top != 0 && (ist_stack_top & 0xF) == 0);
+    SELFTEST_EXPECT(VerifyStackGuardPage(ist_stack_top - kIstStackSize));
+  }
+  for (int i = kIstStackCount; i < 7; ++i) {
+    SELFTEST_EXPECT(tss->ist[i] == 0);
+  }
+  SELFTEST_EXPECT(tss->io_map_base ==
+                  static_cast<uint16_t>(sizeof(TaskStateSegment)));
   return true;
 }
 
@@ -1164,6 +1190,9 @@ static bool TestSmpDiscoveryAndApBringup() {
     }
   }
 
+  for (int i = 0; i < cpu_count; ++i) {
+    SELFTEST_EXPECT(VerifyCpuStackGuardPages(i));
+  }
   SELFTEST_EXPECT(VerifySmpAllCpuStartupAndGsBase());
   return true;
 }
@@ -1646,6 +1675,18 @@ static void IdtPerCpuAndTimerVerifyWorker(const int cpu_index,
       SELFTEST_OK(g_ring_ipi_receivers.Load().Contains(cpu_index));
 }
 
+// IST slot of the IDT gate for `vector`: #DF, NMI and #MC have stacks of their
+// own (gdt.h).
+static uint8_t ExpectedIstSlot(const int vector) {
+  if (vector == kVectorDoubleFault) {
+    return kIstDoubleFault;
+  }
+  if (vector == kVectorNmi) {
+    return kIstNmi;
+  }
+  return (vector == kVectorMachineCheck) ? kIstMachineCheck : 0;
+}
+
 static bool TestIdtPerCpuAndLapicTimer() {
   SELFTEST_EXPECT(IdtIsInitialized());
   SELFTEST_EXPECT(SmpCalibratedTimerInitialCount() != 0);
@@ -1657,7 +1698,7 @@ static bool TestIdtPerCpuAndLapicTimer() {
     const IdtGateDescriptor* const gate = IdtGetGate(v);
     SELFTEST_EXPECT(gate != nullptr);
     SELFTEST_EXPECT(gate->selector == kIdtKernelCodeSelector);
-    SELFTEST_EXPECT(gate->ist == 0);
+    SELFTEST_EXPECT(gate->ist == ExpectedIstSlot(v));
     SELFTEST_EXPECT(gate->type_attr == kIdtInterruptGateAttr);
     SELFTEST_EXPECT(gate->reserved == 0);
     SELFTEST_EXPECT(IdtDecodeGateOffset(*gate) == g_isr_stub_table[v]);
@@ -1905,8 +1946,7 @@ static void StressWorker(void* const raw_arg) {
     }
 
     // Tight back-to-back scheduler API calls without `pause` delays.
-    if (scheduler->CurrentTask() != self || scheduler->RunqueueLoad(cpu) < 0 ||
-        !AreInterruptsEnabled()) {
+    if (scheduler->CurrentTask() != self || !AreInterruptsEnabled()) {
       ctx->stress_failed.store(true, std::memory_order_release);
       return;
     }
@@ -2145,8 +2185,8 @@ static bool TestWorkStealingPhase(TaskScheduler& scheduler,
 
 // Phase 3: high-frequency interrupt and cross-CPU API stress (with the LAPIC
 // timers boosted by the caller). kStressTaskCount workers on all CPUs hammer
-// CurrentTask(), Yield(), and RunqueueLoad(), bombard other CPUs with wakeup
-// IPIs (0x21), check stack canaries, and CreateTask() and Join() children.
+// CurrentTask() and Yield(), bombard other CPUs with wakeup IPIs (0x21), check
+// stack canaries, and CreateTask() and Join() children.
 static bool TestInterruptStressPhase(TaskScheduler& scheduler,
                                      SchedulerTestContext* const ctx) {
   StressWorkerArg args[kStressTaskCount] = {};
@@ -2328,7 +2368,7 @@ constexpr int kBootTestCount = sizeof(kBootTests) / sizeof(kBootTests[0]);
 
 }  // namespace
 
-bool RunBootVerificationSuite() {
+bool RunBootSelfTests() {
   const char* failed_tests[kBootTestCount];
   int failed_count = 0;
   for (int i = 0; i < kBootTestCount; ++i) {
@@ -2346,14 +2386,14 @@ bool RunBootVerificationSuite() {
   // The one VGA line of the suite; it ends with a newline so that the stress
   // test's progress line goes to the next row and doesn't overwrite it.
   if (failed_count == 0) {
-    UartWrite("[TEST] ALL MEMORY TESTS PASSED\n");
-    VgaWrite("[TEST] ALL MEMORY TESTS PASSED (");
+    UartWrite("[TEST] ALL BOOT SELF-TESTS PASSED\n");
+    VgaWrite("[TEST] ALL BOOT SELF-TESTS PASSED (");
     VgaWriteDec(static_cast<uint64_t>(kBootTestCount));
-    VgaWrite(" boot self-tests)\n");
+    VgaWrite(" tests)\n");
     return true;
   }
-  UartWrite("[TEST] MEMORY VERIFICATION FAILED\n");
-  VgaWrite("[TEST] MEMORY VERIFICATION FAILED:");
+  UartWrite("[TEST] BOOT SELF-TESTS FAILED\n");
+  VgaWrite("[TEST] BOOT SELF-TESTS FAILED:");
   for (int i = 0; i < failed_count; ++i) {
     VgaWrite(" ");
     VgaWrite(failed_tests[i]);

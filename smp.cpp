@@ -5,36 +5,25 @@
 #include <memory>
 #include <new>
 #include <type_traits>
-#if __STDC_HOSTED__
-#include <chrono>
-#include <thread>
-#endif
+#include <utility>
 
 #include "check.h"
+#include "console.h"
+#include "gdt.h"
 #include "idt.h"
+#include "multiboot.h"
 #include "paging.h"
 #include "pmm.h"
+#include "smp_hardware.h"
 #include "spinlock.h"
 #include "task.h"
 #include "uart.h"
-#include "vga.h"
 
+// The AP boot handoff (see smp_hardware.h).
 extern "C" {
-#if !__STDC_HOSTED__
-extern const uint8_t ap_trampoline_start[];
-extern const uint8_t ap_trampoline_end[];
-extern const uint8_t stack_bottom[];
-extern const uint8_t stack_top[];
-#endif
-
-// Per-AP bootstrap handoff state read by the 16/32/64-bit trampoline in boot.S
-// while the BSP brings up one Application Processor at a time.
-// Top of the 16 KiB kernel stack allocated for the AP currently being booted.
 volatile uint64_t g_ap_boot_stack = 0;
-// Logical CPU index (1 .. cpu_count - 1) assigned to the AP being booted.
+volatile uint64_t g_ap_boot_cpu_local = 0;
 volatile int g_ap_boot_cpu_index = 0;
-// Set to 1 by the AP trampoline in boot.S as soon as the AP enters 32-bit
-// protected mode, allowing the BSP to skip sending a redundant second SIPI.
 std::atomic<int> g_ap_boot_started{0};
 static_assert(sizeof(g_ap_boot_started) == sizeof(int));
 static_assert(std::is_standard_layout_v<std::atomic<int>>);
@@ -44,11 +33,6 @@ namespace protos {
 
 namespace {
 
-constexpr uint32_t kMultiboot2Magic = 0x36D76289;
-constexpr uint32_t kMultiboot2TagEnd = 0;
-constexpr uint32_t kMultiboot2TagAcpiOld = 14;
-constexpr uint32_t kMultiboot2TagAcpiNew = 15;
-constexpr int64_t kMaxMultibootStructureBytes = 4 * 1024 * 1024;
 constexpr int64_t kMaxAcpiTableBytes = 256 * 1024;
 constexpr int64_t kMaxRsdpBytes = 4096;
 constexpr int64_t kEbdaScanBytes = 1024;
@@ -105,10 +89,9 @@ constexpr int kIcrIdlePollLimit = 1000000;
 constexpr uint32_t kPanicStopIcr =
     kIcrDeliveryNmi | kIcrLevelAssert | kIcrDestAllExcludingSelf;
 
-#if !__STDC_HOSTED__
 constexpr uint32_t kMsrIa32Efer = 0xC0000080;
 constexpr uint64_t kEferLongModeActive = 1ULL << 10;
-constexpr uint64_t kKernelCodeSelector = 0x08;
+constexpr uint16_t kKernelCodeSelector = 0x08;
 
 constexpr uint16_t kPitChannel2DataPort = 0x42;
 constexpr uint16_t kPitCommandPort = 0x43;
@@ -117,7 +100,9 @@ constexpr uint8_t kPitCmdChannel2Mode0 = 0xB0;
 constexpr uint8_t kPitSpeakerGate2Bit = 1u << 0;
 constexpr uint8_t kPitSpeakerEnableMask = 0x03u;
 
-constexpr int64_t kMaxTrampolineBytes = 512;
+// Physical address of the BIOS Data Area word that holds the EBDA segment.
+constexpr uintptr_t kBdaEbdaSegmentAddr = 0x040E;
+
 // INIT-SIPI-SIPI delays from the Intel SDM's MP initialization sequence: 10 ms
 // after INIT and 200 us after each SIPI.
 constexpr int64_t kInitDelayUs = 10000;
@@ -129,23 +114,12 @@ constexpr int64_t kApStartupTimeoutMs = 10000;
 // does not respond. It is deliberately high (8 GHz), so that delays err on the
 // long side.
 constexpr uint64_t kFallbackTscTicksPerMs = 8000000;
-#endif
 // Time idle APs get to acknowledge a SmpRunOnAllCpus() wakeup IPI, and how
 // often the IPI is resent meanwhile.
 constexpr int64_t kDispatchAckTimeoutMs = 10000;
 constexpr int64_t kWakeupIpiResendIntervalUs = 1000;
 // Time the panicking CPU waits for the other CPUs to park.
 constexpr int64_t kPanicParkTimeoutMs = 100;
-
-struct [[gnu::packed]] Multiboot2InfoHeader {
-  uint32_t total_size;
-  uint32_t reserved;
-};
-
-struct [[gnu::packed]] Multiboot2Tag {
-  uint32_t type;
-  uint32_t size;
-};
 
 struct [[gnu::packed]] AcpiRsdpV1 {
   char signature[8];
@@ -207,6 +181,8 @@ struct [[gnu::packed]] AcpiMadtLocalX2Apic {
   uint32_t acpi_processor_uid;
 };
 
+// The machine installed by SmpSetHardware().
+std::shared_ptr<SmpHardware> g_hardware;
 // Discovered CPU topology and per-CPU runtime state populated during SmpInit().
 SmpTopology g_topology = {};
 // Cache-line-aligned per-CPU state blocks (`0 .. SmpCpuCount() - 1`).
@@ -227,11 +203,9 @@ bool g_smp_initialized = false;
 // EnableLocalApic() switches the BSP and then every AP to it; all Local APIC
 // accesses then use the 0x800+ MSR range.
 bool g_x2apic_mode = false;
-#if !__STDC_HOSTED__
 // TSC ticks per millisecond, which time the delays and timeouts (see
 // ReadClockTicks()).
 uint64_t g_tsc_ticks_per_ms = kFallbackTscTicksPerMs;
-#endif
 
 // Panic-stop state (see SmpStopOtherCpusForPanic()):
 // True once the BSP's Local APIC is enabled, so that the panic path can send
@@ -261,87 +235,26 @@ std::unique_ptr<std::atomic<int64_t>[]> g_ap_ack_epoch;
 // the AP goes back to `sti; hlt`.
 std::unique_ptr<std::atomic<int64_t>[]> g_ap_done_epoch;
 
-#if __STDC_HOSTED__
-constexpr uint64_t kDefaultHostCalibrationTicks = 625000;
-
-// Host unit-test overrides configured via SmpSetHostTestHooks().
-uint32_t g_host_bsp_apic_id = 0;
-uintptr_t g_host_ebda_base = 0;
-uintptr_t g_host_bios_rom_base = 0;
-uintptr_t g_host_acpi32_high_bits = 0;
-SmpHostApBootSimFn g_host_ap_sim_fn = nullptr;
-SmpHostCpuidFn g_host_cpuid_fn = nullptr;
-SmpHostReadMsrFn g_host_read_msr_fn = nullptr;
-SmpHostWriteMsrFn g_host_write_msr_fn = nullptr;
-uint64_t g_host_calibration_ticks = kDefaultHostCalibrationTicks;
-std::atomic<int64_t> g_host_eoi_count{0};
-
-struct HostApRunner {
-  int count = 0;
-  std::unique_ptr<std::thread[]> threads;
-  std::unique_ptr<int64_t[]> spawned_epoch;
-  std::unique_ptr<int64_t[]> completed_epoch;
-
-  void EnsureCapacity(const int cpu_count) {
-    if (count >= cpu_count) {
-      return;
-    }
-    Reset();
-    count = cpu_count;
-    threads.reset(new std::thread[cpu_count]);
-    spawned_epoch.reset(new int64_t[cpu_count]());
-    completed_epoch.reset(new int64_t[cpu_count]());
-  }
-
-  void Reset() {
-    if (threads != nullptr) {
-      for (int i = 0; i < count; ++i) {
-        if (threads[i].joinable()) {
-          threads[i].join();
-        }
-      }
-    }
-    threads.reset();
-    spawned_epoch.reset();
-    completed_epoch.reset();
-    count = 0;
-  }
-
-  ~HostApRunner() { Reset(); }
-};
-
-HostApRunner g_host_ap_runner;
-#endif
-
 static constexpr int64_t AlignUp(const int64_t value, const int64_t alignment) {
   return (value + alignment - 1) & ~(alignment - 1);
 }
 
-static uintptr_t ResolveAcpi32Address(const uint32_t addr32) {
-  if (addr32 == 0) {
-    return 0;
-  }
-#if __STDC_HOSTED__
-  return g_host_acpi32_high_bits | static_cast<uintptr_t>(addr32);
-#else
-  return static_cast<uintptr_t>(addr32);
-#endif
+static SmpHardware& Hardware() {
+  DCHECK(g_hardware != nullptr);
+  return *g_hardware;
 }
 
-static void ConsoleWrite(const char* const str) {
-  DCHECK(str != nullptr);
-  UartWrite(str);
-  VgaWrite(str);
+// MultibootPhysicalMapper through the installed hardware.
+static const void* MapPhysicalMemory(const uintptr_t phys_addr,
+                                     const int64_t size) {
+  return Hardware().MapPhysicalMemory(phys_addr, size);
 }
 
-static void ConsoleWriteHex(const uint64_t value) {
-  UartWriteHex(value);
-  VgaWriteHex(value);
-}
-
-static void ConsoleWriteDec(const uint64_t value) {
-  UartWriteDec(value);
-  VgaWriteDec(value);
+// Returns a pointer to the `size` bytes of physical memory at `phys_addr`, or
+// nullptr if they cannot be mapped.
+template <typename T>
+static const T* MapPhysical(const uintptr_t phys_addr, const int64_t size) {
+  return static_cast<const T*>(MapPhysicalMemory(phys_addr, size));
 }
 
 static bool BytesMatch(const char* const actual,    //
@@ -383,16 +296,15 @@ static bool ValidateRsdpV1Bounded(const uintptr_t rsdp_addr,
                                         ? rsdp_max_end_addr
                                         : max_physical_addr;
   if (rsdp_addr >= structure_limit ||
-      (structure_limit - rsdp_addr) < static_cast<uintptr_t>(kV1Size) ||
-      !PagingMapBootstrapRange(rsdp_addr, kV1Size)) {
+      (structure_limit - rsdp_addr) < static_cast<uintptr_t>(kV1Size)) {
     return false;
   }
-  const AcpiRsdpV1* const rsdp = reinterpret_cast<const AcpiRsdpV1*>(rsdp_addr);
-  if (!BytesMatch(rsdp->signature, "RSD PTR ", 8) ||
+  const AcpiRsdpV1* const rsdp = MapPhysical<AcpiRsdpV1>(rsdp_addr, kV1Size);
+  if (rsdp == nullptr || !BytesMatch(rsdp->signature, "RSD PTR ", 8) ||
       !VerifyChecksum(rsdp, kV1Size)) {
     return false;
   }
-  const uintptr_t rsdt_addr = ResolveAcpi32Address(rsdp->rsdt_address);
+  const uintptr_t rsdt_addr = rsdp->rsdt_address;
   if (rsdt_addr == 0 || rsdt_addr >= max_physical_addr) {
     return false;
   }
@@ -418,40 +330,41 @@ static bool ParseRsdpBounded(const uintptr_t rsdp_addr,
                                         ? rsdp_max_end_addr
                                         : max_physical_addr;
   if (rsdp_addr >= structure_limit ||
-      (structure_limit - rsdp_addr) < static_cast<uintptr_t>(kV1Size) ||
-      !PagingMapBootstrapRange(rsdp_addr, kV1Size)) {
+      (structure_limit - rsdp_addr) < static_cast<uintptr_t>(kV1Size)) {
     return false;
   }
 
-  const AcpiRsdpV1* const rsdp_v1 =
-      reinterpret_cast<const AcpiRsdpV1*>(rsdp_addr);
-  if (!BytesMatch(rsdp_v1->signature, "RSD PTR ", 8) ||
+  const AcpiRsdpV1* const rsdp_v1 = MapPhysical<AcpiRsdpV1>(rsdp_addr, kV1Size);
+  if (rsdp_v1 == nullptr || !BytesMatch(rsdp_v1->signature, "RSD PTR ", 8) ||
       !VerifyChecksum(rsdp_v1, kV1Size)) {
     return false;
   }
 
-  const uintptr_t rsdt_addr = ResolveAcpi32Address(rsdp_v1->rsdt_address);
+  const uintptr_t rsdt_addr = rsdp_v1->rsdt_address;
   if (rsdt_addr != 0 && rsdt_addr < max_physical_addr) {
     *out_rsdt_addr = rsdt_addr;
   }
 
   if (rsdp_v1->revision >= 2) {
-    if ((structure_limit - rsdp_addr) < static_cast<uintptr_t>(kV2Size) ||
-        !PagingMapBootstrapRange(rsdp_addr, kV2Size)) {
-      *out_rsdt_addr = 0;
-      return false;
-    }
     const AcpiRsdpV2* const rsdp_v2 =
-        reinterpret_cast<const AcpiRsdpV2*>(rsdp_addr);
-    const int64_t v2_len = rsdp_v2->length;
-    if (v2_len < kV2Size || v2_len > kMaxRsdpBytes ||
-        (structure_limit - rsdp_addr) < static_cast<uintptr_t>(v2_len) ||
-        !PagingMapBootstrapRange(rsdp_addr, v2_len) ||
-        !VerifyChecksum(rsdp_v2, v2_len)) {
+        (structure_limit - rsdp_addr) < static_cast<uintptr_t>(kV2Size)
+            ? nullptr
+            : MapPhysical<AcpiRsdpV2>(rsdp_addr, kV2Size);
+    if (rsdp_v2 == nullptr) {
       *out_rsdt_addr = 0;
       return false;
     }
-    const uintptr_t xsdt_addr = rsdp_v2->xsdt_address;
+    const int64_t v2_len = rsdp_v2->length;
+    const AcpiRsdpV2* const full_rsdp_v2 =
+        (v2_len < kV2Size || v2_len > kMaxRsdpBytes ||
+         (structure_limit - rsdp_addr) < static_cast<uintptr_t>(v2_len))
+            ? nullptr
+            : MapPhysical<AcpiRsdpV2>(rsdp_addr, v2_len);
+    if (full_rsdp_v2 == nullptr || !VerifyChecksum(full_rsdp_v2, v2_len)) {
+      *out_rsdt_addr = 0;
+      return false;
+    }
+    const uintptr_t xsdt_addr = full_rsdp_v2->xsdt_address;
     if (xsdt_addr != 0 && xsdt_addr < max_physical_addr) {
       *out_xsdt_addr = xsdt_addr;
     }
@@ -477,42 +390,23 @@ static bool FindRsdpTagsInMultiboot2(const uintptr_t multiboot_info_addr,
   *out_old_addr = 0;
   *out_old_end_addr = 0;
 
-  constexpr int64_t kHeaderSize = sizeof(Multiboot2InfoHeader);
-  if (multiboot_info_addr >= max_physical_addr ||
-      (max_physical_addr - multiboot_info_addr) <
-          static_cast<uintptr_t>(kHeaderSize) ||
-      !PagingMapBootstrapRange(multiboot_info_addr, kHeaderSize)) {
+  int64_t total_size = 0;
+  const uint8_t* const info = Multiboot2MapInfo(
+      multiboot_info_addr, max_physical_addr, &MapPhysicalMemory, &total_size);
+  if (info == nullptr) {
     return false;
   }
 
-  const Multiboot2InfoHeader* const header =
-      reinterpret_cast<const Multiboot2InfoHeader*>(multiboot_info_addr);
-  const int64_t total_size = header->total_size;
-  if (total_size < kHeaderSize || total_size > kMaxMultibootStructureBytes ||
-      (max_physical_addr - multiboot_info_addr) <
-          static_cast<uintptr_t>(total_size) ||
-      !PagingMapBootstrapRange(multiboot_info_addr, total_size)) {
-    return false;
-  }
-
-  int64_t offset = kHeaderSize;
   constexpr int64_t kTagHeaderSize = sizeof(Multiboot2Tag);
   constexpr int64_t kMinOldTagSize = kTagHeaderSize + sizeof(AcpiRsdpV1);
   constexpr int64_t kMinNewTagSize = kTagHeaderSize + sizeof(AcpiRsdpV2);
-
-  while (offset + kTagHeaderSize <= total_size) {
-    const Multiboot2Tag* const tag =
-        reinterpret_cast<const Multiboot2Tag*>(multiboot_info_addr + offset);
-    const int64_t tag_size = tag->size;
-    if (tag->type == kMultiboot2TagEnd || tag_size < kTagHeaderSize ||
-        offset + tag_size > total_size) {
-      break;
-    }
-
-    const uintptr_t payload_addr =
-        multiboot_info_addr + offset + kTagHeaderSize;
-    const uintptr_t tag_end_addr = multiboot_info_addr + offset + tag_size;
-    if (tag->type == kMultiboot2TagAcpiNew && tag_size >= kMinNewTagSize &&
+  for (Multiboot2TagIterator it(info, total_size); !it.Done(); it.Next()) {
+    const Multiboot2Tag& tag = it.tag();
+    const int64_t tag_size = tag.size;
+    const uintptr_t tag_addr = multiboot_info_addr + it.offset();
+    const uintptr_t payload_addr = tag_addr + kTagHeaderSize;
+    const uintptr_t tag_end_addr = tag_addr + tag_size;
+    if (tag.type == kMultiboot2TagAcpiNew && tag_size >= kMinNewTagSize &&
         *out_new_addr == 0) {
       uintptr_t rsdt = 0;
       uintptr_t xsdt = 0;
@@ -531,7 +425,7 @@ static bool FindRsdpTagsInMultiboot2(const uintptr_t multiboot_info_addr,
         *out_old_addr = payload_addr;
         *out_old_end_addr = tag_end_addr;
       }
-    } else if (tag->type == kMultiboot2TagAcpiOld &&
+    } else if (tag.type == kMultiboot2TagAcpiOld &&
                tag_size >= kMinOldTagSize && *out_old_addr == 0) {
       uintptr_t rsdt = 0;
       if (ValidateRsdpV1Bounded(payload_addr,       //
@@ -542,7 +436,6 @@ static bool FindRsdpTagsInMultiboot2(const uintptr_t multiboot_info_addr,
         *out_old_end_addr = tag_end_addr;
       }
     }
-    offset = AlignUp(offset + tag_size, 8);
   }
 
   return *out_new_addr != 0 || *out_old_addr != 0;
@@ -556,23 +449,25 @@ static const AcpiSdtHeader* MapAndValidateSdt(
   DCHECK(expected_sig != nullptr);
   constexpr int64_t kHeaderSize = sizeof(AcpiSdtHeader);
   if (table_addr == 0 || table_addr >= max_physical_addr ||
-      (max_physical_addr - table_addr) < static_cast<uintptr_t>(kHeaderSize) ||
-      !PagingMapBootstrapRange(table_addr, kHeaderSize)) {
+      (max_physical_addr - table_addr) < static_cast<uintptr_t>(kHeaderSize)) {
     return nullptr;
   }
   const AcpiSdtHeader* const header =
-      reinterpret_cast<const AcpiSdtHeader*>(table_addr);
-  if (!BytesMatch(header->signature, expected_sig, 4)) {
+      MapPhysical<AcpiSdtHeader>(table_addr, kHeaderSize);
+  if (header == nullptr || !BytesMatch(header->signature, expected_sig, 4)) {
     return nullptr;
   }
   const int64_t total_len = header->length;
   if (total_len < kHeaderSize || total_len > kMaxAcpiTableBytes ||
-      (max_physical_addr - table_addr) < static_cast<uintptr_t>(total_len) ||
-      !PagingMapBootstrapRange(table_addr, total_len) ||
-      !VerifyChecksum(header, total_len)) {
+      (max_physical_addr - table_addr) < static_cast<uintptr_t>(total_len)) {
     return nullptr;
   }
-  return header;
+  const AcpiSdtHeader* const table =
+      MapPhysical<AcpiSdtHeader>(table_addr, total_len);
+  if (table == nullptr || !VerifyChecksum(table, total_len)) {
+    return nullptr;
+  }
+  return table;
 }
 
 static bool IsValidLocalApicAddress(const uintptr_t addr,
@@ -721,15 +616,48 @@ static void InitCpuLocalSlot(const int cpu_index,              //
   slot.ipi_count.store(0, std::memory_order_relaxed);
 }
 
+// The stacks of an AP, which SmpInit() allocates as one block of
+// kApStackBlockFrames frames: the kernel stack, then one stack per IST slot,
+// each directly above a guard page.
+struct ApStackBlock {
+  uintptr_t base = 0;
+  uintptr_t guard_pages[1 + kIstStackCount] = {};
+  uintptr_t stack_base = 0;
+  uintptr_t stack_top = 0;
+  uintptr_t ist_stack_tops[kIstStackCount] = {};
+};
+
+static ApStackBlock ApStackBlockAt(const uintptr_t base) {
+  ApStackBlock block;
+  block.base = base;
+  block.guard_pages[0] = base;
+  block.stack_base = base + kPageSize;
+  block.stack_top = block.stack_base + kApStackSize;
+  uintptr_t next = block.stack_top;
+  for (int i = 0; i < kIstStackCount; ++i) {
+    block.guard_pages[1 + i] = next;
+    block.ist_stack_tops[i] = next + kPageSize + kIstStackSize;
+    next = block.ist_stack_tops[i];
+  }
+  DCHECK(next == base + kApStackBlockFrames * kPageSize);
+  return block;
+}
+
+// The stack block of AP `cpu_index`, which starts with the guard page below
+// its kernel stack.
+static ApStackBlock ApStackBlockOf(const int cpu_index) {
+  DCHECK(cpu_index > 0 && cpu_index < g_topology.cpu_count);
+  return ApStackBlockAt(g_topology.cpus[cpu_index].stack_base - kPageSize);
+}
+
 static void ResetSmpState() {
+  // Unbinds the calling CPU (the BSP), whose CpuLocal is freed below.
 #if __STDC_HOSTED__
-  g_host_ap_runner.Reset();
   ResetCpuLocalForTest();
-  g_host_eoi_count.store(0, std::memory_order_relaxed);
 #else
   internal::g_cpu_local_bound.store(false, std::memory_order_release);
-  g_tsc_ticks_per_ms = kFallbackTscTicksPerMs;
 #endif
+  g_tsc_ticks_per_ms = kFallbackTscTicksPerMs;
   g_x2apic_mode = false;
   g_panic_ipi_ready.store(false, std::memory_order_seq_cst);
   g_panic_stop_requested.store(false, std::memory_order_seq_cst);
@@ -741,6 +669,7 @@ static void ResetSmpState() {
   g_ap_boot_done.store(0, std::memory_order_seq_cst);
   g_ap_boot_started.store(0, std::memory_order_seq_cst);
   g_ap_boot_stack = 0;
+  g_ap_boot_cpu_local = 0;
   g_ap_boot_cpu_index = 0;
   g_smp_initialized = false;
   g_dispatch_in_progress.store(false, std::memory_order_seq_cst);
@@ -752,101 +681,28 @@ static void ResetSmpState() {
   g_ap_done_epoch.reset();
 }
 
-static void ReadCpuid(const uint32_t leaf,     //
-                      const uint32_t subleaf,  //
-                      uint32_t* const eax,     //
-                      uint32_t* const ebx,     //
-                      uint32_t* const ecx,     //
-                      uint32_t* const edx) {
-  DCHECK(eax != nullptr);
-  DCHECK(ebx != nullptr);
-  DCHECK(ecx != nullptr);
-  DCHECK(edx != nullptr);
-#if !__STDC_HOSTED__
-  uint32_t a = leaf;
-  uint32_t b = 0;
-  uint32_t c = subleaf;
-  uint32_t d = 0;
-  asm volatile("cpuid" : "+a"(a), "=b"(b), "+c"(c), "=d"(d) : : "cc");
-  *eax = a;
-  *ebx = b;
-  *ecx = c;
-  *edx = d;
-#else
-  *eax = 0;
-  *ebx = 0;
-  *ecx = 0;
-  *edx = 0;
-  if (g_host_cpuid_fn != nullptr) {
-    g_host_cpuid_fn(leaf, subleaf, eax, ebx, ecx, edx);
-  }
-#endif
-}
-
-static uint64_t ReadMsr(const uint32_t msr) {
-#if !__STDC_HOSTED__
-  uint32_t low = 0;
-  uint32_t high = 0;
-  asm volatile("rdmsr" : "=a"(low), "=d"(high) : "c"(msr));
-  return (static_cast<uint64_t>(high) << 32) | low;
-#else
-  if (g_host_read_msr_fn != nullptr) {
-    return g_host_read_msr_fn(msr);
-  }
-  return 0;
-#endif
-}
+static uint64_t ReadMsr(const uint32_t msr) { return Hardware().ReadMsr(msr); }
 
 static void WriteMsr(const uint32_t msr, const uint64_t value) {
-#if !__STDC_HOSTED__
-  const uint32_t low = static_cast<uint32_t>(value & 0xFFFFFFFFu);
-  const uint32_t high = static_cast<uint32_t>(value >> 32);
-  asm volatile("wrmsr" : : "c"(msr), "a"(low), "d"(high) : "memory");
-#else
-  if (g_host_write_msr_fn != nullptr) {
-    g_host_write_msr_fn(msr, value);
-  }
-#endif
-}
-
-static uint32_t ReadCpuidInitialApicId() {
-  uint32_t eax = 0;
-  uint32_t ebx = 0;
-  uint32_t ecx = 0;
-  uint32_t edx = 0;
-  ReadCpuid(1, 0, &eax, &ebx, &ecx, &edx);
-  const uint32_t xapic_id = (ebx >> 24) & 0xFFu;
-  const bool x2apic_supported =
-      (ecx & kCpuidEcxX2ApicBit) != 0 ||
-      (ReadMsr(kMsrIa32ApicBase) & kApicBaseX2ApicEnable) != 0;
-  if (x2apic_supported) {
-    uint32_t max_leaf = 0;
-    uint32_t vendor_ebx = 0;
-    uint32_t vendor_ecx = 0;
-    uint32_t vendor_edx = 0;
-    ReadCpuid(0, 0, &max_leaf, &vendor_ebx, &vendor_ecx, &vendor_edx);
-    if (max_leaf >= 0x0Bu) {
-      uint32_t leaf_b_eax = 0;
-      uint32_t leaf_b_ebx = 0;
-      uint32_t leaf_b_ecx = 0;
-      uint32_t leaf_b_edx = 0;
-      ReadCpuid(0x0Bu, 0, &leaf_b_eax, &leaf_b_ebx, &leaf_b_ecx, &leaf_b_edx);
-      if ((leaf_b_ebx & 0xFFFFu) != 0 || ((leaf_b_ecx >> 8) & 0xFFu) != 0) {
-        return leaf_b_edx;
-      }
-    }
-  }
-  return xapic_id;
+  Hardware().WriteMsr(msr, value);
 }
 
 static bool IsX2ApicSupported() {
-  uint32_t eax = 0;
-  uint32_t ebx = 0;
-  uint32_t ecx = 0;
-  uint32_t edx = 0;
-  ReadCpuid(1, 0, &eax, &ebx, &ecx, &edx);
-  return (ecx & kCpuidEcxX2ApicBit) != 0 ||
+  const CpuidResult leaf1 = Hardware().Cpuid(1, 0);
+  return (leaf1.ecx & kCpuidEcxX2ApicBit) != 0 ||
          (ReadMsr(kMsrIa32ApicBase) & kApicBaseX2ApicEnable) != 0;
+}
+
+static uint32_t ReadCpuidInitialApicId() {
+  SmpHardware& hw = Hardware();
+  const uint32_t xapic_id = (hw.Cpuid(1, 0).ebx >> 24) & 0xFFu;
+  if (IsX2ApicSupported() && hw.Cpuid(0, 0).eax >= 0x0Bu) {
+    const CpuidResult leaf_b = hw.Cpuid(0x0Bu, 0);
+    if ((leaf_b.ebx & 0xFFFFu) != 0 || ((leaf_b.ecx >> 8) & 0xFFu) != 0) {
+      return leaf_b.edx;
+    }
+  }
+  return xapic_id;
 }
 
 // Returns the Local APIC timer's input clock in Hz as reported by CPUID, or 0
@@ -856,22 +712,16 @@ static bool IsX2ApicSupported() {
 // frequency, or 0 if that is not enumerated), and at the bus clock otherwise
 // (leaf 0x16 ECX[15:0], in MHz).
 static int64_t ApicTimerClockHzFromCpuid() {
-  uint32_t max_leaf = 0;
-  uint32_t ebx = 0;
-  uint32_t ecx = 0;
-  uint32_t edx = 0;
-  ReadCpuid(0, 0, &max_leaf, &ebx, &ecx, &edx);
+  SmpHardware& hw = Hardware();
+  const uint32_t max_leaf = hw.Cpuid(0, 0).eax;
   if (max_leaf >= 0x15u) {
-    uint32_t eax = 0;
-    ReadCpuid(0x15u, 0, &eax, &ebx, &ecx, &edx);
-    if (ebx != 0) {
-      return ecx;
+    const CpuidResult leaf15 = hw.Cpuid(0x15u, 0);
+    if (leaf15.ebx != 0) {
+      return leaf15.ecx;
     }
   }
   if (max_leaf >= 0x16u) {
-    uint32_t eax = 0;
-    ReadCpuid(0x16u, 0, &eax, &ebx, &ecx, &edx);
-    return static_cast<int64_t>(ecx & 0xFFFFu) * 1000000;
+    return static_cast<int64_t>(hw.Cpuid(0x16u, 0).ecx & 0xFFFFu) * 1000000;
   }
   return 0;
 }
@@ -901,37 +751,18 @@ static uint32_t ChooseApicTimerInitialCount(
   return kFallbackApicTimerInitialCount;
 }
 
-#if !__STDC_HOSTED__
-static uint64_t ReadTsc() {
-  uint32_t low = 0;
-  uint32_t high = 0;
-  asm volatile("rdtsc" : "=a"(low), "=d"(high));
-  return (static_cast<uint64_t>(high) << 32) | low;
-}
-#endif
-
-// Reads the clock that times delays and timeouts: the TSC on bare metal (at
-// g_tsc_ticks_per_ms), std::chrono::steady_clock nanoseconds in host builds.
-static uint64_t ReadClockTicks() {
-#if !__STDC_HOSTED__
-  return ReadTsc();
-#else
-  return static_cast<uint64_t>(
-      std::chrono::duration_cast<std::chrono::nanoseconds>(
-          std::chrono::steady_clock::now().time_since_epoch())
-          .count());
-#endif
-}
+// Reads the clock that times delays and timeouts: the TSC, at
+// g_tsc_ticks_per_ms.
+static uint64_t ReadClockTicks() { return Hardware().ReadTimestampCounter(); }
 
 // Converts `micros` (>= 0) to ReadClockTicks() ticks.
 static uint64_t ClockTicksForMicros(const int64_t micros) {
   DCHECK(micros >= 0);
-#if !__STDC_HOSTED__
   return static_cast<uint64_t>(micros) * g_tsc_ticks_per_ms / 1000;
-#else
-  return static_cast<uint64_t>(micros) * 1000;
-#endif
 }
+
+// One iteration of a spin-wait loop.
+static void SpinPause() { Hardware().SpinPause(); }
 
 static uint32_t LapicOffsetToX2ApicMsr(const int reg_offset) {
   DCHECK(reg_offset >= 0 && (reg_offset & 0xF) == 0);
@@ -944,9 +775,7 @@ static uint32_t LapicRead(const uintptr_t lapic_base, const int reg_offset) {
   if (g_x2apic_mode) {
     return static_cast<uint32_t>(ReadMsr(LapicOffsetToX2ApicMsr(reg_offset)));
   }
-  const volatile uint32_t* const reg =
-      reinterpret_cast<const volatile uint32_t*>(lapic_base + reg_offset);
-  return *reg;
+  return Hardware().ReadLapicMmio(lapic_base, reg_offset);
 }
 
 static void LapicWrite(const uintptr_t lapic_base,  //
@@ -959,9 +788,7 @@ static void LapicWrite(const uintptr_t lapic_base,  //
     WriteMsr(LapicOffsetToX2ApicMsr(reg_offset), value);
     return;
   }
-  volatile uint32_t* const reg =
-      reinterpret_cast<volatile uint32_t*>(lapic_base + reg_offset);
-  *reg = value;
+  Hardware().WriteLapicMmio(lapic_base, reg_offset, value);
   (void)LapicRead(lapic_base, kLapicRegId);
 }
 
@@ -983,7 +810,7 @@ static bool WaitForIcrIdle(const uintptr_t lapic_base) {
     if ((LapicRead(lapic_base, kLapicRegIcrLow) & kIcrDeliveryPending) == 0) {
       return true;
     }
-    asm volatile("pause" : : : "memory");
+    SpinPause();
   }
   return (LapicRead(lapic_base, kLapicRegIcrLow) & kIcrDeliveryPending) == 0;
 }
@@ -1034,47 +861,14 @@ static void EnableLocalApic(const uintptr_t lapic_base) {
              svr | kLapicSvrSoftwareEnable | kLapicSpuriousVector);
 }
 
-#if !__STDC_HOSTED__
-static inline void Outb(const uint16_t port, const uint8_t value) {
-  asm volatile("out %1, %0" : : "a"(value), "Nd"(port) : "memory");
+static bool IsLongModeActive() {
+  return (ReadMsr(kMsrIa32Efer) & kEferLongModeActive) != 0 &&
+         Hardware().ReadCs() == kKernelCodeSelector;
 }
 
-static inline uint8_t Inb(const uint16_t port) {
-  uint8_t value = 0;
-  asm volatile("in %0, %1" : "=a"(value) : "Nd"(port) : "memory");
-  return value;
+static uint8_t ReadPitSpeakerPort() {
+  return Hardware().InByte(kPitSpeakerPort);
 }
-
-static uintptr_t ReadRsp() {
-  uint64_t rsp = 0;
-  asm volatile("mov %0, rsp" : "=r"(rsp));
-  return rsp;
-}
-
-static uintptr_t ReadCr3() {
-  uint64_t cr3 = 0;
-  asm volatile("mov %0, cr3" : "=r"(cr3));
-  return cr3;
-}
-
-static void MarkMmioPageUncacheable(const uintptr_t phys_addr) {
-  DCHECK(phys_addr != 0);
-  DCHECK(phys_addr < kMaxCanonicalIdentityAddress);
-  CHECK(PagingMarkPageUncacheable(phys_addr));
-}
-
-static uint16_t ReadCs() {
-  uint16_t cs = 0;
-  asm volatile("mov %0, cs" : "=r"(cs));
-  return cs;
-}
-
-static bool IsHardwareLongModeActive() {
-  const uint64_t efer = ReadMsr(kMsrIa32Efer);
-  return (efer & kEferLongModeActive) != 0 && ReadCs() == kKernelCodeSelector;
-}
-
-static uint8_t ReadPitSpeakerPort() { return Inb(kPitSpeakerPort); }
 
 static uint32_t ReadLapicTimerCurrentCount(const uintptr_t lapic_base) {
   return LapicRead(lapic_base, kLapicRegTimerCurrCount);
@@ -1086,26 +880,27 @@ static uint32_t ReadLapicTimerCurrentCount(const uintptr_t lapic_base) {
 // then stays at kFallbackTscTicksPerMs).
 static uint32_t CalibrateLocalApicTimer(const uintptr_t lapic_base) {
   DCHECK(g_x2apic_mode || lapic_base != 0);
+  SmpHardware& hw = Hardware();
   LapicWrite(lapic_base, kLapicRegTimerDivConfig, kLapicTimerDivBy16);
   LapicWrite(lapic_base,         //
              kLapicRegLvtTimer,  //
              kLapicTimerMaskBit | static_cast<uint32_t>(kVectorApicTimer));
 
-  const uint8_t speaker_initial = Inb(kPitSpeakerPort);
+  const uint8_t speaker_initial = hw.InByte(kPitSpeakerPort);
   const uint8_t gate_disabled =
       static_cast<uint8_t>(speaker_initial & ~kPitSpeakerEnableMask);
-  Outb(kPitSpeakerPort, gate_disabled);
+  hw.OutByte(kPitSpeakerPort, gate_disabled);
 
-  Outb(kPitCommandPort, kPitCmdChannel2Mode0);
-  Outb(kPitChannel2DataPort,
-       static_cast<uint8_t>(kPitCalibrationReloadCount & 0xFF));
-  Outb(kPitChannel2DataPort,
-       static_cast<uint8_t>((kPitCalibrationReloadCount >> 8) & 0xFF));
+  hw.OutByte(kPitCommandPort, kPitCmdChannel2Mode0);
+  hw.OutByte(kPitChannel2DataPort,
+             static_cast<uint8_t>(kPitCalibrationReloadCount & 0xFF));
+  hw.OutByte(kPitChannel2DataPort,
+             static_cast<uint8_t>((kPitCalibrationReloadCount >> 8) & 0xFF));
 
   // Rising edge on GATE2 starts the 8254 Channel 2 Mode 0 one-shot countdown.
-  Outb(kPitSpeakerPort,
-       static_cast<uint8_t>(gate_disabled | kPitSpeakerGate2Bit));
-  const uint64_t tsc_start = ReadTsc();
+  hw.OutByte(kPitSpeakerPort,
+             static_cast<uint8_t>(gate_disabled | kPitSpeakerGate2Bit));
+  const uint64_t tsc_start = ReadClockTicks();
   LapicWrite(lapic_base, kLapicRegTimerInitCount, 0xFFFFFFFFu);
 
   const uint32_t initial_count =
@@ -1113,10 +908,10 @@ static uint32_t CalibrateLocalApicTimer(const uintptr_t lapic_base) {
                               kPitCalibrationPollLimit,  //
                               ReadPitSpeakerPort,        //
                               ReadLapicTimerCurrentCount);
-  const uint64_t tsc_elapsed = ReadTsc() - tsc_start;
+  const uint64_t tsc_elapsed = ReadClockTicks() - tsc_start;
 
   LapicWrite(lapic_base, kLapicRegTimerInitCount, 0);
-  Outb(kPitSpeakerPort, gate_disabled);
+  hw.OutByte(kPitSpeakerPort, gate_disabled);
   if (initial_count > 0) {
     // The countdown took kPitCalibrationReloadCount ticks of the PIT clock.
     const uint64_t tsc_ticks_per_ms =
@@ -1158,7 +953,7 @@ static void DelayMicros(const int64_t micros) {
   const uint64_t start = ReadClockTicks();
   const uint64_t ticks = ClockTicksForMicros(micros);
   while (ReadClockTicks() - start < ticks) {
-    asm volatile("pause" : : : "memory");
+    SpinPause();
   }
 }
 
@@ -1172,38 +967,9 @@ static bool WaitForFlag(const std::atomic<int>& flag,
     if (ReadClockTicks() - start >= timeout_ticks) {
       return flag.load(std::memory_order_acquire) != 0;
     }
-    asm volatile("pause" : : : "memory");
+    SpinPause();
   }
   return true;
-}
-
-static void InstallApTrampoline(uint8_t* const saved_bytes) {
-  DCHECK(saved_bytes != nullptr);
-  const uintptr_t start_addr = reinterpret_cast<uintptr_t>(ap_trampoline_start);
-  const uintptr_t end_addr = reinterpret_cast<uintptr_t>(ap_trampoline_end);
-  const int64_t trampoline_bytes = end_addr - start_addr;
-  // `saved_bytes` holds kMaxTrampolineBytes.
-  CHECK(trampoline_bytes > 0 && trampoline_bytes <= kMaxTrampolineBytes);
-  uint8_t* const dst = reinterpret_cast<uint8_t*>(kApTrampolinePhysAddr);
-  const uint8_t* const src = ap_trampoline_start;
-  for (int64_t i = 0; i < trampoline_bytes; ++i) {
-    saved_bytes[i] = dst[i];
-    dst[i] = src[i];
-  }
-  std::atomic_thread_fence(std::memory_order_seq_cst);
-}
-
-static void RestoreApTrampoline(const uint8_t* const saved_bytes) {
-  DCHECK(saved_bytes != nullptr);
-  const uintptr_t start_addr = reinterpret_cast<uintptr_t>(ap_trampoline_start);
-  const uintptr_t end_addr = reinterpret_cast<uintptr_t>(ap_trampoline_end);
-  const int64_t trampoline_bytes = end_addr - start_addr;
-  CHECK(trampoline_bytes > 0 && trampoline_bytes <= kMaxTrampolineBytes);
-  uint8_t* const dst = reinterpret_cast<uint8_t*>(kApTrampolinePhysAddr);
-  for (int64_t i = 0; i < trampoline_bytes; ++i) {
-    dst[i] = saved_bytes[i];
-  }
-  std::atomic_thread_fence(std::memory_order_seq_cst);
 }
 
 // Sends INIT to the AP with `apic_id`, which resets it into the wait-for-SIPI
@@ -1240,6 +1006,7 @@ static bool WakeApplicationProcessor(const uintptr_t lapic_base,
                        : (apic_id < kInvalidXapicId));
   DCHECK(stack_top_addr != 0 && (stack_top_addr & 0xF) == 0);
   g_ap_boot_stack = stack_top_addr;
+  g_ap_boot_cpu_local = reinterpret_cast<uintptr_t>(&g_cpu_locals[cpu_index]);
   g_ap_boot_cpu_index = cpu_index;
   g_ap_boot_started.store(0, std::memory_order_seq_cst);
   g_ap_boot_done.store(0, std::memory_order_seq_cst);
@@ -1267,7 +1034,7 @@ static bool WakeApplicationProcessor(const uintptr_t lapic_base,
 [[noreturn]] static void ParkCpuForPanic() {
   g_panic_parked_cpu_count.fetch_add(1, std::memory_order_acq_rel);
   for (;;) {
-    asm volatile("cli; hlt" : : : "memory");
+    Hardware().HaltForever();
   }
 }
 
@@ -1279,8 +1046,6 @@ static void OnPanicStopNmi(InterruptFrame* const /*frame*/) {
   }
 }
 
-#endif
-
 static bool RunPendingApWork(const int cpu_index,
                              int64_t* const completed_epoch) {
   DCHECK(cpu_index > 0 && cpu_index < g_topology.cpu_count);
@@ -1289,12 +1054,11 @@ static bool RunPendingApWork(const int cpu_index,
   if (epoch <= *completed_epoch) {
     return false;
   }
-#if !__STDC_HOSTED__
-  asm volatile("sti" : : : "memory", "cc");
-#endif
+  // `work_fn` runs with interrupts enabled (`sti`).
+  RestoreInterrupts(true);
   g_ap_ack_epoch[cpu_index].store(epoch, std::memory_order_release);
   while (g_work_start_epoch.load(std::memory_order_acquire) != epoch) {
-    asm volatile("pause" : : : "memory");
+    SpinPause();
   }
   const SmpWorkFn work_fn = g_work_fn.load(std::memory_order_acquire);
   void* const context = g_work_context.load(std::memory_order_acquire);
@@ -1303,44 +1067,6 @@ static bool RunPendingApWork(const int cpu_index,
   *completed_epoch = epoch;
   g_ap_done_epoch[cpu_index].store(epoch, std::memory_order_release);
   return true;
-}
-
-static void SendWakeupIpi(const uintptr_t lapic_base,  //
-                          const int cpu_index,         //
-                          const uint32_t apic_id) {
-  DCHECK(g_x2apic_mode || lapic_base != 0);
-  DCHECK(cpu_index > 0 && cpu_index < g_topology.cpu_count);
-  DCHECK(apic_id != kInvalidX2ApicId);
-#if !__STDC_HOSTED__
-  (void)cpu_index;
-  SendFixedIpi(lapic_base, apic_id, kVectorWakeupIpi);
-#else
-  (void)lapic_base;
-  (void)apic_id;
-  g_host_ap_runner.EnsureCapacity(g_topology.cpu_count);
-  const int64_t target_epoch = g_work_epoch.load(std::memory_order_acquire);
-  if (g_host_ap_runner.spawned_epoch[cpu_index] == target_epoch) {
-    return;
-  }
-  if (g_host_ap_runner.threads[cpu_index].joinable()) {
-    g_host_ap_runner.threads[cpu_index].join();
-  }
-  g_host_ap_runner.spawned_epoch[cpu_index] = target_epoch;
-  g_host_ap_runner.threads[cpu_index] = std::thread([cpu_index]() {
-    BindCpuLocal(&g_cpu_locals[cpu_index]);
-    SetInterruptsEnabledForTest(true);
-    InterruptFrame ipi_frame = {};
-    ipi_frame.vector = kVectorWakeupIpi;
-    IdtDispatch(&ipi_frame);
-    InterruptFrame timer_frame = {};
-    timer_frame.vector = kVectorApicTimer;
-    IdtDispatch(&timer_frame);
-    while (!RunPendingApWork(cpu_index,
-                             &g_host_ap_runner.completed_epoch[cpu_index])) {
-      asm volatile("pause" : : : "memory");
-    }
-  });
-#endif
 }
 
 // Waits until every AP has acknowledged dispatch `epoch` from its idle loop,
@@ -1368,12 +1094,14 @@ static void WaitForDispatchAcks(const uintptr_t lapic_base,
     if (now - last_send >= resend_ticks) {
       for (int i = 1; i < cpu_count; ++i) {
         if (g_ap_ack_epoch[i].load(std::memory_order_acquire) != epoch) {
-          SendWakeupIpi(lapic_base, i, g_topology.cpus[i].apic_id);
+          SendFixedIpi(lapic_base,                  //
+                       g_topology.cpus[i].apic_id,  //
+                       kVectorWakeupIpi);
         }
       }
       last_send = now;
     }
-    asm volatile("pause" : : : "memory");
+    SpinPause();
   }
 }
 
@@ -1389,12 +1117,18 @@ static void EraseTopologyCpu(const int cpu_index) {
 }
 
 // Drops AP `cpu_index`, which did not start, during SmpInit()'s bring-up loop:
-// frees its stack and moves the APs after it, none of which has been started
-// yet, down by one index together with their stacks and CpuLocal slots. CPUs
-// 0 .. cpu_index - 1 are online at this point.
+// frees its stack block and moves the APs after it, none of which has been
+// started yet, down by one index together with their stacks and CpuLocal
+// slots. CPUs 0 .. cpu_index - 1 are online at this point.
 static void DropApThatDidNotStart(const int cpu_index) {
   DCHECK(cpu_index > 0 && cpu_index < g_topology.cpu_count);
-  PmmFreeFrames(g_topology.cpus[cpu_index].stack_base, kApStackFrames);
+  // The PMM keeps its bookkeeping in free frames, so map the guard pages again
+  // first.
+  const ApStackBlock block = ApStackBlockOf(cpu_index);
+  for (const uintptr_t guard_page : block.guard_pages) {
+    CHECK(Hardware().RemapGuardPage(guard_page));
+  }
+  PmmFreeFrames(block.base, kApStackBlockFrames);
   EraseTopologyCpu(cpu_index);
   for (int i = cpu_index; i < g_topology.cpu_count; ++i) {
     InitCpuLocalSlot(i,                              //
@@ -1411,51 +1145,33 @@ static void DropApThatDidNotStart(const int cpu_index) {
   g_online_cpu_count.store(cpu_index, std::memory_order_seq_cst);
 }
 
-#if __STDC_HOSTED__
-// Host stand-in for WakeApplicationProcessor(): runs the test's AP boot
-// simulation (or marks the AP online), then performs the per-CPU steps of
-// ApKernelEntry() on the calling thread. Returns false if the simulation
-// reports that the AP did not start.
-static bool SimulateApStartup(const int cpu_index) {
-  CpuInfo& cpu = g_topology.cpus[cpu_index];
-  g_ap_boot_stack = cpu.stack_top;
-  g_ap_boot_cpu_index = cpu_index;
-  g_ap_boot_started.store(0, std::memory_order_seq_cst);
-  if (g_host_ap_sim_fn != nullptr) {
-    if (!g_host_ap_sim_fn(cpu_index, &cpu)) {
-      return false;
-    }
-  } else {
-    cpu.observed_apic_id = cpu.apic_id;
-    cpu.observed_rsp = cpu.stack_top - 64;
-    cpu.observed_cr3 = g_topology.cpus[0].observed_cr3;
-    cpu.long_mode_active = true;
-    cpu.online = true;
+// Reads the EBDA base address from the BIOS Data Area, or returns 0 if it is
+// not a plausible EBDA location.
+static uintptr_t ReadEbdaBase() {
+  const uint16_t* const ebda_segment =
+      MapPhysical<uint16_t>(kBdaEbdaSegmentAddr, sizeof(uint16_t));
+  if (ebda_segment == nullptr) {
+    return 0;
   }
-  IdtLoad();
-  g_cpu_locals[cpu_index].online = true;
-  BindCpuLocal(&g_cpu_locals[cpu_index]);
-  InterruptFrame ap_timer_frame = {};
-  ap_timer_frame.vector = kVectorApicTimer;
-  IdtDispatch(&ap_timer_frame);
-  BindCpuLocal(&g_cpu_locals[0]);
-  g_online_cpu_count.fetch_add(1, std::memory_order_seq_cst);
-  return true;
+  const uintptr_t ebda_base = static_cast<uintptr_t>(*ebda_segment) << 4;
+  return (ebda_base >= kEbdaMinAddress && ebda_base < kEbdaMaxAddress)
+             ? ebda_base
+             : 0;
 }
-#endif
 
 }  // namespace
 
 extern "C" void ApKernelEntry(const int cpu_index) {
-#if !__STDC_HOSTED__
-  // Bind before loading the kernel IDT or taking any lock: once the BSP has
-  // bound its CpuLocal, CurrentCpuOrNull() trusts IA32_GS_BASE on every CPU,
-  // and this AP's GS base is still 0.
-  BindCpuLocal(&g_cpu_locals[cpu_index]);
+  DCHECK(cpu_index > 0 && cpu_index < g_topology.cpu_count);
+  // The trampoline has bound this AP's CpuLocal (g_ap_boot_cpu_local).
+  DCHECK(CurrentCpuOrNull() == &g_cpu_locals[cpu_index]);
+  SmpHardware& hw = Hardware();
   const uintptr_t lapic_base = g_topology.local_apic_phys_addr;
   DCHECK(g_x2apic_mode || lapic_base != 0);
-  DCHECK(cpu_index > 0 && cpu_index < g_topology.cpu_count);
 
+  // The TSS first: the kernel IDT's #DF, NMI and #MC gates switch to its IST
+  // stacks.
+  GdtLoadForCpu(cpu_index, ApStackBlockOf(cpu_index).ist_stack_tops);
   IdtLoad();
   // A CPU that panicked while this one was in the trampoline sent its stop NMI
   // before the kernel IDT was loaded here.
@@ -1467,9 +1183,9 @@ extern "C" void ApKernelEntry(const int cpu_index) {
 
   CpuInfo& cpu = g_topology.cpus[cpu_index];
   cpu.observed_apic_id = ReadLapicId(lapic_base);
-  cpu.observed_rsp = ReadRsp();
-  cpu.observed_cr3 = ReadCr3();
-  cpu.long_mode_active = IsHardwareLongModeActive();
+  cpu.observed_rsp = hw.ReadRsp();
+  cpu.observed_cr3 = hw.ReadCr3();
+  cpu.long_mode_active = IsLongModeActive();
   cpu.online = true;
 
   StartLocalApicTimer(lapic_base, g_calibrated_timer_initial_count);
@@ -1477,21 +1193,21 @@ extern "C" void ApKernelEntry(const int cpu_index) {
   g_online_cpu_count.fetch_add(1, std::memory_order_seq_cst);
   g_ap_boot_done.store(1, std::memory_order_release);
 
+  // The idle loop: runs SmpRunOnAllCpus() work and scheduler tasks, and halts
+  // with interrupts enabled when there is neither.
   int64_t completed_epoch = 0;
   for (;;) {
-    asm volatile("cli" : : : "memory", "cc");
+    (void)SaveAndDisableInterrupts();
     if (RunPendingApWork(cpu_index, &completed_epoch)) {
       continue;
     }
-    TaskScheduler* const scheduler = GetTaskScheduler();
-    if (scheduler != nullptr && scheduler->PollIdleCpu(cpu_index)) {
+    if (TaskPollIdleCpu(cpu_index)) {
       continue;
     }
-    asm volatile("sti; hlt" : : : "memory", "cc");
+    if (!hw.HaltUntilInterrupt()) {
+      return;
+    }
   }
-#else
-  (void)cpu_index;
-#endif
 }
 
 uintptr_t SmpFindRsdpInMemoryRange(const uintptr_t range_start,
@@ -1502,7 +1218,7 @@ uintptr_t SmpFindRsdpInMemoryRange(const uintptr_t range_start,
   if (range_length < kV1Size || range_start >= kMaxCanonicalIdentityAddress ||
       (kMaxCanonicalIdentityAddress - range_start) <
           static_cast<uintptr_t>(range_length) ||
-      !PagingMapBootstrapRange(range_start, range_length)) {
+      MapPhysical<uint8_t>(range_start, range_length) == nullptr) {
     return 0;
   }
 
@@ -1567,7 +1283,7 @@ uintptr_t SmpFindMadtInSdt(const uintptr_t rsdt_addr,  //
         for (int b = 0; b < static_cast<int>(sizeof(uint32_t)); ++b) {
           raw_entry |= static_cast<uint32_t>(src[b]) << (b * 8);
         }
-        const uintptr_t entry_phys = ResolveAcpi32Address(raw_entry);
+        const uintptr_t entry_phys = raw_entry;
         const AcpiSdtHeader* const candidate =
             MapAndValidateSdt(entry_phys, max_physical_addr, "APIC");
         if (candidate != nullptr && candidate->length >= sizeof(AcpiMadt)) {
@@ -1598,6 +1314,7 @@ bool SmpParseMadt(const uintptr_t madt_addr,          //
   }
 
   const AcpiMadt* const madt = reinterpret_cast<const AcpiMadt*>(header);
+  const uint8_t* const madt_bytes = reinterpret_cast<const uint8_t*>(header);
   const int64_t madt_length = madt->header.length;
   out_topology->local_apic_phys_addr =
       IsValidLocalApicAddress(madt->local_apic_address, max_physical_addr)
@@ -1610,7 +1327,7 @@ bool SmpParseMadt(const uintptr_t madt_addr,          //
   constexpr int64_t kEntryHeaderSize = sizeof(AcpiMadtEntryHeader);
   while (offset + kEntryHeaderSize <= madt_length) {
     const AcpiMadtEntryHeader* const entry =
-        reinterpret_cast<const AcpiMadtEntryHeader*>(madt_addr + offset);
+        reinterpret_cast<const AcpiMadtEntryHeader*>(madt_bytes + offset);
     const int64_t entry_len = entry->length;
     if (entry_len < kEntryHeaderSize || offset + entry_len > madt_length) {
       break;
@@ -1674,7 +1391,7 @@ bool SmpParseMadt(const uintptr_t madt_addr,          //
   offset = kMadtHeaderSize;
   while (offset + kEntryHeaderSize <= madt_length) {
     const AcpiMadtEntryHeader* const entry =
-        reinterpret_cast<const AcpiMadtEntryHeader*>(madt_addr + offset);
+        reinterpret_cast<const AcpiMadtEntryHeader*>(madt_bytes + offset);
     const int64_t entry_len = entry->length;
     if (entry_len < kEntryHeaderSize || offset + entry_len > madt_length) {
       break;
@@ -1846,34 +1563,23 @@ uint32_t CalibrateApicTimerCount(
                                       kApicTimerTargetHz);
 }
 
+void SmpSetHardware(std::shared_ptr<SmpHardware> hardware) {
+  DCHECK(hardware != nullptr);
+  g_hardware = std::move(hardware);
+  ResetSmpState();
+}
+
 void SmpInit(const uint32_t multiboot_magic,
              const uint64_t multiboot_info_addr) {
   ResetSmpState();
   if (!IdtIsInitialized()) {
     IdtInit();
   }
+  SmpHardware& hw = Hardware();
 
-#if !__STDC_HOSTED__
   const uint32_t bsp_initial_apic_id = ReadCpuidInitialApicId();
-  // The BIOS Data Area holds the EBDA segment at physical address 0x40E. The
-  // asm hides that constant address from GCC, which treats accesses to the
-  // first 4 KiB as null-pointer dereferences (a -Warray-bounds error with
-  // -Werror).
-  uintptr_t bda_ebda_addr = 0x040E;
-  asm volatile("" : "+r"(bda_ebda_addr));
-  const uint16_t ebda_segment =
-      *reinterpret_cast<const volatile uint16_t*>(bda_ebda_addr);
-  const uintptr_t raw_ebda_base = static_cast<uintptr_t>(ebda_segment) << 4;
-  const uintptr_t ebda_base =
-      (raw_ebda_base >= kEbdaMinAddress && raw_ebda_base < kEbdaMaxAddress)
-          ? raw_ebda_base
-          : 0;
+  const uintptr_t ebda_base = ReadEbdaBase();
   const uintptr_t bios_rom_base = kBiosRomSearchBase;
-#else
-  const uint32_t bsp_initial_apic_id = g_host_bsp_apic_id;
-  const uintptr_t ebda_base = g_host_ebda_base;
-  const uintptr_t bios_rom_base = g_host_bios_rom_base;
-#endif
 
   // The CPUID initial APIC ID only selects a provisional BSP entry, which is
   // enough to find the Local APIC. Its ID register is authoritative.
@@ -1888,26 +1594,12 @@ void SmpInit(const uint32_t multiboot_magic,
   g_x2apic_mode = IsX2ApicSupported();
   const uintptr_t lapic_base = g_topology.local_apic_phys_addr;
   if (!g_x2apic_mode) {
-    CHECK(PagingMapBootstrapRange(lapic_base, kPageSize));
-#if !__STDC_HOSTED__
-    MarkMmioPageUncacheable(lapic_base);
-#endif
+    CHECK(hw.MapLocalApicPage(lapic_base));
   }
-#if !__STDC_HOSTED__
   EnableLocalApic(lapic_base);
   const uint32_t bsp_apic_id = ReadLapicId(lapic_base);
   IdtRegisterHandler(kVectorNmi, OnPanicStopNmi);
   g_panic_ipi_ready.store(true, std::memory_order_release);
-#else
-  // Host builds have no Local APIC page; only x2APIC mode, whose MSRs the
-  // tests can hook, runs the real code.
-  uint32_t bsp_apic_id = bsp_initial_apic_id;
-  if (g_x2apic_mode) {
-    EnableLocalApic(lapic_base);
-    bsp_apic_id = ReadLapicId(lapic_base);
-    g_panic_ipi_ready.store(true, std::memory_order_release);
-  }
-#endif
   if (bsp_apic_id != g_topology.bsp_apic_id) {
     // Otherwise the BSP's own MADT entry would be taken for an AP, and the BSP
     // would send INIT to itself.
@@ -1946,19 +1638,12 @@ void SmpInit(const uint32_t multiboot_magic,
   g_ap_done_epoch.reset(new std::atomic<int64_t>[cpu_count]());
   CHECK(g_ap_done_epoch != nullptr);
 
-#if !__STDC_HOSTED__
-  g_topology.cpus[0].stack_base = reinterpret_cast<uintptr_t>(stack_bottom);
-  g_topology.cpus[0].stack_top = reinterpret_cast<uintptr_t>(stack_top);
-  g_topology.cpus[0].observed_rsp = ReadRsp();
-  g_topology.cpus[0].observed_cr3 = ReadCr3();
-  g_topology.cpus[0].long_mode_active = IsHardwareLongModeActive();
-#else
-  g_topology.cpus[0].stack_base = 0x100000;
-  g_topology.cpus[0].stack_top = 0x100000 + kApStackSize;
-  g_topology.cpus[0].observed_rsp = 0x100000 + kApStackSize - 64;
-  g_topology.cpus[0].observed_cr3 = 0x105000;
-  g_topology.cpus[0].long_mode_active = true;
-#endif
+  const StackBounds bsp_stack = hw.BspStack();
+  g_topology.cpus[0].stack_base = bsp_stack.base;
+  g_topology.cpus[0].stack_top = bsp_stack.top;
+  g_topology.cpus[0].observed_rsp = hw.ReadRsp();
+  g_topology.cpus[0].observed_cr3 = hw.ReadCr3();
+  g_topology.cpus[0].long_mode_active = IsLongModeActive();
   DCHECK(g_topology.cpus[0].apic_id == bsp_apic_id);
   g_topology.cpus[0].observed_apic_id = bsp_apic_id;
   g_topology.cpus[0].is_bsp = true;
@@ -1971,14 +1656,8 @@ void SmpInit(const uint32_t multiboot_magic,
   BindCpuLocal(&g_cpu_locals[0]);
   g_online_cpu_count.store(1, std::memory_order_seq_cst);
 
-#if !__STDC_HOSTED__
-  const uint32_t pit_timer_count = CalibrateLocalApicTimer(lapic_base);
-#else
-  const uint32_t pit_timer_count = ComputeApicTimerInitialCount(
-      g_host_calibration_ticks, kPitCalibrationReloadCount, kApicTimerTargetHz);
-#endif
   g_calibrated_timer_initial_count =
-      ChooseApicTimerInitialCount(pit_timer_count);
+      ChooseApicTimerInitialCount(CalibrateLocalApicTimer(lapic_base));
 
   ConsoleWrite("[SMP] Discovered CPUs: ");
   ConsoleWriteDec(g_topology.cpu_count);
@@ -2000,11 +1679,17 @@ void SmpInit(const uint32_t multiboot_magic,
   UartWrite(", BSP): online\n");
 
   if (g_topology.cpu_count > 1) {
+    // Every guard page is unmapped before the first AP starts, because only
+    // this CPU's TLB is flushed.
     for (int i = 1; i < g_topology.cpu_count; ++i) {
-      const uintptr_t stack_phys = PmmAllocFrames(kApStackFrames);
-      CHECK(stack_phys != 0);
-      g_topology.cpus[i].stack_base = stack_phys;
-      g_topology.cpus[i].stack_top = stack_phys + kApStackSize;
+      const uintptr_t stack_block = PmmAllocFrames(kApStackBlockFrames);
+      CHECK(stack_block != 0);
+      const ApStackBlock block = ApStackBlockAt(stack_block);
+      for (const uintptr_t guard_page : block.guard_pages) {
+        CHECK(hw.UnmapGuardPage(guard_page));
+      }
+      g_topology.cpus[i].stack_base = block.stack_base;
+      g_topology.cpus[i].stack_top = block.stack_top;
       InitCpuLocalSlot(i,                              //
                        g_topology.cpus[i].apic_id,     //
                        false,                          //
@@ -2012,21 +1697,13 @@ void SmpInit(const uint32_t multiboot_magic,
                        g_topology.cpus[i].stack_top);
     }
 
-#if !__STDC_HOSTED__
-    uint8_t saved_trampoline[kMaxTrampolineBytes] = {};
-    InstallApTrampoline(saved_trampoline);
-#endif
-
+    hw.InstallApTrampoline();
     for (int i = 1; i < g_topology.cpu_count;) {
       const uint32_t apic_id = g_topology.cpus[i].apic_id;
       // An INIT to the BSP's own APIC ID would halt the BSP.
       CHECK(apic_id != g_topology.cpus[0].apic_id);
-#if !__STDC_HOSTED__
       const bool started = WakeApplicationProcessor(
           lapic_base, i, apic_id, g_topology.cpus[i].stack_top);
-#else
-      const bool started = SimulateApStartup(i);
-#endif
       if (!started) {
         UartWrite("[SMP] CPU ");
         UartWriteDec(i);
@@ -2046,29 +1723,16 @@ void SmpInit(const uint32_t multiboot_magic,
       UartWrite(", AP): online\n");
       ++i;
     }
-
-#if !__STDC_HOSTED__
-    RestoreApTrampoline(saved_trampoline);
-#endif
+    hw.RestoreApTrampoline();
   }
 
-#if !__STDC_HOSTED__
   StartLocalApicTimer(lapic_base, g_calibrated_timer_initial_count);
-#else
-  BindCpuLocal(&g_cpu_locals[0]);
-  InterruptFrame bsp_timer_frame = {};
-  bsp_timer_frame.vector = kVectorApicTimer;
-  IdtDispatch(&bsp_timer_frame);
-#endif
 
   g_smp_initialized = true;
   CHECK(SmpOnlineCpuCount() == g_topology.cpu_count);
 
-#if !__STDC_HOSTED__
-  asm volatile("sti" : : : "memory", "cc");
-#else
-  SetInterruptsEnabledForTest(true);
-#endif
+  // `sti`
+  RestoreInterrupts(true);
 
   UartWrite("[SMP] Local APIC timer calibrated: initial_count=");
   UartWriteDec(g_calibrated_timer_initial_count);
@@ -2118,25 +1782,17 @@ uint32_t SmpCalibratedTimerInitialCount() {
 }
 
 void SmpSetLocalApicTimerInitialCount(const uint32_t initial_count) {
-#if !__STDC_HOSTED__
   const uintptr_t lapic_base = g_topology.local_apic_phys_addr;
   if ((!g_x2apic_mode && lapic_base == 0) || initial_count == 0) {
     return;
   }
   LapicWrite(lapic_base, kLapicRegTimerInitCount, initial_count);
-#else
-  (void)initial_count;
-#endif
 }
 
 void SmpSendLocalApicEoi() {
-#if !__STDC_HOSTED__
   const uintptr_t lapic_base = g_topology.local_apic_phys_addr;
   DCHECK(g_x2apic_mode || lapic_base != 0);
   LapicWrite(lapic_base, kLapicRegEoi, 0);
-#else
-  g_host_eoi_count.fetch_add(1, std::memory_order_relaxed);
-#endif
 }
 
 void SmpSendIpi(const int target_cpu_index, const uint8_t vector) {
@@ -2144,20 +1800,9 @@ void SmpSendIpi(const int target_cpu_index, const uint8_t vector) {
   DCHECK(target_cpu_index >= 0 && target_cpu_index < g_topology.cpu_count);
   DCHECK(vector >= static_cast<uint8_t>(kCpuExceptionCount));
   DCHECK(vector != kVectorSpurious);
-#if !__STDC_HOSTED__
   SendFixedIpi(g_topology.local_apic_phys_addr,            //
                g_topology.cpus[target_cpu_index].apic_id,  //
                vector);
-#else
-  if (vector == kVectorWakeupIpi) {
-    g_cpu_locals[target_cpu_index].ipi_count.fetch_add(
-        1, std::memory_order_relaxed);
-  } else if (vector == kVectorApicTimer) {
-    g_cpu_locals[target_cpu_index].timer_ticks.fetch_add(
-        1, std::memory_order_relaxed);
-  }
-  SmpSendLocalApicEoi();
-#endif
 }
 
 void SmpRunOnAllCpus(const SmpWorkFn work_fn, void* const context) {
@@ -2173,14 +1818,6 @@ void SmpRunOnAllCpus(const SmpWorkFn work_fn, void* const context) {
       g_dispatch_in_progress.exchange(true, std::memory_order_acq_rel);
   CHECK(!dispatch_already_running);
 
-#if __STDC_HOSTED__
-  // Host builds have no Local APIC timer: give CPU 0 one simulated tick per
-  // dispatch, as SendWakeupIpi() does for the APs.
-  InterruptFrame bsp_timer_frame = {};
-  bsp_timer_frame.vector = kVectorApicTimer;
-  IdtDispatch(&bsp_timer_frame);
-#endif
-
   int64_t epoch = 0;
   if (cpu_count > 1) {
     // Interrupts stay disabled until every AP has picked up the work, so that
@@ -2193,7 +1830,7 @@ void SmpRunOnAllCpus(const SmpWorkFn work_fn, void* const context) {
     g_work_context.store(context, std::memory_order_release);
     epoch = g_work_epoch.fetch_add(1, std::memory_order_acq_rel) + 1;
     for (int i = 1; i < cpu_count; ++i) {
-      SendWakeupIpi(lapic_base, i, g_topology.cpus[i].apic_id);
+      SendFixedIpi(lapic_base, g_topology.cpus[i].apic_id, kVectorWakeupIpi);
     }
     WaitForDispatchAcks(lapic_base, epoch);
     g_work_start_epoch.store(epoch, std::memory_order_release);
@@ -2205,7 +1842,7 @@ void SmpRunOnAllCpus(const SmpWorkFn work_fn, void* const context) {
   // No timeout: `work_fn` may legitimately run for a long time.
   for (int i = 1; i < cpu_count; ++i) {
     while (g_ap_done_epoch[i].load(std::memory_order_acquire) != epoch) {
-      asm volatile("pause" : : : "memory");
+      SpinPause();
     }
   }
 
@@ -2237,39 +1874,11 @@ void SmpStopOtherCpusForPanic() {
   while (g_panic_parked_cpu_count.load(std::memory_order_acquire) <
              other_cpu_count &&
          ReadClockTicks() - start < timeout_ticks) {
-    asm volatile("pause" : : : "memory");
+    SpinPause();
   }
 }
 
 #if __STDC_HOSTED__
-void SmpSetHostTestHooks(const uint32_t bsp_apic_id,     //
-                         const uintptr_t ebda_base,      //
-                         const uintptr_t bios_rom_base,  //
-                         const uintptr_t acpi32_arena,   //
-                         const SmpHostApBootSimFn sim_fn) {
-  DCHECK(bsp_apic_id != kInvalidX2ApicId);
-  ResetSmpState();
-  g_host_cpuid_fn = nullptr;
-  g_host_read_msr_fn = nullptr;
-  g_host_write_msr_fn = nullptr;
-  g_host_bsp_apic_id = bsp_apic_id;
-  g_host_ebda_base = ebda_base;
-  g_host_bios_rom_base = bios_rom_base;
-  g_host_acpi32_high_bits = acpi32_arena & ~0xFFFFFFFFULL;
-  g_host_ap_sim_fn = sim_fn;
-  g_host_calibration_ticks = kDefaultHostCalibrationTicks;
-}
-
-void SmpSetHostHardwareHooksForTest(const bool x2apic_mode,
-                                    const SmpHostCpuidFn cpuid_fn,
-                                    const SmpHostReadMsrFn read_msr_fn,
-                                    const SmpHostWriteMsrFn write_msr_fn) {
-  g_x2apic_mode = x2apic_mode;
-  g_host_cpuid_fn = cpuid_fn;
-  g_host_read_msr_fn = read_msr_fn;
-  g_host_write_msr_fn = write_msr_fn;
-}
-
 uintptr_t SmpFindRsdpInMultiboot2ForTest(const uintptr_t multiboot_info_addr,
                                          const uintptr_t max_physical_addr) {
   DCHECK(multiboot_info_addr != 0);
@@ -2305,38 +1914,6 @@ bool SmpParseRsdpForTest(const uintptr_t rsdp_addr,          //
 }
 
 uint32_t SmpReadCpuidInitialApicIdForTest() { return ReadCpuidInitialApicId(); }
-
-uint32_t SmpReadLapicIdForTest(const uintptr_t lapic_base) {
-  return ReadLapicId(lapic_base);
-}
-
-void SmpEnableLocalApicForTest(const uintptr_t lapic_base) {
-  EnableLocalApic(lapic_base);
-}
-
-void SmpLapicWriteForTest(const uintptr_t lapic_base,  //
-                          const int reg_offset,        //
-                          const uint32_t value) {
-  LapicWrite(lapic_base, reg_offset, value);
-}
-
-void SmpLapicSendIpiCommandForTest(const uintptr_t lapic_base,
-                                   const uint32_t apic_id,
-                                   const uint32_t icr_low) {
-  LapicSendIpiCommand(lapic_base, apic_id, icr_low);
-}
-
-void SmpSetHostTimerCalibrationTicksForTest(const uint64_t elapsed_apic_ticks) {
-  g_host_calibration_ticks = elapsed_apic_ticks;
-}
-
-int64_t SmpGetHostEoiCountForTest() {
-  return g_host_eoi_count.load(std::memory_order_relaxed);
-}
-
-void SmpResetHostEoiCountForTest() {
-  g_host_eoi_count.store(0, std::memory_order_relaxed);
-}
 #endif
 
 }  // namespace protos
