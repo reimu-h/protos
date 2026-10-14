@@ -33,6 +33,10 @@ class TaskSchedulerInternals {
     return scheduler.RunqueueLoad(cpu_index);
   }
 
+  static bool IsCpuBusy(const TaskScheduler& scheduler, const int cpu_index) {
+    return scheduler.IsCpuBusy(cpu_index);
+  }
+
   static bool StealTask(TaskScheduler& scheduler,  //
                         const int dst_cpu,         //
                         const int src_cpu) {

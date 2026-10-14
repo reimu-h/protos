@@ -18,6 +18,7 @@
 #include "smp.h"
 #include "spinlock.h"
 #include "task.h"
+#include "task_stack.h"
 #include "uart.h"
 #include "vga.h"
 
@@ -917,7 +918,9 @@ static bool TestEdgeCasesAndOom() {
 }
 
 // Verifies that PagingMarkPageUncacheable rejects physical page 0 (at offsets
-// 0, 0x400, and kPageSize - 1) and non-canonical addresses without allocating
+// 0, 0x400, and kPageSize - 1) and non-canonical addresses, and that the
+// kernel virtual page functions reject addresses outside the upper half,
+// unaligned addresses and pages without page tables, all without allocating
 // page tables.
 static bool TestPagingEdgeCases() {
   const int64_t pmm_free_before = PmmFreeFrameCount();
@@ -925,6 +928,21 @@ static bool TestPagingEdgeCases() {
   SELFTEST_EXPECT(!PagingMarkPageUncacheable(0x400));
   SELFTEST_EXPECT(!PagingMarkPageUncacheable(kPageSize - 1));
   SELFTEST_EXPECT(!PagingMarkPageUncacheable(kMaxCanonicalIdentityAddress));
+
+  // The first page of the upper half has no page tables: nothing maps it.
+  const uintptr_t frame = kBootstrapIdentityMapSize - kPageSize;
+  SELFTEST_EXPECT(!PagingReserveKernelRange(kPageSize, kPageSize));
+  SELFTEST_EXPECT(!PagingReserveKernelRange(kKernelVirtualBase + 8, kPageSize));
+  SELFTEST_EXPECT(!PagingReserveKernelRange(kKernelVirtualBase, 0));
+  SELFTEST_EXPECT(!PagingReserveKernelRange(kKernelVirtualBase, 100));
+  SELFTEST_EXPECT(
+      !PagingReserveKernelRange(0xFFFFFFFFFFFFF000ULL, 2 * kPageSize));
+  SELFTEST_EXPECT(!PagingMapKernelPage(frame, frame));
+  SELFTEST_EXPECT(!PagingMapKernelPage(kKernelVirtualBase, frame));
+  SELFTEST_EXPECT(!PagingMapKernelPage(kKernelVirtualBase, frame + 8));
+  SELFTEST_EXPECT(PagingKernelPageFrame(kKernelVirtualBase) == 0);
+  SELFTEST_EXPECT(PagingUnmapKernelPage(kKernelVirtualBase) == 0);
+  SELFTEST_EXPECT(PagingUnmapKernelPage(frame) == 0);
   SELFTEST_EXPECT(PmmFreeFrameCount() == pmm_free_before);
   return true;
 }
@@ -2339,6 +2357,229 @@ static bool TestTaskSchedulerSmp() {
   return true;
 }
 
+// A kernel virtual page that only TestTlbShootdown() maps.
+constexpr uintptr_t kTlbTestPage = 0xFFFFFE8000000000ULL;
+constexpr uint64_t kTlbTestOldValue = 0x01D0F7A3E0000001ULL;
+constexpr uint64_t kTlbTestNewValue = 0x2E3FB00C10000002ULL;
+constexpr int kShootdownsPerTask = 200;
+
+// Unmaps kTlbTestPage, if it is mapped, when it goes out of scope.
+class ScopedTlbTestPageUnmap {
+ public:
+  ScopedTlbTestPageUnmap() = default;
+  ~ScopedTlbTestPageUnmap() {
+    if (PagingUnmapKernelPage(kTlbTestPage) != 0) {
+      SmpTlbShootdown();
+    }
+  }
+
+  ScopedTlbTestPageUnmap(const ScopedTlbTestPageUnmap&) = delete;
+  ScopedTlbTestPageUnmap& operator=(const ScopedTlbTestPageUnmap&) = delete;
+};
+
+struct TlbTestReadContext {
+  uint64_t expected = 0;
+  std::atomic<int> reads{0};
+  std::atomic<int> mismatches{0};
+};
+
+static void ReadTlbTestPageOnCpu(const int /*cpu_index*/, void* const raw_ctx) {
+  TlbTestReadContext* const ctx = static_cast<TlbTestReadContext*>(raw_ctx);
+  const uint64_t value =
+      *reinterpret_cast<const volatile uint64_t*>(kTlbTestPage);
+  if (value != ctx->expected) {
+    ctx->mismatches.fetch_add(1, std::memory_order_relaxed);
+  }
+  ctx->reads.fetch_add(1, std::memory_order_release);
+}
+
+struct ShootdownStormContext {
+  int cpu_count = 0;
+  std::atomic<int> started{0};
+  std::atomic<int> finished{0};
+  // Set if not every task could be created.
+  std::atomic<bool> stop{false};
+};
+
+// Runs kShootdownsPerTask TLB shootdowns, every other one with interrupts
+// disabled, once the tasks on all CPUs have started.
+static void ShootdownStormWorker(void* const raw_ctx) {
+  ShootdownStormContext* const ctx =
+      static_cast<ShootdownStormContext*>(raw_ctx);
+  ctx->started.fetch_add(1, std::memory_order_acq_rel);
+  while (ctx->started.load(std::memory_order_acquire) < ctx->cpu_count) {
+    if (ctx->stop.load(std::memory_order_acquire)) {
+      return;
+    }
+    asm volatile("pause" : : : "memory");
+  }
+  for (int i = 0; i < kShootdownsPerTask; ++i) {
+    if ((i & 1) == 0) {
+      SmpTlbShootdown();
+    } else {
+      const ScopedIrqDisable irq_disable;
+      SmpTlbShootdown();
+    }
+  }
+  ctx->finished.fetch_add(1, std::memory_order_acq_rel);
+}
+
+// Checks that SmpTlbShootdown() reaches every CPU: every CPU reads a kernel
+// virtual page, which caches its translation, then the page is mapped to
+// another frame, and after a shootdown every CPU must read the new frame.
+// Then a task on each CPU runs shootdowns at the same time as the others,
+// half of them with interrupts disabled, and all of them must complete.
+static bool TestTlbShootdown() {
+  const int cpu_count = SmpCpuCount();
+  TaskScheduler* const scheduler = GetTaskScheduler();
+  SELFTEST_EXPECT(scheduler != nullptr);
+  // The page tables of the test page stay allocated for good.
+  SELFTEST_EXPECT(PagingReserveKernelRange(kTlbTestPage, kPageSize));
+  const int64_t pmm_free_before = PmmFreeFrameCount();
+  {
+    const ScopedPmmFrames old_frame(PmmAllocFrame(), 1);
+    const ScopedPmmFrames new_frame(PmmAllocFrame(), 1);
+    SELFTEST_EXPECT(old_frame.get() != 0 && new_frame.get() != 0);
+    *reinterpret_cast<volatile uint64_t*>(old_frame.get()) = kTlbTestOldValue;
+    *reinterpret_cast<volatile uint64_t*>(new_frame.get()) = kTlbTestNewValue;
+
+    // Destroyed first, so the page is unmapped before its frames are freed.
+    const ScopedTlbTestPageUnmap unmap_test_page;
+    SELFTEST_EXPECT(PagingMapKernelPage(kTlbTestPage, old_frame.get()));
+    SELFTEST_EXPECT(!PagingMapKernelPage(kTlbTestPage, new_frame.get()));
+    SELFTEST_EXPECT(PagingKernelPageFrame(kTlbTestPage) == old_frame.get());
+    TlbTestReadContext old_reads;
+    old_reads.expected = kTlbTestOldValue;
+    SmpRunOnAllCpus(ReadTlbTestPageOnCpu, &old_reads);
+    SELFTEST_EXPECT(old_reads.reads.load(std::memory_order_acquire) ==
+                    cpu_count);
+    SELFTEST_EXPECT(old_reads.mismatches.load(std::memory_order_relaxed) == 0);
+
+    SELFTEST_EXPECT(PagingUnmapKernelPage(kTlbTestPage) == old_frame.get());
+    SELFTEST_EXPECT(PagingMapKernelPage(kTlbTestPage, new_frame.get()));
+    SmpTlbShootdown();
+    TlbTestReadContext new_reads;
+    new_reads.expected = kTlbTestNewValue;
+    SmpRunOnAllCpus(ReadTlbTestPageOnCpu, &new_reads);
+    SELFTEST_EXPECT(new_reads.reads.load(std::memory_order_acquire) ==
+                    cpu_count);
+    SELFTEST_EXPECT(new_reads.mismatches.load(std::memory_order_relaxed) == 0);
+  }
+  SELFTEST_EXPECT(PagingKernelPageFrame(kTlbTestPage) == 0);
+  SELFTEST_EXPECT(PmmFreeFrameCount() == pmm_free_before);
+
+  ShootdownStormContext storm;
+  storm.cpu_count = cpu_count;
+  {
+    PhaseTaskGroup tasks(*scheduler, &storm.stop);
+    for (int cpu = 0; cpu < cpu_count; ++cpu) {
+      Task* const task = scheduler->CreateTaskOnCpu(ShootdownStormWorker,  //
+                                                    &storm,                //
+                                                    kDefaultTaskWeight,    //
+                                                    cpu);
+      SELFTEST_EXPECT(tasks.Add(task));
+    }
+    tasks.JoinAll();
+  }
+  SELFTEST_EXPECT(storm.finished.load(std::memory_order_acquire) == cpu_count);
+  SELFTEST_EXPECT(PmmFreeFrameCount() == pmm_free_before);
+  return true;
+}
+
+struct GuardedStackProbeContext {
+  std::atomic<int> probes{0};
+  std::atomic<int> failures{0};
+};
+
+// Returns true if `addr` lies in the stack of a task stack slot whose stack
+// pages are mapped and whose guard page is not.
+static bool IsOnGuardedTaskStack(const uintptr_t addr) {
+  const uintptr_t area_size =
+      static_cast<uintptr_t>(kTaskStackSlotCount * kTaskStackSlotSize);
+  if (addr < kTaskStackAreaBase || addr - kTaskStackAreaBase >= area_size) {
+    return false;
+  }
+  const uintptr_t slot_size = static_cast<uintptr_t>(kTaskStackSlotSize);
+  const uintptr_t guard_page =
+      kTaskStackAreaBase + (addr - kTaskStackAreaBase) / slot_size * slot_size;
+  const uintptr_t stack_base = guard_page + kPageSize;
+  if (addr < stack_base || PagingKernelPageFrame(guard_page) != 0) {
+    return false;
+  }
+  for (int page = 0; page < kTaskStackFrames; ++page) {
+    const uintptr_t page_addr =
+        stack_base + static_cast<uintptr_t>(page * kPageSize);
+    if (PagingKernelPageFrame(page_addr) == 0) {
+      return false;
+    }
+  }
+  return true;
+}
+
+static void GuardedStackProbeWorker(void* const raw_ctx) {
+  GuardedStackProbeContext* const ctx =
+      static_cast<GuardedStackProbeContext*>(raw_ctx);
+  volatile uint64_t local = 0;
+  if (!IsOnGuardedTaskStack(reinterpret_cast<uintptr_t>(&local))) {
+    ctx->failures.fetch_add(1, std::memory_order_relaxed);
+  }
+  ctx->probes.fetch_add(1, std::memory_order_release);
+}
+
+// Checks the task stacks: TaskStackAlloc() maps a stack in the task stack
+// area directly above an unmapped guard page, TaskStackFree() unmaps it and
+// returns its frames at once, and a task on each CPU runs on such a stack.
+static bool TestTaskStackGuardPages() {
+  const int cpu_count = SmpCpuCount();
+  TaskScheduler* const scheduler = GetTaskScheduler();
+  SELFTEST_EXPECT(scheduler != nullptr);
+  const int64_t pmm_free_before = PmmFreeFrameCount();
+
+  const uintptr_t stack = TaskStackAlloc();
+  SELFTEST_EXPECT(stack != 0);
+  bool stack_ok =
+      SELFTEST_OK(IsOnGuardedTaskStack(stack)) &&
+      SELFTEST_OK(IsOnGuardedTaskStack(stack + kTaskStackSize - 1)) &&
+      SELFTEST_OK(PagingKernelPageFrame(stack - kPageSize) == 0) &&
+      SELFTEST_OK(PagingKernelPageFrame(stack + kTaskStackSize) == 0) &&
+      SELFTEST_OK(PmmFreeFrameCount() == pmm_free_before - kTaskStackFrames);
+  for (int page = 0; stack_ok && page < kTaskStackFrames; ++page) {
+    // Each stack page is a PMM frame that the identity map also reaches.
+    const uintptr_t page_addr =
+        stack + static_cast<uintptr_t>(page * kPageSize);
+    const uintptr_t frame = PagingKernelPageFrame(page_addr);
+    const uint64_t pattern = 0x57AC000000000000ULL | page_addr;
+    *reinterpret_cast<volatile uint64_t*>(page_addr + kPageSize - 8) = pattern;
+    stack_ok = SELFTEST_OK(PmmRangeIsValidUsableRam(frame, kPageSize)) &&
+               SELFTEST_OK(*reinterpret_cast<const volatile uint64_t*>(
+                               frame + kPageSize - 8) == pattern);
+  }
+  TaskStackFree(stack);
+  SELFTEST_EXPECT(stack_ok);
+  for (int page = 0; page < kTaskStackFrames; ++page) {
+    SELFTEST_EXPECT(PagingKernelPageFrame(
+                        stack + static_cast<uintptr_t>(page * kPageSize)) == 0);
+  }
+  SELFTEST_EXPECT(PmmFreeFrameCount() == pmm_free_before);
+
+  GuardedStackProbeContext probe;
+  {
+    PhaseTaskGroup tasks(*scheduler, nullptr);
+    for (int cpu = 0; cpu < cpu_count; ++cpu) {
+      Task* const task = scheduler->CreateTaskOnCpu(GuardedStackProbeWorker,  //
+                                                    &probe,                   //
+                                                    kDefaultTaskWeight,       //
+                                                    cpu);
+      SELFTEST_EXPECT(tasks.Add(task));
+    }
+    tasks.JoinAll();
+  }
+  SELFTEST_EXPECT(probe.probes.load(std::memory_order_acquire) == cpu_count);
+  SELFTEST_EXPECT(probe.failures.load(std::memory_order_relaxed) == 0);
+  SELFTEST_EXPECT(PmmFreeFrameCount() == pmm_free_before);
+  return true;
+}
+
 struct BootTest {
   const char* name;
   bool (*run)();
@@ -2363,6 +2604,8 @@ constexpr BootTest kBootTests[] = {
     {"smp_multicpu_sync_stress", TestSmpMultiCpuSyncStress},
     {"idt_percpu_and_lapic_timer", TestIdtPerCpuAndLapicTimer},
     {"task_scheduler_smp", TestTaskSchedulerSmp},
+    {"tlb_shootdown", TestTlbShootdown},
+    {"task_stack_guard_pages", TestTaskStackGuardPages},
 };
 constexpr int kBootTestCount = sizeof(kBootTests) / sizeof(kBootTests[0]);
 

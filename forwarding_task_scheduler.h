@@ -72,6 +72,10 @@ class ForwardingTaskScheduler : public TaskScheduler {
     return TaskSchedulerInternals::RunqueueLoad(*inner_, cpu_index);
   }
 
+  bool IsCpuBusy(const int cpu_index) const override {
+    return TaskSchedulerInternals::IsCpuBusy(*inner_, cpu_index);
+  }
+
   bool StealTask(const int dst_cpu, const int src_cpu) override {
     return TaskSchedulerInternals::StealTask(*inner_, dst_cpu, src_cpu);
   }

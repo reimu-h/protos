@@ -411,6 +411,28 @@ void SmpRunOnAllCpus(SmpWorkFn work_fn, void* context);
 // Local APIC. Never fails a `CHECK`, which would re-enter the panic path.
 void SmpStopOtherCpusForPanic();
 
+// TLB shootdown: flushes the TLB of every online CPU and returns once all of
+// them have done so. The calling CPU flushes its own TLB; every other CPU
+// flushes its own when it handles the IPI on `kVectorTlbShootdown` (idt.h)
+// that this sends it. When it returns, no CPU caches a translation (or a
+// paging-structure entry) that was removed from the page tables before the
+// call. Flushes are whole-TLB CR3 reloads (`SmpHardware::FlushTlb()`).
+//
+// Only removed or restricted translations need a shootdown: CPUs never cache
+// a translation for a page that is not mapped, so mapping a page needs none.
+//
+// Safe to call on several CPUs at once, with interrupts enabled or disabled.
+// It runs with interrupts disabled, so that the caller cannot migrate to
+// another CPU halfway, and while it waits for the other CPUs it also handles
+// their pending shootdown requests itself. Two CPUs that shoot down at the
+// same time with interrupts disabled therefore never wait for each other
+// forever. The caller must not hold an `IrqSpinLock` (`DCHECK`): another CPU
+// may be spinning on it with interrupts disabled and could then never handle
+// the IPI. Before `SmpInit` has completed, it must run before the APs start
+// (`DCHECK`) and flushes only the calling CPU's TLB. Fails a `CHECK` if a CPU
+// does not respond within 10 s.
+void SmpTlbShootdown();
+
 #if __STDC_HOSTED__
 // Host unit-test wrappers around internal helpers of `SmpDiscoverTopology` and
 // `SmpInit`; they read through the installed `SmpHardware`.

@@ -175,6 +175,16 @@ int FakeSmpHardware::EoiCount(const uint32_t apic_id) const {
   return count;
 }
 
+int FakeSmpHardware::TlbFlushCount(const uint32_t apic_id) const {
+  int count = 0;
+  for (const Event& event : Events()) {
+    if (event.kind == Event::Kind::kTlbFlush && event.cpu == apic_id) {
+      ++count;
+    }
+  }
+  return count;
+}
+
 std::vector<uintptr_t> FakeSmpHardware::GuardPages() const {
   const std::lock_guard<std::mutex> lock(mutex_);
   return std::vector<uintptr_t>(guard_pages_.begin(), guard_pages_.end());
@@ -579,6 +589,11 @@ bool FakeSmpHardware::RemapGuardPage(const uintptr_t addr) {
                0,                                //
                addr);
   return true;
+}
+
+void FakeSmpHardware::FlushTlb() {
+  const std::lock_guard<std::mutex> lock(mutex_);
+  RecordLocked(Event::Kind::kTlbFlush, CurrentCpuLocked().apic_id, 0, 0);
 }
 
 uintptr_t FakeSmpHardware::ReadRsp() {

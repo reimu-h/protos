@@ -1,5 +1,5 @@
-// Host fakes for the PMM, heap, SMP, UART and VGA modules, used by the
-// scheduler unit tests. See scheduler_test_support.h.
+// Host fakes for the PMM, heap, SMP, task stack, UART and VGA modules, used by
+// the scheduler unit tests. See scheduler_test_support.h.
 
 #include <atomic>
 #include <cstddef>
@@ -15,6 +15,8 @@
 #include "pmm.h"
 #include "scheduler_test_support.h"
 #include "smp.h"
+#include "task.h"
+#include "task_stack.h"
 #include "uart.h"
 #include "vga.h"
 
@@ -81,6 +83,16 @@ void PmmFreeFrame(const uintptr_t frame_addr) { PmmFreeFrames(frame_addr, 1); }
 int64_t PmmFreeFrameCount() {
   return kInitialFakeFreeFrames -
          g_env.allocated_frames.load(std::memory_order_acquire);
+}
+
+// Task stacks come straight from the fake PMM, without guard pages, so that
+// tests can count them in `g_env.allocated_frames`.
+void TaskStackInit() {}
+
+uintptr_t TaskStackAlloc() { return PmmAllocFrames(kTaskStackFrames); }
+
+void TaskStackFree(const uintptr_t stack_base) {
+  PmmFreeFrames(stack_base, kTaskStackFrames);
 }
 
 void* KmallocAligned(const int64_t size, const int64_t alignment) {

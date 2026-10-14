@@ -64,6 +64,11 @@ static void WriteCr3(const uintptr_t cr3_phys) {
   asm volatile("mov cr3, %0" : : "r"(value) : "memory");
 }
 
+// Invalidates the calling CPU's TLB entries for the page that contains `addr`.
+static void InvalidatePage(const uintptr_t addr) {
+  asm volatile("invlpg [%0]" : : "r"(addr) : "memory");
+}
+
 // Allocates a single 4 KiB page-table frame and zeroes its 512 entries. The
 // frame comes from the PMM when `use_pmm` is true, and from the static
 // bootstrap pool when `use_pmm` is false or the PMM is out of frames. Zeroing
@@ -283,6 +288,63 @@ static uint64_t* FindGuardPtEntryLocked(const uintptr_t addr) {
   return pte;
 }
 
+// Returns true if `virt_addr` is a page-aligned address in the upper canonical
+// half, where the kernel virtual ranges are.
+static bool IsKernelVirtualPage(const uintptr_t virt_addr) {
+  return virt_addr >= kKernelVirtualBase &&
+         (virt_addr & (static_cast<uintptr_t>(kPageSize) - 1)) == 0;
+}
+
+// Returns the page table that the paging-structure entry `*entry` points to,
+// first pointing it to a new zeroed table from `AllocZeroedPageTable(use_pmm)`
+// if it is not present. Returns nullptr if `*entry` maps a large page or no
+// table is available.
+static uint64_t* EnsureNextTableLocked(uint64_t* const entry,
+                                       const bool use_pmm) {
+  if ((*entry & kPtePresent) == 0) {
+    const uintptr_t table_phys = AllocZeroedPageTable(use_pmm);
+    if (table_phys == 0) {
+      return nullptr;
+    }
+    *entry = table_phys | kPtePresent | kPteWritable;
+  } else if ((*entry & kPteHugePage) != 0) {
+    return nullptr;
+  }
+  return reinterpret_cast<uint64_t*>(*entry & kPteAddressMask);
+}
+
+// Returns the page table that the present paging-structure entry `entry`
+// points to, or nullptr if it is not present or maps a large page.
+static uint64_t* NextTable(const uint64_t entry) {
+  if ((entry & kPtePresent) == 0 || (entry & kPteHugePage) != 0) {
+    return nullptr;
+  }
+  return reinterpret_cast<uint64_t*>(entry & kPteAddressMask);
+}
+
+// Returns the 4 KiB PT entry for the kernel virtual page `virt_addr`, or
+// nullptr if the page tables on the way to it are missing.
+static uint64_t* FindKernelPtEntryLocked(const uintptr_t virt_addr) {
+  const uintptr_t pml4_phys = ReadCr3();
+  if (pml4_phys == 0) {
+    return nullptr;
+  }
+  uint64_t* const pml4 = reinterpret_cast<uint64_t*>(pml4_phys);
+  uint64_t* const pdpt = NextTable(pml4[(virt_addr >> 39) & 0x1FF]);
+  if (pdpt == nullptr) {
+    return nullptr;
+  }
+  uint64_t* const pd = NextTable(pdpt[(virt_addr >> 30) & 0x1FF]);
+  if (pd == nullptr) {
+    return nullptr;
+  }
+  uint64_t* const pt = NextTable(pd[(virt_addr >> 21) & 0x1FF]);
+  if (pt == nullptr) {
+    return nullptr;
+  }
+  return &pt[(virt_addr >> 12) & 0x1FF];
+}
+
 }  // namespace
 
 bool PagingMapBootstrapRange(const uintptr_t phys_addr, const int64_t size) {
@@ -423,5 +485,86 @@ uintptr_t PagingIdentityMappedLimit() {
   const IrqSpinLockGuard lock_guard(g_paging_lock);
   return g_identity_mapped_limit;
 }
+
+bool PagingReserveKernelRange(const uintptr_t virt_addr, const int64_t size) {
+  const bool use_pmm = PmmIsInitialized();
+  const IrqSpinLockGuard lock_guard(g_paging_lock);
+  if (!IsKernelVirtualPage(virt_addr) || size <= 0 ||
+      (size & (kPageSize - 1)) != 0 ||
+      static_cast<uintptr_t>(size - 1) > UINTPTR_MAX - virt_addr) {
+    return false;
+  }
+  const uintptr_t pml4_phys = ReadCr3();
+  if (pml4_phys == 0) {
+    return false;
+  }
+  uint64_t* const pml4 = reinterpret_cast<uint64_t*>(pml4_phys);
+  const uintptr_t last_addr = virt_addr + static_cast<uintptr_t>(size - 1);
+  // One PT maps a 2 MiB region; stepping by regions from the one that
+  // contains `virt_addr` visits every PT of the range. The loop ends before
+  // `addr` could wrap past the top of the address space.
+  for (uintptr_t addr = virt_addr & ~(kHugePageSize - 1);;
+       addr += kHugePageSize) {
+    uint64_t* const pdpt =
+        EnsureNextTableLocked(&pml4[(addr >> 39) & 0x1FF], use_pmm);
+    if (pdpt == nullptr) {
+      return false;
+    }
+    uint64_t* const pd =
+        EnsureNextTableLocked(&pdpt[(addr >> 30) & 0x1FF], use_pmm);
+    if (pd == nullptr) {
+      return false;
+    }
+    if (EnsureNextTableLocked(&pd[(addr >> 21) & 0x1FF], use_pmm) == nullptr) {
+      return false;
+    }
+    if (last_addr - addr < kHugePageSize) {
+      return true;
+    }
+  }
+}
+
+bool PagingMapKernelPage(const uintptr_t virt_addr, const uintptr_t phys_addr) {
+  if (!IsKernelVirtualPage(virt_addr) || phys_addr == 0 ||
+      (phys_addr & ~kPteAddressMask) != 0) {
+    return false;
+  }
+  const IrqSpinLockGuard lock_guard(g_paging_lock);
+  uint64_t* const pte = FindKernelPtEntryLocked(virt_addr);
+  if (pte == nullptr || (*pte & kPtePresent) != 0) {
+    return false;
+  }
+  *pte = phys_addr | kPtePresent | kPteWritable;
+  return true;
+}
+
+uintptr_t PagingUnmapKernelPage(const uintptr_t virt_addr) {
+  if (!IsKernelVirtualPage(virt_addr)) {
+    return 0;
+  }
+  const IrqSpinLockGuard lock_guard(g_paging_lock);
+  uint64_t* const pte = FindKernelPtEntryLocked(virt_addr);
+  if (pte == nullptr || (*pte & kPtePresent) == 0) {
+    return 0;
+  }
+  const uintptr_t phys_addr = *pte & kPteAddressMask;
+  *pte = 0;
+  InvalidatePage(virt_addr);
+  return phys_addr;
+}
+
+uintptr_t PagingKernelPageFrame(const uintptr_t virt_addr) {
+  if (!IsKernelVirtualPage(virt_addr)) {
+    return 0;
+  }
+  const IrqSpinLockGuard lock_guard(g_paging_lock);
+  const uint64_t* const pte = FindKernelPtEntryLocked(virt_addr);
+  if (pte == nullptr || (*pte & kPtePresent) == 0) {
+    return 0;
+  }
+  return *pte & kPteAddressMask;
+}
+
+void PagingFlushLocalTlb() { WriteCr3(ReadCr3()); }
 
 }  // namespace protos

@@ -110,6 +110,8 @@ class KernelSmpHardware final : public SmpHardware {
     return PagingRemapGuardPage(addr);
   }
 
+  void FlushTlb() override { PagingFlushLocalTlb(); }
+
   uintptr_t ReadRsp() override {
     uint64_t rsp = 0;
     asm volatile("mov %0, rsp" : "=r"(rsp));

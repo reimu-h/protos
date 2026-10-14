@@ -19,6 +19,9 @@
 #                      OVMF_CODE image when OVMF_VARS is also set.
 #   OVMF_VARS          OVMF_VARS template; selects pflash mode with OVMF.
 #   REQUIRE_UEFI=1     Fail instead of skipping when no OVMF image is found.
+#   KVM=1              Run QEMU with KVM acceleration: -enable-kvm -cpu host
+#                      (-cpu host,+x2apic in the UEFI pass). Needs read and
+#                      write access to /dev/kvm.
 set -euo pipefail
 
 ORIG_PWD="${PWD}"
@@ -57,6 +60,7 @@ fi
 BIOS_TIMEOUT_SECS="${BIOS_TIMEOUT_SECS:-60}"
 UEFI_TIMEOUT_SECS="${UEFI_TIMEOUT_SECS:-90}"
 MIN_STRESS_PASSES="${MIN_STRESS_PASSES:-3}"
+KVM="${KVM:-0}"
 
 EXPECTED_STRING="Hello, x86-64 Kernel World!"
 COMPLETION_MARKER="[TEST] ALL BOOT SELF-TESTS PASSED"
@@ -90,6 +94,8 @@ REQUIRED_MARKERS=(
   "[TEST] smp_multicpu_sync_stress: PASS"
   "[TEST] idt_percpu_and_lapic_timer: PASS"
   "[TEST] task_scheduler_smp: PASS"
+  "[TEST] tlb_shootdown: PASS"
+  "[TEST] task_stack_guard_pages: PASS"
   "${COMPLETION_MARKER}"
   "${STRESS_MARKER}"
 )
@@ -115,6 +121,13 @@ trap cleanup EXIT
 if [[ ! -f "${ISO_FILE}" ]]; then
   echo "Error: ISO file '${ISO_FILE}' not found." >&2
   exit 1
+fi
+if [[ "${KVM}" == "1" ]]; then
+  if [[ ! -r /dev/kvm || ! -w /dev/kvm ]]; then
+    echo "Error: KVM=1 needs read and write access to /dev/kvm, which is missing or not accessible to this user (uid $(id -u)); enable KVM, join the group that owns /dev/kvm, or unset KVM." >&2
+    exit 1
+  fi
+  echo "Using KVM acceleration (/dev/kvm)."
 fi
 
 mkdir -p "${BUILD_DIR}"
@@ -357,8 +370,12 @@ run_bios_pass() {
   local QEMU_PID=""
   trap kill_qemu RETURN
 
+  local qemu_args=(-cdrom "${iso}")
+  if [[ "${KVM}" == "1" ]]; then
+    qemu_args+=(-enable-kvm -cpu host)
+  fi
   echo "Running ${label} boot verification..."
-  start_qemu "${name}" -cdrom "${iso}"
+  start_qemu "${name}" "${qemu_args[@]}"
   if ! wait_for_boot "${log}" "${QEMU_PID}" "${BIOS_TIMEOUT_SECS}"; then
     report_failure "${label}" "${log}"
     return 1
@@ -391,8 +408,12 @@ run_uefi_pass() {
     return 0
   fi
 
+  local cpu_args=(-cpu "qemu64,+x2apic")
+  if [[ "${KVM}" == "1" ]]; then
+    cpu_args=(-enable-kvm -cpu "host,+x2apic")
+  fi
   echo "Running ${label} boot verification..."
-  start_qemu "${name}" "${OVMF_ARGS[@]}" -cpu qemu64,+x2apic -m 4G -cdrom "${iso}"
+  start_qemu "${name}" "${OVMF_ARGS[@]}" "${cpu_args[@]}" -m 4G -cdrom "${iso}"
   if ! wait_for_boot "${log}" "${QEMU_PID}" "${UEFI_TIMEOUT_SECS}"; then
     report_failure "${label}" "${log}"
     return 1
@@ -417,20 +438,34 @@ run_mb1_pass() {
   run_bios_pass mb1 "${iso}" "BIOS/Multiboot1"
 }
 
-run_bios_pass bios "${ISO_FILE}" "BIOS/Multiboot2" >"${BUILD_DIR}/bios_pass_stdout.log" 2>&1 &
-BIOS_JOB_PID=$!
-run_uefi_pass "${ISO_FILE}" >"${BUILD_DIR}/uefi_pass_stdout.log" 2>&1 &
-UEFI_JOB_PID=$!
-run_mb1_pass "${MB1_ISO_FILE}" >"${BUILD_DIR}/mb1_pass_stdout.log" 2>&1 &
-MB1_JOB_PID=$!
+run_pass() {
+  case "$1" in
+    bios) run_bios_pass bios "${ISO_FILE}" "BIOS/Multiboot2" ;;
+    uefi) run_uefi_pass "${ISO_FILE}" ;;
+    mb1) run_mb1_pass "${MB1_ISO_FILE}" ;;
+  esac
+}
+
+# The passes run in parallel; JOB_PIDS[i] is the job running PASS_NAMES[i].
+JOB_PIDS=()
+for name in "${PASS_NAMES[@]}"; do
+  run_pass "${name}" >"${BUILD_DIR}/${name}_pass_stdout.log" 2>&1 &
+  JOB_PIDS+=("$!")
+done
 
 overall_rc=0
 summary=()
-for name in "${PASS_NAMES[@]}"; do
-  pid_var="$(tr '[:lower:]' '[:upper:]' <<<"${name}")_JOB_PID"
+for i in "${!PASS_NAMES[@]}"; do
+  name="${PASS_NAMES[i]}"
   rc=0
-  wait "${!pid_var}" || rc=$?
-  cat "${BUILD_DIR}/${name}_pass_stdout.log"
+  wait "${JOB_PIDS[i]}" || rc=$?
+  pass_stdout="${BUILD_DIR}/${name}_pass_stdout.log"
+  cat "${pass_stdout}"
+  # The pass output ends with the serial log, whose last line is cut off if
+  # QEMU was stopped in the middle of it.
+  if [[ -n "$(tail -c 1 "${pass_stdout}")" ]]; then
+    echo
+  fi
   if [[ "${rc}" -ne 0 ]]; then
     overall_rc=1
     summary+=("${name}: FAIL")

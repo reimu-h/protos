@@ -47,10 +47,11 @@ TEST(CoreRunqueueSchedulerTest,
 
     const std::shared_ptr<TaskScheduler> core = CreateCoreRunqueueScheduler();
     ASSERT_THAT(core, t::NotNull());
-    // Before Init(), PollIdleCpu must safely return false and RunqueueLoad
-    // must report an empty runqueue.
+    // Before Init(), PollIdleCpu must safely return false, RunqueueLoad must
+    // report an empty runqueue and IsCpuBusy an idle CPU.
     EXPECT_FALSE(TaskSchedulerInternals::PollIdleCpu(*core, 0));
     EXPECT_THAT(TaskSchedulerInternals::RunqueueLoad(*core, 0), t::Eq(0));
+    EXPECT_FALSE(TaskSchedulerInternals::IsCpuBusy(*core, 0));
 
     TaskSchedulerInternals::Init(*core);
 
@@ -67,8 +68,11 @@ TEST(CoreRunqueueSchedulerTest,
     Task* const bootstrap = core->CurrentTask();
     ASSERT_THAT(bootstrap, t::NotNull());
 
+    // Nothing is queued anywhere. CPU 0 is busy running the bootstrap task;
+    // every AP runs its idle task.
     for (int c = 0; c < num_cpus; ++c) {
       EXPECT_THAT(TaskSchedulerInternals::RunqueueLoad(*core, c), t::Eq(0));
+      EXPECT_THAT(TaskSchedulerInternals::IsCpuBusy(*core, c), t::Eq(c == 0));
       EXPECT_FALSE(TaskSchedulerInternals::PollIdleCpu(*core, c));
     }
     // Out-of-range PollIdleCpu returns false safely.
@@ -224,8 +228,8 @@ TEST(CoreRunqueueSchedulerTest,
   core->Join(queued_on_cpu2);
 
   // Verify CreateTaskOnCpu returns nullptr without leaking heap or PMM memory
-  // when either Kmalloc(sizeof(Task)) or PmmAllocFrames(kTaskStackFrames) fails
-  // due to OOM.
+  // when either Kmalloc(sizeof(Task)) or TaskStackAlloc() (which the fake
+  // serves from the PMM) fails due to OOM.
   const int64_t free_pmm_baseline = PmmFreeFrameCount();
   const int64_t free_heap_baseline = HeapTotalFreeBytes();
 
@@ -512,8 +516,18 @@ static void RecordIdTwoWorker(void* const raw_arg) {
   ctx->execution_order.push_back(2);
 }
 
+// Called by the bootstrap task: yields until the tasks queued on CPU 0 have
+// run, for at most a few yields, so that a test whose task landed on another
+// CPU fails instead of hanging in Join().
+static void YieldUntilCpu0QueueIsEmpty(TaskScheduler& core) {
+  for (int i = 0; i < 8 && TaskSchedulerInternals::RunqueueLoad(core, 0) > 0;
+       ++i) {
+    core.Yield();
+  }
+}
+
 TEST(CoreRunqueueSchedulerTest,
-     StealTaskMovesLeftmostTaskAndRespectsDestinationAndSourceState) {
+     StealTaskMovesTheTailTaskAndRespectsDestinationAndSourceState) {
   SetupEnv(4);
   const int64_t pmm_before = PmmFreeFrameCount();
   const int64_t heap_before = HeapTotalFreeBytes();
@@ -530,7 +544,8 @@ TEST(CoreRunqueueSchedulerTest,
   StealOrderCtx ctx;
   ctx.sched = core.get();
 
-  // 2. Enqueue two tasks on CPU 2 (`t1` first, `t2` second).
+  // 2. Enqueue two tasks on CPU 2 (`t1` first, `t2` second). Both start at CPU
+  //    2's `min_vruntime`, so the later `enqueue_seq` puts `t2` at the tail.
   Task* const t1 =
       core->CreateTaskOnCpu(RecordIdOneWorker, &ctx, kDefaultTaskWeight, 2);
   Task* const t2 =
@@ -540,14 +555,14 @@ TEST(CoreRunqueueSchedulerTest,
   EXPECT_THAT(TaskSchedulerInternals::RunqueueLoad(*core, 2), t::Eq(2));
 
   // 3. Test `dst_cpu > src_cpu`: steal from CPU 2 to CPU 3 (`3 > 2`).
-  //    Must steal the lowest-key task (`t1`, earlier `enqueue_seq`).
+  //    Must steal the highest-key task (`t2`, later `enqueue_seq`).
   EXPECT_TRUE(TaskSchedulerInternals::StealTask(*core, 3, 2));
   EXPECT_THAT(TaskSchedulerInternals::RunqueueLoad(*core, 2), t::Eq(1));
   EXPECT_THAT(TaskSchedulerInternals::RunqueueLoad(*core, 3), t::Eq(1));
 
   // 4. Calling `StealTask(3, 2)` again while CPU 3 is already non-empty
   //    (`RunqueueLoad(3) == 1`) must return `true` immediately WITHOUT stealing
-  //    `t2` from CPU 2.
+  //    `t1` from CPU 2.
   EXPECT_TRUE(TaskSchedulerInternals::StealTask(*core, 3, 2));
   EXPECT_THAT(TaskSchedulerInternals::RunqueueLoad(*core, 2), t::Eq(1));
   EXPECT_THAT(TaskSchedulerInternals::RunqueueLoad(*core, 3), t::Eq(1));
@@ -559,19 +574,91 @@ TEST(CoreRunqueueSchedulerTest,
   EXPECT_FALSE(TaskSchedulerInternals::StealTask(*core, 0, 1));
   g_env.cpu_locals[1].online = true;
 
-  // 6. Test `dst_cpu < src_cpu`: steal `t1` from CPU 3 to CPU 0 (`0 < 3`) and
-  //    run it, then steal `t2` from CPU 2 to CPU 0 (`0 < 2`) and run it.
+  // 6. Test `dst_cpu < src_cpu`: steal `t2` from CPU 3 to CPU 0 (`0 < 3`) and
+  //    run it, then steal `t1` from CPU 2 to CPU 0 (`0 < 2`) and run it.
   EXPECT_TRUE(TaskSchedulerInternals::StealTask(*core, 0, 3));
   EXPECT_THAT(TaskSchedulerInternals::RunqueueLoad(*core, 3), t::Eq(0));
   EXPECT_THAT(TaskSchedulerInternals::RunqueueLoad(*core, 0), t::Eq(1));
-  core->Join(t1);
-  EXPECT_THAT(ctx.execution_order, t::ElementsAre(1));
+  YieldUntilCpu0QueueIsEmpty(*core);
+  EXPECT_THAT(ctx.execution_order, t::ElementsAre(2));
 
   EXPECT_TRUE(TaskSchedulerInternals::StealTask(*core, 0, 2));
   EXPECT_THAT(TaskSchedulerInternals::RunqueueLoad(*core, 2), t::Eq(0));
   EXPECT_THAT(TaskSchedulerInternals::RunqueueLoad(*core, 0), t::Eq(1));
+  YieldUntilCpu0QueueIsEmpty(*core);
+  EXPECT_THAT(ctx.execution_order, t::ElementsAre(2, 1));
+  core->Join(t1);
   core->Join(t2);
-  EXPECT_THAT(ctx.execution_order, t::ElementsAre(1, 2));
+
+  EXPECT_THAT(PmmFreeFrameCount(), t::Eq(pmm_before));
+  EXPECT_THAT(HeapTotalFreeBytes(), t::Eq(heap_before));
+}
+
+struct LargestVruntimeCtx {
+  TaskScheduler* sched = nullptr;
+  int ahead_first_cpu = -1;
+  int ahead_resumed_cpu = -1;
+  int newcomer_cpu = -1;
+};
+
+// Created with weight 1, so the Yield() in its first slice charges it about
+// 1M of vruntime and leaves it queued far ahead of any task created later.
+static void AheadWorker(void* const raw_arg) {
+  LargestVruntimeCtx* const ctx = static_cast<LargestVruntimeCtx*>(raw_arg);
+  ctx->ahead_first_cpu = CurrentCpuId();
+  ctx->sched->Yield();
+  ctx->ahead_resumed_cpu = CurrentCpuId();
+}
+
+static void NewcomerWorker(void* const raw_arg) {
+  LargestVruntimeCtx* const ctx = static_cast<LargestVruntimeCtx*>(raw_arg);
+  ctx->newcomer_cpu = CurrentCpuId();
+}
+
+TEST(CoreRunqueueSchedulerTest,
+     StealTaskMovesTheTaskWithTheLargestVruntimeNotTheNewestOrLeftmostOne) {
+  SetupEnv(3);
+  const int64_t pmm_before = PmmFreeFrameCount();
+  const int64_t heap_before = HeapTotalFreeBytes();
+
+  const std::shared_ptr<TaskScheduler> core = CreateCoreRunqueueScheduler();
+  TaskSchedulerInternals::Init(*core);
+
+  LargestVruntimeCtx ctx;
+  ctx.sched = core.get();
+
+  // 1. Run the first slice of `ahead`; its Yield() switches back to the
+  //    bootstrap task and leaves `ahead` queued on CPU 0 with about 1M of
+  //    vruntime.
+  Task* const ahead =
+      core->CreateTaskOnCpu(AheadWorker, &ctx, kMinTaskWeight, 0);
+  ASSERT_THAT(ahead, t::NotNull());
+  core->Yield();
+  ASSERT_THAT(ctx.ahead_first_cpu, t::Eq(0));
+  ASSERT_THAT(ctx.ahead_resumed_cpu, t::Eq(-1));
+
+  // 2. `newcomer` is enqueued after `ahead` but starts at CPU 0's
+  //    min_vruntime, so it is the leftmost task and `ahead` the rightmost.
+  Task* const newcomer =
+      core->CreateTaskOnCpu(NewcomerWorker, &ctx, kDefaultTaskWeight, 0);
+  ASSERT_THAT(newcomer, t::NotNull());
+  EXPECT_THAT(TaskSchedulerInternals::RunqueueLoad(*core, 0), t::Eq(2));
+
+  // 3. StealTask() takes `ahead`, the task that would wait longest on CPU 0,
+  //    rather than the newest or the leftmost task (`newcomer` in both cases).
+  EXPECT_TRUE(TaskSchedulerInternals::StealTask(*core, 2, 0));
+  EXPECT_THAT(TaskSchedulerInternals::RunqueueLoad(*core, 0), t::Eq(1));
+  EXPECT_THAT(TaskSchedulerInternals::RunqueueLoad(*core, 2), t::Eq(1));
+
+  // 4. `ahead` resumes on CPU 2 when the calling thread stands in for CPU 2's
+  //    idle loop, and `newcomer` runs on CPU 0.
+  BindCpuLocal(SmpGetCpuLocal(2));
+  EXPECT_TRUE(TaskSchedulerInternals::PollIdleCpu(*core, 2));
+  BindCpuLocal(SmpGetCpuLocal(0));
+  core->Join(newcomer);
+  core->Join(ahead);
+  EXPECT_THAT(ctx.ahead_resumed_cpu, t::Eq(2));
+  EXPECT_THAT(ctx.newcomer_cpu, t::Eq(0));
 
   EXPECT_THAT(PmmFreeFrameCount(), t::Eq(pmm_before));
   EXPECT_THAT(HeapTotalFreeBytes(), t::Eq(heap_before));
@@ -589,6 +676,8 @@ struct SkipBootstrapCtx {
   StealProbeResult probe;
   int helper_first_cpu = -1;
   int helper_resumed_cpu = -1;
+  int first_target_cpu = -1;
+  int second_target_cpu = -1;
 };
 
 // Runs on CPU 0 while the bootstrap task waits in Join(), that is, while the
@@ -615,7 +704,7 @@ static void SkipBootstrapHelperWorker(void* const raw_arg) {
 }
 
 TEST(CoreRunqueueSchedulerTest,
-     StealTaskSkipsBootstrapTaskAtHeadOfSourceRunqueue) {
+     StealTaskNeverMovesBootstrapTaskAtHeadOfSourceRunqueue) {
   SetupEnv(4);
   const int64_t pmm_before = PmmFreeFrameCount();
   const int64_t heap_before = HeapTotalFreeBytes();
@@ -651,8 +740,8 @@ TEST(CoreRunqueueSchedulerTest,
   ASSERT_THAT(ctx.helper_resumed_cpu, t::Eq(-1));
 
   // 3. While the second probe runs, the bootstrap task is the leftmost task in
-  //    CPU 0's runqueue and the helper is behind it. StealTask(2, 0) must skip
-  //    the bootstrap task and move the helper.
+  //    CPU 0's runqueue and the helper, with about 1M of vruntime, is behind
+  //    it at the tail. StealTask(2, 0) must move the helper.
   ctx.probe = StealProbeResult{};
   Task* const second_probe = core->CreateTaskOnCpu(StealFromCpu0ProbeWorker,  //
                                                    &ctx,                      //
@@ -675,6 +764,127 @@ TEST(CoreRunqueueSchedulerTest,
 
   EXPECT_THAT(PmmFreeFrameCount(), t::Eq(pmm_before));
   EXPECT_THAT(HeapTotalFreeBytes(), t::Eq(heap_before));
+}
+
+static void FirstTargetWorker(void* const raw_arg) {
+  static_cast<SkipBootstrapCtx*>(raw_arg)->first_target_cpu = CurrentCpuId();
+}
+
+static void SecondTargetWorker(void* const raw_arg) {
+  static_cast<SkipBootstrapCtx*>(raw_arg)->second_target_cpu = CurrentCpuId();
+}
+
+TEST(CoreRunqueueSchedulerTest,
+     StealTaskSkipsBootstrapTaskAtTailOfSourceRunqueue) {
+  SetupEnv(3);
+  const int64_t pmm_before = PmmFreeFrameCount();
+  const int64_t heap_before = HeapTotalFreeBytes();
+
+  const std::shared_ptr<TaskScheduler> core = CreateCoreRunqueueScheduler();
+  TaskSchedulerInternals::Init(*core);
+  Task* const bootstrap = core->CurrentTask();
+
+  SkipBootstrapCtx ctx;
+  ctx.sched = core.get();
+
+  // The probe and both targets start at CPU 0's min_vruntime, which is the
+  // bootstrap task's vruntime. Join(probe) charges the bootstrap task for a
+  // Yield() before it switches to the probe, so while the probe runs, CPU 0's
+  // runqueue holds the first target, the second target and, at the tail, the
+  // bootstrap task. StealTask(2, 0) must skip the bootstrap task and move the
+  // second target.
+  Task* const probe = core->CreateTaskOnCpu(StealFromCpu0ProbeWorker,  //
+                                            &ctx,                      //
+                                            kDefaultTaskWeight,        //
+                                            0);
+  Task* const first_target =
+      core->CreateTaskOnCpu(FirstTargetWorker, &ctx, kDefaultTaskWeight, 0);
+  Task* const second_target =
+      core->CreateTaskOnCpu(SecondTargetWorker, &ctx, kDefaultTaskWeight, 0);
+  ASSERT_THAT(probe, t::NotNull());
+  ASSERT_THAT(first_target, t::NotNull());
+  ASSERT_THAT(second_target, t::NotNull());
+  core->Join(probe);
+  EXPECT_THAT(ctx.probe.src_load_before, t::Eq(2));
+  EXPECT_TRUE(ctx.probe.stolen);
+  EXPECT_THAT(ctx.probe.src_load_after, t::Eq(1));
+  EXPECT_THAT(ctx.probe.dst_load_after, t::Eq(1));
+  EXPECT_THAT(core->CurrentTask(), t::Eq(bootstrap));
+
+  // The first target ran on CPU 0 before the bootstrap task, and the second
+  // target runs on CPU 2 when the calling thread stands in for its idle loop.
+  BindCpuLocal(SmpGetCpuLocal(2));
+  EXPECT_TRUE(TaskSchedulerInternals::PollIdleCpu(*core, 2));
+  BindCpuLocal(SmpGetCpuLocal(0));
+  core->Join(first_target);
+  core->Join(second_target);
+  EXPECT_THAT(ctx.first_target_cpu, t::Eq(0));
+  EXPECT_THAT(ctx.second_target_cpu, t::Eq(2));
+
+  EXPECT_THAT(PmmFreeFrameCount(), t::Eq(pmm_before));
+  EXPECT_THAT(HeapTotalFreeBytes(), t::Eq(heap_before));
+}
+
+struct BusyProbeCtx {
+  TaskScheduler* sched = nullptr;
+  int cpu = -1;
+  bool own_cpu_busy = false;
+  int own_cpu_load = -1;
+  bool idle_cpu_busy = true;
+};
+
+// Records what the core reports, while this task runs with nothing queued
+// behind it, for its own CPU `ctx->cpu` and for the idle CPU 2.
+static void BusyProbeWorker(void* const raw_arg) {
+  BusyProbeCtx* const ctx = static_cast<BusyProbeCtx*>(raw_arg);
+  ctx->own_cpu_busy = TaskSchedulerInternals::IsCpuBusy(*ctx->sched, ctx->cpu);
+  ctx->own_cpu_load =
+      TaskSchedulerInternals::RunqueueLoad(*ctx->sched, ctx->cpu);
+  ctx->idle_cpu_busy = TaskSchedulerInternals::IsCpuBusy(*ctx->sched, 2);
+}
+
+TEST(CoreRunqueueSchedulerTest,
+     IsCpuBusyTellsBusyCpuWithNothingQueuedFromIdle) {
+  SetupEnv(3);
+  const std::shared_ptr<TaskScheduler> core = CreateCoreRunqueueScheduler();
+  TaskSchedulerInternals::Init(*core);
+
+  // 1. A task queued on an idle AP does not make it busy.
+  BusyProbeCtx ap_ctx;
+  ap_ctx.sched = core.get();
+  ap_ctx.cpu = 1;
+  Task* const ap_probe =
+      core->CreateTaskOnCpu(BusyProbeWorker, &ap_ctx, kDefaultTaskWeight, 1);
+  ASSERT_THAT(ap_probe, t::NotNull());
+  EXPECT_THAT(TaskSchedulerInternals::RunqueueLoad(*core, 1), t::Eq(1));
+  EXPECT_FALSE(TaskSchedulerInternals::IsCpuBusy(*core, 1));
+
+  // 2. While the probe runs on CPU 1 with nothing queued, RunqueueLoad(1) is 0
+  //    as for the idle CPU 2, but only CPU 1 is busy. Once the probe has
+  //    exited, CPU 1 runs its idle task again.
+  BindCpuLocal(SmpGetCpuLocal(1));
+  EXPECT_TRUE(TaskSchedulerInternals::PollIdleCpu(*core, 1));
+  BindCpuLocal(SmpGetCpuLocal(0));
+  EXPECT_TRUE(ap_ctx.own_cpu_busy);
+  EXPECT_THAT(ap_ctx.own_cpu_load, t::Eq(0));
+  EXPECT_FALSE(ap_ctx.idle_cpu_busy);
+  EXPECT_FALSE(TaskSchedulerInternals::IsCpuBusy(*core, 1));
+  core->Join(ap_probe);
+
+  // 3. CPU 0 has no idle task: it is busy whether it runs the bootstrap task
+  //    or, while the bootstrap task waits in Join(), another task.
+  EXPECT_TRUE(TaskSchedulerInternals::IsCpuBusy(*core, 0));
+  BusyProbeCtx cpu0_ctx;
+  cpu0_ctx.sched = core.get();
+  cpu0_ctx.cpu = 0;
+  Task* const cpu0_probe =
+      core->CreateTaskOnCpu(BusyProbeWorker, &cpu0_ctx, kDefaultTaskWeight, 0);
+  ASSERT_THAT(cpu0_probe, t::NotNull());
+  core->Join(cpu0_probe);
+  EXPECT_TRUE(cpu0_ctx.own_cpu_busy);
+  EXPECT_THAT(cpu0_ctx.own_cpu_load, t::Eq(0));
+  EXPECT_FALSE(cpu0_ctx.idle_cpu_busy);
+  EXPECT_TRUE(TaskSchedulerInternals::IsCpuBusy(*core, 0));
 }
 
 // ============================================================================
@@ -880,6 +1090,9 @@ struct MtCoreSharedCtx {
   std::atomic<int> completed_tasks{0};
   std::atomic<int64_t> total_iterations{0};
   std::atomic<int64_t> remote_executions{0};
+  // Times a task saw its own CPU reported idle, or an idle loop saw its CPU
+  // reported busy.
+  std::atomic<int64_t> busy_state_violations{0};
 };
 
 struct MtCoreTaskArg {
@@ -903,6 +1116,9 @@ static void MtCoreConcurrencyWorker(void* const raw_arg) {
                               std::memory_order_acq_rel);
     if (cpu != 0) {
       shared->remote_executions.fetch_add(1, std::memory_order_acq_rel);
+    }
+    if (!TaskSchedulerInternals::IsCpuBusy(*sched, cpu)) {
+      shared->busy_state_violations.fetch_add(1, std::memory_order_acq_rel);
     }
     arg->iterations.fetch_add(1, std::memory_order_acq_rel);
     shared->total_iterations.fetch_add(1, std::memory_order_acq_rel);
@@ -963,7 +1179,8 @@ TEST(CoreRunqueueSchedulerTest,
   ap_threads.reserve(kNumCpus - 1);
 
   for (int cpu = 1; cpu < kNumCpus; ++cpu) {
-    ap_threads.emplace_back([cpu, &core, &ready_workers, &stop_workers]() {
+    ap_threads.emplace_back([cpu, &core, &shared, &ready_workers,
+                             &stop_workers]() {
       BindCpuLocal(SmpGetCpuLocal(cpu));
       SetInterruptsEnabledForTest(true);
       ready_workers.fetch_add(1, std::memory_order_acq_rel);
@@ -982,7 +1199,13 @@ TEST(CoreRunqueueSchedulerTest,
             }
           }
         }
-        if (!TaskSchedulerInternals::PollIdleCpu(*core, cpu)) {
+        const bool dispatched = TaskSchedulerInternals::PollIdleCpu(*core, cpu);
+        // Only this thread switches CPU `cpu`'s tasks, and its idle task
+        // runs again once PollIdleCpu() returns.
+        if (TaskSchedulerInternals::IsCpuBusy(*core, cpu)) {
+          shared.busy_state_violations.fetch_add(1, std::memory_order_acq_rel);
+        }
+        if (!dispatched) {
           std::this_thread::yield();
         }
       }
@@ -1028,6 +1251,7 @@ TEST(CoreRunqueueSchedulerTest,
 
   EXPECT_THAT(shared.remote_executions.load(), t::Gt(0));
   EXPECT_THAT(shared.cpu_mask.load() & ~1u, t::Ne(0u));
+  EXPECT_THAT(shared.busy_state_violations.load(), t::Eq(0));
 
   for (int c = 0; c < kNumCpus; ++c) {
     EXPECT_THAT(TaskSchedulerInternals::RunqueueLoad(*core, c), t::Eq(0));

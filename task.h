@@ -18,7 +18,8 @@ constexpr int64_t kMaxTaskWeight = 1024 * 1024;
 // a task with weight == kDefaultTaskWeight.
 constexpr int64_t kBaseVruntimeDelta = 1024;
 
-// Number of 4 KiB physical frames allocated per task kernel stack (16 KiB).
+// Number of 4 KiB pages of each task's kernel stack (16 KiB). Each task stack
+// sits directly above an unmapped guard page (task_stack.h).
 constexpr int64_t kTaskStackFrames = 4;
 constexpr int64_t kTaskStackSize = kTaskStackFrames * 4096;
 
@@ -33,7 +34,8 @@ using TaskFn = void (*)(void* arg);
 //
 // - CreateTask() and CreateTaskOnCpu() return an opaque `Task*` handle, or
 //   nullptr if the join record, the task control block (TCB) or the stack
-//   can't be allocated.
+//   can't be allocated. At most `kTaskStackSlotCount` (task_stack.h) tasks
+//   can have a stack at the same time.
 // - A task exits when its entry function returns (there is no explicit exit
 //   call). The next task that runs on that CPU frees the exited task's stack.
 //   The TCB and the join record stay allocated until the task is reclaimed.
@@ -86,11 +88,14 @@ class TaskScheduler {
   // returns.
 
   // Creates a task that runs `entry(arg)` on its own 16-byte-aligned 16 KiB
-  // kernel stack with proportional-share `weight`
-  // (`kMinTaskWeight <= weight <= kMaxTaskWeight`), queues it on a CPU chosen
-  // by the scheduler (the least-loaded online CPU) and returns its handle, or
-  // nullptr if memory runs out. The caller must eventually Join() or Detach()
-  // the handle (see "Task lifecycle" above).
+  // kernel stack, directly above an unmapped guard page, with
+  // proportional-share `weight` (`kMinTaskWeight <= weight <= kMaxTaskWeight`),
+  // queues it on a CPU chosen by the scheduler (the least-loaded online CPU,
+  // counting both its queued tasks and the task it is running) and returns its
+  // handle, or nullptr if memory runs out. The caller must eventually Join() or
+  // Detach() the handle (see "Task lifecycle" above). Must not be called while
+  // holding an `IrqSpinLock`: allocating the stack may wait for the other CPUs
+  // to flush their TLBs (task_stack.h).
   virtual Task* CreateTask(TaskFn entry, void* arg, int64_t weight) = 0;
 
   // Like CreateTask(), but queues the task on online CPU `target_cpu`
@@ -194,17 +199,26 @@ class TaskScheduler {
   // `Init()`.
   virtual int RunqueueLoad(int cpu_index) const = 0;
 
+  // Returns `true` if CPU `cpu_index` (`0 <= cpu_index < SmpCpuCount()`) is
+  // running a task other than its idle task, which tells a busy CPU with
+  // nothing queued from an idle one. CPU 0 has no idle task (it always runs
+  // the bootstrap task or another task), so it is always busy. Returns `false`
+  // before `Init()`.
+  virtual bool IsCpuBusy(int cpu_index) const = 0;
+
   // Tries to move one runnable task (never an idle or bootstrap task) from
-  // `src_cpu`'s runqueue to `dst_cpu`'s. The stolen task's virtual runtime is
-  // normalized relative to `dst_cpu`'s min_vruntime: it keeps the lead it had
-  // over `src_cpu`'s min_vruntime, and a task that was behind starts at
-  // `dst_cpu`'s min_vruntime. Returns `true` if `dst_cpu` already had runnable
-  // work or a task was moved.
+  // `src_cpu`'s runqueue to `dst_cpu`'s: the one with the largest virtual
+  // runtime, which would wait longest on `src_cpu`. The stolen task's virtual
+  // runtime is normalized relative to `dst_cpu`'s min_vruntime: it keeps the
+  // lead it had over `src_cpu`'s min_vruntime, and a task that was behind
+  // starts at `dst_cpu`'s min_vruntime. Returns `true` if `dst_cpu` already
+  // had runnable work or a task was moved.
   virtual bool StealTask(int dst_cpu, int src_cpu) = 0;
 };
 
 // Composes the scheduler layers (join lifecycle -> preemptive -> work stealing
-// -> core runqueues), initializes them and registers the timer and wakeup IPI
+// -> core runqueues), sets up the task stack area (`TaskStackInit()`,
+// task_stack.h), initializes the layers and registers the timer and wakeup IPI
 // handlers. Must be called exactly once, on the BSP, after IdtInit(),
 // PmmInit(), HeapInit() and SmpInit(). CHECK-fails if the IDT is not
 // initialized or a scheduler already exists.

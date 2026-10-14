@@ -24,7 +24,8 @@ struct StackBounds {
 // What smp.cpp does to the machine, and nothing more: CPUID and MSRs (x2APIC
 // registers are MSRs), xAPIC Local APIC MMIO registers, port I/O (the PIT),
 // the time stamp counter and spin-wait loops, physical memory (ACPI tables and
-// the guard pages of the AP stacks), the AP startup trampoline, and halting.
+// the guard pages of the AP stacks), TLB flushes, the AP startup trampoline,
+// and halting.
 // All SMP logic, including AP bring-up with INIT-SIPI-SIPI, IPIs and the AP
 // idle loop, runs unchanged on top of either implementation:
 // CreateKernelSmpHardware() executes the instructions, and host unit tests use
@@ -68,6 +69,9 @@ class SmpHardware {
   // failure.
   virtual bool UnmapGuardPage(uintptr_t addr) = 0;
   virtual bool RemapGuardPage(uintptr_t addr) = 0;
+  // Flushes the calling CPU's TLB, paging-structure caches included (reloads
+  // CR3).
+  virtual void FlushTlb() = 0;
 
   // Registers of the calling CPU.
   virtual uintptr_t ReadRsp() = 0;

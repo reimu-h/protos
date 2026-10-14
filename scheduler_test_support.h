@@ -9,16 +9,30 @@
 // modules with host fakes whose state lives in `g_env`. The fakes are plain
 // (non-inline, non-weak) definitions in two source files, and the Makefile
 // links each test with the ones it needs (`TEST_EXTRA_SRCS_<test>`):
-// - scheduler_test_fakes.cpp fakes the PMM, heap, SMP, UART and VGA functions
-//   that the scheduler code and these tests call. Every test that includes
-//   this header links it; none of them links pmm.cpp, heap.cpp, smp.cpp,
-//   uart.cpp or vga.cpp.
+// - scheduler_test_fakes.cpp fakes the PMM, heap, SMP, task stack
+//   (task_stack.h), UART and VGA functions that the scheduler code and these
+//   tests call. Every test that includes this header links it; none of them
+//   links pmm.cpp, heap.cpp, smp.cpp, task_stack.cpp, uart.cpp or vga.cpp.
+//   Its task stacks come from the fake PMM and have no guard pages.
 // - scheduler_test_idt_task_fakes.cpp fakes the parts of idt.h and task.h
 //   that SetupEnv() and the scheduler layers use. Only tests that link
 //   neither idt.cpp nor task.cpp use it; task_test and stress_test link
 //   the real modules instead.
 // A test that links both a fake and the real module fails to link with a
 // duplicate symbol error rather than silently using one of them.
+//
+// These tests cannot preempt a task asynchronously. Host builds emulate
+// RFLAGS.IF with a thread-local flag (interrupts.h), so an asynchronous host
+// "interrupt" would be a POSIX signal whose handler switches tasks. But the
+// emulated save-and-disable is not atomic with respect to signals, and a task
+// can resume on another host thread, which has its own flag. Switching stacks
+// in a signal handler is also not async-signal-safe, and ASan and TSan don't
+// support it. Instead, the tests inject interrupts synchronously at chosen
+// points, through IdtDispatch() or, for a single layer, through its
+// OnTimerInterrupt() and OnWakeupIpi() (TaskSchedulerInternals). Real
+// asynchronous timer interrupts are covered by the boot self-tests and the
+// multi-CPU stress test (selftest/), which test_boot.sh runs in QEMU, or with
+// KVM=1 under KVM.
 
 #include <gmock/gmock.h>
 #include <gtest/gtest.h>
@@ -160,6 +174,7 @@ class MockTaskScheduler : public TaskScheduler {
   MOCK_METHOD(int, ReapZombies, (), (override));
   MOCK_METHOD(bool, PollIdleCpu, (int), (override));
   MOCK_METHOD(int, RunqueueLoad, (int), (const, override));
+  MOCK_METHOD(bool, IsCpuBusy, (int), (const, override));
   MOCK_METHOD(bool, StealTask, (int, int), (override));
   MOCK_METHOD(void, SetPreemptEnabled, (bool), (override));
   MOCK_METHOD(bool, IsPreemptEnabled, (), (const, override));

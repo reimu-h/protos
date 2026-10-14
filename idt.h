@@ -59,6 +59,10 @@ constexpr int kLegacyPicVectorCount = 16;
 // Local APIC interrupt vectors (32..255).
 constexpr uint8_t kVectorApicTimer = 0x20;
 constexpr uint8_t kVectorWakeupIpi = 0x21;
+// TLB shootdown IPI (`SmpTlbShootdown()` in smp.h), in the highest Local APIC
+// priority class so that it is delivered ahead of pending timer and wakeup
+// interrupts.
+constexpr uint8_t kVectorTlbShootdown = 0xF0;
 constexpr uint8_t kVectorSpurious = 0xFF;
 
 // 16-byte 64-bit IDT Gate Descriptor per Intel SDM Vol. 3A §6.14.1.

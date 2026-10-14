@@ -15,6 +15,11 @@ WERROR_FLAG := $(if $(filter 1,$(WERROR)),-Werror)
 # `make run-boot-test`/`make test` require SELFTEST=1.
 SELFTEST ?= 1
 
+# With KVM=1, `make run` and the boot tests (test_boot.sh) run QEMU with KVM
+# acceleration (-enable-kvm -cpu host), which needs read/write access to
+# /dev/kvm. With USE_DOCKER=1 the container gets the host's /dev/kvm.
+KVM ?= 0
+
 ASFLAGS := --64
 # Sources include project headers by their path from the repository root (for
 # example "selftest/stress.h"), also from files in subdirectories.
@@ -27,14 +32,18 @@ PROJECT_INCLUDE_FLAGS := -iquote .
 # compilers and clang/libc++ are not supported. The runtime support those
 # headers need is provided by heap.cpp (operator new/delete) and
 # cxx_runtime.cpp (mem* functions, __cxa_* hooks).
+# -fstack-clash-protection makes a function whose stack frame is larger than a
+# page touch the frame's pages in order, so that it can't step over the
+# unmapped guard page below a stack without faulting.
 CXXFLAGS := -m64 -masm=intel -std=c++20 -O2 -Wall -Wextra $(WERROR_FLAG) \
             -ffreestanding -nostdlib -fno-builtin \
             -fno-exceptions -fno-rtti -mno-red-zone \
             -mgeneral-regs-only -fno-stack-protector -fno-pie \
+            -fstack-clash-protection \
             -DPROTOS_SELFTEST=$(if $(filter 1,$(SELFTEST)),1,0) \
             $(PROJECT_INCLUDE_FLAGS) -I$(BUILD_DIR)/include
 
-TEST_COMMON_CXXFLAGS := -std=c++20 -Wall -Wextra $(WERROR_FLAG) $(PROJECT_INCLUDE_FLAGS) -MMD -MP
+TEST_COMMON_CXXFLAGS := -std=c++20 -Wall -Wextra $(WERROR_FLAG) $(PROJECT_INCLUDE_FLAGS) -pthread -MMD -MP
 TEST_COMMON_LDFLAGS := -lgmock_main -lgmock -lgtest -pthread
 
 TEST_BUILD_MODES := debug opt
@@ -93,6 +102,7 @@ TEST_EXTRA_SRCS_pmm_test := pmm.cpp console.cpp
 TEST_EXTRA_SRCS_random_test := random.cpp
 TEST_EXTRA_SRCS_selftest_test := selftest/selftest.cpp
 TEST_EXTRA_SRCS_smp_test := smp.cpp smp_hardware_fake.cpp gdt.cpp multiboot.cpp console.cpp $(IDT_TEST_SRCS)
+TEST_EXTRA_SRCS_task_stack_test := task_stack.cpp
 TEST_EXTRA_SRCS_vga_test := vga.cpp
 # Host fakes for the scheduler tests (see scheduler_test_support.h). Tests that
 # link the real idt.cpp and task.cpp must not link the IDT/task fakes. Tests
@@ -123,6 +133,7 @@ CXX_SRCS := \
     smp.cpp \
     smp_hardware.cpp \
     $(TASK_LAYER_SRCS) \
+    task_stack.cpp \
     task.cpp \
     random.cpp \
     $(if $(filter 1,$(SELFTEST)),$(SELFTEST_SRCS)) \
@@ -146,6 +157,7 @@ CXX_HDRS := \
     smp.h \
     smp_hardware.h \
     task.h \
+    task_stack.h \
     $(TASK_LAYER_HDRS) \
     rbtree.h \
     random.h \
@@ -187,7 +199,7 @@ missing_bins = $(strip $(foreach bin,$(1),$(if $(shell command -v $(bin) 2>/dev/
 HAVE_HOST_GTEST := $(and $(wildcard /usr/include/gtest/gtest.h),$(wildcard /usr/include/gmock/gmock.h))
 
 GOALS := $(or $(MAKECMDGOALS),all)
-UNIT_TEST_ONLY_GOALS := unit-test test-host test-% \
+UNIT_TEST_ONLY_GOALS := unit-test test-host test-% $(BUILD_DIR)/obj/% \
     $(foreach b,$(TEST_BUILD_MODES),$(foreach s,$(TEST_SAN_MODES),run-%-$(b)-$(s) $(BUILD_DIR)/%_$(b)_$(s)))
 NEED_GTEST := $(filter test $(UNIT_TEST_ONLY_GOALS),$(GOALS))
 NEED_QEMU := $(filter test run run-boot-test,$(GOALS))
@@ -230,9 +242,15 @@ INNER_MAKE := make --no-print-directory WERROR=$(WERROR) SELFTEST=$(SELFTEST) \
 BOOT_TEST_ENV_VARS := BIOS_TIMEOUT_SECS UEFI_TIMEOUT_SECS MIN_STRESS_PASSES OVMF OVMF_VARS REQUIRE_UEFI
 
 ifeq ($(USE_DOCKER),1)
+# With KVM=1 the container gets the host's /dev/kvm, membership in the group
+# that owns the device (so that the container user may open it), and KVM=1 for
+# test_boot.sh.
+DOCKER_KVM_ARGS := $(if $(filter 1,$(KVM)),--device /dev/kvm -e KVM=1 \
+                   $(if $(wildcard /dev/kvm),--group-add $(shell stat -c %g /dev/kvm)))
 DOCKER_RUN_ARGS := --rm --platform=$(DOCKER_PLATFORM) \
                    --user $(HOST_UID):$(HOST_GID) \
                    -e HOME=/tmp $(foreach var,$(BOOT_TEST_ENV_VARS),-e $(var)) \
+                   $(DOCKER_KVM_ARGS) \
                    -v "$(CURDIR):/workspace" \
                    -w /workspace
 DOCKER_RUN := $(DOCKER) run $(DOCKER_RUN_ARGS) $(DOCKER_IMAGE)
@@ -242,14 +260,21 @@ else
 DOCKER_RUN :=
 DOCKER_RUN_INTERACTIVE :=
 DOCKER_DEPS :=
+# Host builds run in parallel by default, unless the command line has a -j.
+# Sub-makes use the job slots of the top-level make: GNU make before 4.4
+# doesn't show -j in MAKEFLAGS while it reads the makefile, so the filter alone
+# would make every sub-make start its own -j$(NPROC) jobserver.
+ifeq ($(MAKELEVEL),0)
 ifeq ($(filter -j% --jobserver%,$(MAKEFLAGS)),)
 MAKEFLAGS += -j$(NPROC) $(OUTPUT_SYNC)
 endif
 endif
+endif
 
 QEMU_RUN_FLAGS ?= -smp 4 -m 256M -serial mon:stdio
+QEMU_KVM_FLAGS := $(if $(filter 1,$(KVM)),-enable-kvm -cpu host)
 
-.PHONY: all clean test unit-test test-host docker-build docker-test run run-boot-test FORCE test-rbtree test-spinlock test-heap test-idt test-gdt test-pmm test-smp test-core-runqueue-scheduler test-work-stealing-scheduler test-join-lifecycle-scheduler test-preemptive-scheduler test-task test-stress
+.PHONY: all clean test unit-test test-host docker-build docker-test run run-boot-test FORCE test-rbtree test-spinlock test-heap test-idt test-gdt test-pmm test-smp test-core-runqueue-scheduler test-work-stealing-scheduler test-join-lifecycle-scheduler test-preemptive-scheduler test-task test-task-stack test-stress
 
 ifeq ($(USE_DOCKER),1)
 all: $(DOCKER_STAMP)
@@ -304,11 +329,44 @@ $(KERNEL_ISO): $(BUILD_DIR)/kernel.bin Makefile $(DOCKER_DEPS) | $(BUILD_DIR)
 $(KERNEL_MB1_ISO): $(BUILD_DIR)/kernel.bin Makefile $(DOCKER_DEPS) | $(BUILD_DIR)
 	$(call MAKE_ISO,$@,multiboot)
 
+# Unit-test objects. Each source of a unit test is compiled on its own into
+# $(BUILD_DIR)/obj/<mode>_<san>/<source path without extension>.o, with a .d
+# file next to it that lists the headers the source includes. The test
+# binaries of one variant (build mode and sanitizer mode) share the objects of
+# their common sources. The .config stamp of a variant records its compile and
+# link commands, so that changing them (e.g. WERROR) rebuilds the variant.
+HOST_TEST_OBJ_DIR := $(BUILD_DIR)/obj
+
+# $(call host_test_objs,test_name,variant)
+host_test_objs = $(addprefix $(HOST_TEST_OBJ_DIR)/$(2)/,$(addsuffix .o,$(basename $(HOST_TEST_SRC_$(1)) $(TEST_EXTRA_SRCS_$(1)))))
+
+# $(call DEFINE_HOST_TEST_OBJECTS,build_mode,san_mode)
+define DEFINE_HOST_TEST_OBJECTS
+TEST_CXXFLAGS_$(1)_$(2) := $$(TEST_COMMON_CXXFLAGS) $$(TEST_BUILD_FLAGS_$(1)) $$(TEST_SAN_FLAGS_$(2))
+TEST_LDFLAGS_$(1)_$(2) := $$(TEST_SAN_FLAGS_$(2)) $$(TEST_COMMON_LDFLAGS)
+TEST_CONFIG_$(1)_$(2) := $$(CXX) $$(TEST_CXXFLAGS_$(1)_$(2)) | $$(TEST_LDFLAGS_$(1)_$(2))
+
+$(HOST_TEST_OBJ_DIR)/$(1)_$(2)/.config: FORCE
+	@mkdir -p $$(@D)
+	@echo '$$(TEST_CONFIG_$(1)_$(2))' | cmp -s - $$@ || echo '$$(TEST_CONFIG_$(1)_$(2))' > $$@
+
+$(HOST_TEST_OBJ_DIR)/$(1)_$(2)/%.o: %.cpp $(HOST_TEST_OBJ_DIR)/$(1)_$(2)/.config $$(DOCKER_DEPS)
+	@mkdir -p $$(@D)
+	$$(DOCKER_RUN) $$(CXX) $$(TEST_CXXFLAGS_$(1)_$(2)) -c $$< -o $$@
+
+$(HOST_TEST_OBJ_DIR)/$(1)_$(2)/%.o: %.S $(HOST_TEST_OBJ_DIR)/$(1)_$(2)/.config $$(DOCKER_DEPS)
+	@mkdir -p $$(@D)
+	$$(DOCKER_RUN) $$(CXX) $$(TEST_CXXFLAGS_$(1)_$(2)) -c $$< -o $$@
+endef
+
+$(foreach b,$(TEST_BUILD_MODES),$(foreach s,$(TEST_SAN_MODES),$(eval $(call DEFINE_HOST_TEST_OBJECTS,$(b),$(s)))))
+
 # $(call DEFINE_HOST_TEST_VARIANT,test_name,build_mode,san_mode)
 define DEFINE_HOST_TEST_VARIANT
-$(BUILD_DIR)/$(1)_$(2)_$(3): $(HOST_TEST_SRC_$(1)) $$(TEST_EXTRA_SRCS_$(1)) $$(DOCKER_DEPS) | $(BUILD_DIR)
-	$$(DOCKER_RUN) $$(CXX) $$(TEST_COMMON_CXXFLAGS) $$(TEST_BUILD_FLAGS_$(2)) $$(TEST_SAN_FLAGS_$(3)) \
-		$(HOST_TEST_SRC_$(1)) $$(TEST_EXTRA_SRCS_$(1)) $$(TEST_SAN_FLAGS_$(3)) $$(TEST_COMMON_LDFLAGS) -o $$@
+HOST_TEST_OBJS_$(1)_$(2)_$(3) := $$(call host_test_objs,$(1),$(2)_$(3))
+
+$(BUILD_DIR)/$(1)_$(2)_$(3): $$(HOST_TEST_OBJS_$(1)_$(2)_$(3)) $(HOST_TEST_OBJ_DIR)/$(2)_$(3)/.config $$(DOCKER_DEPS) | $(BUILD_DIR)
+	$$(DOCKER_RUN) $$(CXX) $$(HOST_TEST_OBJS_$(1)_$(2)_$(3)) $$(TEST_LDFLAGS_$(2)_$(3)) -o $$@
 
 .PHONY: run-$(1)-$(2)-$(3)
 run-$(1)-$(2)-$(3): $(BUILD_DIR)/$(1)_$(2)_$(3)
@@ -318,6 +376,7 @@ HOST_TEST_BINS_$(1) += $(BUILD_DIR)/$(1)_$(2)_$(3)
 HOST_TEST_RUNS_$(1) += run-$(1)-$(2)-$(3)
 HOST_TEST_ALL_BINS += $(BUILD_DIR)/$(1)_$(2)_$(3)
 HOST_TEST_ALL_RUNS += run-$(1)-$(2)-$(3)
+HOST_TEST_ALL_OBJS += $$(HOST_TEST_OBJS_$(1)_$(2)_$(3))
 endef
 
 define DEFINE_HOST_TEST_SUITE
@@ -346,6 +405,7 @@ test-work-stealing-scheduler: test-work_stealing_scheduler_test
 test-join-lifecycle-scheduler: test-join_lifecycle_scheduler_test
 test-preemptive-scheduler: test-preemptive_scheduler_test
 test-task: test-task_test
+test-task-stack: test-task_stack_test
 test-stress: test-stress_test
 
 ifeq ($(USE_DOCKER),1)
@@ -362,9 +422,9 @@ run-boot-test: $(KERNEL_ISO) $(KERNEL_MB1_ISO) $(DOCKER_DEPS)
 	$(DOCKER_RUN) ./test_boot.sh $(KERNEL_ISO) $(KERNEL_MB1_ISO)
 
 # Boots the kernel interactively; the serial console is attached to the
-# terminal (press Ctrl-A X to quit QEMU).
+# terminal (press Ctrl-A X to quit QEMU). KVM=1 enables KVM acceleration.
 run: $(KERNEL_ISO) $(DOCKER_DEPS)
-	$(DOCKER_RUN_INTERACTIVE) qemu-system-x86_64 $(QEMU_RUN_FLAGS) \
+	$(DOCKER_RUN_INTERACTIVE) qemu-system-x86_64 $(QEMU_RUN_FLAGS) $(QEMU_KVM_FLAGS) \
 		$(if $(filter 1,$(USE_DOCKER)),-display none) -cdrom $(KERNEL_ISO)
 
 # The QEMU boot test is timing-sensitive, so it runs only after the unit tests
@@ -387,4 +447,4 @@ docker-test:
 clean:
 	rm -rf $(BUILD_DIR)
 
--include $(wildcard $(BUILD_DIR)/*.d)
+-include $(wildcard $(sort $(HOST_TEST_ALL_OBJS:.o=.d)))

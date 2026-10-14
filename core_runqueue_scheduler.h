@@ -33,8 +33,12 @@ namespace protos {
 //   migrate: the running task, the idle tasks and the bootstrap task are
 //   excluded, so a CPU running one task with nothing queued reports 0. It
 //   returns 0 before `Init()`.
-// - `StealTask()` moves the leftmost stealable task of `src_cpu` and keeps its
-//   `vruntime` offset from `src_cpu`'s `min_vruntime`, rebased on `dst_cpu`'s.
+// - `IsCpuBusy()` reports whether a CPU's current task is not its idle task.
+//   CPU 0, whose current task is always the bootstrap task or another task,
+//   is therefore always busy. It returns false before `Init()`.
+// - `StealTask()` moves the stealable task of `src_cpu` with the largest
+//   `vruntime` (the rightmost one in its runqueue) and keeps its `vruntime`
+//   offset from `src_cpu`'s `min_vruntime`, rebased on `dst_cpu`'s.
 //
 // Boot contexts: `Init()` adopts the calling context (`kernel_main()` on the
 // BSP) as the bootstrap task and each AP's boot context (the idle loop in
@@ -51,13 +55,16 @@ namespace protos {
 // interrupts internally where they touch per-CPU state. `OnTimerInterrupt()`,
 // `OnWakeupIpi()` and `PollIdleCpu()` do nothing before `Init()` or on an
 // unbound or offline CPU, and `PollIdleCpu(cpu_index)` does nothing unless
-// called on CPU `cpu_index`. `Yield()`, `Join()` and returning from a task
-// must not happen while an `IrqSpinLock` is held. `Init()` must run on the BSP
-// after `SmpInit()` (which binds the BSP's `CpuLocal`) and `IdtInit()`.
+// called on CPU `cpu_index`. `CreateTask*()`, `Yield()`, `Join()` and
+// returning from a task must not happen while an `IrqSpinLock` is held.
+// `Init()` must run on the BSP after `SmpInit()` (which binds the BSP's
+// `CpuLocal`) and `IdtInit()`.
 //
-// Each task stack the core allocates has a canary at its lowest address. The
-// core CHECK-fails if a task overwrote it (overflowed its stack) when the task
-// is switched out or exits.
+// The core allocates task stacks with `TaskStackAlloc()` (task_stack.h), which
+// puts an unmapped guard page below each stack, and frees a stack with
+// `TaskStackFree()` when its task exits. Each stack also has a canary at its
+// lowest address. The core CHECK-fails if a task overwrote it (overflowed its
+// stack) when the task is switched out or exits.
 std::shared_ptr<TaskScheduler> CreateCoreRunqueueScheduler();
 
 #if __STDC_HOSTED__

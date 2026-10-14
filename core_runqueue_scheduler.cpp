@@ -21,10 +21,10 @@
 #include "check.h"
 #include "heap.h"
 #include "idt.h"
-#include "pmm.h"
 #include "rbtree.h"
 #include "smp.h"
 #include "spinlock.h"
+#include "task_stack.h"
 
 namespace protos {
 struct Task;
@@ -76,7 +76,6 @@ struct Task {
   uintptr_t rsp = 0;
   uintptr_t stack_base = 0;
   uintptr_t stack_top = 0;
-  int64_t stack_frames = 0;
 
   TaskFn entry = nullptr;
   void* arg = nullptr;
@@ -143,10 +142,11 @@ static_assert(offsetof(InitialSwitchFrame, rip) == 6 * sizeof(uint64_t));
 
 // Written at the lowest address (`stack_base`) of every stack the core
 // allocates and CHECKed by `FinishContextSwitch()` each time the task is
-// switched out and before the stack is freed, so that a task that ran off the
-// end of its stack is caught at its next switch rather than wherever the
-// corrupted memory is used next. This is best effort: there is no guard page,
-// so an overflow that skips over this word goes unnoticed.
+// switched out and before the stack is freed. It backs up the unmapped guard
+// page below each task stack (task_stack.h), which stops an overflow when it
+// happens: the canary also catches a task that used up its stack to the last
+// word without touching the guard page, and it is the only overflow check in
+// host tests, whose task stacks have no guard pages.
 constexpr uint64_t kTaskStackCanary = 0x57ACCA9A57ACCA9AULL;
 
 struct alignas(64) CpuRunqueue {
@@ -161,6 +161,9 @@ struct alignas(64) CpuRunqueue {
   // The AP's adopted boot context. `nullptr` on CPU 0, whose boot context is
   // the bootstrap task (see `Init()`).
   Task* idle_task = nullptr;
+  // Whether `current_task` is a task other than the idle task. Written with
+  // `current_task` under `lock`, read without the lock by `IsCpuBusy()`.
+  std::atomic<bool> busy{false};
 
   Task* pending_handoff_task = nullptr;
   TaskState pending_handoff_state = TaskState::kReady;
@@ -355,19 +358,19 @@ class CoreRunqueueTaskScheduler final : public TaskScheduler {
     if (raw_tcb == nullptr) {
       return nullptr;
     }
-    const uintptr_t stack_phys = PmmAllocFrames(kTaskStackFrames);
-    if (stack_phys == 0) {
+    // May wait for the other CPUs to flush their TLBs (task_stack.h).
+    const uintptr_t stack_base = TaskStackAlloc();
+    if (stack_base == 0) {
       Kfree(raw_tcb);
       return nullptr;
     }
-    DCHECK((stack_phys & 0xFu) == 0);
+    DCHECK((stack_base & 0xFu) == 0);
 
     Task* const task = new (raw_tcb) Task();
     task->owner = this;
     task->id = next_task_id_.fetch_add(1, std::memory_order_relaxed);
-    task->stack_base = stack_phys;
-    task->stack_top = stack_phys + kTaskStackSize;
-    task->stack_frames = kTaskStackFrames;
+    task->stack_base = stack_base;
+    task->stack_top = stack_base + kTaskStackSize;
     task->entry = entry;
     task->arg = arg;
     task->weight = weight;
@@ -512,7 +515,6 @@ class CoreRunqueueTaskScheduler final : public TaskScheduler {
     bootstrap_task_.id = 0;
     bootstrap_task_.stack_base = bsp_local->stack_base;
     bootstrap_task_.stack_top = bsp_local->stack_top;
-    bootstrap_task_.stack_frames = kTaskStackFrames;
     bootstrap_task_.weight = kDefaultTaskWeight;
     bootstrap_task_.vruntime = 0;
     bootstrap_task_.enqueue_seq = 0;
@@ -524,6 +526,7 @@ class CoreRunqueueTaskScheduler final : public TaskScheduler {
     bootstrap_task_.has_custom_stack = false;
     RefreshNativeTaskSanitizerState(&bootstrap_task_);
     runqueues_[0].current_task = &bootstrap_task_;
+    runqueues_[0].busy.store(true, std::memory_order_relaxed);
 
     // Adopt each AP's boot context, the idle loop in `ApKernelEntry()` that is
     // already running on the AP's stack, as that AP's idle task.
@@ -537,7 +540,6 @@ class CoreRunqueueTaskScheduler final : public TaskScheduler {
       idle.id = i + 1;
       idle.stack_base = cpu_local->stack_base;
       idle.stack_top = cpu_local->stack_top;
-      idle.stack_frames = kApStackFrames;
       idle.weight = kDefaultTaskWeight;
       idle.vruntime = 0;
       idle.enqueue_seq = 0;
@@ -587,6 +589,15 @@ class CoreRunqueueTaskScheduler final : public TaskScheduler {
     return runqueues_[cpu_index].runnable_count.load(std::memory_order_acquire);
   }
 
+  bool IsCpuBusy(const int cpu_index) const override {
+    // Like `RunqueueLoad()`, safe to call before `Init()`.
+    if (!initialized_.load(std::memory_order_acquire)) {
+      return false;
+    }
+    DCHECK(cpu_index >= 0 && cpu_index < cpu_count_);
+    return runqueues_[cpu_index].busy.load(std::memory_order_acquire);
+  }
+
   bool StealTask(const int dst_cpu, const int src_cpu) override {
     DCHECK(initialized_.load(std::memory_order_acquire));
     DCHECK(dst_cpu >= 0 && dst_cpu < cpu_count_);
@@ -611,11 +622,13 @@ class CoreRunqueueTaskScheduler final : public TaskScheduler {
       return false;
     }
 
-    // The bootstrap task runs on the BSP's boot stack and must stay on CPU 0,
-    // so skip it even when it is the leftmost task.
-    Task* stolen = src_rq.tree.First();
+    // Take the task that would wait longest on `src_cpu`: the rightmost one,
+    // with the largest `vruntime`. The bootstrap task runs on the BSP's boot
+    // stack and must stay on CPU 0, so skip it even when it is the rightmost
+    // task.
+    Task* stolen = src_rq.tree.Last();
     while (stolen != nullptr && (stolen->is_bootstrap || stolen->is_idle)) {
-      stolen = TaskRunqueueTree::Next(stolen);
+      stolen = TaskRunqueueTree::Prev(stolen);
     }
     if (stolen == nullptr) {
       return false;
@@ -710,8 +723,9 @@ class CoreRunqueueTaskScheduler final : public TaskScheduler {
   // has switched `%rsp` onto the incoming task's stack (`next`). Only once the
   // CPU is no longer executing on the outgoing task's stack (`prev`) is it
   // safe on SMP to either re-enqueue `prev` into `rq.tree` (where a remote CPU
-  // could immediately steal and resume it) or free `prev`'s stack frames back
-  // to the PMM on task exit. Both paths first check `prev`'s stack canary.
+  // could immediately steal and resume it) or free `prev`'s stack on task exit
+  // (`TaskStackFree()`, which never waits for other CPUs, so it is safe with
+  // interrupts disabled). Both paths first check `prev`'s stack canary.
   [[gnu::noinline]] void FinishContextSwitch() {
     DCHECK(!AreInterruptsEnabled());
     DCHECK(!HoldsAnyIrqSpinLock());
@@ -765,15 +779,13 @@ class CoreRunqueueTaskScheduler final : public TaskScheduler {
     if (prev->owns_stack && prev->stack_base != 0) {
       CheckTaskStackCanary(prev);
       const uintptr_t base = prev->stack_base;
-      const int64_t frames = prev->stack_frames;
       prev->stack_base = 0;
       prev->stack_top = 0;
-      prev->stack_frames = 0;
 #if __STDC_HOSTED__ && defined(__SANITIZE_ADDRESS__)
       __asan_unpoison_memory_region(reinterpret_cast<const void*>(base),
-                                    static_cast<size_t>(frames * kPageSize));
+                                    static_cast<size_t>(kTaskStackSize));
 #endif
-      PmmFreeFrames(base, frames);
+      TaskStackFree(base);
       prev->stack_reaped.store(true, std::memory_order_release);
     } else {
       prev->stack_reaped.store(true, std::memory_order_release);
@@ -872,6 +884,7 @@ class CoreRunqueueTaskScheduler final : public TaskScheduler {
       next->state.store(TaskState::kRunning, std::memory_order_release);
       next->running_cpu.store(cpu_id, std::memory_order_release);
       rq.current_task = next;
+      rq.busy.store(!next->is_idle, std::memory_order_release);
       UpdateRunqueueMinVruntime(&rq);
 
       // SMP stack-safety caveat: Do NOT re-insert `prev` into `rq.tree` (or

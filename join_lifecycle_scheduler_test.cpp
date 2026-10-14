@@ -851,8 +851,9 @@ TEST(JoinLifecycleSchedulerTest,
 
 // 12. Yield(), SetPreemptEnabled(), IsPreemptEnabled(), CurrentTask() and the
 //     scheduler internals other than Init() (OnTimerInterrupt(),
-//     OnWakeupIpi(), PollIdleCpu(), RunqueueLoad() and StealTask()) are
-//     forwarded to inner once each, with unchanged arguments and result.
+//     OnWakeupIpi(), PollIdleCpu(), RunqueueLoad(), IsCpuBusy() and
+//     StealTask()) are forwarded to inner once each, with unchanged arguments
+//     and result.
 TEST(JoinLifecycleSchedulerTest,
      ForwardsOtherMethodsToInnerOnceWithUnchangedArgumentsAndResult) {
   ResetTestEnv();
@@ -916,6 +917,18 @@ TEST(JoinLifecycleSchedulerTest,
     return 7;
   });
   EXPECT_THAT(TaskSchedulerInternals::RunqueueLoad(*sched, 3), t::Eq(7));
+
+  EXPECT_CALL(*mock_inner, IsCpuBusy)
+      .WillOnce([](const int cpu_index) {
+        EXPECT_THAT(cpu_index, t::Eq(1));
+        return true;
+      })
+      .WillOnce([](const int cpu_index) {
+        EXPECT_THAT(cpu_index, t::Eq(2));
+        return false;
+      });
+  EXPECT_TRUE(TaskSchedulerInternals::IsCpuBusy(*sched, 1));
+  EXPECT_FALSE(TaskSchedulerInternals::IsCpuBusy(*sched, 2));
 
   EXPECT_CALL(*mock_inner, StealTask)
       .WillOnce([](const int dst_cpu, const int src_cpu) {

@@ -40,11 +40,11 @@ namespace protos {
 // - Physical memory is `Options::physical_memory`, at physical address 0.
 //   UnmapGuardPage() and RemapGuardPage() only track which pages are guard
 //   pages; unmapping one while the trampoline is installed (APs may be
-//   starting) fails the test.
+//   starting) fails the test. FlushTlb() only records the flush.
 //
 // Records every Local APIC register write, other MSR write, IPI, trampoline
-// install and restore, and guard page change, in order and with the time it
-// happened.
+// install and restore, guard page change, and TLB flush, in order and with the
+// time it happened.
 class FakeSmpHardware final : public SmpHardware {
  public:
   // How an AP responds to SIPIs.
@@ -96,6 +96,7 @@ class FakeSmpHardware final : public SmpHardware {
       kTrampolineRestored,
       kGuardPageUnmapped,
       kGuardPageRemapped,
+      kTlbFlush,
     };
     Kind kind;
     uint64_t time_ns;
@@ -132,6 +133,8 @@ class FakeSmpHardware final : public SmpHardware {
   std::vector<Event> MsrWrites(uint32_t apic_id) const;
   // Number of End-Of-Interrupt writes by the CPU with `apic_id`.
   int EoiCount(uint32_t apic_id) const;
+  // Number of FlushTlb() calls by the CPU with `apic_id`.
+  int TlbFlushCount(uint32_t apic_id) const;
   // The pages that are unmapped as guard pages, in ascending order.
   std::vector<uintptr_t> GuardPages() const;
   uint64_t NowNs() const;
@@ -151,6 +154,7 @@ class FakeSmpHardware final : public SmpHardware {
   bool MapLocalApicPage(uintptr_t phys_addr) override;
   bool UnmapGuardPage(uintptr_t addr) override;
   bool RemapGuardPage(uintptr_t addr) override;
+  void FlushTlb() override;
   uintptr_t ReadRsp() override;
   uintptr_t ReadCr3() override;
   uint16_t ReadCs() override;

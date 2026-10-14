@@ -10,6 +10,7 @@
 #include "join_lifecycle_scheduler.h"
 #include "preemptive_scheduler.h"
 #include "task_scheduler_internals.h"
+#include "task_stack.h"
 #include "work_stealing_scheduler.h"
 
 namespace protos {
@@ -45,6 +46,9 @@ void TaskInit() {
   CHECK(IdtIsInitialized());
   CHECK(GetTaskScheduler() == nullptr);
 
+  // Before the scheduler is published below: other CPUs free task stacks only
+  // once they see it.
+  TaskStackInit();
   std::shared_ptr<TaskScheduler> scheduler =
       CreateJoinLifecycleScheduler(CreatePreemptiveScheduler(
           CreateWorkStealingScheduler(CreateCoreRunqueueScheduler())));

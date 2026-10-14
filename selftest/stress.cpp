@@ -984,9 +984,10 @@ static void RunPreemptionProbe(TaskScheduler& scheduler,
 // preempts or steals from an interrupt handler. So the barrier tasks can only
 // run if idle CPUs steal them, and a CPU that runs one keeps it until it is
 // released: every other CPU must steal exactly one. While they hold the other
-// CPUs, preemption is enabled again for RunPreemptionProbe(); a CPU busy with a
-// barrier task only steals the probe's spinner in the moment before the
-// bootstrap task yields to it.
+// CPUs, preemption is enabled again for RunPreemptionProbe(). A timer tick or
+// wakeup IPI on a CPU busy with a barrier task does not steal the probe's
+// spinner: CPU 0, with the bootstrap task and the spinner, is at most one task
+// busier (see work_stealing_scheduler.h).
 static void VerifyStealingAndPreemption(TaskScheduler& scheduler,
                                         StressSharedState* const shared) {
   DCHECK(shared != nullptr);

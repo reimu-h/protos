@@ -526,6 +526,18 @@ TEST(ForwardingTaskSchedulerTest,
   });
   EXPECT_THAT(TaskSchedulerInternals::RunqueueLoad(layer, 3), t::Eq(7));
 
+  EXPECT_CALL(*mock_inner, IsCpuBusy)
+      .WillOnce([](const int cpu_index) {
+        EXPECT_THAT(cpu_index, t::Eq(1));
+        return true;
+      })
+      .WillOnce([](const int cpu_index) {
+        EXPECT_THAT(cpu_index, t::Eq(2));
+        return false;
+      });
+  EXPECT_TRUE(TaskSchedulerInternals::IsCpuBusy(layer, 1));
+  EXPECT_FALSE(TaskSchedulerInternals::IsCpuBusy(layer, 2));
+
   EXPECT_CALL(*mock_inner, StealTask)
       .WillOnce([](const int dst_cpu, const int src_cpu) {
         EXPECT_THAT(dst_cpu, t::Eq(0));

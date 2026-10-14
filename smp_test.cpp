@@ -52,6 +52,7 @@ constexpr uint32_t kIcrXapicInitDeassert = 0x00008500;
 constexpr uint32_t kIcrX2ApicInit = 0x00004500;
 constexpr uint32_t kIcrStartupAt0x8000 = 0x00004608;
 constexpr uint32_t kIcrWakeupIpi = 0x00004021;
+constexpr uint32_t kIcrTlbShootdownIpi = 0x000040F0;
 // Local APIC registers (xAPIC offsets).
 constexpr uint32_t kLapicTpr = 0x080;
 constexpr uint32_t kLapicEoi = 0x0B0;
@@ -1684,6 +1685,123 @@ TEST_F(SmpTest, SmpRunOnAllCpusChecksItsCallingContext) {
   EXPECT_THAT(interrupts_enabled_count.load(), t::Eq(4));
   EXPECT_TRUE(AreInterruptsEnabled());
   EXPECT_THAT(CurrentCpuId(), t::Eq(0));
+}
+
+TEST_F(SmpTest, TlbShootdownMakesEveryCpuFlushBeforeItReturns) {
+  for (const bool x2apic : {false, true}) {
+    SCOPED_TRACE(x2apic ? "x2APIC" : "xAPIC");
+    const FakeSmpHardware& hw =
+        InitSmp(LapicRecords(4), x2apic ? X2ApicOptions() : DefaultOptions());
+    ASSERT_THAT(SmpCpuCount(), t::Eq(4));
+    const int events_before = static_cast<int>(hw.Events().size());
+
+    SmpTlbShootdown();
+    EXPECT_TRUE(AreInterruptsEnabled());
+
+    // CPU 0 flushed its own TLB and sent each AP a fixed IPI on vector 0xF0,
+    // and each AP flushed its TLB when it handled the IPI, all before
+    // SmpTlbShootdown() returned.
+    const std::vector<Event> events = hw.Events();
+    int ipi_index[4] = {-1, -1, -1, -1};
+    int flush_index[4] = {-1, -1, -1, -1};
+    for (int i = events_before; i < static_cast<int>(events.size()); ++i) {
+      const Event& event = events[i];
+      if (event.kind == Event::Kind::kIpi &&
+          static_cast<uint32_t>(event.value) == kIcrTlbShootdownIpi) {
+        EXPECT_THAT(event.cpu, t::Eq(0u));
+        ipi_index[event.value >> 32] = i;
+      } else if (event.kind == Event::Kind::kTlbFlush) {
+        flush_index[event.cpu] = i;
+      }
+    }
+    EXPECT_THAT(ipi_index[0], t::Eq(-1));
+    EXPECT_THAT(flush_index[0], t::Ge(events_before));
+    for (int apic_id = 1; apic_id < 4; ++apic_id) {
+      SCOPED_TRACE(apic_id);
+      EXPECT_THAT(ipi_index[apic_id], t::Ge(events_before));
+      EXPECT_THAT(flush_index[apic_id], t::Gt(ipi_index[apic_id]));
+    }
+    for (uint32_t apic_id = 0; apic_id < 4; ++apic_id) {
+      EXPECT_THAT(hw.TlbFlushCount(apic_id), t::Eq(1));
+    }
+
+    // Each shootdown flushes every CPU again.
+    SmpTlbShootdown();
+    for (uint32_t apic_id = 0; apic_id < 4; ++apic_id) {
+      EXPECT_THAT(hw.TlbFlushCount(apic_id), t::Eq(2));
+    }
+  }
+}
+
+TEST_F(SmpTest, TlbShootdownFlushesOnlyTheCallingCpuWhenNoOtherCpuRuns) {
+  // Before SmpInit().
+  const FakeSmpHardware& hw = ResetState();
+  SmpTlbShootdown();
+  EXPECT_THAT(hw.TlbFlushCount(0), t::Eq(1));
+  EXPECT_THAT(hw.Ipis(), t::IsEmpty());
+
+  // On a single CPU.
+  const FakeSmpHardware& single_cpu_hw = InitSmp(LapicRecords(1));
+  SmpTlbShootdown();
+  EXPECT_THAT(single_cpu_hw.TlbFlushCount(0), t::Eq(1));
+  EXPECT_THAT(single_cpu_hw.Ipis(), t::IsEmpty());
+}
+
+TEST_F(SmpTest, ConcurrentTlbShootdownsWithInterruptsDisabledAllComplete) {
+  const FakeSmpHardware& hw = InitSmp(LapicRecords(4));
+  ASSERT_THAT(SmpCpuCount(), t::Eq(4));
+
+  struct ShootdownState {
+    std::atomic<int> calls{0};
+    std::atomic<int> aps_done{0};
+  };
+  ShootdownState state;
+  SmpRunOnAllCpus(
+      [](const int cpu_index, void* const raw_state) {
+        ShootdownState* const st = static_cast<ShootdownState*>(raw_state);
+        // The fake interrupts a CPU only while it halts, so no CPU here takes
+        // an IPI, as if all of them had interrupts disabled: the shootdowns
+        // complete only because each waiting CPU handles the requests of the
+        // others.
+        const ScopedIrqDisable irq_disable;
+        for (int i = 0; i < 50; ++i) {
+          SmpTlbShootdown();
+          st->calls.fetch_add(1);
+        }
+        EXPECT_FALSE(AreInterruptsEnabled());
+        if (cpu_index != 0) {
+          // A halted AP takes the IPIs of later shootdowns.
+          st->aps_done.fetch_add(1);
+          return;
+        }
+        // The fake never interrupts CPU 0, so it keeps handling the requests
+        // of the APs until they are done.
+        while (st->aps_done.load() < 3) {
+          SmpTlbShootdown();
+        }
+      },
+      &state);
+
+  EXPECT_THAT(state.calls.load(), t::Eq(4 * 50));
+  for (uint32_t apic_id = 0; apic_id < 4; ++apic_id) {
+    EXPECT_THAT(hw.TlbFlushCount(apic_id), t::Gt(0));
+  }
+  EXPECT_TRUE(AreInterruptsEnabled());
+}
+
+TEST_F(SmpTest, TlbShootdownChecksItsCallingContextAndThatEveryCpuResponds) {
+  FakeSmpHardware& hw = InitSmp(LapicRecords(2));
+  // Another CPU might be spinning on the lock with interrupts disabled.
+  EXPECT_DEATH(
+      {
+        IrqSpinLock lock;
+        const IrqSpinLockGuard guard(lock);
+        SmpTlbShootdown();
+      },
+      "Check failed: !HoldsAnyIrqSpinLock\\(\\)");
+  // A CPU that is off never handles the IPI.
+  hw.PowerOffAps();
+  EXPECT_DEATH(SmpTlbShootdown(), "Check failed: cpus_responded_in_time");
 }
 
 TEST_F(SmpTest, X2ApicModeRunsWith32BitApicIds) {

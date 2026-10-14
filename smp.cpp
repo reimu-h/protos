@@ -120,6 +120,8 @@ constexpr int64_t kDispatchAckTimeoutMs = 10000;
 constexpr int64_t kWakeupIpiResendIntervalUs = 1000;
 // Time the panicking CPU waits for the other CPUs to park.
 constexpr int64_t kPanicParkTimeoutMs = 100;
+// Time the other CPUs get to handle a TLB shootdown request.
+constexpr int64_t kTlbShootdownTimeoutMs = 10000;
 
 struct [[gnu::packed]] AcpiRsdpV1 {
   char signature[8];
@@ -234,6 +236,15 @@ std::unique_ptr<std::atomic<int64_t>[]> g_ap_ack_epoch;
 // Per-CPU completion epoch written by AP `i` after `g_work_fn` returns, before
 // the AP goes back to `sti; hlt`.
 std::unique_ptr<std::atomic<int64_t>[]> g_ap_done_epoch;
+
+// TLB shootdown state (see SmpTlbShootdown()):
+// Number of shootdowns requested so far. A CPU increments it after it has
+// changed the page tables, and then waits until every CPU has handled it.
+std::atomic<int64_t> g_tlb_shootdown_requests{0};
+// Per CPU: the value of `g_tlb_shootdown_requests` that CPU `i` read before
+// its last TLB flush, so it has handled every request up to that one. Only
+// CPU `i` writes it, always with interrupts disabled.
+std::unique_ptr<std::atomic<int64_t>[]> g_tlb_shootdown_handled;
 
 static constexpr int64_t AlignUp(const int64_t value, const int64_t alignment) {
   return (value + alignment - 1) & ~(alignment - 1);
@@ -679,6 +690,8 @@ static void ResetSmpState() {
   g_work_start_epoch.store(0, std::memory_order_seq_cst);
   g_ap_ack_epoch.reset();
   g_ap_done_epoch.reset();
+  g_tlb_shootdown_requests.store(0, std::memory_order_seq_cst);
+  g_tlb_shootdown_handled.reset();
 }
 
 static uint64_t ReadMsr(const uint32_t msr) { return Hardware().ReadMsr(msr); }
@@ -1043,6 +1056,31 @@ static bool WakeApplicationProcessor(const uintptr_t lapic_base,
 static void OnPanicStopNmi(InterruptFrame* const /*frame*/) {
   if (g_panic_stop_requested.load(std::memory_order_acquire)) {
     ParkCpuForPanic();
+  }
+}
+
+// Flushes the TLB of the calling CPU, `cpu_index`, if a TLB shootdown was
+// requested since its last flush, and records which requests the flush
+// handled. Runs with interrupts disabled.
+static void HandleTlbShootdownRequests(const int cpu_index) {
+  std::atomic<int64_t>& handled = g_tlb_shootdown_handled[cpu_index];
+  // Read the request count first: the flush that follows then also drops
+  // every translation that the requesting CPUs removed before they counted
+  // their requests (the acquire load makes those page table writes visible).
+  const int64_t requests =
+      g_tlb_shootdown_requests.load(std::memory_order_acquire);
+  if (requests == handled.load(std::memory_order_relaxed)) {
+    return;
+  }
+  Hardware().FlushTlb();
+  handled.store(requests, std::memory_order_release);
+}
+
+// Handler of the kVectorTlbShootdown IPI that SmpTlbShootdown() sends.
+static void OnTlbShootdownIpi(InterruptFrame* const /*frame*/) {
+  const CpuLocal* const cpu = CurrentCpuOrNull();
+  if (cpu != nullptr && g_tlb_shootdown_handled != nullptr) {
+    HandleTlbShootdownRequests(cpu->cpu_id);
   }
 }
 
@@ -1637,6 +1675,9 @@ void SmpInit(const uint32_t multiboot_magic,
   CHECK(g_ap_ack_epoch != nullptr);
   g_ap_done_epoch.reset(new std::atomic<int64_t>[cpu_count]());
   CHECK(g_ap_done_epoch != nullptr);
+  g_tlb_shootdown_handled.reset(new std::atomic<int64_t>[cpu_count]());
+  CHECK(g_tlb_shootdown_handled != nullptr);
+  IdtRegisterHandler(kVectorTlbShootdown, OnTlbShootdownIpi);
 
   const StackBounds bsp_stack = hw.BspStack();
   g_topology.cpus[0].stack_base = bsp_stack.base;
@@ -1875,6 +1916,48 @@ void SmpStopOtherCpusForPanic() {
              other_cpu_count &&
          ReadClockTicks() - start < timeout_ticks) {
     SpinPause();
+  }
+}
+
+void SmpTlbShootdown() {
+  DCHECK(!HoldsAnyIrqSpinLock());
+  const ScopedIrqDisable irq_disable;
+  SmpHardware& hw = Hardware();
+  if (!g_smp_initialized) {
+    // Only this CPU runs before SmpInit() starts the APs.
+    DCHECK(g_online_cpu_count.load(std::memory_order_acquire) <= 1);
+    hw.FlushTlb();
+    return;
+  }
+  const int cpu_count = g_topology.cpu_count;
+  const int self = CurrentCpuId();
+  // The caller's page table changes happen before this increment (acq_rel),
+  // and every CPU reads the count before it flushes for it.
+  const int64_t request =
+      g_tlb_shootdown_requests.fetch_add(1, std::memory_order_acq_rel) + 1;
+  HandleTlbShootdownRequests(self);
+  const uintptr_t lapic_base = g_topology.local_apic_phys_addr;
+  for (int i = 0; i < cpu_count; ++i) {
+    if (i != self) {
+      SendFixedIpi(lapic_base, g_topology.cpus[i].apic_id, kVectorTlbShootdown);
+    }
+  }
+
+  const uint64_t start = ReadClockTicks();
+  const uint64_t timeout_ticks =
+      ClockTicksForMicros(kTlbShootdownTimeoutMs * 1000);
+  for (int i = 0; i < cpu_count; ++i) {
+    while (g_tlb_shootdown_handled[i].load(std::memory_order_acquire) <
+           request) {
+      // A CPU that waits in its own shootdown with interrupts disabled can't
+      // take this CPU's IPI, and this CPU can't take its IPI either: each
+      // handles the other's request here instead.
+      HandleTlbShootdownRequests(self);
+      const bool cpus_responded_in_time =
+          ReadClockTicks() - start < timeout_ticks;
+      CHECK(cpus_responded_in_time);
+      SpinPause();
+    }
   }
 }
 
