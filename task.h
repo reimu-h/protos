@@ -6,6 +6,7 @@
 namespace protos {
 
 class AddressSpace;
+struct FpuState;
 struct InterruptFrame;
 struct Task;
 
@@ -169,6 +170,18 @@ class TaskScheduler {
   // handler, or while holding an `IrqSpinLock`.
   virtual void SetAddressSpace(AddressSpace* address_space) = 0;
 
+  // Keeps the calling task's x87/MMX/SSE/AVX registers in `state` (fpu.h)
+  // from now on: loads the registers from `state` at once, saves them into it
+  // whenever the task is switched out, and loads them from it whenever the
+  // task resumes, on whichever CPU. nullptr stops this, dropping the current
+  // register values. Tasks start without a state, and the scheduler never
+  // saves or loads the registers for a task without one: kernel code doesn't
+  // use them. `state` must stay allocated until the task stops using it, by
+  // calling SetFpuState() again or by exiting (the registers of an exiting
+  // task are not saved). Must not be called from an idle task or an interrupt
+  // handler, or while holding an `IrqSpinLock`.
+  virtual void SetFpuState(FpuState* state) = 0;
+
  private:
   // Scheduler internals
   // -------------------
@@ -246,6 +259,16 @@ bool TaskPollIdleCpu(int cpu_index);
 // `TaskInit()`. Safe to call from any CPU, including from interrupt handlers
 // and idle loops. The kernel never destroys the scheduler.
 TaskScheduler* GetTaskScheduler();
+
+// Returns the CPU that is running `task` (a handle from CreateTask*() that has
+// not been reclaimed yet), or -1 if no CPU is: the task is queued, has not
+// started or has exited. A task counts as running from the moment a CPU picks
+// it until that CPU has completely switched away from it, so -1 means that the
+// task executes on no CPU at that moment. The answer may be out of date as soon
+// as it is returned. Safe on any CPU, with interrupts enabled or disabled. The
+// core layer (core_runqueue_scheduler.h), which owns the task control blocks,
+// implements it.
+int TaskRunningCpu(const Task* task);
 
 #if __STDC_HOSTED__
 // Host unit-test hook: unregisters the interrupt handlers and destroys the

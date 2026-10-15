@@ -1,6 +1,6 @@
-// Host fakes for the PMM, heap, SMP, task stack, address space switching, UART
-// and VGA modules, used by the scheduler unit tests. See
-// scheduler_test_support.h.
+// Host fakes for the PMM, heap, SMP, task stack, address space switching, FPU
+// register switching, UART and VGA modules, used by the scheduler unit tests.
+// See scheduler_test_support.h.
 
 #include <atomic>
 #include <cstddef>
@@ -12,8 +12,10 @@
 
 #include "address_space.h"
 #include "check.h"
+#include "fpu.h"
 #include "heap.h"
 #include "idt.h"
+#include "interrupts.h"
 #include "pmm.h"
 #include "scheduler_test_support.h"
 #include "smp.h"
@@ -49,6 +51,13 @@ static void AppendLogFormatted(std::string* const log,    //
                 format,       //
                 static_cast<unsigned long long>(value));
   AppendLog(log, buf);
+}
+
+static void RecordFpuCall(const FakeFpuOp op,  //
+                          const int cpu,       //
+                          const FpuState* const state) {
+  const std::lock_guard<std::mutex> lock(g_env.log_mutex);
+  g_env.fpu_calls.push_back(FakeFpuCall{op, cpu, state});
 }
 
 }  // namespace
@@ -103,6 +112,29 @@ void ActivateAddressSpace(const AddressSpace* const address_space) {
   g_env.active_address_space[CurrentCpuIdIrqsOff()].store(
       address_space, std::memory_order_release);
   g_env.address_space_switches.fetch_add(1, std::memory_order_acq_rel);
+}
+
+// Records the save instead of executing XSAVE or FXSAVE, and counts it as a
+// mismatch if the calling CPU's registers hold another state than `state`.
+// The scheduler calls it with interrupts disabled, on the CPU that switches.
+void FpuSave(FpuState* const state) {
+  DCHECK(state != nullptr);
+  DCHECK(!AreInterruptsEnabled());
+  const int cpu = CurrentCpuIdIrqsOff();
+  if (g_env.loaded_fpu_state[cpu].load(std::memory_order_acquire) != state) {
+    g_env.fpu_save_mismatches.fetch_add(1, std::memory_order_acq_rel);
+  }
+  RecordFpuCall(FakeFpuOp::kSave, cpu, state);
+}
+
+// Records the load instead of executing XRSTOR or FXRSTOR: the calling CPU's
+// registers hold `state` from now on.
+void FpuRestore(const FpuState* const state) {
+  DCHECK(state != nullptr);
+  DCHECK(!AreInterruptsEnabled());
+  const int cpu = CurrentCpuIdIrqsOff();
+  g_env.loaded_fpu_state[cpu].store(state, std::memory_order_release);
+  RecordFpuCall(FakeFpuOp::kRestore, cpu, state);
 }
 
 void* KmallocAligned(const int64_t size, const int64_t alignment) {

@@ -567,6 +567,21 @@ isr_stub_\vec:
     jmp isr_paranoid_stub
 .endm
 
+/* Clears RFLAGS.AC if SMAP is enabled, whatever the interrupted code had:
+ * user code may set AC, and the user-copy helpers (user_access.h) run with it
+ * set. The handler thus runs with SMAP enforced, and iretq gives the
+ * interrupted code its AC back from the frame. CLAC raises #UD on CPUs
+ * without SMAP, where AC doesn't affect kernel code (CR0.AM is clear), hence
+ * the check of g_cpu_smap_enabled (cpu.h), a byte. Changes only the
+ * arithmetic flags besides AC. */
+.extern g_cpu_smap_enabled
+.macro CLEAR_AC_IF_SMAP
+    cmp byte ptr [rip + g_cpu_smap_enabled], 0
+    je .Lac_clear_\@
+    clac
+.Lac_clear_\@:
+.endm
+
 /* The interrupted code's privilege level decides the GS swaps: the CPL in the
  * saved CS ([rsp + 24] on entry, below the vector, error code and RIP) is 3
  * if the interrupt arrived in user mode. Maskable interrupts and the
@@ -596,6 +611,7 @@ isr_common_stub:
     push r15
 
     cld
+    CLEAR_AC_IF_SMAP
     mov rdi, rsp
     mov rbp, rsp
     and rsp, -16
@@ -660,6 +676,7 @@ isr_paranoid_stub:
     swapgs
     mov ebx, 1
 1:
+    CLEAR_AC_IF_SMAP
     mov rdi, rsp
     mov rbp, rsp
     and rsp, -16

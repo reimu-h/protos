@@ -20,12 +20,14 @@
 
 #include "address_space.h"
 #include "check.h"
+#include "fpu.h"
 #include "heap.h"
 #include "idt.h"
 #include "rbtree.h"
 #include "smp.h"
 #include "spinlock.h"
 #include "task_stack.h"
+#include "user_access.h"
 
 namespace protos {
 struct Task;
@@ -83,9 +85,15 @@ struct Task {
   // Set by `SetAddressSpace()`; nullptr while the task runs in the kernel's
   // page tables.
   AddressSpace* address_space = nullptr;
+  // Set by `SetFpuState()`; nullptr while the scheduler keeps no x87/SSE/AVX
+  // register state for the task.
+  FpuState* fpu_state = nullptr;
 
   int64_t weight = kDefaultTaskWeight;
   int64_t vruntime = 0;
+  // The task's `CpuLocal::task_timer_ticks` while it doesn't run, saved and
+  // loaded by `Schedule()` under the lock of the CPU that switches it.
+  int64_t timer_ticks = 0;
   int64_t enqueue_seq = 0;
   RbNode runqueue_node;
 
@@ -511,6 +519,26 @@ class CoreRunqueueTaskScheduler final : public TaskScheduler {
     SwitchAddressSpaceLocked(&rq, address_space);
   }
 
+  void SetFpuState(FpuState* const state) override {
+    DCHECK(initialized_.load(std::memory_order_acquire));
+    DCHECK(!HoldsAnyIrqSpinLock());
+    // Interrupts stay disabled from the store to the load: a task switch in
+    // between would save the registers, which still hold the values of
+    // another task, into `state`.
+    const ScopedIrqDisable irq_guard;
+    const int cpu_id = CurrentCpuIdIrqsOff();
+    DCHECK(cpu_id >= 0 && cpu_id < cpu_count_);
+    CpuRunqueue& rq = runqueues_[cpu_id];
+    const IrqSpinLockGuard lock_guard(rq.lock);
+    Task* const curr = rq.current_task;
+    DCHECK(curr != nullptr);
+    DCHECK(!curr->is_idle);
+    curr->fpu_state = state;
+    if (state != nullptr) {
+      FpuRestore(state);
+    }
+  }
+
  private:
   friend void protos::TaskStartupEntry(Task* curr);
 
@@ -919,6 +947,16 @@ class CoreRunqueueTaskScheduler final : public TaskScheduler {
       next->running_cpu.store(cpu_id, std::memory_order_release);
       rq.current_task = next;
       rq.busy.store(!next->is_idle, std::memory_order_release);
+      // Lets code that runs on this CPU tell whether the CPU switched tasks
+      // between two points, and count the timer interrupts of the running
+      // task (cpu_clock.h).
+      CpuLocal* const cpu_local = CurrentCpuOrNullIrqsOff();
+      DCHECK(cpu_local != nullptr);
+      cpu_local->context_switches.fetch_add(1, std::memory_order_relaxed);
+      prev->timer_ticks =
+          cpu_local->task_timer_ticks.load(std::memory_order_relaxed);
+      cpu_local->task_timer_ticks.store(next->timer_ticks,
+                                        std::memory_order_relaxed);
       UpdateRunqueueMinVruntime(&rq);
       // Switch to `next`'s page tables while still on `prev`'s stack: the
       // kernel, both stacks included, is mapped the same in every address
@@ -939,6 +977,21 @@ class CoreRunqueueTaskScheduler final : public TaskScheduler {
 
       prev_rsp_ptr = &prev->rsp;
       next_rsp_val = next->rsp;
+    }
+
+    // Save `prev`'s x87/SSE/AVX registers and load `next`'s, still on
+    // `prev`'s stack with interrupts disabled. Other CPUs can take `prev` only
+    // once FinishContextSwitch() has queued it under `rq.lock`, after this
+    // save, so whichever CPU resumes it loads what was saved here. An exiting
+    // task never runs again, so its registers are dropped. Tasks without a
+    // state (kernel tasks, such as the idle tasks and the bootstrap task) skip
+    // both steps: kernel code doesn't use the registers, and loading the next
+    // state overwrites all of them.
+    if (outgoing_state != TaskState::kExited && prev->fpu_state != nullptr) {
+      FpuSave(prev->fpu_state);
+    }
+    if (next->fpu_state != nullptr) {
+      FpuRestore(next->fpu_state);
     }
 
 #if __STDC_HOSTED__
@@ -971,6 +1024,12 @@ class CoreRunqueueTaskScheduler final : public TaskScheduler {
     // Make sure no locks are held and interrupts are disabled.
     DCHECK(!AreInterruptsEnabled());
     DCHECK(!HoldsAnyIrqSpinLock());
+
+    // RFLAGS doesn't switch with the task (context_switch.S), so `next` would
+    // run with SMAP lifted. Only the user-copy helpers lift it, in one asm
+    // statement that never switches tasks; an interrupt in the middle of one
+    // keeps its AC in the interrupt frame (user_access.h).
+    DCHECK(!UserAccessWindowOpen());
 
     // Do the context switch.
     TaskContextSwitch(prev_rsp_ptr, next_rsp_val);
@@ -1018,6 +1077,21 @@ extern "C" void TaskStartupEntry(Task* const curr) {
 
 std::shared_ptr<TaskScheduler> CreateCoreRunqueueScheduler() {
   return std::make_shared<CoreRunqueueTaskScheduler>();
+}
+
+int TaskRunningCpu(const Task* const task) {
+  DCHECK(task != nullptr);
+  // `Schedule()` sets `running_cpu` before the CPU switches to the task, and
+  // `FinishContextSwitch()` clears it only once the CPU has switched away from
+  // it. Sequentially consistent, so that a store before the call and this load
+  // are not reordered (see UserProcess::Kill()).
+  // On the task's side, the store of `running_cpu` in `Schedule()` and the
+  // task's later loads, such as the kill check on its way to user mode, are
+  // ordered by the locked read-modify-write that takes `rq.lock` in
+  // `FinishContextSwitch()` (also on a new task's first run): a full barrier
+  // on x86, the kernel's only target. So either the caller sees the task
+  // running, or the task sees what the caller stored before the call.
+  return task->running_cpu.load(std::memory_order_seq_cst);
 }
 
 #if __STDC_HOSTED__

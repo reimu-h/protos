@@ -9,13 +9,18 @@
 #include <cstdio>
 #include <cstdlib>
 #include <memory>
+#include <mutex>
 #include <new>
 #include <string>
 #include <thread>
 #include <vector>
 
+#include "cpu_clock.h"
 #include "scheduler_test_support.h"
+#include "smp.h"
+#include "task.h"
 #include "task_scheduler_internals.h"
+#include "user_access.h"
 
 namespace protos {
 namespace {
@@ -46,6 +51,41 @@ static AddressSpace* FakeAddressSpace(const int index) {
 // CPU `cpu` to (nullptr: the kernel's page tables).
 static const AddressSpace* ActiveAddressSpace(const int cpu) {
   return g_env.active_address_space[cpu].load(std::memory_order_acquire);
+}
+
+// Returns a distinct fake FPU state for each `index`. The core only stores and
+// passes on FpuState pointers, which the fake FpuSave() and FpuRestore() only
+// record, so they need not point to real states.
+static FpuState* FakeFpuState(const int index) {
+  return reinterpret_cast<FpuState*>(0x100000 + index * 0x1000);
+}
+
+// Returns the FPU state whose values the registers of CPU `cpu` hold: the one
+// that the fake FpuRestore() last loaded there.
+static const FpuState* LoadedFpuState(const int cpu) {
+  return g_env.loaded_fpu_state[cpu].load(std::memory_order_acquire);
+}
+
+// Returns the calls of the fake FpuSave() and FpuRestore() so far, in order.
+static std::vector<FakeFpuCall> FpuCalls() {
+  const std::lock_guard<std::mutex> lock(g_env.log_mutex);
+  return g_env.fpu_calls;
+}
+
+static void ClearFpuCalls() {
+  const std::lock_guard<std::mutex> lock(g_env.log_mutex);
+  g_env.fpu_calls.clear();
+}
+
+// Returns the number of calls in `calls` that did `op` with `state`.
+static int CountFpuCalls(const std::vector<FakeFpuCall>& calls,  //
+                         const FakeFpuOp op,                     //
+                         const FpuState* const state) {
+  int count = 0;
+  for (const FakeFpuCall& call : calls) {
+    count += (call.op == op && call.state == state) ? 1 : 0;
+  }
+  return count;
 }
 
 // ============================================================================
@@ -262,6 +302,147 @@ TEST(CoreRunqueueSchedulerTest,
 
   EXPECT_THAT(PmmFreeFrameCount(), t::Eq(pmm_before));
   EXPECT_THAT(HeapTotalFreeBytes(), t::Eq(heap_before));
+}
+
+TEST(CoreRunqueueSchedulerTest, CountsEveryContextSwitchOnTheCpuThatMakesIt) {
+  SetupEnv(2);
+  const std::shared_ptr<TaskScheduler> core = CreateCoreRunqueueScheduler();
+  TaskSchedulerInternals::Init(*core);
+  const CpuLocal& cpu0 = *SmpGetCpuLocal(0);
+  const CpuLocal& cpu1 = *SmpGetCpuLocal(1);
+
+  // With nothing else to run, `Yield()` keeps running the caller.
+  core->Yield();
+  EXPECT_THAT(cpu0.context_switches.load(), t::Eq(0));
+
+  // To the task, and back once it has returned.
+  Task* const local = core->CreateTask(NoopTask, nullptr, kDefaultTaskWeight);
+  ASSERT_THAT(local, t::NotNull());
+  core->Join(local);
+  EXPECT_THAT(cpu0.context_switches.load(), t::Eq(2));
+
+  // CPU 1 counts its own switches: from its idle loop to the task and back.
+  Task* const remote =
+      core->CreateTaskOnCpu(NoopTask, nullptr, kDefaultTaskWeight, 1);
+  ASSERT_THAT(remote, t::NotNull());
+  BindCpuLocal(SmpGetCpuLocal(1));
+  EXPECT_TRUE(TaskSchedulerInternals::PollIdleCpu(*core, 1));
+  BindCpuLocal(SmpGetCpuLocal(0));
+  core->Join(remote);
+  EXPECT_THAT(cpu1.context_switches.load(), t::Eq(2));
+  EXPECT_THAT(cpu0.context_switches.load(), t::Eq(2));
+}
+
+struct RunningCpuCtx {
+  TaskScheduler* sched = nullptr;
+  int running_cpu = -2;
+  bool started = false;
+  bool release = false;
+  bool finished = false;
+};
+
+static void RunningCpuWorker(void* const raw_ctx) {
+  RunningCpuCtx* const ctx = static_cast<RunningCpuCtx*>(raw_ctx);
+  ctx->running_cpu = TaskRunningCpu(ctx->sched->CurrentTask());
+  ctx->started = true;
+  while (!ctx->release) {
+    ctx->sched->Yield();
+  }
+  ctx->finished = true;
+}
+
+TEST(CoreRunqueueSchedulerTest,
+     TaskRunningCpuReportsTheCpuOnlyWhileTheTaskRuns) {
+  SetupEnv(3);
+  const std::shared_ptr<TaskScheduler> core = CreateCoreRunqueueScheduler();
+  TaskSchedulerInternals::Init(*core);
+  EXPECT_THAT(TaskRunningCpu(core->CurrentTask()), t::Eq(0));
+
+  RunningCpuCtx ctx;
+  ctx.sched = core.get();
+  Task* const task =
+      core->CreateTaskOnCpu(RunningCpuWorker, &ctx, kDefaultTaskWeight, 2);
+  ASSERT_THAT(task, t::NotNull());
+  // Queued and not started yet, also after another CPU took it.
+  EXPECT_THAT(TaskRunningCpu(task), t::Eq(-1));
+  EXPECT_TRUE(TaskSchedulerInternals::StealTask(*core, 0, 2));
+  EXPECT_THAT(TaskRunningCpu(task), t::Eq(-1));
+
+  // The task saw itself running on CPU 0, and it is switched out while this
+  // task runs.
+  while (!ctx.started) {
+    core->Yield();
+  }
+  EXPECT_THAT(ctx.running_cpu, t::Eq(0));
+  EXPECT_THAT(TaskRunningCpu(task), t::Eq(-1));
+
+  // Ended, but not reclaimed yet.
+  ctx.release = true;
+  while (!ctx.finished) {
+    core->Yield();
+  }
+  EXPECT_THAT(TaskRunningCpu(task), t::Eq(-1));
+  core->Join(task);
+}
+
+struct TaskTimerTicksCtx {
+  TaskScheduler* sched = nullptr;
+  CpuClockSample at_start;
+  CpuClockSample at_end;
+  bool started = false;
+  bool release = false;
+};
+
+// Samples its clock, takes three timer interrupts (counted as idt.cpp counts
+// them), and samples its clock again once released, maybe on another CPU.
+static void TaskTimerTicksWorker(void* const raw_ctx) {
+  TaskTimerTicksCtx* const ctx = static_cast<TaskTimerTicksCtx*>(raw_ctx);
+  ctx->at_start = ReadCpuClock();
+  for (int i = 0; i < 3; ++i) {
+    CurrentCpu()->task_timer_ticks.fetch_add(1, std::memory_order_relaxed);
+  }
+  ctx->started = true;
+  while (!ctx->release) {
+    ctx->sched->Yield();
+  }
+  ctx->at_end = ReadCpuClock();
+}
+
+TEST(CoreRunqueueSchedulerTest, KeepsEachTasksTimerTicksAcrossContextSwitches) {
+  SetupEnv(2);
+  const std::shared_ptr<TaskScheduler> core = CreateCoreRunqueueScheduler();
+  TaskSchedulerInternals::Init(*core);
+  CpuLocal& cpu0 = *SmpGetCpuLocal(0);
+  CpuLocal& cpu1 = *SmpGetCpuLocal(1);
+  // So far, 7 timer interrupts interrupted this task and 11 CPU 1's idle task.
+  cpu0.task_timer_ticks.store(7, std::memory_order_relaxed);
+  cpu1.task_timer_ticks.store(11, std::memory_order_relaxed);
+
+  TaskTimerTicksCtx ctx;
+  ctx.sched = core.get();
+  Task* const task =
+      core->CreateTaskOnCpu(TaskTimerTicksWorker, &ctx, kDefaultTaskWeight, 0);
+  ASSERT_THAT(task, t::NotNull());
+  while (!ctx.started) {
+    core->Yield();
+  }
+  // The new task started from 0, and this task got its own count back.
+  EXPECT_THAT(ctx.at_start.cpu, t::Eq(0));
+  EXPECT_THAT(ctx.at_start.task_ticks, t::Eq(0));
+  EXPECT_THAT(cpu0.task_timer_ticks.load(), t::Eq(7));
+
+  // The task moves to CPU 1, whose idle loop runs it to its end.
+  EXPECT_TRUE(TaskSchedulerInternals::StealTask(*core, 1, 0));
+  ctx.release = true;
+  BindCpuLocal(&cpu1);
+  EXPECT_TRUE(TaskSchedulerInternals::PollIdleCpu(*core, 1));
+  BindCpuLocal(&cpu0);
+  core->Join(task);
+  // Its three ticks went with it, and CPU 1's idle task got its count back.
+  EXPECT_THAT(ctx.at_end.cpu, t::Eq(1));
+  EXPECT_THAT(ctx.at_end.task_ticks, t::Eq(3));
+  EXPECT_THAT(cpu1.task_timer_ticks.load(), t::Eq(11));
+  EXPECT_THAT(cpu0.task_timer_ticks.load(), t::Eq(7));
 }
 
 // ============================================================================
@@ -1094,7 +1275,7 @@ TEST(CoreRunqueueSchedulerTest,
 
 // ============================================================================
 // 8. Multi-Threaded SMP Concurrency Test (`Yield`, `StealTask`,
-// `OnTimerInterrupt`, `SetAddressSpace`)
+// `OnTimerInterrupt`, `SetAddressSpace`, `SetFpuState`)
 // ============================================================================
 
 struct MtCoreSharedCtx {
@@ -1108,6 +1289,8 @@ struct MtCoreSharedCtx {
   std::atomic<int64_t> busy_state_violations{0};
   // Times a task found its CPU in another address space than its own.
   std::atomic<int64_t> address_space_violations{0};
+  // Times a task found another FPU state than its own loaded on its CPU.
+  std::atomic<int64_t> fpu_state_violations{0};
 };
 
 struct MtCoreTaskArg {
@@ -1126,9 +1309,12 @@ static void MtCoreConcurrencyWorker(void* const raw_arg) {
   timer_frame.rflags = kRflagsInterruptEnableBit;
 
   // Each task runs in an address space of its own, which every CPU that runs
-  // the task must switch to.
+  // the task must switch to, and keeps an FPU state of its own, which every
+  // CPU that runs the task must load. The task exits with the state attached.
   AddressSpace* const address_space = FakeAddressSpace(arg->task_index);
   sched->SetAddressSpace(address_space);
+  FpuState* const fpu_state = FakeFpuState(arg->task_index);
+  sched->SetFpuState(fpu_state);
 
   for (int round = 0; round < 6; ++round) {
     const int cpu = CurrentCpuId();
@@ -1142,6 +1328,9 @@ static void MtCoreConcurrencyWorker(void* const raw_arg) {
     }
     if (ActiveAddressSpace(cpu) != address_space) {
       shared->address_space_violations.fetch_add(1, std::memory_order_acq_rel);
+    }
+    if (LoadedFpuState(cpu) != fpu_state) {
+      shared->fpu_state_violations.fetch_add(1, std::memory_order_acq_rel);
     }
     arg->iterations.fetch_add(1, std::memory_order_acq_rel);
     shared->total_iterations.fetch_add(1, std::memory_order_acq_rel);
@@ -1278,6 +1467,21 @@ TEST(CoreRunqueueSchedulerTest,
   EXPECT_THAT(shared.address_space_violations.load(), t::Eq(0));
   // The bootstrap task never left the kernel's page tables.
   EXPECT_THAT(ActiveAddressSpace(0), t::IsNull());
+  // Every CPU that ran a task had loaded the task's FPU state and saved it
+  // into nothing else, and each task's state was loaded once more than it was
+  // saved: when the task attached it, and whenever a CPU resumed the task,
+  // while the task was saved whenever it was switched out, except when it
+  // exited.
+  EXPECT_THAT(shared.fpu_state_violations.load(), t::Eq(0));
+  EXPECT_THAT(g_env.fpu_save_mismatches.load(), t::Eq(0));
+  const std::vector<FakeFpuCall> fpu_calls = FpuCalls();
+  for (int i = 0; i < kNumTasks; ++i) {
+    const int restores =
+        CountFpuCalls(fpu_calls, FakeFpuOp::kRestore, FakeFpuState(i));
+    const int saves =
+        CountFpuCalls(fpu_calls, FakeFpuOp::kSave, FakeFpuState(i));
+    EXPECT_THAT(restores, t::Eq(saves + 1)) << "task " << i;
+  }
 
   for (int c = 0; c < kNumCpus; ++c) {
     EXPECT_THAT(TaskSchedulerInternals::RunqueueLoad(*core, c), t::Eq(0));
@@ -1432,6 +1636,19 @@ TEST(CoreRunqueueSchedulerDeathTest,
         core->Join(t);
       },
       kLockHeld);
+
+  // 6. Switching tasks while the user-access window is open (user_access.h)
+  //    must trigger `DCHECK`: RFLAGS doesn't switch with the task, so the next
+  //    task would run with SMAP lifted.
+  EXPECT_DEATH(
+      {
+        Task* const task =
+            core->CreateTaskOnCpu(NoopTask, nullptr, kDefaultTaskWeight, 0);
+        ASSERT_THAT(task, t::NotNull());
+        SetUserAccessWindowOpenForTest(true);
+        core->Yield();
+      },
+      "Check failed: !UserAccessWindowOpen\\(\\)");
 }
 
 // ============================================================================
@@ -1636,6 +1853,286 @@ TEST(CoreRunqueueSchedulerTest,
 
   core->SetAddressSpace(nullptr);
   EXPECT_THAT(ActiveAddressSpace(0), t::IsNull());
+}
+
+// ============================================================================
+// 12. x87/MMX/SSE/AVX Register State (`SetFpuState`)
+// ============================================================================
+
+struct FpuStateTaskCtx {
+  TaskScheduler* sched = nullptr;
+  FpuState* state = nullptr;
+  // Times the task found another state than its own loaded on CPU 0 after
+  // its SetFpuState() call.
+  int mismatches = 0;
+};
+
+static void FpuStateWorker(void* const raw_arg) {
+  FpuStateTaskCtx* const ctx = static_cast<FpuStateTaskCtx*>(raw_arg);
+  ctx->sched->SetFpuState(ctx->state);
+  for (int i = 0; i < 4; ++i) {
+    if (LoadedFpuState(0) != ctx->state) {
+      ++ctx->mismatches;
+    }
+    ctx->sched->Yield();
+  }
+  if (LoadedFpuState(0) != ctx->state) {
+    ++ctx->mismatches;
+  }
+  ctx->sched->SetFpuState(nullptr);
+}
+
+TEST(CoreRunqueueSchedulerTest,
+     SetFpuStateLoadsTheStateAtOnceAndOnEveryResume) {
+  SetupEnv(1);
+  const std::shared_ptr<TaskScheduler> core = CreateCoreRunqueueScheduler();
+  TaskSchedulerInternals::Init(*core);
+  FpuState* const bootstrap_state = FakeFpuState(1);
+
+  // The calling task's state is loaded at once, and the registers' previous
+  // values are not saved anywhere.
+  core->SetFpuState(bootstrap_state);
+  EXPECT_THAT(FpuCalls(), t::ElementsAre(FakeFpuCall{FakeFpuOp::kRestore,  //
+                                                     0,                    //
+                                                     bootstrap_state}));
+  EXPECT_THAT(LoadedFpuState(0), t::Eq(bootstrap_state));
+
+  // CPU 0 always holds the state of the task with a state that it runs: of
+  // each worker after its SetFpuState() call, on every resume, and the
+  // bootstrap task's again once both workers have exited.
+  FpuStateTaskCtx ctx_a;
+  ctx_a.sched = core.get();
+  ctx_a.state = FakeFpuState(2);
+  FpuStateTaskCtx ctx_b;
+  ctx_b.sched = core.get();
+  ctx_b.state = FakeFpuState(3);
+  Task* const task_a =
+      core->CreateTask(FpuStateWorker, &ctx_a, kDefaultTaskWeight);
+  Task* const task_b =
+      core->CreateTask(FpuStateWorker, &ctx_b, kDefaultTaskWeight);
+  ASSERT_THAT(task_a, t::NotNull());
+  ASSERT_THAT(task_b, t::NotNull());
+  core->Join(task_a);
+  core->Join(task_b);
+
+  EXPECT_THAT(ctx_a.mismatches, t::Eq(0));
+  EXPECT_THAT(ctx_b.mismatches, t::Eq(0));
+  EXPECT_THAT(g_env.fpu_save_mismatches.load(), t::Eq(0));
+  EXPECT_THAT(LoadedFpuState(0), t::Eq(bootstrap_state));
+  // Each state was loaded when its task attached it and on every resume, and
+  // saved whenever its task was switched out with it attached. A worker was
+  // switched out at least once while the other one was queued.
+  const std::vector<FakeFpuCall> calls = FpuCalls();
+  for (const FpuState* const state :
+       {bootstrap_state, ctx_a.state, ctx_b.state}) {
+    EXPECT_THAT(CountFpuCalls(calls, FakeFpuOp::kRestore, state),
+                t::Eq(CountFpuCalls(calls, FakeFpuOp::kSave, state) + 1));
+  }
+  EXPECT_THAT(CountFpuCalls(calls, FakeFpuOp::kSave, ctx_a.state) +
+                  CountFpuCalls(calls, FakeFpuOp::kSave, ctx_b.state),
+              t::Ge(1));
+
+  // Detaching drops the registers without saving them.
+  core->SetFpuState(nullptr);
+  EXPECT_THAT(FpuCalls(), t::SizeIs(calls.size()));
+}
+
+struct FpuOrderTaskCtx {
+  TaskScheduler* sched = nullptr;
+  FpuState* state = nullptr;
+  std::atomic<bool> attached{false};
+  std::atomic<bool> release{false};
+};
+
+static void FpuOrderWorker(void* const raw_arg) {
+  FpuOrderTaskCtx* const ctx = static_cast<FpuOrderTaskCtx*>(raw_arg);
+  ctx->sched->SetFpuState(ctx->state);
+  ctx->attached.store(true, std::memory_order_release);
+  while (!ctx->release.load(std::memory_order_acquire)) {
+    ctx->sched->Yield();
+  }
+  ctx->sched->SetFpuState(nullptr);
+}
+
+TEST(CoreRunqueueSchedulerTest,
+     SwitchSavesThePreviousStateBeforeLoadingTheNext) {
+  SetupEnv(1);
+  const std::shared_ptr<TaskScheduler> core = CreateCoreRunqueueScheduler();
+  TaskSchedulerInternals::Init(*core);
+  FpuState* const bootstrap_state = FakeFpuState(1);
+  FpuState* const task_state = FakeFpuState(2);
+  core->SetFpuState(bootstrap_state);
+
+  FpuOrderTaskCtx ctx;
+  ctx.sched = core.get();
+  ctx.state = task_state;
+  Task* const task = core->CreateTask(FpuOrderWorker, &ctx, kDefaultTaskWeight);
+  ASSERT_THAT(task, t::NotNull());
+  while (!ctx.attached.load(std::memory_order_acquire)) {
+    core->Yield();
+  }
+
+  // A switch to the task and one back: each saves the registers of the task
+  // that leaves the CPU before it loads those of the task that gets it.
+  ClearFpuCalls();
+  while (FpuCalls().size() < 4) {
+    core->Yield();
+  }
+  EXPECT_THAT(
+      FpuCalls(),
+      t::ElementsAre(FakeFpuCall{FakeFpuOp::kSave, 0, bootstrap_state},
+                     FakeFpuCall{FakeFpuOp::kRestore, 0, task_state},
+                     FakeFpuCall{FakeFpuOp::kSave, 0, task_state},
+                     FakeFpuCall{FakeFpuOp::kRestore, 0, bootstrap_state}));
+
+  // The task detaches its state and exits: neither saves its registers.
+  ClearFpuCalls();
+  ctx.release.store(true, std::memory_order_release);
+  core->Join(task);
+  EXPECT_THAT(
+      FpuCalls(),
+      t::ElementsAre(FakeFpuCall{FakeFpuOp::kSave, 0, bootstrap_state},
+                     FakeFpuCall{FakeFpuOp::kRestore, 0, task_state},
+                     FakeFpuCall{FakeFpuOp::kRestore, 0, bootstrap_state}));
+  EXPECT_THAT(g_env.fpu_save_mismatches.load(), t::Eq(0));
+  core->SetFpuState(nullptr);
+}
+
+static void YieldFourTimes(void* const raw_sched) {
+  TaskScheduler* const sched = static_cast<TaskScheduler*>(raw_sched);
+  for (int i = 0; i < 4; ++i) {
+    sched->Yield();
+  }
+}
+
+static void AttachFpuStateAndExit(void* const raw_ctx) {
+  FpuStateTaskCtx* const ctx = static_cast<FpuStateTaskCtx*>(raw_ctx);
+  ctx->sched->SetFpuState(ctx->state);
+}
+
+TEST(CoreRunqueueSchedulerTest,
+     ExitingTasksAreNotSavedAndTasksWithoutAStateSkipBothSteps) {
+  SetupEnv(1);
+  const std::shared_ptr<TaskScheduler> core = CreateCoreRunqueueScheduler();
+  TaskSchedulerInternals::Init(*core);
+
+  // Switches between tasks without a state neither save nor load registers.
+  Task* kernel_tasks[3] = {};
+  for (Task*& task : kernel_tasks) {
+    task = core->CreateTask(YieldFourTimes, core.get(), kDefaultTaskWeight);
+    ASSERT_THAT(task, t::NotNull());
+  }
+  for (Task* const task : kernel_tasks) {
+    core->Join(task);
+  }
+  EXPECT_THAT(FpuCalls(), t::IsEmpty());
+
+  // A task that exits with its state attached: loaded once, never saved.
+  FpuStateTaskCtx exiting_ctx;
+  exiting_ctx.sched = core.get();
+  exiting_ctx.state = FakeFpuState(4);
+  Task* const exiting_task =
+      core->CreateTask(AttachFpuStateAndExit, &exiting_ctx, kDefaultTaskWeight);
+  ASSERT_THAT(exiting_task, t::NotNull());
+  core->Join(exiting_task);
+  EXPECT_THAT(FpuCalls(), t::ElementsAre(FakeFpuCall{FakeFpuOp::kRestore,  //
+                                                     0,                    //
+                                                     exiting_ctx.state}));
+
+  // Switches between a task with a state and one without: only the state of
+  // the former is saved and loaded, once per switch.
+  ClearFpuCalls();
+  FpuState* const bootstrap_state = FakeFpuState(1);
+  core->SetFpuState(bootstrap_state);
+  Task* const kernel_task =
+      core->CreateTask(YieldFourTimes, core.get(), kDefaultTaskWeight);
+  ASSERT_THAT(kernel_task, t::NotNull());
+  core->Join(kernel_task);
+  const std::vector<FakeFpuCall> calls = FpuCalls();
+  EXPECT_THAT(calls,
+              t::Each(t::Field(&FakeFpuCall::state, t::Eq(bootstrap_state))));
+  EXPECT_THAT(CountFpuCalls(calls, FakeFpuOp::kSave, bootstrap_state),
+              t::Ge(1));
+  EXPECT_THAT(
+      CountFpuCalls(calls, FakeFpuOp::kRestore, bootstrap_state),
+      t::Eq(CountFpuCalls(calls, FakeFpuOp::kSave, bootstrap_state) + 1));
+  EXPECT_THAT(g_env.fpu_save_mismatches.load(), t::Eq(0));
+  core->SetFpuState(nullptr);
+}
+
+struct FpuMigrationTaskCtx {
+  TaskScheduler* sched = nullptr;
+  FpuState* state = nullptr;
+  std::atomic<bool> attached{false};
+  // The CPU on which the task attached its state, the CPU that resumed it
+  // after it left that CPU, and the state that the latter held then.
+  int attach_cpu = -1;
+  int resume_cpu = -1;
+  const FpuState* loaded_on_resume = nullptr;
+};
+
+static void FpuMigrationWorker(void* const raw_arg) {
+  FpuMigrationTaskCtx* const ctx = static_cast<FpuMigrationTaskCtx*>(raw_arg);
+  ctx->sched->SetFpuState(ctx->state);
+  ctx->attach_cpu = CurrentCpuId();
+  ctx->attached.store(true, std::memory_order_release);
+  // Bounded, so that the test fails rather than hangs if no other CPU takes
+  // the task.
+  for (int i = 0; i < 1000 && CurrentCpuId() == ctx->attach_cpu; ++i) {
+    ctx->sched->Yield();
+  }
+  ctx->resume_cpu = CurrentCpuId();
+  ctx->loaded_on_resume = LoadedFpuState(ctx->resume_cpu);
+  ctx->sched->SetFpuState(nullptr);
+}
+
+TEST(CoreRunqueueSchedulerTest, FpuStateFollowsATaskThatMovesToAnotherCpu) {
+  SetupEnv(2);
+  const std::shared_ptr<TaskScheduler> core = CreateCoreRunqueueScheduler();
+  TaskSchedulerInternals::Init(*core);
+  FpuState* const bootstrap_state = FakeFpuState(1);
+  FpuState* const task_state = FakeFpuState(2);
+  core->SetFpuState(bootstrap_state);
+
+  // The task attaches its state on CPU 0 and yields until it runs elsewhere.
+  FpuMigrationTaskCtx ctx;
+  ctx.sched = core.get();
+  ctx.state = task_state;
+  Task* const task =
+      core->CreateTaskOnCpu(FpuMigrationWorker, &ctx, kDefaultTaskWeight, 0);
+  ASSERT_THAT(task, t::NotNull());
+  while (!ctx.attached.load(std::memory_order_acquire)) {
+    core->Yield();
+  }
+  ASSERT_THAT(TaskSchedulerInternals::RunqueueLoad(*core, 0), t::Eq(1));
+
+  // CPU 1 takes the queued task from CPU 0 and runs it until it exits.
+  std::thread cpu1([&core]() {
+    BindCpuLocal(SmpGetCpuLocal(1));
+    SetInterruptsEnabledForTest(true);
+    EXPECT_TRUE(TaskSchedulerInternals::StealTask(*core, 1, 0));
+    EXPECT_TRUE(TaskSchedulerInternals::PollIdleCpu(*core, 1));
+    ResetCpuLocalForTest();
+  });
+  cpu1.join();
+  core->Join(task);
+
+  // CPU 0 saved the task's registers when the task left it, and CPU 1 loaded
+  // them before it resumed the task.
+  EXPECT_THAT(ctx.attach_cpu, t::Eq(0));
+  EXPECT_THAT(ctx.resume_cpu, t::Eq(1));
+  EXPECT_THAT(ctx.loaded_on_resume, t::Eq(task_state));
+  EXPECT_THAT(
+      FpuCalls(),
+      t::ElementsAre(FakeFpuCall{FakeFpuOp::kRestore, 0, bootstrap_state},
+                     FakeFpuCall{FakeFpuOp::kSave, 0, bootstrap_state},
+                     FakeFpuCall{FakeFpuOp::kRestore, 0, task_state},
+                     FakeFpuCall{FakeFpuOp::kSave, 0, task_state},
+                     FakeFpuCall{FakeFpuOp::kRestore, 0, bootstrap_state},
+                     FakeFpuCall{FakeFpuOp::kRestore, 1, task_state}));
+  EXPECT_THAT(g_env.fpu_save_mismatches.load(), t::Eq(0));
+  EXPECT_THAT(LoadedFpuState(0), t::Eq(bootstrap_state));
+  core->SetFpuState(nullptr);
 }
 
 }  // namespace

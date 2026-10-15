@@ -1,13 +1,32 @@
 #!/usr/bin/env bash
 # Boots the kernel ISO(s) headlessly in QEMU and verifies the boot self-tests.
 #
-# Passes (run in parallel):
-#   1. Legacy BIOS + Multiboot2: serial markers plus the VGA text buffer at
-#      0xB8000.
-#   2. UEFI (OVMF) + Multiboot2 + x2APIC + 4 GiB RAM: serial markers plus the
-#      GOP linear framebuffer.
-#   3. Legacy BIOS + Multiboot1: serial markers plus the VGA text buffer (only
-#      when the Multiboot1 ISO exists).
+# Passes (as many at once as BOOT_TEST_JOBS says, by default one at a time on
+# hosts with fewer than 48 CPUs):
+#   1. bios: legacy BIOS + Multiboot2 on CPU model qemu64: serial markers plus
+#      the VGA text buffer at 0xB8000.
+#   2. uefi: UEFI (OVMF) + Multiboot2 + x2APIC + 4 GiB RAM on qemu64: serial
+#      markers plus the GOP linear framebuffer.
+#   3. mb1: legacy BIOS + Multiboot1 on qemu64: serial markers plus the VGA
+#      text buffer (only when the Multiboot1 ISO exists).
+#   4. max: legacy BIOS + Multiboot2 on CPU model max: serial markers plus the
+#      VGA text buffer.
+#   5. smep: legacy BIOS + Multiboot2 on CPU model qemu64,+smep,+xsave,+xgetbv1:
+#      serial markers plus the VGA text buffer. (QEMU 7.2's TCG hangs on a
+#      write of CR4.OSXSAVE unless CPUID.(EAX=0DH,ECX=1):EAX names a feature,
+#      such as XGETBV with ECX=1, which the kernel doesn't use.)
+# The CPU model decides how the kernel keeps the x87/SSE/AVX state of user
+# processes, which its boot report names: qemu64 lacks XSAVE, so the kernel
+# must fall back to FXSAVE; max has XSAVE and AVX, so the kernel must enable
+# both, and the FPU isolation self-test must also cover the upper halves of the
+# YMM registers; the smep model has XSAVE without AVX (and without XSAVEOPT),
+# so the kernel must enable XSAVE with the x87 and SSE state only. The CPU
+# model also decides whether the kernel enables SMEP and SMAP, which the boot
+# report names too: qemu64 has neither, max has both, and the smep model has
+# SMEP only. Besides the markers that each pass requires, the markers that
+# would contradict its CPU model (a protection, state component or test
+# coverage that the CPU lacks, or a probe that it should run but skipped) must
+# be absent, and each boot report line must not contradict itself.
 #
 # Usage: test_boot.sh [kernel.iso [kernel-mb1.iso]]
 #
@@ -15,13 +34,18 @@
 #   BIOS_TIMEOUT_SECS  Timeout of each legacy BIOS pass (default: 60).
 #   UEFI_TIMEOUT_SECS  Timeout of the UEFI pass (default: 90).
 #   MIN_STRESS_PASSES  Stress-test iterations that must pass (default: 3).
+#   BOOT_TEST_JOBS     How many passes run at once (default: one per 24 host
+#                      CPUs, at least one; see PASS_JOBS below). Values above
+#                      the number of passes run them all at once.
 #   OVMF               Combined OVMF image (passed with -bios), or the
 #                      OVMF_CODE image when OVMF_VARS is also set.
 #   OVMF_VARS          OVMF_VARS template; selects pflash mode with OVMF.
 #   REQUIRE_UEFI=1     Fail instead of skipping when no OVMF image is found.
-#   KVM=1              Run QEMU with KVM acceleration: -enable-kvm -cpu host
-#                      (-cpu host,+x2apic in the UEFI pass). Needs read and
-#                      write access to /dev/kvm.
+#   KVM=1              Run QEMU with KVM acceleration: -enable-kvm -cpu host in
+#                      every pass (-cpu host,+x2apic in the UEFI pass), so the
+#                      checks that depend on the CPU model are skipped, and so
+#                      is the smep pass, whose CPU model only TCG provides.
+#                      Needs read and write access to /dev/kvm.
 set -euo pipefail
 
 ORIG_PWD="${PWD}"
@@ -61,6 +85,30 @@ BIOS_TIMEOUT_SECS="${BIOS_TIMEOUT_SECS:-60}"
 UEFI_TIMEOUT_SECS="${UEFI_TIMEOUT_SECS:-90}"
 MIN_STRESS_PASSES="${MIN_STRESS_PASSES:-3}"
 KVM="${KVM:-0}"
+# The vCPUs of the QEMU of each pass.
+VCPUS_PER_PASS=4
+# How many passes run at once. The tick bounds of the boot self-tests (such as
+# a kill within 10 timer ticks of CPU 0) also count time in which the host
+# runs none of a vCPU's threads, so the passes must not oversubscribe the host
+# themselves: their vCPUs take at most a sixth of the host's CPUs. A host whose
+# CPUs all run another busy thread then has at most 7 busy threads for every 6
+# CPUs, where five 4-vCPU passes at once on 24 CPUs would make 44 for 24.
+# BOOT_TEST_JOBS overrides it.
+DEFAULT_PASS_JOBS=$(( $(nproc 2>/dev/null || echo 1) / (6 * VCPUS_PER_PASS) ))
+if [[ "${DEFAULT_PASS_JOBS}" -lt 1 ]]; then
+  DEFAULT_PASS_JOBS=1
+fi
+PASS_JOBS="${BOOT_TEST_JOBS:-${DEFAULT_PASS_JOBS}}"
+if [[ ! "${PASS_JOBS}" =~ ^[1-9][0-9]*$ ]]; then
+  echo "FAIL: BOOT_TEST_JOBS must be a positive integer, not '${PASS_JOBS}'." >&2
+  exit 1
+fi
+# Every value from the number of passes up runs them all at once. Clamp longer
+# values by their digit count, before any arithmetic, which overflows from
+# 2^63 on (2^64 would make the batch loop below endless).
+if [[ "${#PASS_JOBS}" -gt 3 ]]; then
+  PASS_JOBS=999
+fi
 
 EXPECTED_STRING="Hello, x86-64 Kernel World!"
 COMPLETION_MARKER="[TEST] ALL BOOT SELF-TESTS PASSED"
@@ -102,11 +150,156 @@ REQUIRED_MARKERS=(
   "[TEST] address_space_switching: PASS"
   "[TEST] user_mode_programs: PASS"
   "[TEST] user_mode_preemption: PASS"
+  "[TEST] user_mode_preemptible_syscalls: PASS"
+  "[TEST] user_mode_kill: PASS"
+  "[TEST] user_mode_fpu_isolation: PASS"
+  "[TEST] user_mode_fpu_initial_state: PASS"
+  "[TEST] cpu_protection_features: PASS"
+  "[TEST] smap_smep_protection: PASS"
+  "[TEST] user_mode_kill_edge_cases: PASS"
+  "[TEST] user_mode_syscall_buffer_checks: PASS"
+  "[TEST] user_mode_fpu_lifecycle: PASS"
+  "[TEST] user_mode_mixed_workload: PASS"
+  "[TEST] user_mode_fpu_isolation: covered x87/MMX SSE MXCSR FCW"
+  "[TEST] user_mode_fpu_initial_state: reuse_rounds="
+  "[TEST] user_mode_fpu_initial_state: exit_reuse_rounds="
+  "[TEST] cpu_protection_features: cpus=4 "
+  "[TEST] smap_smep_protection: not-present page fault recovered on 4/4 CPUs (error code 0x0)"
+  "[TEST] user_mode_kill_edge_cases: cases=8 "
+  "[TEST] user_mode_fpu_lifecycle: switched="
+  "[TEST] user_mode_mixed_workload: tenants=12 short=16 "
   "${COMPLETION_MARKER}"
   "${STRESS_MARKER}"
 )
 
-PASS_NAMES=(bios uefi mb1)
+# Markers that depend on the CPU model of a pass: the kernel's report of how it
+# keeps the x87/SSE/AVX state, whether it resets the x87 pointers (it must on
+# every pass: under TCG, QEMU 7.2's qemu64 and max models, on which all passes
+# are based, are AMD CPUs without XSaveErPtr; Intel models such as Nehalem
+# would report "disabled") and whether it enabled SMEP and SMAP, whether the
+# FPU isolation self-test covered the upper halves of the YMM registers, and
+# which SMAP and SMEP probes the protection self-tests ran and which they
+# skipped. With KVM=1 every pass runs on the host CPU, whose features are
+# unknown, so only the start of each report and probe line, which does not
+# depend on the CPU, is required.
+FPU_AVX_NOT_COVERED="[TEST] user_mode_fpu_isolation: AVX not covered (CPU has no AVX state)"
+X87_POINTER_RESET="[CPU] x87 pointer reset: enabled"
+SMAP_PROBES_SKIPPED="[TEST] smap_smep_protection: smap probes skipped (SMAP disabled)"
+SMEP_PROBE_SKIPPED="[TEST] smap_smep_protection: smep probe skipped (SMEP disabled)"
+SMEP_PROBE_RAN="[TEST] smap_smep_protection: smep exec probe recovered on 4/4 CPUs (error code 0x11)"
+AC_WINDOW_SKIPPED="[TEST] smap_smep_protection: interrupt in user-access window skipped (SMAP disabled)"
+NMI_WINDOW_SKIPPED="[TEST] smap_smep_protection: nmi in user-access window skipped (SMAP disabled)"
+BUFFER_CHECKS_SMAP_OFF="[TEST] user_mode_syscall_buffer_checks: checks=13 smap=off"
+# The boot report lines, each of which must not contradict itself in a pass.
+REPORT_PREFIXES=("[CPU] FPU state:" "[CPU] x87 pointer reset:" "[CPU] SMEP:")
+if [[ "${KVM}" == "1" ]]; then
+  KVM_MARKERS=(
+    "[CPU] FPU state: "
+    "[CPU] x87 pointer reset: "
+    "[CPU] SMEP: "
+    "[TEST] smap_smep_protection: smap "
+    "[TEST] smap_smep_protection: smep "
+    "[TEST] smap_smep_protection: nmi in user-access window "
+    "[TEST] user_mode_syscall_buffer_checks: checks=13 smap="
+    "[TEST] user_mode_mixed_workload: hardening probes "
+  )
+  QEMU64_MARKERS=("${KVM_MARKERS[@]}")
+  MAX_MARKERS=("${KVM_MARKERS[@]}")
+  SMEP_MARKERS=("${KVM_MARKERS[@]}")
+  # Which markers would contradict the host CPU is unknown.
+  QEMU64_ABSENT_MARKERS=()
+  MAX_ABSENT_MARKERS=()
+  SMEP_ABSENT_MARKERS=()
+else
+  QEMU64_MARKERS=(
+    "[CPU] FPU state: FXSAVE, 512 bytes"
+    "${FPU_AVX_NOT_COVERED}"
+    "${X87_POINTER_RESET}"
+    "[CPU] SMEP: disabled, SMAP: disabled"
+    "[TEST] cpu_protection_features: cpus=4 smep=off smap=off xcr0=none"
+    "${SMAP_PROBES_SKIPPED}"
+    "${SMEP_PROBE_SKIPPED}"
+    "${AC_WINDOW_SKIPPED}"
+    "${NMI_WINDOW_SKIPPED}"
+    "${BUFFER_CHECKS_SMAP_OFF}"
+    "[TEST] user_mode_mixed_workload: hardening probes skipped (no SMAP or SMEP)"
+  )
+  MAX_MARKERS=(
+    "[CPU] FPU state: XSAVE, XCR0=0x7 (x87 SSE AVX)"
+    "[TEST] user_mode_fpu_isolation: covered AVX YMM upper halves"
+    "${X87_POINTER_RESET}"
+    "[CPU] SMEP: enabled, SMAP: enabled"
+    "[TEST] cpu_protection_features: cpus=4 smep=on smap=on xcr0=0x7"
+    "[TEST] smap_smep_protection: smap read probe recovered on 4/4 CPUs (error code 0x1)"
+    "[TEST] smap_smep_protection: smap write probe recovered on 4/4 CPUs (error code 0x3)"
+    "${SMEP_PROBE_RAN}"
+    "[TEST] smap_smep_protection: interrupt in user-access window checked"
+    "[TEST] smap_smep_protection: nmi in user-access window checked"
+    "[TEST] user_mode_syscall_buffer_checks: checks=13 smap=on"
+    "[TEST] user_mode_mixed_workload: hardening probes smap=on smep=on recovered on 4/4 CPUs"
+  )
+  SMEP_MARKERS=(
+    "[CPU] FPU state: XSAVE, XCR0=0x3 (x87 SSE)"
+    "${FPU_AVX_NOT_COVERED}"
+    "${X87_POINTER_RESET}"
+    "[CPU] SMEP: enabled, SMAP: disabled"
+    "[TEST] cpu_protection_features: cpus=4 smep=on smap=off xcr0=0x3"
+    "${SMEP_PROBE_RAN}"
+    "${SMAP_PROBES_SKIPPED}"
+    "${AC_WINDOW_SKIPPED}"
+    "${NMI_WINDOW_SKIPPED}"
+    "${BUFFER_CHECKS_SMAP_OFF}"
+    "[TEST] user_mode_mixed_workload: hardening probes smap=off smep=on recovered on 4/4 CPUs"
+  )
+  # Markers that must be absent because they contradict the CPU model: a
+  # protection or state component that it lacks (or lacking one that it has),
+  # coverage of the AVX state without AVX, a probe that ran without the
+  # protection, or one skipped although the CPU has it. Fixed strings that
+  # can't match inside the expected lines (bare "XSAVE" would match "FXSAVE").
+  QEMU64_ABSENT_MARKERS=(
+    "SMEP: enabled"
+    "SMAP: enabled"
+    "smep=on"
+    "smap=on"
+    "[CPU] FPU state: XSAVE"
+    "[TEST] user_mode_fpu_isolation: covered AVX YMM upper halves"
+    "smap read probe recovered"
+    "smap write probe recovered"
+    "smep exec probe recovered"
+    "interrupt in user-access window checked"
+    "nmi in user-access window checked"
+    "[TEST] user_mode_mixed_workload: hardening probes smap="
+  )
+  MAX_ABSENT_MARKERS=(
+    "SMEP: disabled"
+    "SMAP: disabled"
+    "smep=off"
+    "smap=off"
+    "[CPU] FPU state: FXSAVE"
+    "[TEST] user_mode_fpu_isolation: AVX not covered"
+    "smap probes skipped"
+    "smep probe skipped"
+    "interrupt in user-access window skipped"
+    "nmi in user-access window skipped"
+    "hardening probes skipped"
+  )
+  SMEP_ABSENT_MARKERS=(
+    "SMEP: disabled"
+    "SMAP: enabled"
+    "smep=off"
+    "smap=on"
+    "[CPU] FPU state: FXSAVE"
+    "[TEST] user_mode_fpu_isolation: covered AVX YMM upper halves"
+    "smap read probe recovered"
+    "smap write probe recovered"
+    "smep probe skipped"
+    "interrupt in user-access window checked"
+    "nmi in user-access window checked"
+    "hardening probes skipped"
+  )
+fi
+
+PASS_NAMES=(bios uefi mb1 max smep)
 TEMP_FILES=()
 for name in "${PASS_NAMES[@]}"; do
   TEMP_FILES+=(
@@ -203,6 +396,51 @@ verify_serial_log() {
     echo "FAIL: Expected the greeting once, found it ${greeting_count} times (reboot loop)." >&2
     return 1
   fi
+}
+
+# Checks that the serial log $1 contains none of the markers $2...: lines that
+# would contradict the CPU model of the pass. Reports the first one found on
+# stderr (the pass output, not the serial log).
+verify_absent_markers() {
+  local log="$1"
+  shift
+  local marker
+  for marker in "$@"; do
+    if grep -Fq -- "${marker}" "${log}"; then
+      echo "FAIL: Unexpected marker '${marker}' in serial output." >&2
+      return 1
+    fi
+  done
+}
+
+# Checks that in the serial log $1 all lines that contain a boot report prefix
+# $2... are the same, so that no report contradicts itself (for example a
+# second report line that names other features).
+verify_consistent_reports() {
+  local log="$1"
+  shift
+  local prefix count
+  for prefix in "$@"; do
+    count="$(grep -F -- "${prefix}" "${log}" | sort -u | wc -l || true)"
+    if [[ "${count}" -ne 1 ]]; then
+      echo "FAIL: Expected one distinct '${prefix}' line in serial output, found ${count}." >&2
+      return 1
+    fi
+  done
+}
+
+# Checks the serial log $2 of pass $1 for consistent boot reports and for the
+# markers that the CPU model of the pass forbids (none with KVM=1).
+verify_pass_absent_markers() {
+  local name="$1" log="$2"
+  local absent=()
+  case "${name}" in
+    bios | uefi | mb1) absent=(${QEMU64_ABSENT_MARKERS[@]+"${QEMU64_ABSENT_MARKERS[@]}"}) ;;
+    max) absent=(${MAX_ABSENT_MARKERS[@]+"${MAX_ABSENT_MARKERS[@]}"}) ;;
+    smep) absent=(${SMEP_ABSENT_MARKERS[@]+"${SMEP_ABSENT_MARKERS[@]}"}) ;;
+  esac
+  verify_consistent_reports "${log}" "${REPORT_PREFIXES[@]}" &&
+    verify_absent_markers "${log}" ${absent[@]+"${absent[@]}"}
 }
 
 # Sends the QEMU monitor command $2 through the UNIX socket $1 and waits up to
@@ -343,7 +581,7 @@ start_qemu() {
   local name="$1"
   shift
   qemu-system-x86_64 \
-    -smp 4 \
+    -smp "${VCPUS_PER_PASS}" \
     -display none \
     -serial "file:${BUILD_DIR}/serial_${name}_output.log" \
     -monitor "unix:${BUILD_DIR}/qemu_${name}_monitor.sock,server,nowait" \
@@ -369,24 +607,27 @@ report_failure() {
   fi
 }
 
-# Legacy BIOS boot of ISO $2; pass name $1, display label $3.
+# Legacy BIOS boot of ISO $2 on QEMU CPU model $4; pass name $1, display label
+# $3. The remaining arguments are serial markers that only this pass requires.
 run_bios_pass() {
-  local name="$1" iso="$2" label="$3"
+  local name="$1" iso="$2" label="$3" cpu="$4"
+  shift 4
   local log="${BUILD_DIR}/serial_${name}_output.log"
   local QEMU_PID=""
   trap kill_qemu RETURN
 
-  local qemu_args=(-cdrom "${iso}")
+  local cpu_args=(-cpu "${cpu}")
   if [[ "${KVM}" == "1" ]]; then
-    qemu_args+=(-enable-kvm -cpu host)
+    cpu_args=(-enable-kvm -cpu host)
   fi
   echo "Running ${label} boot verification..."
-  start_qemu "${name}" "${qemu_args[@]}"
+  start_qemu "${name}" "${cpu_args[@]}" -cdrom "${iso}"
   if ! wait_for_boot "${log}" "${QEMU_PID}" "${BIOS_TIMEOUT_SECS}"; then
     report_failure "${label}" "${log}"
     return 1
   fi
-  if ! verify_serial_log "${log}" "${QEMU_PID}" ||
+  if ! verify_serial_log "${log}" "${QEMU_PID}" "$@" ||
+     ! verify_pass_absent_markers "${name}" "${log}" ||
      ! verify_vga_text "${BUILD_DIR}/qemu_${name}_monitor.sock" "${BUILD_DIR}/vga_${name}_dump.bin"; then
     cat "${log}" >&2
     return 1
@@ -425,7 +666,9 @@ run_uefi_pass() {
     return 1
   fi
   if ! verify_serial_log "${log}" "${QEMU_PID}" \
-         "[PMM] mmap entry: base=0x100000000" "[PMM] Framebuffer: addr=" ||
+         "[PMM] mmap entry: base=0x100000000" "[PMM] Framebuffer: addr=" \
+         "${QEMU64_MARKERS[@]}" ||
+     ! verify_pass_absent_markers "${name}" "${log}" ||
      ! verify_framebuffer "${log}" "${BUILD_DIR}/qemu_${name}_monitor.sock" "${BUILD_DIR}/vga_${name}_dump.bin"; then
     cat "${log}" >&2
     return 1
@@ -441,30 +684,63 @@ run_mb1_pass() {
     echo "skipped" >"${BUILD_DIR}/mb1_pass_result"
     return 0
   fi
-  run_bios_pass mb1 "${iso}" "BIOS/Multiboot1"
+  run_bios_pass mb1 "${iso}" "BIOS/Multiboot1" qemu64 "${QEMU64_MARKERS[@]}"
+}
+
+# Legacy BIOS boot of ISO $1 on a CPU with SMEP and XSAVE but without SMAP,
+# AVX and XSAVEOPT, a CPU model that only TCG provides.
+run_smep_pass() {
+  local iso="$1"
+  # +xgetbv1 only because QEMU 7.2's TCG treats CR4.OSXSAVE as reserved (and
+  # hangs on writing it) unless CPUID.(EAX=0DH,ECX=1):EAX is not zero.
+  local cpu="qemu64,+smep,+xsave,+xgetbv1"
+  local label="BIOS/Multiboot2 (-cpu ${cpu})"
+  if [[ "${KVM}" == "1" ]]; then
+    echo "SKIPPED: ${label} pass (TCG-only CPU model; KVM=1)."
+    echo "skipped" >"${BUILD_DIR}/smep_pass_result"
+    return 0
+  fi
+  run_bios_pass smep "${iso}" "${label}" "${cpu}" "${SMEP_MARKERS[@]}"
 }
 
 run_pass() {
   case "$1" in
-    bios) run_bios_pass bios "${ISO_FILE}" "BIOS/Multiboot2" ;;
+    bios) run_bios_pass bios "${ISO_FILE}" "BIOS/Multiboot2" qemu64 "${QEMU64_MARKERS[@]}" ;;
     uefi) run_uefi_pass "${ISO_FILE}" ;;
     mb1) run_mb1_pass "${MB1_ISO_FILE}" ;;
+    max) run_bios_pass max "${ISO_FILE}" "BIOS/Multiboot2 (-cpu max)" max "${MAX_MARKERS[@]}" ;;
+    smep) run_smep_pass "${ISO_FILE}" ;;
   esac
 }
 
-# The passes run in parallel; JOB_PIDS[i] is the job running PASS_NAMES[i].
-JOB_PIDS=()
-for name in "${PASS_NAMES[@]}"; do
-  run_pass "${name}" >"${BUILD_DIR}/${name}_pass_stdout.log" 2>&1 &
-  JOB_PIDS+=("$!")
+# The passes run in batches of PASS_JOBS, each batch after the one before has
+# ended; PASS_RCS[i] is the exit status of the job that ran PASS_NAMES[i].
+PASS_RCS=()
+batch_start=0
+while [[ "${batch_start}" -lt "${#PASS_NAMES[@]}" ]]; do
+  batch_end=$((batch_start + PASS_JOBS))
+  if [[ "${batch_end}" -gt "${#PASS_NAMES[@]}" ]]; then
+    batch_end="${#PASS_NAMES[@]}"
+  fi
+  batch_pids=()
+  for ((i = batch_start; i < batch_end; ++i)); do
+    name="${PASS_NAMES[i]}"
+    run_pass "${name}" >"${BUILD_DIR}/${name}_pass_stdout.log" 2>&1 &
+    batch_pids+=("$!")
+  done
+  for j in "${!batch_pids[@]}"; do
+    rc=0
+    wait "${batch_pids[j]}" || rc=$?
+    PASS_RCS[batch_start + j]="${rc}"
+  done
+  batch_start="${batch_end}"
 done
 
 overall_rc=0
 summary=()
 for i in "${!PASS_NAMES[@]}"; do
   name="${PASS_NAMES[i]}"
-  rc=0
-  wait "${JOB_PIDS[i]}" || rc=$?
+  rc="${PASS_RCS[i]}"
   pass_stdout="${BUILD_DIR}/${name}_pass_stdout.log"
   cat "${pass_stdout}"
   # The pass output ends with the serial log, whose last line is cut off if

@@ -35,6 +35,9 @@ PROJECT_INCLUDE_FLAGS := -iquote .
 # -fstack-clash-protection makes a function whose stack frame is larger than a
 # page touch the frame's pages in order, so that it can't step over the
 # unmapped guard page below a stack without faulting.
+# -mgeneral-regs-only keeps the kernel off the x87/MMX/SSE/AVX registers, which
+# hold the values of the interrupted user program until the scheduler saves
+# them (fpu.h).
 CXXFLAGS := -m64 -masm=intel -std=c++20 -O2 -Wall -Wextra $(WERROR_FLAG) \
             -ffreestanding -nostdlib -fno-builtin \
             -fno-exceptions -fno-rtti -mno-red-zone \
@@ -48,15 +51,16 @@ TEST_COMMON_LDFLAGS := -lgmock_main -lgmock -lgtest -pthread
 
 # User programs (user/): freestanding static executables for user space, which
 # the kernel image embeds (user_programs.S). user/user.ld links them in the top
-# 2 GiB of the address space, which the kernel code model addresses. Like the
-# kernel, they leave the x87/SSE registers alone, which the kernel does not
-# save (user_mode.h), and GCC must not turn their loops into calls of the
+# 2 GiB of the address space, which the kernel code model addresses. Unlike the
+# kernel, they may use the x87/MMX/SSE registers, and the AVX registers in
+# inline assembly, which the kernel keeps for each process (user_mode.h), so
+# GCC may use SSE in them. GCC must not turn their loops into calls of the
 # memory functions that user/crt.cpp defines with such loops.
 USER_PROGRAMS := init usertest
 USER_CXXFLAGS := -m64 -masm=intel -std=c++20 -O2 -Wall -Wextra $(WERROR_FLAG) \
                  -ffreestanding -nostdlib -fno-builtin \
                  -fno-exceptions -fno-rtti -mno-red-zone \
-                 -mgeneral-regs-only -fno-stack-protector -fno-pie \
+                 -fno-stack-protector -fno-pie \
                  -mcmodel=kernel -fno-asynchronous-unwind-tables \
                  -fno-tree-loop-distribute-patterns \
                  $(PROJECT_INCLUDE_FLAGS) -I$(BUILD_DIR)/include
@@ -113,8 +117,10 @@ TASK_LAYER_HDRS := \
 IDT_TEST_SRCS := idt.cpp idt_host_fakes.cpp gdt.cpp
 
 TEST_EXTRA_SRCS_console_test := console.cpp
+TEST_EXTRA_SRCS_cpu_test := cpu.cpp
 TEST_EXTRA_SRCS_cxx_runtime_test := cxx_runtime.cpp
 TEST_EXTRA_SRCS_elf_test := elf.cpp
+TEST_EXTRA_SRCS_fpu_test := fpu.cpp
 TEST_EXTRA_SRCS_gdt_test := gdt.cpp
 TEST_EXTRA_SRCS_heap_test := heap.cpp
 TEST_EXTRA_SRCS_idt_test := $(IDT_TEST_SRCS)
@@ -122,8 +128,11 @@ TEST_EXTRA_SRCS_multiboot_test := multiboot.cpp console.cpp
 TEST_EXTRA_SRCS_pmm_test := pmm.cpp console.cpp
 TEST_EXTRA_SRCS_random_test := random.cpp
 TEST_EXTRA_SRCS_selftest_test := selftest/selftest.cpp
-TEST_EXTRA_SRCS_smp_test := smp.cpp smp_hardware_fake.cpp multiboot.cpp console.cpp $(IDT_TEST_SRCS)
+# ApKernelEntry() (smp.cpp) calls CpuInitAp(), whose host build counts calls.
+TEST_EXTRA_SRCS_smp_test := smp.cpp smp_hardware_fake.cpp multiboot.cpp console.cpp cpu.cpp $(IDT_TEST_SRCS)
 TEST_EXTRA_SRCS_task_stack_test := task_stack.cpp
+# The user-copy helpers read the SMAP flag that cpu.cpp defines.
+TEST_EXTRA_SRCS_user_access_test := user_access.cpp cpu.cpp
 TEST_EXTRA_SRCS_vga_test := vga.cpp
 # Host fakes for the scheduler tests (see scheduler_test_support.h). Tests that
 # link the real idt.cpp and task.cpp must not link the IDT/task fakes. Tests
@@ -146,6 +155,8 @@ CXX_SRCS := \
     console.cpp \
     idt.cpp \
     gdt.cpp \
+    cpu.cpp \
+    fpu.cpp \
     multiboot.cpp \
     paging.cpp \
     pmm.cpp \
@@ -159,6 +170,7 @@ CXX_SRCS := \
     task.cpp \
     elf.cpp \
     user_mode.cpp \
+    user_access.cpp \
     random.cpp \
     $(if $(filter 1,$(SELFTEST)),$(SELFTEST_SRCS)) \
     kernel.cpp
@@ -173,6 +185,8 @@ CXX_HDRS := \
     console.h \
     idt.h \
     gdt.h \
+    cpu.h \
+    fpu.h \
     multiboot.h \
     paging.h \
     pmm.h \
@@ -180,6 +194,7 @@ CXX_HDRS := \
     cxx_runtime.h \
     smp.h \
     smp_hardware.h \
+    cpu_clock.h \
     task.h \
     task_stack.h \
     address_space.h \
@@ -189,13 +204,14 @@ CXX_HDRS := \
     elf.h \
     syscall_abi.h \
     user_mode.h \
+    user_access.h \
     user_programs.h \
     user/usertest.h \
     selftest/selftest.h \
     selftest/boot_selftest.h \
     selftest/stress.h
 
-ASM_SRCS := boot.S context_switch.S user_mode_entry.S user_programs.S
+ASM_SRCS := boot.S context_switch.S user_mode_entry.S user_programs.S fault_probe.S
 ASM_OBJS := $(patsubst %.S,$(BUILD_DIR)/%.o,$(ASM_SRCS))
 CXX_OBJS := $(patsubst %.cpp,$(BUILD_DIR)/%.o,$(CXX_SRCS))
 OBJS := $(ASM_OBJS) $(CXX_OBJS)
@@ -269,7 +285,7 @@ LDFLAGS := -m elf_x86_64 -z max-page-size=0x1000 $(LD_NO_WARN_RWX) -T linker.ld
 INNER_MAKE := make --no-print-directory WERROR=$(WERROR) SELFTEST=$(SELFTEST) \
               $(if $(findstring k,$(firstword -$(MAKEFLAGS))),-k)
 # Boot-test settings forwarded into the container (see test_boot.sh).
-BOOT_TEST_ENV_VARS := BIOS_TIMEOUT_SECS UEFI_TIMEOUT_SECS MIN_STRESS_PASSES OVMF OVMF_VARS REQUIRE_UEFI
+BOOT_TEST_ENV_VARS := BIOS_TIMEOUT_SECS UEFI_TIMEOUT_SECS MIN_STRESS_PASSES OVMF OVMF_VARS REQUIRE_UEFI BOOT_TEST_JOBS
 
 ifeq ($(USE_DOCKER),1)
 # With KVM=1 the container gets the host's /dev/kvm, membership in the group

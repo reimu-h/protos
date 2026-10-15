@@ -16,6 +16,7 @@
 #include <utility>
 #include <vector>
 
+#include "cpu.h"
 #include "gdt.h"
 #include "idt.h"
 #include "multiboot.h"
@@ -53,6 +54,8 @@ constexpr uint32_t kIcrX2ApicInit = 0x00004500;
 constexpr uint32_t kIcrStartupAt0x8000 = 0x00004608;
 constexpr uint32_t kIcrWakeupIpi = 0x00004021;
 constexpr uint32_t kIcrTlbShootdownIpi = 0x000040F0;
+// An NMI (delivery mode 100b, no vector).
+constexpr uint32_t kIcrNmi = 0x00004400;
 // Local APIC registers (xAPIC offsets).
 constexpr uint32_t kLapicTpr = 0x080;
 constexpr uint32_t kLapicEoi = 0x0B0;
@@ -175,6 +178,7 @@ static FakeSmpHardware& ResetState(
   std::memset(g_fake_ram, 0, sizeof(g_fake_ram));
   IdtResetForTest();
   GdtResetForTest();
+  CpuResetForTest();
   g_hw = std::make_shared<FakeSmpHardware>(options);
   SmpSetHardware(g_hw);
   return *g_hw;
@@ -1005,7 +1009,8 @@ TEST_F(SmpTest, ApsStartWithInitSipiAndTheSdmDelaysThroughTheTrampoline) {
               t::Each(0x5A));
 
   // Each AP ran ApKernelEntry() on the stack and with the CpuLocal that the BSP
-  // handed to it, and loaded the IDT (IdtInit() loaded it on the BSP).
+  // handed to it, loaded the IDT (IdtInit() loaded it on the BSP), and applied
+  // the BSP's CPU configuration.
   for (int i = 1; i < 3; ++i) {
     const CpuInfo* const info = SmpGetCpuInfo(i);
     EXPECT_GT(info->observed_rsp, info->stack_base);
@@ -1017,6 +1022,7 @@ TEST_F(SmpTest, ApsStartWithInitSipiAndTheSdmDelaysThroughTheTrampoline) {
     EXPECT_TRUE(SmpGetCpuLocal(i)->online);
   }
   EXPECT_THAT(IdtGetHostLoadCountForTest(), t::Eq(3));
+  EXPECT_THAT(CpuGetHostApInitCountForTest(), t::Eq(2));
 }
 
 TEST_F(SmpTest, EveryApGetsStacksAboveGuardPagesAndLoadsItsTss) {
@@ -1506,6 +1512,29 @@ TEST_F(SmpTest, SmpSendIpiTargetsTheApicIdAndTheReceivingCpuHandlesIt) {
     EXPECT_THAT(hw.EoiCount(3), t::Eq(0));
     EXPECT_THAT(SmpGetCpuLocal(1)->ipi_count.load(), t::Eq(0));
     EXPECT_THAT(SmpGetCpuLocal(0)->ipi_count.load(), t::Eq(0));
+  }
+}
+
+TEST_F(SmpTest, SmpSendNmiSendsAnNmiToTheApicIdOfTheTargetCpu) {
+  std::vector<uint8_t> recs;
+  AppendLapicRecord(&recs, 0, 0, 1);
+  AppendLapicRecord(&recs, 1, 3, 1);
+  AppendLapicRecord(&recs, 2, 5, 1);
+  for (const bool x2apic : {false, true}) {
+    SCOPED_TRACE(x2apic ? "x2APIC" : "xAPIC");
+    const FakeSmpHardware& hw =
+        InitSmp(recs, x2apic ? X2ApicOptions() : DefaultOptions());
+    ASSERT_THAT(SmpCpuCount(), t::Eq(3));
+
+    const bool irq_before = AreInterruptsEnabled();
+    SmpSendNmi(1);
+    EXPECT_THAT(AreInterruptsEnabled(), t::Eq(irq_before));
+
+    // An NMI, with no vector, from the BSP to APIC ID 3.
+    const std::vector<Event> ipis = hw.Ipis();
+    ASSERT_FALSE(ipis.empty());
+    EXPECT_THAT(ipis.back().cpu, t::Eq(0u));
+    EXPECT_THAT(ipis.back().value, t::Eq((3ULL << 32) | kIcrNmi));
   }
 }
 

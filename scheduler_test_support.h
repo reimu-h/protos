@@ -11,9 +11,10 @@
 // links each test with the ones it needs (`TEST_EXTRA_SRCS_<test>`):
 // - scheduler_test_fakes.cpp fakes the PMM, heap, SMP, task stack
 //   (task_stack.h), address space switching (`ActivateAddressSpace()`,
-//   address_space.h), UART and VGA functions that the scheduler code and these
-//   tests call. Every test that includes this header links it; none of them
-//   links pmm.cpp, heap.cpp, smp.cpp, task_stack.cpp, address_space.cpp,
+//   address_space.h), FPU register switching (`FpuSave()` and `FpuRestore()`,
+//   fpu.h), UART and VGA functions that the scheduler code and these tests
+//   call. Every test that includes this header links it; none of them links
+//   pmm.cpp, heap.cpp, smp.cpp, task_stack.cpp, address_space.cpp, fpu.cpp,
 //   uart.cpp or vga.cpp. Its task stacks come from the fake PMM and have no
 //   guard pages.
 // - scheduler_test_idt_task_fakes.cpp fakes the parts of idt.h and task.h
@@ -46,9 +47,12 @@
 #include <cstdlib>
 #include <memory>
 #include <mutex>
+#include <ostream>
 #include <string>
+#include <vector>
 
 #include "check.h"
+#include "fpu.h"
 #include "heap.h"
 #include "idt.h"
 #include "pmm.h"
@@ -63,6 +67,24 @@ namespace protos {
 constexpr int64_t kInitialFakeFreeFrames = 16384;
 constexpr int64_t kInitialFakeHeapBytes = 4 * 1024 * 1024;
 constexpr uintptr_t kFakeStackBase = 0x200000;
+
+// A call of the fake FpuSave() or FpuRestore() (FakeSchedulerEnv::fpu_calls):
+// the operation, the CPU that made it, and the state.
+enum class FakeFpuOp : uint8_t { kSave, kRestore };
+
+struct FakeFpuCall {
+  FakeFpuOp op = FakeFpuOp::kSave;
+  int cpu = -1;
+  const FpuState* state = nullptr;
+
+  bool operator==(const FakeFpuCall& other) const = default;
+};
+
+// Prints `call` in gtest messages.
+inline void PrintTo(const FakeFpuCall& call, std::ostream* const os) {
+  *os << (call.op == FakeFpuOp::kSave ? "Save" : "Restore") << "(cpu "
+      << call.cpu << ", " << static_cast<const void*>(call.state) << ")";
+}
 
 // State of the fakes. SetupEnv() resets it.
 struct FakeSchedulerEnv {
@@ -90,6 +112,17 @@ struct FakeSchedulerEnv {
   // CPU to (nullptr: the kernel's page tables), and how many switches it made.
   std::unique_ptr<std::atomic<const AddressSpace*>[]> active_address_space;
   std::atomic<int64_t> address_space_switches{0};
+
+  // The FpuState whose values the registers of each CPU hold: the one that
+  // the fake FpuRestore() last loaded there (nullptr: none yet). The fake
+  // FpuSave() counts each save into another state than the CPU's in
+  // `fpu_save_mismatches`: the scheduler saved the registers of another task
+  // into it, because it missed a load or loaded before it saved.
+  std::unique_ptr<std::atomic<const FpuState*>[]> loaded_fpu_state;
+  std::atomic<int64_t> fpu_save_mismatches{0};
+  // Every call of the fake FpuSave() and FpuRestore(), in order, guarded by
+  // `log_mutex`.
+  std::vector<FakeFpuCall> fpu_calls;
 
   // Output of the fake UART and VGA functions, guarded by `log_mutex`.
   std::mutex log_mutex;
@@ -120,8 +153,10 @@ inline void SetupEnv(const int num_cpus = 1) {
   g_env.allocated_heap_blocks.store(0, std::memory_order_relaxed);
   g_env.eoi_count.store(0, std::memory_order_relaxed);
   g_env.address_space_switches.store(0, std::memory_order_relaxed);
+  g_env.fpu_save_mismatches.store(0, std::memory_order_relaxed);
   {
     const std::lock_guard<std::mutex> lock(g_env.log_mutex);
+    g_env.fpu_calls.clear();
     g_env.uart_log.clear();
     g_env.vga_log.clear();
     g_env.uart_panic_log.clear();
@@ -135,6 +170,7 @@ inline void SetupEnv(const int num_cpus = 1) {
   g_env.last_ipi_vector.reset(new std::atomic<uint8_t>[num_cpus]());
   g_env.active_address_space.reset(
       new std::atomic<const AddressSpace*>[num_cpus]());
+  g_env.loaded_fpu_state.reset(new std::atomic<const FpuState*>[num_cpus]());
 
   for (int i = 0; i < num_cpus; ++i) {
     const uintptr_t stack_base =
@@ -192,6 +228,7 @@ class MockTaskScheduler : public TaskScheduler {
   MOCK_METHOD(void, OnWakeupIpi, (InterruptFrame*), (override));
   MOCK_METHOD(Task*, CurrentTask, (), (const, override));
   MOCK_METHOD(void, SetAddressSpace, (AddressSpace*), (override));
+  MOCK_METHOD(void, SetFpuState, (FpuState*), (override));
 };
 
 }  // namespace protos

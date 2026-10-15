@@ -9,6 +9,7 @@
 
 #include "check.h"
 #include "console.h"
+#include "cpu.h"
 #include "gdt.h"
 #include "idt.h"
 #include "multiboot.h"
@@ -623,8 +624,11 @@ static void InitCpuLocalSlot(const int cpu_index,              //
   slot.stack_base = stack_base_addr;
   slot.stack_top = stack_top_addr;
   slot.top_held_lock = nullptr;
+  slot.fault_probe = nullptr;
   slot.timer_ticks.store(0, std::memory_order_relaxed);
   slot.ipi_count.store(0, std::memory_order_relaxed);
+  slot.context_switches.store(0, std::memory_order_relaxed);
+  slot.task_timer_ticks.store(0, std::memory_order_relaxed);
 }
 
 // The stacks of an AP, which SmpInit() allocates as one block of
@@ -1216,6 +1220,11 @@ extern "C" void ApKernelEntry(const int cpu_index) {
   if (g_panic_stop_requested.load(std::memory_order_acquire)) {
     ParkCpuForPanic();
   }
+  // Before this AP runs any task: the x87/SSE/AVX state of user processes,
+  // which may move between CPUs, needs the BSP's configuration on every CPU,
+  // and so do SMEP and SMAP, which must be on before the AP runs a system
+  // call.
+  CpuInitAp();
   g_cpu_locals[cpu_index].online = true;
   EnableLocalApic(lapic_base);
 
@@ -1840,6 +1849,14 @@ void SmpSendIpi(const int target_cpu_index, const uint8_t vector) {
   SendFixedIpi(g_topology.local_apic_phys_addr,            //
                g_topology.cpus[target_cpu_index].apic_id,  //
                vector);
+}
+
+void SmpSendNmi(const int target_cpu_index) {
+  DCHECK(g_smp_initialized);
+  DCHECK(target_cpu_index >= 0 && target_cpu_index < g_topology.cpu_count);
+  LapicSendIpiCommand(g_topology.local_apic_phys_addr,
+                      g_topology.cpus[target_cpu_index].apic_id,
+                      kIcrDeliveryNmi | kIcrLevelAssert);
 }
 
 void SmpRunOnAllCpus(const SmpWorkFn work_fn, void* const context) {

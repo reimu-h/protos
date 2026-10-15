@@ -850,10 +850,10 @@ TEST(JoinLifecycleSchedulerTest,
 }
 
 // 12. Yield(), SetPreemptEnabled(), IsPreemptEnabled(), CurrentTask(),
-//     SetAddressSpace() and the scheduler internals other than Init()
-//     (OnTimerInterrupt(), OnWakeupIpi(), PollIdleCpu(), RunqueueLoad(),
-//     IsCpuBusy() and StealTask()) are forwarded to inner once each, with
-//     unchanged arguments and result.
+//     SetAddressSpace(), SetFpuState() and the scheduler internals other than
+//     Init() (OnTimerInterrupt(), OnWakeupIpi(), PollIdleCpu(),
+//     RunqueueLoad(), IsCpuBusy() and StealTask()) are forwarded to inner once
+//     each, with unchanged arguments and result.
 TEST(JoinLifecycleSchedulerTest,
      ForwardsOtherMethodsToInnerOnceWithUnchangedArgumentsAndResult) {
   ResetTestEnv();
@@ -899,6 +899,15 @@ TEST(JoinLifecycleSchedulerTest,
       });
   sched->SetAddressSpace(fake_address_space);
   sched->SetAddressSpace(nullptr);
+
+  FpuState* const fake_fpu_state = reinterpret_cast<FpuState*>(0x3000);
+  EXPECT_CALL(*mock_inner, SetFpuState)
+      .WillOnce([&](FpuState* const state) {
+        EXPECT_THAT(state, t::Eq(fake_fpu_state));
+      })
+      .WillOnce([](FpuState* const state) { EXPECT_THAT(state, t::IsNull()); });
+  sched->SetFpuState(fake_fpu_state);
+  sched->SetFpuState(nullptr);
 
   EXPECT_CALL(*mock_inner, OnTimerInterrupt)
       .WillOnce([&](InterruptFrame* const frame) {

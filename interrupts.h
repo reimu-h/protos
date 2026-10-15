@@ -7,6 +7,11 @@ namespace protos {
 
 // RFLAGS.IF (bit 9): maskable interrupts are enabled while it is set.
 inline constexpr uint64_t kRflagsInterruptEnableBit = 1ULL << 9;
+// RFLAGS.AC (bit 18). User code may set it freely (CR0.AM is clear, so it
+// checks no alignment). While SMAP is enabled (cpu.h), kernel code reaches
+// user pages only while it is set, which only the user-copy helpers do
+// (user_access.h).
+inline constexpr uint64_t kRflagsAlignmentCheckBit = 1ULL << 18;
 
 // Implementation details of the interrupt helpers below. Other code should use
 // the public functions instead.

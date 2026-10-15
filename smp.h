@@ -67,6 +67,7 @@ struct CpuInfo {
 
 class IrqSpinLock;
 class SmpHardware;
+struct FaultProbe;
 
 // Cache-line-aligned per-CPU runtime state bound to `IA32_GS_BASE` on bare
 // metal (`gs:[0]`) and a `thread_local` pointer in host unit tests.
@@ -78,8 +79,23 @@ struct alignas(64) CpuLocal {
   uintptr_t stack_base = 0;
   uintptr_t stack_top = 0;
   IrqSpinLock* top_held_lock = nullptr;
+  // The fault probe armed on this CPU (RunFaultProbe() in idt.h), or nullptr.
+  // Only this CPU reads and writes it, with interrupts disabled.
+  FaultProbe* fault_probe = nullptr;
   std::atomic<int64_t> timer_ticks{0};
   std::atomic<int64_t> ipi_count{0};
+  // The context switches from one task to another that this CPU has made
+  // (`Schedule()` in core_runqueue_scheduler.cpp). Code that reads the same
+  // count at two points on this CPU ran here all the time in between
+  // (cpu_clock.h).
+  std::atomic<int64_t> context_switches{0};
+  // The timer interrupts that have interrupted the task running on this CPU
+  // so far, on whichever CPUs it ran: `Schedule()`
+  // (core_runqueue_scheduler.cpp) saves the count into the task that it
+  // switches out and loads the count of the task that it switches in, and
+  // every switch must go through it. Code that reads it at two points learns
+  // how many timer interrupts interrupted it in between (cpu_clock.h).
+  std::atomic<int64_t> task_timer_ticks{0};
 };
 static_assert(offsetof(CpuLocal, self) == 0);
 static_assert(alignof(CpuLocal) == 64);
@@ -381,6 +397,13 @@ void SmpSendLocalApicEoi();
 // vector `0xFF`, so a fixed IPI on it would block every lower-priority
 // interrupt on the target CPU for good. Validates preconditions with `DCHECK`.
 void SmpSendIpi(int target_cpu_index, uint8_t vector);
+
+// Sends a Non-Maskable Interrupt to online CPU `target_cpu_index`
+// (`0 <= target_cpu_index < SmpCpuCount()`), which takes it even while it
+// runs with interrupts disabled. The handler that SmpInit() installs ignores
+// it unless a panic stop was requested (boot self-tests put a handler of
+// their own in front of it). Validates preconditions with `DCHECK`.
+void SmpSendNmi(int target_cpu_index);
 
 // Callback signature for multi-CPU work dispatched via `SmpRunOnAllCpus`.
 using SmpWorkFn = void (*)(int cpu_index, void* context);

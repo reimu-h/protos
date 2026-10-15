@@ -16,6 +16,7 @@
 #include "interrupts.h"
 #include "smp.h"
 #include "uart.h"
+#include "user_access.h"
 #include "vga.h"
 
 namespace protos {
@@ -222,17 +223,26 @@ TEST(IdtTest, DispatchHandlesLocalApicTimerWakeupIpiSpuriousAndCustomVectors) {
   EXPECT_THAT(CurrentCpuId(), t::Eq(2));
 
   // Vector 0x20 (Local APIC Timer): increments timer_ticks and sends EOI.
+  // Before its handler, which may switch tasks, it counts the interrupt for
+  // the task that it interrupted.
   static int timer_handler_calls = 0;
+  static int64_t task_ticks_in_handler = 0;
   timer_handler_calls = 0;
   IdtRegisterHandler(kVectorApicTimer, [](InterruptFrame* const frame) {
     EXPECT_THAT(frame->vector, t::Eq(static_cast<uint64_t>(kVectorApicTimer)));
     ++timer_handler_calls;
+    const CpuLocal* const current = CurrentCpuOrNull();
+    task_ticks_in_handler =
+        (current != nullptr) ? current->task_timer_ticks.load() : -1;
   });
   InterruptFrame timer_frame = {};
   timer_frame.vector = kVectorApicTimer;
   IdtDispatch(&timer_frame);
+  EXPECT_THAT(task_ticks_in_handler, t::Eq(1));
   IdtDispatch(&timer_frame);
+  EXPECT_THAT(task_ticks_in_handler, t::Eq(2));
   EXPECT_THAT(cpu.timer_ticks.load(), t::Eq(2));
+  EXPECT_THAT(cpu.task_timer_ticks.load(), t::Eq(2));
   EXPECT_THAT(cpu.ipi_count.load(), t::Eq(0));
   EXPECT_THAT(timer_handler_calls, t::Eq(2));
   EXPECT_THAT(g_env.eoi_count.load(), t::Eq(2));
@@ -248,6 +258,7 @@ TEST(IdtTest, DispatchHandlesLocalApicTimerWakeupIpiSpuriousAndCustomVectors) {
   ipi_frame.vector = kVectorWakeupIpi;
   IdtDispatch(&ipi_frame);
   EXPECT_THAT(cpu.timer_ticks.load(), t::Eq(2));
+  EXPECT_THAT(cpu.task_timer_ticks.load(), t::Eq(2));
   EXPECT_THAT(cpu.ipi_count.load(), t::Eq(1));
   EXPECT_THAT(ipi_handler_calls, t::Eq(1));
   EXPECT_THAT(g_env.eoi_count.load(), t::Eq(3));
@@ -301,7 +312,9 @@ TEST(IdtTest, DispatchHandlesLocalApicTimerWakeupIpiSpuriousAndCustomVectors) {
   // dereferencing a null CpuLocal pointer.
   IdtDispatch(&timer_frame);
   IdtDispatch(&ipi_frame);
+  EXPECT_THAT(task_ticks_in_handler, t::Eq(-1));
   EXPECT_THAT(cpu.timer_ticks.load(), t::Eq(2));
+  EXPECT_THAT(cpu.task_timer_ticks.load(), t::Eq(2));
   EXPECT_THAT(cpu.ipi_count.load(), t::Eq(1));
   EXPECT_THAT(timer_handler_calls, t::Eq(3));
   EXPECT_THAT(ipi_handler_calls, t::Eq(2));
@@ -600,6 +613,243 @@ TEST(IdtDeathTest, ExceptionsThatTheUserFaultHandlerMustNotEndStillPanic) {
   IdtSetUserFaultHandler(nullptr);
 }
 
+TEST(IdtDeathTest, HandlersMustStartWithTheUserAccessWindowClosed) {
+  ResetEnv();
+  IdtInit();
+  // The entry stubs close it (boot.S): a handler that ran with it open could
+  // touch user memory although SMAP is enabled.
+  EXPECT_DEATH(
+      {
+        SetUserAccessWindowOpenForTest(true);
+        InterruptFrame frame = {};
+        frame.vector = kVectorSpurious;
+        frame.cs = kKernelCs;
+        IdtDispatch(&frame);
+      },
+      "Check failed: !UserAccessWindowOpen\\(\\)");
+  InterruptFrame frame = {};
+  frame.vector = kVectorSpurious;
+  frame.cs = kKernelCs;
+  IdtDispatch(&frame);
+  EXPECT_THAT(g_env.eoi_count.load(), t::Eq(0));
+}
+
+// The resume point of the fault probes of the tests below, and the address
+// whose access faults.
+constexpr uint64_t kProbeResumeRip = 0x105000;
+constexpr uint64_t kProbeResumeRsp = 0x208000;
+constexpr uint64_t kProbedAddress = 0xFFFF800000000010ULL;
+
+// Binds `cpu` and arms `probe` on it, as RunFaultProbe() does, with CR2 at
+// kProbedAddress.
+static void ArmFaultProbe(CpuLocal* const cpu, FaultProbe* const probe) {
+  cpu->self = cpu;
+  cpu->cpu_id = 2;
+  BindCpuLocal(cpu);
+  *probe = {};
+  probe->resume_rip = kProbeResumeRip;
+  probe->resume_rsp = kProbeResumeRsp;
+  cpu->fault_probe = probe;
+  IdtSetHostCr2ForTest(kProbedAddress);
+}
+
+// A page fault of kernel code at `rip` with `rsp`, interrupts disabled and
+// RFLAGS.AC set (as with the user-access window open).
+static InterruptFrame KernelPageFault(const uint64_t rip, const uint64_t rsp) {
+  InterruptFrame frame = {};
+  frame.vector = kVectorPageFault;
+  frame.error_code = 0x1;
+  frame.cs = kKernelCs;
+  frame.rip = rip;
+  frame.rsp = rsp;
+  frame.rflags = kRflagsAlignmentCheckBit | 0x46;
+  return frame;
+}
+
+TEST(IdtTest, ArmedFaultProbeEndsAtAPageFaultOfKernelCode) {
+  ResetEnv();
+  IdtInit();
+  CpuLocal cpu = {};
+  FaultProbe probe;
+  ArmFaultProbe(&cpu, &probe);
+
+  InterruptFrame frame = KernelPageFault(0x104321, kProbeResumeRsp - 8);
+  IdtDispatch(&frame);
+  // Back at the resume point, with AC clear and interrupts still disabled.
+  EXPECT_THAT(frame.rip, t::Eq(kProbeResumeRip));
+  EXPECT_THAT(frame.rsp, t::Eq(kProbeResumeRsp));
+  EXPECT_THAT(frame.rflags, t::Eq(0x46u));
+  EXPECT_THAT(frame.cs, t::Eq(kKernelCs));
+  EXPECT_TRUE(probe.faulted);
+  EXPECT_THAT(probe.error_code, t::Eq(0x1u));
+  EXPECT_THAT(probe.fault_address, t::Eq(kProbedAddress));
+  EXPECT_THAT(probe.fault_rip, t::Eq(0x104321u));
+  // Disarmed.
+  EXPECT_THAT(cpu.fault_probe, t::IsNull());
+  EXPECT_THAT(g_env.eoi_count.load(), t::Eq(0));
+  ResetCpuLocalForTest();
+}
+
+TEST(IdtTest, ArmedFaultProbeEndsAtASmepFaultAndAtTheEdgeOfItsStack) {
+  ResetEnv();
+  IdtInit();
+  CpuLocal cpu = {};
+  FaultProbe probe;
+
+  // The fetch from a user page right after the call: RIP = CR2.
+  ArmFaultProbe(&cpu, &probe);
+  constexpr uint64_t kUserCode = 0xFFFFFFFF80200000ULL;
+  IdtSetHostCr2ForTest(kUserCode);
+  InterruptFrame smep = KernelPageFault(kUserCode, kProbeResumeRsp - 8);
+  smep.error_code = 0x11;
+  IdtDispatch(&smep);
+  EXPECT_THAT(smep.rip, t::Eq(kProbeResumeRip));
+  EXPECT_TRUE(probe.faulted);
+  EXPECT_THAT(probe.error_code, t::Eq(0x11u));
+  EXPECT_THAT(probe.fault_address, t::Eq(kUserCode));
+  EXPECT_THAT(probe.fault_rip, t::Eq(kUserCode));
+
+  // As deep below the resume point as the probe allows.
+  ArmFaultProbe(&cpu, &probe);
+  InterruptFrame deep =
+      KernelPageFault(0x104321, kProbeResumeRsp - kFaultProbeStackLimit);
+  IdtDispatch(&deep);
+  EXPECT_THAT(deep.rip, t::Eq(kProbeResumeRip));
+  EXPECT_THAT(deep.rsp, t::Eq(kProbeResumeRsp));
+  EXPECT_TRUE(probe.faulted);
+  EXPECT_THAT(cpu.fault_probe, t::IsNull());
+  ResetCpuLocalForTest();
+}
+
+TEST(IdtTest, ArmedFaultProbeLeavesUserFaultsAndNmisAlone) {
+  ResetEnv();
+  GdtResetForTest();
+  IdtInit();
+  CpuLocal cpu = {};
+  FaultProbe probe;
+  ArmFaultProbe(&cpu, &probe);
+  SetInterruptsEnabledForTest(false);
+  IdtSetUserFaultHandler(ThrowingUserFaultHandler);
+
+  // A page fault of user code goes to the user fault handler.
+  alignas(16) InterruptFrame user_fault =
+      KernelPageFault(0xFFFFFFFF80001000ULL, kProbeResumeRsp - 8);
+  user_fault.cs = kUserCs;
+  try {
+    IdtDispatch(&user_fault);
+    ADD_FAILURE() << "the user page fault did not reach the handler";
+  } catch (const UserFaultHandled& handled) {
+    EXPECT_THAT(handled.vector, t::Eq(static_cast<uint64_t>(kVectorPageFault)));
+  }
+  // An NMI runs its handler.
+  static int nmis = 0;
+  nmis = 0;
+  IdtRegisterHandler(kVectorNmi, [](InterruptFrame* const) { ++nmis; });
+  InterruptFrame nmi = KernelPageFault(0x104321, kProbeResumeRsp - 8);
+  nmi.vector = kVectorNmi;
+  IdtDispatch(&nmi);
+  EXPECT_THAT(nmis, t::Eq(1));
+  EXPECT_THAT(nmi.rip, t::Eq(0x104321u));
+  // The probe is still armed and untouched.
+  EXPECT_FALSE(probe.faulted);
+  EXPECT_THAT(cpu.fault_probe, t::Eq(&probe));
+
+  IdtUnregisterHandler(kVectorNmi);
+  IdtSetUserFaultHandler(nullptr);
+  SetInterruptsEnabledForTest(true);
+  ResetCpuLocalForTest();
+}
+
+TEST(IdtDeathTest, FaultsThatNoArmedProbeExpectsStillPanic) {
+  ResetEnv();
+  IdtInit();
+  g_env.stderr_console = PanicConsole::kUart;
+  constexpr const char* kPageFaultPanic =
+      "Unhandled CPU exception 14 \\(#PF\\)";
+  // Above the resume point.
+  EXPECT_DEATH(
+      {
+        CpuLocal cpu = {};
+        FaultProbe probe;
+        ArmFaultProbe(&cpu, &probe);
+        InterruptFrame frame = KernelPageFault(0x104321, kProbeResumeRsp + 8);
+        IdtDispatch(&frame);
+      },
+      kPageFaultPanic);
+  // Deeper below it than the probe allows, such as on another stack.
+  EXPECT_DEATH(
+      {
+        CpuLocal cpu = {};
+        FaultProbe probe;
+        ArmFaultProbe(&cpu, &probe);
+        InterruptFrame frame = KernelPageFault(
+            0x104321, kProbeResumeRsp - kFaultProbeStackLimit - 8);
+        IdtDispatch(&frame);
+      },
+      kPageFaultPanic);
+  // So far below it that the distance has the sign bit set.
+  EXPECT_DEATH(
+      {
+        CpuLocal cpu = {};
+        FaultProbe probe;
+        ArmFaultProbe(&cpu, &probe);
+        probe.resume_rsp = 0xFFFF800000208000ULL;
+        InterruptFrame frame = KernelPageFault(0x104321, kProbeResumeRsp);
+        IdtDispatch(&frame);
+      },
+      kPageFaultPanic);
+  // With interrupts enabled, which a probed function never has.
+  EXPECT_DEATH(
+      {
+        CpuLocal cpu = {};
+        FaultProbe probe;
+        ArmFaultProbe(&cpu, &probe);
+        InterruptFrame frame = KernelPageFault(0x104321, kProbeResumeRsp - 8);
+        frame.rflags |= kRflagsInterruptEnableBit;
+        IdtDispatch(&frame);
+      },
+      kPageFaultPanic);
+  // Armed on another CPU.
+  EXPECT_DEATH(
+      {
+        CpuLocal cpu = {};
+        FaultProbe probe;
+        ArmFaultProbe(&cpu, &probe);
+        CpuLocal other = {};
+        other.self = &other;
+        BindCpuLocal(&other);
+        InterruptFrame frame = KernelPageFault(0x104321, kProbeResumeRsp - 8);
+        IdtDispatch(&frame);
+      },
+      kPageFaultPanic);
+  // A second page fault after the first ended the probe.
+  EXPECT_DEATH(
+      {
+        CpuLocal cpu = {};
+        FaultProbe probe;
+        ArmFaultProbe(&cpu, &probe);
+        InterruptFrame first = KernelPageFault(0x104321, kProbeResumeRsp - 8);
+        IdtDispatch(&first);
+        InterruptFrame second = KernelPageFault(0x104321, kProbeResumeRsp - 8);
+        IdtDispatch(&second);
+      },
+      kPageFaultPanic);
+  // Other exceptions of the probed function.
+  for (const int vector :
+       {kVectorGeneralProtection, kVectorDoubleFault, kVectorMachineCheck}) {
+    EXPECT_DEATH(
+        {
+          CpuLocal cpu = {};
+          FaultProbe probe;
+          ArmFaultProbe(&cpu, &probe);
+          InterruptFrame frame = KernelPageFault(0x104321, kProbeResumeRsp - 8);
+          frame.vector = static_cast<uint64_t>(vector);
+          IdtDispatch(&frame);
+        },
+        "Unhandled CPU exception " + std::to_string(vector) + " ");
+  }
+}
+
 TEST(IdtTest, ReturnsToUserModeWithTheKernelStackRightAboveTheFrame) {
   ResetEnv();
   GdtResetForTest();
@@ -648,6 +898,251 @@ TEST(IdtTest, ReturnsToUserModeWithTheKernelStackRightAboveTheFrame) {
   EXPECT_THAT(Rsp0(3), t::Eq(frame_top));
   IdtUnregisterHandler(0x51);
 
+  SetInterruptsEnabledForTest(true);
+  ResetCpuLocalForTest();
+}
+
+// Binds `cpus[0]` and `cpus[1]` as CPUs 2 and 3 of the tests below, and
+// `cpus[0]` to the calling thread, with interrupts disabled as on entry to
+// `IdtDispatch()`.
+static void BindTestCpus(CpuLocal* const cpus) {
+  for (int i = 0; i < 2; ++i) {
+    cpus[i].self = &cpus[i];
+    cpus[i].cpu_id = 2 + i;
+    cpus[i].timer_ticks.store(0, std::memory_order_relaxed);
+    cpus[i].ipi_count.store(0, std::memory_order_relaxed);
+  }
+  BindCpuLocal(&cpus[0]);
+  SetInterruptsEnabledForTest(false);
+}
+
+// Returns a frame of user code with interrupts enabled, as the CPU pushes it
+// for `vector`.
+static InterruptFrame UserFrame(const uint64_t vector) {
+  InterruptFrame frame = {};
+  frame.vector = vector;
+  frame.cs = kUserCs;
+  frame.rflags = kRflagsInterruptEnableBit | 0x2;
+  return frame;
+}
+
+TEST(IdtTest,
+     ReturnsToUserModeWithInterruptsDisabledWhereverTheHandlerLeftThem) {
+  ResetEnv();
+  GdtResetForTest();
+  IdtInit();
+  static CpuLocal cpus[2];
+  BindTestCpus(cpus);
+  constexpr uintptr_t kOldRsp0 = 0x10000;
+  GdtSetKernelStack(kOldRsp0);
+  alignas(16) InterruptFrame frame = UserFrame(kVectorSyscall);
+  const uintptr_t frame_top = reinterpret_cast<uintptr_t>(&frame + 1);
+
+  // A system call handler that serves the call with interrupts enabled, as
+  // they were in user mode (user_mode.h).
+  IdtRegisterHandler(kVectorSyscall, [](InterruptFrame* const syscall_frame) {
+    EXPECT_FALSE(AreInterruptsEnabled());
+    RestoreInterrupts((syscall_frame->rflags & kRflagsInterruptEnableBit) != 0);
+    syscall_frame->rax = 7;
+  });
+  IdtDispatch(&frame);
+  EXPECT_FALSE(AreInterruptsEnabled());
+  EXPECT_THAT(Rsp0(2), t::Eq(frame_top));
+  EXPECT_THAT(frame.rax, t::Eq(7u));
+  IdtUnregisterHandler(kVectorSyscall);
+
+  // A handler that enabled interrupts and switched tasks may return on
+  // another CPU, which then returns to user mode with interrupts disabled.
+  GdtSetKernelStack(kOldRsp0);
+  IdtRegisterHandler(0x51, [](InterruptFrame* const) {
+    SetInterruptsEnabledForTest(true);
+    BindCpuLocal(&cpus[1]);
+  });
+  frame.vector = 0x51;
+  IdtDispatch(&frame);
+  EXPECT_FALSE(AreInterruptsEnabled());
+  EXPECT_THAT(Rsp0(2), t::Eq(kOldRsp0));
+  EXPECT_THAT(Rsp0(3), t::Eq(frame_top));
+  IdtUnregisterHandler(0x51);
+
+  // Even if interrupts were enabled on entry.
+  BindCpuLocal(&cpus[0]);
+  SetInterruptsEnabledForTest(true);
+  frame.vector = 0x50;
+  IdtDispatch(&frame);
+  EXPECT_FALSE(AreInterruptsEnabled());
+  EXPECT_THAT(Rsp0(2), t::Eq(frame_top));
+
+  // Interrupted kernel code, and the IST vectors, keep the interrupt flag as
+  // the handler left it, and TSS.rsp0.
+  GdtSetKernelStack(kOldRsp0);
+  SetInterruptsEnabledForTest(true);
+  frame.cs = kKernelCs;
+  IdtDispatch(&frame);
+  EXPECT_TRUE(AreInterruptsEnabled());
+  frame.cs = kUserCs;
+  frame.vector = kVectorNmi;
+  IdtDispatch(&frame);
+  EXPECT_TRUE(AreInterruptsEnabled());
+  EXPECT_THAT(Rsp0(2), t::Eq(kOldRsp0));
+
+  ResetCpuLocalForTest();
+}
+
+// What the return-to-user handler of the tests below saw at its latest call.
+struct UserReturnRecord {
+  int calls = 0;
+  const InterruptFrame* frame = nullptr;
+  bool interrupts_enabled = true;
+  int cpu = -1;
+  uint64_t rsp0 = 0;
+  int64_t eoi_count = 0;
+};
+
+UserReturnRecord g_user_return;
+
+// A return-to-user handler that records what it sees in `g_user_return`.
+static void RecordingUserReturnHandler(InterruptFrame* const frame) {
+  ++g_user_return.calls;
+  g_user_return.frame = frame;
+  g_user_return.interrupts_enabled = AreInterruptsEnabled();
+  g_user_return.cpu = CurrentCpuOrNull()->cpu_id;
+  g_user_return.rsp0 = Rsp0(g_user_return.cpu);
+  g_user_return.eoi_count = g_env.eoi_count.load(std::memory_order_relaxed);
+}
+
+TEST(IdtTest,
+     UserReturnHandlerRunsLastOnTheReturningCpuWithInterruptsDisabled) {
+  ResetEnv();
+  GdtResetForTest();
+  IdtInit();
+  static CpuLocal cpus[2];
+  BindTestCpus(cpus);
+  constexpr uintptr_t kOldRsp0 = 0x10000;
+  GdtSetKernelStack(kOldRsp0);
+  g_user_return = {};
+  IdtSetUserReturnHandler(RecordingUserReturnHandler);
+  alignas(16) InterruptFrame frame = UserFrame(0x51);
+  const uintptr_t frame_top = reinterpret_cast<uintptr_t>(&frame + 1);
+
+  // After the vector's handler, which enabled interrupts and moved the task
+  // to CPU 3, and after the EOI.
+  IdtRegisterHandler(0x51, [](InterruptFrame* const) {
+    SetInterruptsEnabledForTest(true);
+    BindCpuLocal(&cpus[1]);
+  });
+  IdtDispatch(&frame);
+  EXPECT_THAT(g_user_return.calls, t::Eq(1));
+  EXPECT_THAT(g_user_return.frame, t::Eq(&frame));
+  EXPECT_FALSE(g_user_return.interrupts_enabled);
+  EXPECT_THAT(g_user_return.cpu, t::Eq(3));
+  EXPECT_THAT(g_user_return.rsp0, t::Eq(frame_top));
+  EXPECT_THAT(g_user_return.eoi_count, t::Eq(1));
+  EXPECT_THAT(Rsp0(2), t::Eq(kOldRsp0));
+  EXPECT_FALSE(AreInterruptsEnabled());
+  IdtUnregisterHandler(0x51);
+
+  // On the way back from system calls (no EOI) and timer interrupts.
+  BindCpuLocal(&cpus[0]);
+  frame.vector = kVectorSyscall;
+  IdtDispatch(&frame);
+  EXPECT_THAT(g_user_return.calls, t::Eq(2));
+  EXPECT_THAT(g_user_return.cpu, t::Eq(2));
+  EXPECT_THAT(g_user_return.eoi_count, t::Eq(1));
+  frame.vector = kVectorApicTimer;
+  IdtDispatch(&frame);
+  EXPECT_THAT(g_user_return.calls, t::Eq(3));
+  EXPECT_THAT(g_user_return.eoi_count, t::Eq(2));
+
+  // Not when interrupted kernel code resumes, nor after the IST vectors.
+  frame.cs = kKernelCs;
+  frame.vector = 0x50;
+  IdtDispatch(&frame);
+  frame.cs = kUserCs;
+  frame.vector = kVectorNmi;
+  IdtDispatch(&frame);
+  IdtRegisterHandler(kVectorMachineCheck, [](InterruptFrame* const) {});
+  frame.vector = kVectorMachineCheck;
+  IdtDispatch(&frame);
+  IdtUnregisterHandler(kVectorMachineCheck);
+  EXPECT_THAT(g_user_return.calls, t::Eq(3));
+
+  // `nullptr` unregisters the handler, and so does IdtResetForTest().
+  IdtSetUserReturnHandler(nullptr);
+  frame.vector = 0x50;
+  IdtDispatch(&frame);
+  EXPECT_THAT(g_user_return.calls, t::Eq(3));
+  IdtSetUserReturnHandler(RecordingUserReturnHandler);
+  ResetEnv();
+  IdtInit();
+  BindTestCpus(cpus);
+  IdtDispatch(&frame);
+  EXPECT_THAT(g_user_return.calls, t::Eq(3));
+
+  SetInterruptsEnabledForTest(true);
+  ResetCpuLocalForTest();
+}
+
+TEST(IdtTest, UserReturnHandlerMayEndTheProgramInsteadOfReturning) {
+  ResetEnv();
+  GdtResetForTest();
+  IdtInit();
+  static CpuLocal cpus[2];
+  BindTestCpus(cpus);
+  static int handler_calls = 0;
+  handler_calls = 0;
+  IdtRegisterHandler(0x51, [](InterruptFrame* const) { ++handler_calls; });
+  IdtSetUserReturnHandler(ThrowingUserFaultHandler);
+  alignas(16) InterruptFrame frame = UserFrame(0x51);
+  uint64_t ended_vector = 0;
+  try {
+    IdtDispatch(&frame);
+  } catch (const UserFaultHandled& handled) {
+    ended_vector = handled.vector;
+  }
+  EXPECT_THAT(ended_vector, t::Eq(0x51u));
+  EXPECT_THAT(handler_calls, t::Eq(1));
+  EXPECT_THAT(Rsp0(2), t::Eq(reinterpret_cast<uintptr_t>(&frame + 1)));
+  IdtUnregisterHandler(0x51);
+  IdtSetUserReturnHandler(nullptr);
+  SetInterruptsEnabledForTest(true);
+  ResetCpuLocalForTest();
+}
+
+TEST(IdtTest, KickIpiNeedsNoHandlerAndOnlyGetsAnEoi) {
+  static_assert(kVectorKickIpi >= kCpuExceptionCount &&
+                kVectorKickIpi < kVectorLegacyPicBase);
+  static_assert(kVectorKickIpi != kVectorApicTimer &&
+                kVectorKickIpi != kVectorWakeupIpi &&
+                kVectorKickIpi != kVectorSyscall &&
+                kVectorKickIpi != kVectorTlbShootdown &&
+                kVectorKickIpi != kVectorSpurious);
+  ResetEnv();
+  GdtResetForTest();
+  IdtInit();
+  EXPECT_THAT(IdtGetHandler(kVectorKickIpi), t::IsNull());
+  static CpuLocal cpus[2];
+  BindTestCpus(cpus);
+  g_user_return = {};
+  IdtSetUserReturnHandler(RecordingUserReturnHandler);
+  alignas(16) InterruptFrame frame = UserFrame(kVectorKickIpi);
+
+  // Kernel code only gets the EOI.
+  frame.cs = kKernelCs;
+  IdtDispatch(&frame);
+  EXPECT_THAT(g_env.eoi_count.load(std::memory_order_relaxed), t::Eq(1));
+  EXPECT_THAT(g_user_return.calls, t::Eq(0));
+
+  // User code returns to user mode through the return-to-user handler, after
+  // the EOI.
+  frame.cs = kUserCs;
+  IdtDispatch(&frame);
+  EXPECT_THAT(g_user_return.calls, t::Eq(1));
+  EXPECT_THAT(g_user_return.eoi_count, t::Eq(2));
+  EXPECT_THAT(cpus[0].timer_ticks.load(std::memory_order_relaxed), t::Eq(0));
+  EXPECT_THAT(cpus[0].ipi_count.load(std::memory_order_relaxed), t::Eq(0));
+
+  IdtSetUserReturnHandler(nullptr);
   SetInterruptsEnabledForTest(true);
   ResetCpuLocalForTest();
 }

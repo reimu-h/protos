@@ -56,6 +56,10 @@ class ForwardingTaskScheduler : public TaskScheduler {
     inner_->SetAddressSpace(address_space);
   }
 
+  void SetFpuState(FpuState* const state) override {
+    inner_->SetFpuState(state);
+  }
+
  protected:
   // Scheduler internals:
   void Init() override { TaskSchedulerInternals::Init(*inner_); }

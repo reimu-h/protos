@@ -3,6 +3,7 @@
 
 #include "check.h"
 #include "console.h"
+#include "cpu.h"
 #include "gdt.h"
 #include "heap.h"
 #include "idt.h"
@@ -48,6 +49,10 @@ extern "C" [[noreturn]] void kernel_main(const uint32_t multiboot_magic,
   // switch to its IST stacks.
   GdtInit();
   IdtInit();
+  // Before SmpInit() starts the APs, which apply the configuration it chooses,
+  // and before any user page exists: with SMAP, the kernel reaches user
+  // memory only through the user-copy helpers (user_access.h).
+  CpuInitBsp();
   PmmInit(multiboot_magic, multiboot_info_addr);
   HeapInit();
   // Before any user address space exists and before the APs start: from here

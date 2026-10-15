@@ -71,6 +71,12 @@ namespace protos {
 // when a CPU switches to a task whose address space differs from the one the
 // CPU uses. Every task starts in the kernel's page tables, and idle tasks
 // always run in them.
+//
+// x87/MMX/SSE/AVX registers: the core records the register state of each task
+// (`SetFpuState()`), saves the registers into it with `FpuSave()` (fpu.h) when
+// a CPU switches the task out, unless it exits, and loads them from it with
+// `FpuRestore()` when a CPU switches to the task. Tasks without a state, idle
+// tasks included, leave the registers alone.
 std::shared_ptr<TaskScheduler> CreateCoreRunqueueScheduler();
 
 #if __STDC_HOSTED__

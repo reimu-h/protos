@@ -1,6 +1,7 @@
 #ifndef PROTOS_IDT_H_
 #define PROTOS_IDT_H_
 
+#include <cstddef>
 #include <cstdint>
 
 namespace protos {
@@ -59,9 +60,18 @@ constexpr int kLegacyPicVectorCount = 16;
 // Local APIC interrupt vectors (32..255).
 constexpr uint8_t kVectorApicTimer = 0x20;
 constexpr uint8_t kVectorWakeupIpi = 0x21;
+// Kick IPI (`UserProcess::Kill()` in user_mode.h): makes a CPU that runs user
+// code enter the kernel, so that it returns to user mode through the
+// return-to-user handler (`IdtSetUserReturnHandler()`). Nothing handles it:
+// `IdtDispatch` only sends the Local APIC EOI. (Same priority class as the
+// timer.)
+constexpr uint8_t kVectorKickIpi = 0x22;
 // System calls (user_mode.h): the only vector whose gate user code may invoke
 // (DPL 3), with `int 0x80`. A software interrupt, so `IdtDispatch` sends no
-// Local APIC EOI for it.
+// Local APIC EOI for it. Its gate is an interrupt gate like every other one:
+// `isr_common_stub` (boot.S) must swap GS before an interrupt can arrive. The
+// system call handler enables interrupts itself once it has done its per-CPU
+// bookkeeping (user_mode.h).
 constexpr uint8_t kVectorSyscall = 0x80;
 // TLB shootdown IPI (`SmpTlbShootdown()` in smp.h), in the highest Local APIC
 // priority class so that it is delivered ahead of pending timer and wakeup
@@ -191,16 +201,88 @@ inline bool IsUserFrame(const InterruptFrame& frame) {
 // state is broken. `nullptr` unregisters the handler.
 void IdtSetUserFaultHandler(InterruptHandlerFn handler);
 
+// Registers `handler` to run each time `IdtDispatch()` is about to return to
+// user code (`IsUserFrame()`) from a vector without an IST stack: after the
+// vector's own handler, with interrupts disabled, once `TSS.rsp0` of the CPU
+// that returns (which may be another CPU than the one that took the interrupt)
+// points at the top of `frame`. `handler` may end the user program instead of
+// returning, for example when another task has killed it (user_mode.h).
+// `nullptr` unregisters the handler.
+void IdtSetUserReturnHandler(InterruptHandlerFn handler);
+
 // Returns CR2, the linear address whose access caused the most recent page
 // fault on the calling CPU. Host tests link a fake instead
 // (idt_host_fakes.h).
 uint64_t ReadCr2();
 
+// Kernel fault probes
+// ===================
+//
+// RunFaultProbe() lets kernel code make an access that page-faults on purpose
+// and carry on: the boot self-tests use it to show that SMAP and SMEP stop the
+// kernel from touching and executing user pages. It calls a function with
+// interrupts disabled and a probe armed on the calling CPU
+// (`CpuLocal::fault_probe`, smp.h). If the function page-faults, IdtDispatch()
+// records the fault in the probe, disarms it and resumes RunFaultProbe() as if
+// the function had returned. Every other fault still panics: a page fault
+// with no probe armed on the CPU, of user code, with interrupts enabled, or of
+// code that does not run on the probe's stack within kFaultProbeStackLimit
+// below its resume point (such as an NMI or machine-check handler on its IST
+// stack), and every other exception.
+
+// The resume point of an armed fault probe and the page fault that ended it.
+// FaultProbeCall() (fault_probe.S) writes the first two fields.
+struct FaultProbe {
+  uint64_t resume_rip = 0;
+  uint64_t resume_rsp = 0;
+  // Set by IdtDispatch() when a page fault ends the probe: its error code,
+  // address (CR2) and RIP.
+  bool faulted = false;
+  uint64_t error_code = 0;
+  uint64_t fault_address = 0;
+  uint64_t fault_rip = 0;
+};
+// fault_probe.S hard-codes these offsets.
+static_assert(offsetof(FaultProbe, resume_rip) == 0);
+static_assert(offsetof(FaultProbe, resume_rsp) == 8);
+
+// How far below its resume point the stack of a probed function may reach, in
+// bytes.
+constexpr int64_t kFaultProbeStackLimit = 4096;
+
+// What RunFaultProbe() observed.
+struct FaultProbeResult {
+  // The CPU that ran the function.
+  int cpu = -1;
+  // Whether the function page-faulted instead of returning, and if so the
+  // page fault's error code, address (CR2) and RIP.
+  bool faulted = false;
+  uint64_t error_code = 0;
+  uint64_t address = 0;
+  uint64_t rip = 0;
+};
+
+#if !__STDC_HOSTED__
+// Calls `fn(arg)` on the calling CPU with interrupts disabled and a fault probe
+// armed, and returns whether and how it page-faulted. `fn` may be the address
+// of code in a user page. `fn` must neither enable interrupts nor switch
+// tasks, and probes don't nest (DCHECK). Not for interrupt handlers.
+FaultProbeResult RunFaultProbe(void (*fn)(uintptr_t arg), uintptr_t arg);
+#endif
+
 // C++ interrupt and exception dispatch entry point invoked by `isr_common_stub`
-// in `boot.S` with `rdi = rsp` (`InterruptFrame*`). Before it returns to user
-// code (`IsUserFrame()`), which may happen on another CPU than the one that
-// took the interrupt, it points that CPU's `TSS.rsp0` back at the top of the
-// task's interrupt frame (`GdtSetKernelStack()`).
+// in `boot.S` with `rdi = rsp` (`InterruptFrame*`). It starts with interrupts
+// disabled (every gate is an interrupt gate). The handlers of vectors that
+// interrupt user code may enable interrupts and switch tasks; the system call
+// handler does (user_mode.h). Before such a frame returns to user code, which
+// may then happen on another CPU than the one that took the interrupt,
+// `IdtDispatch` disables interrupts again, points that CPU's `TSS.rsp0` back
+// at the top of the task's interrupt frame (`GdtSetKernelStack()`), and runs
+// the return-to-user handler (`IdtSetUserReturnHandler()`). Interrupts stay
+// disabled from there until `iretq`. Frames of interrupted kernel code, and of
+// the IST vectors (NMI, #DF, #MC), return with the interrupt flag as their
+// handlers left it. Unhandled CPU exceptions of kernel code panic, except a
+// page fault that ends the fault probe armed on the CPU (RunFaultProbe()).
 extern "C" void IdtDispatch(InterruptFrame* frame);
 
 #if __STDC_HOSTED__

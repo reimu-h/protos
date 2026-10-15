@@ -13,7 +13,11 @@
 #include <thread>
 #include <vector>
 
+#include "gdt.h"
+#include "idt.h"
+#include "interrupts.h"
 #include "scheduler_test_support.h"
+#include "smp.h"
 #include "task_scheduler_internals.h"
 
 namespace protos {
@@ -856,6 +860,118 @@ TEST(TaskTest, ConcurrentMultiThreadedWorkStealingAndContentionUnderTsan) {
   EXPECT_THAT(PmmFreeFrameCount(), t::Eq(pmm_before));
   EXPECT_THAT(HeapTotalFreeBytes(), t::Eq(heap_before));
 
+  TaskResetForTest();
+}
+
+struct PreemptedSyscallCtx {
+  std::atomic<bool> in_syscall{false};
+  std::atomic<bool> done{false};
+  int entry_cpu = -1;
+  int exit_cpu = -1;
+  int timer_interrupts = 0;
+  bool interrupts_enabled_after_return = true;
+  uint64_t rsp0_after_return = 0;
+  uintptr_t frame_top = 0;
+  uint64_t rax = 0;
+};
+
+// The context of `PreemptibleSyscallHandler()`, which can't take an argument.
+PreemptedSyscallCtx* g_preempted_syscall = nullptr;
+
+// Stands in for UserProcess::OnSyscall(): serves the call with interrupts
+// enabled, taking timer interrupts until one of them has switched the task out
+// and the task has resumed on another CPU, and returns `rdi + 1`.
+static void PreemptibleSyscallHandler(InterruptFrame* const frame) {
+  PreemptedSyscallCtx* const ctx = g_preempted_syscall;
+  ctx->entry_cpu = CurrentCpuIdIrqsOff();
+  RestoreInterrupts((frame->rflags & kRflagsInterruptEnableBit) != 0);
+  ctx->in_syscall.store(true, std::memory_order_release);
+  for (int i = 0; i < 100 && CurrentCpuId() == ctx->entry_cpu; ++i) {
+    InterruptFrame timer_frame = MakeInterruptFrame(kVectorApicTimer);
+    // As the interrupt gate and `iretq` do.
+    SetInterruptsEnabledForTest(false);
+    IdtDispatch(&timer_frame);
+    SetInterruptsEnabledForTest(true);
+    ++ctx->timer_interrupts;
+  }
+  ctx->exit_cpu = CurrentCpuId();
+  frame->rax = frame->rdi + 1;
+}
+
+// Makes a system call from "user mode" (a frame with a user code segment).
+static void SyscallTaskWorker(void* const raw_ctx) {
+  PreemptedSyscallCtx* const ctx = static_cast<PreemptedSyscallCtx*>(raw_ctx);
+  alignas(16) InterruptFrame frame = MakeInterruptFrame(kVectorSyscall);
+  frame.cs = kGdtUserCodeSelector;
+  frame.rdi = 41;
+  // As the interrupt gate leaves them.
+  SetInterruptsEnabledForTest(false);
+  IdtDispatch(&frame);
+  ctx->interrupts_enabled_after_return = AreInterruptsEnabled();
+  ctx->rsp0_after_return = GdtGetTss(CurrentCpuIdIrqsOff())->rsp[0];
+  ctx->frame_top = reinterpret_cast<uintptr_t>(&frame + 1);
+  ctx->rax = frame.rax;
+  // `iretq` restores the interrupt flag of user mode.
+  SetInterruptsEnabledForTest(true);
+  ctx->done.store(true, std::memory_order_release);
+}
+
+TEST(TaskTest,
+     SystemCallWithInterruptsEnabledIsPreemptedAndFinishesOnAnotherCpu) {
+  SetupEnv(2);
+  GdtResetForTest();
+  TaskInit();
+  TaskScheduler* const sched = GetTaskScheduler();
+  const int64_t pmm_before = PmmFreeFrameCount();
+  const int64_t heap_before = HeapTotalFreeBytes();
+  PreemptedSyscallCtx ctx;
+  g_preempted_syscall = &ctx;
+  IdtRegisterHandler(kVectorSyscall, PreemptibleSyscallHandler);
+
+  Task* const task =
+      sched->CreateTaskOnCpu(SyscallTaskWorker, &ctx, kDefaultTaskWeight, 0);
+  ASSERT_THAT(task, t::NotNull());
+  // The task enters the system call on CPU 0, where a timer interrupt
+  // switches it out in the middle of it, back to this task.
+  sched->Yield();
+  EXPECT_TRUE(ctx.in_syscall.load(std::memory_order_acquire));
+  EXPECT_FALSE(ctx.done.load(std::memory_order_acquire));
+  EXPECT_THAT(TaskRunningCpu(task), t::Eq(-1));
+
+  // CPU 1, idle, takes the task and resumes it, while this task stays out of
+  // the scheduler.
+  std::thread cpu1([&ctx]() {
+    BindCpuLocal(SmpGetCpuLocal(1));
+    SetInterruptsEnabledForTest(true);
+    while (!ctx.done.load(std::memory_order_acquire)) {
+      if (!TaskPollIdleCpu(1)) {
+        std::this_thread::yield();
+      }
+    }
+    ResetCpuLocalForTest();
+  });
+  cpu1.join();
+
+  EXPECT_THAT(ctx.entry_cpu, t::Eq(0));
+  EXPECT_THAT(ctx.exit_cpu, t::Eq(1));
+  EXPECT_THAT(ctx.timer_interrupts, t::Ge(1));
+  // CPU 1 returned to user mode with interrupts disabled, its TSS.rsp0 right
+  // above the frame; CPU 0 never returned to user mode.
+  EXPECT_FALSE(ctx.interrupts_enabled_after_return);
+  EXPECT_THAT(ctx.rsp0_after_return, t::Eq(ctx.frame_top));
+  const uint64_t cpu0_rsp0 = GdtGetTss(0)->rsp[0];
+  EXPECT_THAT(cpu0_rsp0, t::Eq(0u));
+  EXPECT_THAT(ctx.rax, t::Eq(42u));
+  // CPU 0 switched to the task and away from it; CPU 1 to it and back to its
+  // idle loop.
+  EXPECT_THAT(SmpGetCpuLocal(0)->context_switches.load(), t::Ge(2));
+  EXPECT_THAT(SmpGetCpuLocal(1)->context_switches.load(), t::Ge(2));
+
+  sched->Join(task);
+  IdtUnregisterHandler(kVectorSyscall);
+  g_preempted_syscall = nullptr;
+  EXPECT_THAT(PmmFreeFrameCount(), t::Eq(pmm_before));
+  EXPECT_THAT(HeapTotalFreeBytes(), t::Eq(heap_before));
   TaskResetForTest();
 }
 

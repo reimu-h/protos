@@ -10,8 +10,10 @@
 #include "check.h"
 #include "format.h"
 #include "gdt.h"
+#include "interrupts.h"
 #include "smp.h"
 #include "uart.h"
+#include "user_access.h"
 #include "vga.h"
 
 namespace protos {
@@ -34,6 +36,8 @@ std::atomic<InterruptHandlerFn> g_handlers[kIdtEntryCount] = {};
 std::atomic<bool> g_idt_initialized{false};
 // See `IdtSetUserFaultHandler()`.
 std::atomic<InterruptHandlerFn> g_user_fault_handler{nullptr};
+// See `IdtSetUserReturnHandler()`.
+std::atomic<InterruptHandlerFn> g_user_return_handler{nullptr};
 
 #if __STDC_HOSTED__
 std::atomic<int> g_host_idt_load_count{0};
@@ -335,7 +339,43 @@ void IdtSetUserFaultHandler(const InterruptHandlerFn handler) {
   g_user_fault_handler.store(handler, std::memory_order_release);
 }
 
+void IdtSetUserReturnHandler(const InterruptHandlerFn handler) {
+  g_user_return_handler.store(handler, std::memory_order_release);
+}
+
 namespace {
+
+// Ends the fault probe armed on the calling CPU at the page fault of kernel
+// code in `frame`, if the fault is the probed function's (RunFaultProbe() in
+// idt.h): records it in the probe, disarms the probe and makes `frame` return
+// to the probe's resume point with RFLAGS.AC clear. Returns false, changing
+// nothing, otherwise.
+static bool RecoverFaultProbe(InterruptFrame* const frame) {
+  // Read CR2 first, like PanicUnhandledException().
+  const uint64_t cr2 = ReadCr2();
+  CpuLocal* const cpu = CurrentCpuOrNull();
+  if (cpu == nullptr || cpu->fault_probe == nullptr) {
+    return false;
+  }
+  FaultProbe* const probe = cpu->fault_probe;
+  // The probed function runs with interrupts disabled, on the probe's stack
+  // right below the resume point.
+  if ((frame->rflags & kRflagsInterruptEnableBit) != 0 ||
+      frame->rsp > probe->resume_rsp ||
+      probe->resume_rsp - frame->rsp >
+          static_cast<uint64_t>(kFaultProbeStackLimit)) {
+    return false;
+  }
+  cpu->fault_probe = nullptr;
+  probe->faulted = true;
+  probe->error_code = frame->error_code;
+  probe->fault_address = cr2;
+  probe->fault_rip = frame->rip;
+  frame->rip = probe->resume_rip;
+  frame->rsp = probe->resume_rsp;
+  frame->rflags &= ~kRflagsAlignmentCheckBit;
+  return true;
+}
 
 // Calls the handler of `frame->vector`, sends the Local APIC EOI if the vector
 // needs one, and panics on CPU exceptions that nothing handles.
@@ -356,6 +396,12 @@ static void DispatchToHandler(InterruptFrame* const frame) {
       handler(frame);
       return;
     }
+    // A page fault that kernel code causes on purpose ends the fault probe
+    // that expects it.
+    if (vector == kVectorPageFault && !IsUserFrame(*frame) &&
+        RecoverFaultProbe(frame)) {
+      return;
+    }
     // A fault of user code ends the user program instead, unless it is a
     // double fault or machine check, which mean that the kernel is broken.
     const InterruptHandlerFn user_fault_handler =
@@ -372,6 +418,9 @@ static void DispatchToHandler(InterruptFrame* const frame) {
     CpuLocal* const cpu = CurrentCpuOrNull();
     if (cpu != nullptr) {
       cpu->timer_ticks.fetch_add(1, std::memory_order_relaxed);
+      // Before the handler, which may switch the task out: the interrupt
+      // counts for the task that it interrupted (cpu_clock.h).
+      cpu->task_timer_ticks.fetch_add(1, std::memory_order_relaxed);
     }
     SmpSendLocalApicEoi();
     if (handler != nullptr) {
@@ -432,19 +481,68 @@ extern "C" void IdtDispatch(InterruptFrame* const frame) {
   DCHECK(g_idt_initialized.load(std::memory_order_acquire));
   DCHECK(frame != nullptr);
   DCHECK(frame->vector < static_cast<uint64_t>(kIdtEntryCount));
+  // The entry stub has cleared RFLAGS.AC if SMAP is enabled (boot.S), so that
+  // handlers reach user memory only through the user-copy helpers
+  // (user_access.h). The interrupted code's AC is in `frame->rflags`, and
+  // iretq restores it.
+  DCHECK(!UserAccessWindowOpen());
 
   DispatchToHandler(frame);
 
   // The interrupted user code resumes when the stub returns, maybe on another
-  // CPU than the one that took the interrupt (the handler may have switched
-  // tasks). The next interrupt there must again push its frame where this one
-  // is, at the top of the task's interrupt stack (user_mode.h). Frames of the
-  // IST vectors are not on that stack, and their handlers don't switch tasks.
+  // CPU than the one that took the interrupt: the handler may have enabled
+  // interrupts (the system call handler does, user_mode.h), and the task may
+  // have been switched out and resumed elsewhere meanwhile. From here to
+  // `iretq` interrupts stay disabled: the task must stay on this CPU, whose
+  // next interrupt from user mode must push its frame where this one is, at
+  // the top of the task's interrupt stack (user_mode.h), and nothing may
+  // interrupt the stub's swapgs and iretq (boot.S). Frames of the IST vectors
+  // are not on that stack, and their handlers neither enable interrupts nor
+  // switch tasks.
   if (IsUserFrame(*frame) &&
       IstSlotForVector(static_cast<int>(frame->vector)) == 0) {
+    (void)SaveAndDisableInterrupts();
     GdtSetKernelStack(reinterpret_cast<uintptr_t>(frame + 1));
+    // Last: the handler may end the user program instead of returning, so
+    // nothing above may need cleaning up after it.
+    const InterruptHandlerFn on_return =
+        g_user_return_handler.load(std::memory_order_acquire);
+    if (on_return != nullptr) {
+      on_return(frame);
+    }
   }
 }
+
+#if !__STDC_HOSTED__
+// fault_probe.S: calls `fn(arg)` and returns false, or returns true once
+// IdtDispatch() resumed it at the resume point that it stored in `probe`
+// after a page fault in `fn`.
+extern "C" bool FaultProbeCall(void (*fn)(uintptr_t),  //
+                               uintptr_t arg,          //
+                               FaultProbe* probe);
+
+FaultProbeResult RunFaultProbe(void (*const fn)(uintptr_t),
+                               const uintptr_t arg) {
+  DCHECK(fn != nullptr);
+  const bool interrupts_were_enabled = SaveAndDisableInterrupts();
+  CpuLocal* const cpu = CurrentCpu();
+  DCHECK(cpu->fault_probe == nullptr);
+  FaultProbe probe;
+  cpu->fault_probe = &probe;
+  const bool faulted = FaultProbeCall(fn, arg, &probe);
+  // A page fault has disarmed it already.
+  cpu->fault_probe = nullptr;
+  DCHECK(faulted == probe.faulted);
+  FaultProbeResult result;
+  result.cpu = cpu->cpu_id;
+  result.faulted = faulted;
+  result.error_code = probe.error_code;
+  result.address = probe.fault_address;
+  result.rip = probe.fault_rip;
+  RestoreInterrupts(interrupts_were_enabled);
+  return result;
+}
+#endif
 
 #if __STDC_HOSTED__
 void IdtResetForTest() {
@@ -453,6 +551,7 @@ void IdtResetForTest() {
     g_handlers[v].store(nullptr, std::memory_order_relaxed);
   }
   g_user_fault_handler.store(nullptr, std::memory_order_relaxed);
+  g_user_return_handler.store(nullptr, std::memory_order_relaxed);
   g_idt_pointer = {};
   g_idt_initialized.store(false, std::memory_order_release);
   g_host_idt_load_count.store(0, std::memory_order_relaxed);

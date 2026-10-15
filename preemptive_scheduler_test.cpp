@@ -427,6 +427,7 @@ TEST(ForwardingTaskSchedulerTest,
   Task* const fake_current = reinterpret_cast<Task*>(0x1003);
   AddressSpace* const fake_address_space =
       reinterpret_cast<AddressSpace*>(0x2000);
+  FpuState* const fake_fpu_state = reinterpret_cast<FpuState*>(0x3000);
   int dummy_arg_a = 11;
   int dummy_arg_b = 22;
   InterruptFrame timer_frame = MakeInterruptFrame(kVectorApicTimer);
@@ -503,6 +504,14 @@ TEST(ForwardingTaskSchedulerTest,
       });
   layer.SetAddressSpace(fake_address_space);
   layer.SetAddressSpace(nullptr);
+
+  EXPECT_CALL(*mock_inner, SetFpuState)
+      .WillOnce([&](FpuState* const state) {
+        EXPECT_THAT(state, t::Eq(fake_fpu_state));
+      })
+      .WillOnce([](FpuState* const state) { EXPECT_THAT(state, t::IsNull()); });
+  layer.SetFpuState(fake_fpu_state);
+  layer.SetFpuState(nullptr);
 
   // Scheduler internals.
   EXPECT_CALL(*mock_inner, Init);

@@ -3,17 +3,148 @@
 
 #include "user/usertest.h"
 
+#include <cstddef>
 #include <cstdint>
 
 #include "syscall_abi.h"
 #include "user/syscall.h"
 
 static_assert(protos::kSyscallGetCpu == 2);
+static_assert(protos::kSyscallSpin == 3);
+// `KernelSpinArg()` can ask for the longest spin() call.
+static_assert(protos::kSyscallSpinMaxTicks <=
+              protos::usertest::kKernelSpinMaxTicks);
 
 // Makes a get_cpu() system call with distinct values in every general-purpose
 // register but rax and rsp, and returns the bits of these registers that the
 // call changed: 0 if it preserved them all.
 extern "C" uint64_t SyscallChangedRegisterBits();
+
+// What `FpuHoldRound()` does. The offsets of the fields are part of its code.
+struct FpuHoldParams {
+  // The x87/SSE/AVX state to load, in the XSAVE format (FXSAVE format if
+  // `components` is 0). 64-byte aligned.
+  const void* image;
+  // nullptr, or the values to load into MM0-MM7 after `image`.
+  const uint64_t* mmx_values;
+  // Where to save the state after loading it, and after the system calls.
+  // 64-byte aligned.
+  void* before;
+  void* after;
+  // The XSAVE state components to load and save (EDX:EAX of XRSTOR/XSAVE),
+  // or 0 to use FXRSTOR/FXSAVE.
+  uint64_t components;
+  // The get_cpu() system calls to make, and the iterations of integer-only
+  // computation before each.
+  int64_t syscalls;
+  int64_t iterations;
+};
+static_assert(offsetof(FpuHoldParams, image) == 0);
+static_assert(offsetof(FpuHoldParams, mmx_values) == 8);
+static_assert(offsetof(FpuHoldParams, before) == 16);
+static_assert(offsetof(FpuHoldParams, after) == 24);
+static_assert(offsetof(FpuHoldParams, components) == 32);
+static_assert(offsetof(FpuHoldParams, syscalls) == 40);
+static_assert(offsetof(FpuHoldParams, iterations) == 48);
+
+// Loads the state that `*params` gives, saves it into `params->before`, makes
+// the system calls with nothing but integer computation in between, saves the
+// state into `params->after`, and then leaves the x87 FPU and MXCSR in their
+// initial state, as the ABI expects at a return. All in one routine, so that
+// no compiled code runs while the registers hold the loaded values.
+extern "C" void FpuHoldRound(const FpuHoldParams* params);
+
+asm(R"(
+    .pushsection .text
+    .globl FpuHoldRound
+    .type FpuHoldRound, @function
+FpuHoldRound:
+    push rbx
+    push r12
+    push r13
+    push r14
+    push r15
+    mov r12, rdi
+    mov r13, [r12 + 32]
+    mov rsi, [r12]
+    test r13, r13
+    jz .Lfpu_hold_fxrstor
+    mov eax, r13d
+    xor edx, edx
+    xrstor64 [rsi]
+    jmp .Lfpu_hold_mmx
+.Lfpu_hold_fxrstor:
+    fxrstor64 [rsi]
+.Lfpu_hold_mmx:
+    mov rsi, [r12 + 8]
+    test rsi, rsi
+    jz .Lfpu_hold_save_before
+    movq mm0, [rsi]
+    movq mm1, [rsi + 8]
+    movq mm2, [rsi + 16]
+    movq mm3, [rsi + 24]
+    movq mm4, [rsi + 32]
+    movq mm5, [rsi + 40]
+    movq mm6, [rsi + 48]
+    movq mm7, [rsi + 56]
+.Lfpu_hold_save_before:
+    mov rdi, [r12 + 16]
+    test r13, r13
+    jz .Lfpu_hold_fxsave_before
+    mov eax, r13d
+    xor edx, edx
+    xsave64 [rdi]
+    jmp .Lfpu_hold_hold
+.Lfpu_hold_fxsave_before:
+    fxsave64 [rdi]
+.Lfpu_hold_hold:
+    mov r14, [r12 + 40]
+    mov rbx, 0x2545F4914F6CDD1D
+.Lfpu_hold_syscall:
+    mov r15, [r12 + 48]
+.Lfpu_hold_compute:
+    mov rcx, rbx
+    shl rcx, 13
+    xor rbx, rcx
+    mov rcx, rbx
+    shr rcx, 7
+    xor rbx, rcx
+    mov rcx, rbx
+    shl rcx, 17
+    xor rbx, rcx
+    dec r15
+    jnz .Lfpu_hold_compute
+    mov eax, 2
+    int 0x80
+    dec r14
+    jnz .Lfpu_hold_syscall
+    mov rdi, [r12 + 24]
+    test r13, r13
+    jz .Lfpu_hold_fxsave_after
+    mov eax, r13d
+    xor edx, edx
+    xsave64 [rdi]
+    jmp .Lfpu_hold_reset
+.Lfpu_hold_fxsave_after:
+    fxsave64 [rdi]
+.Lfpu_hold_reset:
+    test r13d, 4
+    jz .Lfpu_hold_no_avx
+    vzeroupper
+.Lfpu_hold_no_avx:
+    fninit
+    push 0x1F80
+    ldmxcsr [rsp]
+    add rsp, 8
+    pop r15
+    pop r14
+    pop r13
+    pop r12
+    pop rbx
+    ret
+    .size FpuHoldRound, . - FpuHoldRound
+    .popsection
+)");
 
 asm(R"(
     .pushsection .text
@@ -81,6 +212,393 @@ SyscallChangedRegisterBits:
     .popsection
 )");
 
+// Makes a spin(buffer, size, ticks) system call with values that depend on
+// `seed` and differ from register to register in every other general-purpose
+// register but rsp, stores its result in `*result`, and returns the bits of
+// the registers but rax that the call changed: 0 if it preserved them all.
+extern "C" uint64_t SyscallSpinChangedRegisterBits(const void* buffer,  //
+                                                   int64_t size,        //
+                                                   int64_t ticks,       //
+                                                   int64_t* result,     //
+                                                   uint64_t seed);
+
+// The seed arrives in r8 and stays at [rsp]; ticks, size, buffer and result
+// follow at [rsp + 8] to [rsp + 32].
+asm(R"(
+    .pushsection .text
+    .globl SyscallSpinChangedRegisterBits
+    .type SyscallSpinChangedRegisterBits, @function
+SyscallSpinChangedRegisterBits:
+    push rbx
+    push rbp
+    push r12
+    push r13
+    push r14
+    push r15
+    push rcx
+    push rdi
+    push rsi
+    push rdx
+    push r8
+    mov rbx, 0x11111111
+    xor rbx, r8
+    mov rcx, -0x22222222
+    xor rcx, r8
+    mov rbp, -0x66666666
+    xor rbp, r8
+    mov r9, -0x08888888
+    xor r9, r8
+    mov r10, 0x19999999
+    xor r10, r8
+    mov r11, -0x2AAAAAAA
+    xor r11, r8
+    mov r12, 0x3BBBBBBB
+    xor r12, r8
+    mov r13, -0x4CCCCCCC
+    xor r13, r8
+    mov r14, 0x5DDDDDDD
+    xor r14, r8
+    mov r15, -0x6EEEEEEE
+    xor r15, r8
+    xor r8, 0x77777777
+    mov eax, 3
+    int 0x80
+    xor rdx, [rsp + 8]
+    xor rsi, [rsp + 16]
+    xor rdi, [rsp + 24]
+    xor rbx, [rsp]
+    xor rbx, 0x11111111
+    xor rcx, [rsp]
+    xor rcx, -0x22222222
+    xor rbp, [rsp]
+    xor rbp, -0x66666666
+    xor r8, [rsp]
+    xor r8, 0x77777777
+    xor r9, [rsp]
+    xor r9, -0x08888888
+    xor r10, [rsp]
+    xor r10, 0x19999999
+    xor r11, [rsp]
+    xor r11, -0x2AAAAAAA
+    xor r12, [rsp]
+    xor r12, 0x3BBBBBBB
+    xor r13, [rsp]
+    xor r13, -0x4CCCCCCC
+    xor r14, [rsp]
+    xor r14, 0x5DDDDDDD
+    xor r15, [rsp]
+    xor r15, -0x6EEEEEEE
+    or rbx, rcx
+    or rbx, rdx
+    or rbx, rsi
+    or rbx, rdi
+    or rbx, rbp
+    or rbx, r8
+    or rbx, r9
+    or rbx, r10
+    or rbx, r11
+    or rbx, r12
+    or rbx, r13
+    or rbx, r14
+    or rbx, r15
+    mov rcx, [rsp + 32]
+    mov [rcx], rax
+    mov rax, rbx
+    add rsp, 40
+    pop r15
+    pop r14
+    pop r13
+    pop r12
+    pop rbp
+    pop rbx
+    ret
+    .size SyscallSpinChangedRegisterBits, . - SyscallSpinChangedRegisterBits
+    .popsection
+)");
+
+// Counts `iterations` (> 0) down to 0 with values that depend on `seed` and
+// differ from register to register in every other general-purpose register
+// but rsp, and returns the bits of these registers that changed meanwhile: 0
+// if none did. Makes no system call.
+extern "C" uint64_t SpinChangedRegisterBits(int64_t iterations, uint64_t seed);
+
+// The seed arrives in rsi and stays at [rsp].
+asm(R"(
+    .pushsection .text
+    .globl SpinChangedRegisterBits
+    .type SpinChangedRegisterBits, @function
+SpinChangedRegisterBits:
+    push rbx
+    push rbp
+    push r12
+    push r13
+    push r14
+    push r15
+    push rsi
+    mov rax, rdi
+    mov rbx, 0x11111111
+    xor rbx, rsi
+    mov rcx, -0x22222222
+    xor rcx, rsi
+    mov rdx, 0x33333333
+    xor rdx, rsi
+    mov rdi, 0x55555555
+    xor rdi, rsi
+    mov rbp, -0x66666666
+    xor rbp, rsi
+    mov r8, 0x77777777
+    xor r8, rsi
+    mov r9, -0x08888888
+    xor r9, rsi
+    mov r10, 0x19999999
+    xor r10, rsi
+    mov r11, -0x2AAAAAAA
+    xor r11, rsi
+    mov r12, 0x3BBBBBBB
+    xor r12, rsi
+    mov r13, -0x4CCCCCCC
+    xor r13, rsi
+    mov r14, 0x5DDDDDDD
+    xor r14, rsi
+    mov r15, -0x6EEEEEEE
+    xor r15, rsi
+    xor rsi, -0x44444444
+1:
+    sub rax, 1
+    jnz 1b
+    xor rbx, [rsp]
+    xor rbx, 0x11111111
+    xor rcx, [rsp]
+    xor rcx, -0x22222222
+    xor rdx, [rsp]
+    xor rdx, 0x33333333
+    xor rsi, [rsp]
+    xor rsi, -0x44444444
+    xor rdi, [rsp]
+    xor rdi, 0x55555555
+    xor rbp, [rsp]
+    xor rbp, -0x66666666
+    xor r8, [rsp]
+    xor r8, 0x77777777
+    xor r9, [rsp]
+    xor r9, -0x08888888
+    xor r10, [rsp]
+    xor r10, 0x19999999
+    xor r11, [rsp]
+    xor r11, -0x2AAAAAAA
+    xor r12, [rsp]
+    xor r12, 0x3BBBBBBB
+    xor r13, [rsp]
+    xor r13, -0x4CCCCCCC
+    xor r14, [rsp]
+    xor r14, 0x5DDDDDDD
+    xor r15, [rsp]
+    xor r15, -0x6EEEEEEE
+    mov rax, rbx
+    or rax, rcx
+    or rax, rdx
+    or rax, rsi
+    or rax, rdi
+    or rax, rbp
+    or rax, r8
+    or rax, r9
+    or rax, r10
+    or rax, r11
+    or rax, r12
+    or rax, r13
+    or rax, r14
+    or rax, r15
+    add rsp, 8
+    pop r15
+    pop r14
+    pop r13
+    pop r12
+    pop rbp
+    pop rbx
+    ret
+    .size SpinChangedRegisterBits, . - SpinChangedRegisterBits
+    .popsection
+)");
+
+// What `FpuSpinRound()` does. The offsets of the fields are part of its code.
+struct FpuSpinParams {
+  // The x87/SSE/AVX state to load, in the XSAVE format (FXSAVE format if
+  // `components` is 0), and nullptr or the values to load into MM0-MM7 after
+  // it. 64-byte aligned.
+  const void* image;
+  const uint64_t* mmx_values;
+  // Where to save the state after loading it, and after the system call.
+  // 64-byte aligned.
+  void* before;
+  void* after;
+  // The XSAVE state components to load and save (EDX:EAX of XRSTOR/XSAVE),
+  // or 0 to use FXRSTOR/FXSAVE.
+  uint64_t components;
+  // The arguments of the spin() system call, and the seed of the values in
+  // the other general-purpose registers (`SyscallSpinChangedRegisterBits()`).
+  const void* buffer;
+  int64_t size;
+  int64_t ticks;
+  uint64_t register_seed;
+  // Results: what the call returned, and the bits of the general-purpose
+  // registers but rax that it changed.
+  int64_t result;
+  uint64_t changed_bits;
+};
+static_assert(offsetof(FpuSpinParams, image) == 0);
+static_assert(offsetof(FpuSpinParams, mmx_values) == 8);
+static_assert(offsetof(FpuSpinParams, before) == 16);
+static_assert(offsetof(FpuSpinParams, after) == 24);
+static_assert(offsetof(FpuSpinParams, components) == 32);
+static_assert(offsetof(FpuSpinParams, buffer) == 40);
+static_assert(offsetof(FpuSpinParams, size) == 48);
+static_assert(offsetof(FpuSpinParams, ticks) == 56);
+static_assert(offsetof(FpuSpinParams, register_seed) == 64);
+static_assert(offsetof(FpuSpinParams, result) == 72);
+static_assert(offsetof(FpuSpinParams, changed_bits) == 80);
+
+// Like `FpuHoldRound()`, but with one spin() system call instead of the
+// get_cpu() calls: loads the state that `*params` gives, saves it into
+// `params->before`, makes the call with `SyscallSpinChangedRegisterBits()`
+// (which touches no x87/SSE/AVX register) and stores its results in
+// `*params`, saves the state into `params->after`, and then leaves the x87
+// FPU and MXCSR in their initial state. All in one routine, so that no
+// compiled code runs while the registers hold the loaded values.
+extern "C" void FpuSpinRound(FpuSpinParams* params);
+
+asm(R"(
+    .pushsection .text
+    .globl FpuSpinRound
+    .type FpuSpinRound, @function
+FpuSpinRound:
+    push rbx
+    push r12
+    push r13
+    mov r12, rdi
+    mov r13, [r12 + 32]
+    mov rsi, [r12]
+    test r13, r13
+    jz .Lfpu_spin_fxrstor
+    mov eax, r13d
+    xor edx, edx
+    xrstor64 [rsi]
+    jmp .Lfpu_spin_mmx
+.Lfpu_spin_fxrstor:
+    fxrstor64 [rsi]
+.Lfpu_spin_mmx:
+    mov rsi, [r12 + 8]
+    test rsi, rsi
+    jz .Lfpu_spin_save_before
+    movq mm0, [rsi]
+    movq mm1, [rsi + 8]
+    movq mm2, [rsi + 16]
+    movq mm3, [rsi + 24]
+    movq mm4, [rsi + 32]
+    movq mm5, [rsi + 40]
+    movq mm6, [rsi + 48]
+    movq mm7, [rsi + 56]
+.Lfpu_spin_save_before:
+    mov rdi, [r12 + 16]
+    test r13, r13
+    jz .Lfpu_spin_fxsave_before
+    mov eax, r13d
+    xor edx, edx
+    xsave64 [rdi]
+    jmp .Lfpu_spin_call
+.Lfpu_spin_fxsave_before:
+    fxsave64 [rdi]
+.Lfpu_spin_call:
+    mov rdi, [r12 + 40]
+    mov rsi, [r12 + 48]
+    mov rdx, [r12 + 56]
+    lea rcx, [r12 + 72]
+    mov r8, [r12 + 64]
+    call SyscallSpinChangedRegisterBits
+    mov [r12 + 80], rax
+    mov rdi, [r12 + 24]
+    test r13, r13
+    jz .Lfpu_spin_fxsave_after
+    mov eax, r13d
+    xor edx, edx
+    xsave64 [rdi]
+    jmp .Lfpu_spin_reset
+.Lfpu_spin_fxsave_after:
+    fxsave64 [rdi]
+.Lfpu_spin_reset:
+    test r13d, 4
+    jz .Lfpu_spin_no_avx
+    vzeroupper
+.Lfpu_spin_no_avx:
+    fninit
+    push 0x1F80
+    ldmxcsr [rsp]
+    add rsp, 8
+    pop r13
+    pop r12
+    pop rbx
+    ret
+    .size FpuSpinRound, . - FpuSpinRound
+    .popsection
+)");
+
+// Unmasks the x87 zero-divide exception (control word 0x037B) and divides 1
+// by 0, which leaves the exception pending, and stores the x87 status word at
+// `*status_word`. Then makes `rounds` (> 0) get_cpu() system calls, each
+// after chunks of `iterations` (> 0) iterations of integer computation until
+// the TSC has advanced by at least `round_cycles` since the round began (one
+// chunk if `round_cycles` is 0), and executes FWAIT, which raises the
+// pending exception (#MF). Returns only if FWAIT did not. Nothing but FNSTSW
+// touches the x87 FPU in between (RDTSC is no x87 instruction).
+extern "C" void X87PendingZeroDivide(uint16_t* status_word, int64_t rounds,
+                                     int64_t iterations, int64_t round_cycles);
+
+// The system calls preserve every register but rax.
+asm(R"(
+    .pushsection .text
+    .globl X87PendingZeroDivide
+    .type X87PendingZeroDivide, @function
+X87PendingZeroDivide:
+    push rbx
+    mov r8, rdi
+    mov r9, rsi
+    mov r10, rdx
+    mov r11, rcx
+    push 0x037B
+    fldcw word ptr [rsp]
+    add rsp, 8
+    fldz
+    fld1
+    fdiv st(0), st(1)
+    fnstsw word ptr [r8]
+    xor ebx, ebx
+.Lx87_pending_round:
+    rdtsc
+    shl rdx, 32
+    or rax, rdx
+    mov rsi, rax
+.Lx87_pending_chunk:
+    mov rcx, r10
+.Lx87_pending_compute:
+    add rbx, rcx
+    dec rcx
+    jnz .Lx87_pending_compute
+    rdtsc
+    shl rdx, 32
+    or rax, rdx
+    sub rax, rsi
+    cmp rax, r11
+    jb .Lx87_pending_chunk
+    mov eax, 2
+    int 0x80
+    dec r9
+    jnz .Lx87_pending_round
+    fwait
+    pop rbx
+    ret
+    .size X87PendingZeroDivide, . - X87PendingZeroDivide
+    .popsection
+)");
+
 namespace protos::user {
 namespace {
 
@@ -90,6 +608,9 @@ constexpr uint64_t kRflagsInterruptEnable = 1 << 9;
 constexpr uint64_t kRflagsIoPrivilegeLevel = 3 << 12;
 // kMaxSupportedCpus in smp.h.
 constexpr int kMaxCpus = 128;
+// Odd, so that it maps different seeds to different register values, which
+// spread over all 64 bits.
+constexpr uint64_t kRegisterSeedMultiplier = 0x9E3779B97F4A7C15;
 
 const char kNulBytes[8] = {};
 constexpr int64_t kNulByteCount = sizeof(kNulBytes);
@@ -100,6 +621,14 @@ uint8_t g_return_instruction[16] = {0xC3};
 uint64_t g_spin_seed = 0;
 // Never set: `Recurse()` recurses until the stack overflows.
 volatile uint64_t g_recursion_limit = 0;
+
+constexpr int64_t kPageSize = 4096;
+// The buffer of `Mode::kKernelSpin`: two pages, so that the bytes of a spin()
+// call may cross a page boundary. Each process has its own copy.
+alignas(kPageSize) uint8_t g_kernel_spin_buffer[2 * kPageSize];
+// The iterations of the register loop of `Mode::kSpinWithoutSyscalls` between
+// two checks of its stack and data.
+constexpr int64_t kQuietSpinIterations = int64_t{1} << 16;
 
 // Hides from the compiler where `pointer` points.
 template <typename T>
@@ -118,6 +647,13 @@ static uint64_t ReadRflags() {
   uint64_t rflags = 0;
   asm volatile("pushfq\n\tpop %0" : "=r"(rflags));
   return rflags;
+}
+
+// Returns true if a spin() call of the `size` bytes at `buffer` fails with
+// `kSyscallErrorFault`.
+static bool SpinFaults(const uintptr_t buffer, const int64_t size) {
+  return SpinOnBuffer(reinterpret_cast<const void*>(buffer), size, 0) ==
+         kSyscallErrorFault;
 }
 
 // Runs the checks of `Mode::kSyscalls` and returns 0 if all pass, else the
@@ -179,6 +715,29 @@ static int64_t RunSyscallChecks() {
   if (cpu < 0 || cpu >= kMaxCpus) {
     return check;
   }
+  ++check;
+  if (SpinOnBuffer(kNulBytes, -1, 0) != kSyscallErrorInvalid ||
+      SpinOnBuffer(kNulBytes, kSyscallSpinMaxSize + 1, 0) !=
+          kSyscallErrorInvalid ||
+      SpinOnBuffer(kNulBytes, kNulByteCount, -1) != kSyscallErrorInvalid ||
+      SpinOnBuffer(kNulBytes, kNulByteCount, kSyscallSpinMaxTicks + 1) !=
+          kSyscallErrorInvalid) {
+    return check;
+  }
+  ++check;
+  // As for write() above, and a range that runs past the top of the stack.
+  if (!SpinFaults(usertest::kKernelAddress, 8) ||
+      !SpinFaults(0xFFFF800000000000ULL, 8) ||
+      !SpinFaults(0xFFFFFFFFFFFFFFF8ULL, 16) || !SpinFaults(stack_top - 4, 8)) {
+    return check;
+  }
+  ++check;
+  if (SpinOnBuffer(nullptr, 0, 0) != kSyscallSpinChecksumInit ||
+      SpinOnBuffer(kNulBytes, kNulByteCount, 1) !=
+          SyscallSpinChecksum(reinterpret_cast<const uint8_t*>(kNulBytes),
+                              kNulByteCount)) {
+    return check;
+  }
   return 0;
 }
 
@@ -215,10 +774,801 @@ static int64_t Spin(const uint64_t seed) {
   }
 }
 
+// Fills the `size` bytes at `buffer` with values derived from `state`, and
+// returns the next state.
+static uint64_t FillBuffer(uint8_t* const buffer,  //
+                           const int64_t size,     //
+                           uint64_t state) {
+  for (int64_t i = 0; i < size; ++i) {
+    state = XorShift(state);
+    buffer[i] = static_cast<uint8_t>(state >> 24);
+  }
+  return state;
+}
+
+// Runs `Mode::kKernelSpin` as `arg` (`usertest::KernelSpinArg()`) says.
+static int64_t KernelSpin(const uint64_t arg) {
+  const int64_t ticks = usertest::KernelSpinTicks(arg);
+  const int64_t calls = usertest::KernelSpinCalls(arg);
+  // Odd, because XorShift() must not start from 0.
+  const uint64_t seed = (usertest::KernelSpinSeed(arg) << 1) | 1;
+  // Registers of another process, with another seed, fail the check.
+  const uint64_t register_seed = seed * kRegisterSeedMultiplier;
+  g_spin_seed = seed;
+  uint64_t state = seed;
+  uint64_t in_register = seed;
+  volatile uint64_t on_stack = seed;
+  for (int64_t call = 0; calls == 0 || call < calls; ++call) {
+    state = XorShift(state);
+    const int64_t offset =
+        static_cast<int64_t>(state % static_cast<uint64_t>(kPageSize));
+    const int64_t size = static_cast<int64_t>(
+        (state >> 12) % static_cast<uint64_t>(kSyscallSpinMaxSize + 1));
+    uint8_t* const buffer = g_kernel_spin_buffer + offset;
+    state = FillBuffer(buffer, size, state);
+    const int64_t checksum = SyscallSpinChecksum(buffer, size);
+    int64_t result = 0;
+    if (SyscallSpinChangedRegisterBits(buffer,   //
+                                       size,     //
+                                       ticks,    //
+                                       &result,  //
+                                       register_seed) != 0) {
+      return usertest::kKernelSpinRegistersChangedStatus;
+    }
+    if (result < 0 && result >= -4095) {
+      return usertest::kKernelSpinErrorStatus;
+    }
+    if (result != checksum) {
+      return usertest::kKernelSpinChecksumStatus;
+    }
+    if (SyscallSpinChecksum(buffer, size) != checksum) {
+      return usertest::kKernelSpinBufferChangedStatus;
+    }
+    in_register = XorShift(in_register);
+    on_stack = XorShift(on_stack);
+    if (in_register != on_stack || *Launder(&g_spin_seed) != seed) {
+      return usertest::kKernelSpinCorruptedStatus;
+    }
+  }
+  return 0;
+}
+
+// Runs `Mode::kSpinWithoutSyscalls` with `seed`.
+static int64_t SpinWithoutSyscalls(const uint64_t seed) {
+  // Registers of another process, with another seed, fail the check.
+  const uint64_t register_seed = seed * kRegisterSeedMultiplier;
+  g_spin_seed = seed;
+  uint64_t in_register = seed | 1;
+  volatile uint64_t on_stack = seed | 1;
+  for (;;) {
+    if (SpinChangedRegisterBits(kQuietSpinIterations, register_seed) != 0) {
+      return usertest::kSpinRegistersChangedStatus;
+    }
+    for (int i = 0; i < usertest::kSpinRoundIterations; ++i) {
+      in_register = XorShift(in_register);
+      on_stack = XorShift(on_stack);
+    }
+    // Launder() makes the compiler load `g_spin_seed` from memory.
+    if (in_register != on_stack || *Launder(&g_spin_seed) != seed) {
+      return usertest::kSpinCorruptedStatus;
+    }
+  }
+}
+
+// The layout of an XSAVE area in the standard format, whose first 512 bytes
+// (the legacy region) have the layout of an FXSAVE area (Intel SDM Vol. 1,
+// 10.5.1 and 13.4.1). The x87 control word, status word and abridged tag word
+// (bit i set: physical register i is valid).
+constexpr int kFpuFcwOffset = 0;
+constexpr int kFpuFswOffset = 2;
+constexpr int kFpuFtwOffset = 4;
+// The last x87 opcode, instruction pointer and operand pointer.
+constexpr int kFpuLastInstructionOffset = 6;
+constexpr int kFpuLastInstructionSize = 18;
+constexpr int kFpuMxcsrOffset = 24;
+// ST0-ST7 (MM0-MM7 in their low 8 bytes): 10 bytes in 16-byte slots.
+constexpr int kFpuStOffset = 32;
+constexpr int kFpuStSlotSize = 16;
+constexpr int kFpuStSize = 10;
+// XMM0-XMM15.
+constexpr int kFpuXmmOffset = 160;
+constexpr int kFpuXmmEnd = 416;
+constexpr int kFpuXmmSize = kFpuXmmEnd - kFpuXmmOffset;
+// XSTATE_BV in the XSAVE header: the state components that the area holds;
+// the others are in their initial configuration.
+constexpr int kFpuXstateBvOffset = 512;
+// The AVX state, the upper halves of YMM0-YMM15, lies at the offset that
+// CPUID.(EAX=0DH,ECX=2):EBX reports (YmmOffset()).
+constexpr int kFpuYmmSize = 256;
+constexpr int kFpuAreaSize = protos::user::kInitialFpuStateSize;
+
+// XCR0 state components.
+constexpr uint64_t kXstateX87 = 1 << 0;
+constexpr uint64_t kXstateSse = 1 << 1;
+constexpr uint64_t kXstateAvx = 1 << 2;
+// Set if the kernel set CR4.OSXSAVE, which lets user code use XGETBV.
+constexpr uint32_t kCpuid1EcxOsxsave = 1u << 27;
+// The architectural initial x87 control word and MXCSR.
+constexpr uint16_t kInitialFcw = 0x037F;
+constexpr uint32_t kInitialMxcsr = 0x1F80;
+
+// An XSAVE or FXSAVE area that holds the x87, SSE and AVX state.
+struct alignas(64) FpuArea {
+  uint8_t bytes[kFpuAreaSize];
+};
+
+// What `kFpuHold` and `kFpuDirty` load (`g_fpu_image`, and in the MMX rounds
+// of `kFpuHold` also `g_fpu_mmx_values`) and save.
+FpuArea g_fpu_image;
+uint64_t g_fpu_mmx_values[8];
+FpuArea g_fpu_before;
+FpuArea g_fpu_after;
+
+// Returns the `size` bytes at `bytes` as a little-endian number.
+static uint64_t LoadLittleEndian(const uint8_t* const bytes, const int size) {
+  uint64_t value = 0;
+  for (int i = size - 1; i >= 0; --i) {
+    value = (value << 8) | bytes[i];
+  }
+  return value;
+}
+
+// Stores the low `size` bytes of `value` at `bytes`, least significant first.
+static void StoreLittleEndian(uint8_t* const bytes,  //
+                              uint64_t value,        //
+                              const int size) {
+  for (int i = 0; i < size; ++i) {
+    bytes[i] = static_cast<uint8_t>(value);
+    value >>= 8;
+  }
+}
+
+static void ZeroBytes(uint8_t* const bytes, const int size) {
+  for (int i = 0; i < size; ++i) {
+    bytes[i] = 0;
+  }
+}
+
+static bool AllZero(const uint8_t* const bytes, const int size) {
+  for (int i = 0; i < size; ++i) {
+    if (bytes[i] != 0) {
+      return false;
+    }
+  }
+  return true;
+}
+
+// Executes CPUID with `leaf` in EAX and `subleaf` in ECX, and stores EAX, EBX,
+// ECX and EDX in `regs[0..3]`.
+static void Cpuid(const uint32_t leaf,     //
+                  const uint32_t subleaf,  //
+                  uint32_t* const regs) {
+  asm volatile("cpuid"
+               : "=a"(regs[0]), "=b"(regs[1]), "=c"(regs[2]), "=d"(regs[3])
+               : "a"(leaf), "c"(subleaf));
+}
+
+// Returns XCR0, the state components that the kernel enabled for XSAVE, or 0
+// if it did not enable XSAVE.
+static uint64_t EnabledXstateComponents() {
+  uint32_t regs[4];
+  Cpuid(1, 0, regs);
+  if ((regs[2] & kCpuid1EcxOsxsave) == 0) {
+    return 0;
+  }
+  uint32_t low = 0;
+  uint32_t high = 0;
+  asm volatile("xgetbv" : "=a"(low), "=d"(high) : "c"(0));
+  return (static_cast<uint64_t>(high) << 32) | low;
+}
+
+// Returns the state components that the FPU modes load and save with XRSTOR
+// and XSAVE, or 0 if they use FXRSTOR and FXSAVE: the x87, SSE and AVX
+// components that the kernel enabled, like the entry point (user/crt.cpp).
+static uint64_t FpuComponents() {
+  return EnabledXstateComponents() & (kXstateX87 | kXstateSse | kXstateAvx);
+}
+
+// Returns the offset of the AVX state in an XSAVE area, or 0 if it doesn't
+// fit in an `FpuArea` after the legacy region and the header.
+static int YmmOffset() {
+  uint32_t regs[4];
+  Cpuid(0xD, 2, regs);
+  const int64_t offset = regs[1];
+  return (offset >= 576 && offset + kFpuYmmSize <= kFpuAreaSize)
+             ? static_cast<int>(offset)
+             : 0;
+}
+
+// Writes the state that round `round` of `kFpuHold` with `seed` loads (and
+// `kFpuDirty`, with round 0) into `*image`, in the format that `components`
+// selects (FpuComponents()), and the values that `kFpuHold` loads into
+// MM0-MM7 in its MMX rounds into `mmx_values[0..7]`. The values depend on the
+// seed and the round: they differ from register to register and from one
+// round to the next, and none of the registers holds its initial value.
+static void BuildFpuImage(const uint64_t seed,        //
+                          const int64_t round,        //
+                          const uint64_t components,  //
+                          const int ymm_offset,       //
+                          FpuArea* const image,       //
+                          uint64_t* const mmx_values) {
+  uint8_t* const bytes = image->bytes;
+  ZeroBytes(bytes, kFpuAreaSize);
+  // The control fields follow `control`, which changes every round; the
+  // registers take random values from both the seed and the round.
+  const uint64_t round_bits = static_cast<uint64_t>(round);
+  const uint64_t control = seed + round_bits;
+  const uint64_t round_mix = round_bits * 0xBF58476D1CE4E5B9ULL;
+  uint64_t random = ((seed * kRegisterSeedMultiplier) ^ round_mix) | 1;
+  // All x87 exceptions masked; precision single, double or extended (another
+  // one every round); rounding never to nearest, so the control word is never
+  // the initial 0x37F.
+  constexpr uint64_t kPrecisions[3] = {0, 2, 3};
+  const uint64_t precision = kPrecisions[control % 3];
+  const uint64_t rounding = 1 + (control / 3) % 3;
+  const uint64_t fcw = 0x007F | (precision << 8) | (rounding << 10);
+  StoreLittleEndian(bytes + kFpuFcwOffset, fcw, 2);
+  // Condition codes C0-C3 (never all clear), TOP 0, no exceptions.
+  const uint64_t conditions = 1 + control % 15;
+  const uint64_t fsw = ((conditions & 7) << 8) | ((conditions >> 3) << 14);
+  StoreLittleEndian(bytes + kFpuFswOffset, fsw, 2);
+  // All eight registers valid.
+  bytes[kFpuFtwOffset] = 0xFF;
+  // All SIMD exceptions masked, some exception flags, rounding never to
+  // nearest, flush to zero in every other round; never denormals-are-zero,
+  // which MXCSR_MASK may not allow.
+  const uint64_t mxcsr = kInitialMxcsr | (control & 0x3F) |
+                         ((1 + control % 3) << 13) | ((control & 1) << 15);
+  StoreLittleEndian(bytes + kFpuMxcsrOffset, mxcsr, 4);
+  for (int i = 0; i < 8; ++i) {
+    random = XorShift(random);
+    uint8_t* const st = bytes + kFpuStOffset + i * kFpuStSlotSize;
+    // A normal 80-bit number: integer bit set, exponent neither 0 nor 0x7FFF.
+    StoreLittleEndian(st, random | (uint64_t{1} << 63), 8);
+    const uint64_t sign = (random >> 7) & 0x8000;
+    const uint64_t exponent = 0x3000 + i * 0x101 + (control & 0xFF);
+    StoreLittleEndian(st + 8, sign | exponent, 2);
+  }
+  for (int i = kFpuXmmOffset; i < kFpuXmmEnd; i += 8) {
+    random = XorShift(random);
+    StoreLittleEndian(bytes + i, random, 8);
+  }
+  if ((components & kXstateAvx) != 0) {
+    for (int i = 0; i < kFpuYmmSize; i += 8) {
+      random = XorShift(random);
+      StoreLittleEndian(bytes + ymm_offset + i, random, 8);
+    }
+  }
+  // XRSTOR loads every component that XSTATE_BV names from the image.
+  StoreLittleEndian(bytes + kFpuXstateBvOffset, components, 8);
+  for (int i = 0; i < 8; ++i) {
+    random = XorShift(random);
+    mmx_values[i] = random;
+  }
+}
+
+// Returns the `kFpuCorrupted*Status` for a difference at `offset` in an
+// `FpuArea`.
+static int64_t FpuCorruptionStatus(const int offset) {
+  if (offset < kFpuMxcsrOffset) {
+    return usertest::kFpuCorruptedX87ControlStatus;
+  }
+  if (offset < kFpuStOffset) {
+    return usertest::kFpuCorruptedMxcsrStatus;
+  }
+  if (offset < kFpuXmmOffset) {
+    return usertest::kFpuCorruptedX87RegistersStatus;
+  }
+  if (offset < kFpuXmmEnd) {
+    return usertest::kFpuCorruptedXmmStatus;
+  }
+  return usertest::kFpuCorruptedYmmStatus;
+}
+
+// Returns 0 if bytes `[offset, offset + size)` of `a` and `b` are equal, else
+// the `kFpuCorrupted*Status` of the first difference.
+static int64_t CompareFpuBytes(const FpuArea& a,  //
+                               const FpuArea& b,  //
+                               const int offset,  //
+                               const int size) {
+  for (int i = offset; i < offset + size; ++i) {
+    if (a.bytes[i] != b.bytes[i]) {
+      return FpuCorruptionStatus(i);
+    }
+  }
+  return 0;
+}
+
+// Returns 0 if `a` and `b` name the same state components in XSTATE_BV, else
+// the `kFpuCorrupted*Status` of a component that only one of them names.
+static int64_t CompareXstateBv(const FpuArea& a, const FpuArea& b) {
+  const uint64_t differences =
+      LoadLittleEndian(a.bytes + kFpuXstateBvOffset, 8) ^
+      LoadLittleEndian(b.bytes + kFpuXstateBvOffset, 8);
+  if ((differences & kXstateX87) != 0) {
+    return usertest::kFpuCorruptedX87RegistersStatus;
+  }
+  if ((differences & kXstateSse) != 0) {
+    return usertest::kFpuCorruptedXmmStatus;
+  }
+  return (differences != 0) ? usertest::kFpuCorruptedYmmStatus : 0;
+}
+
+// Checks one round of `kFpuHold`: `before` must hold the values that the
+// round loaded (`image`, with `mmx_values` in the low 8 bytes of ST0-ST7
+// unless it is nullptr), and `after` everything that `before` holds,
+// byte for byte, including fields whose contents depend on the CPU (the MMX
+// exponents and the last x87 instruction pointers). `components` and
+// `ymm_offset` are those that built the image. Returns 0, or the
+// `kFpuCorrupted*Status` of the first difference.
+static int64_t CheckFpuHoldRound(const FpuArea& image,              //
+                                 const uint64_t* const mmx_values,  //
+                                 const FpuArea& before,             //
+                                 const FpuArea& after,              //
+                                 const uint64_t components,         //
+                                 const int ymm_offset) {
+  // MMX instructions leave their values in the low 8 bytes of the x87
+  // registers, all registers valid and TOP 0, and set the exponents.
+  FpuArea expected = image;
+  int loaded_st_size = kFpuStSize;
+  if (mmx_values != nullptr) {
+    loaded_st_size = 8;
+    for (int i = 0; i < 8; ++i) {
+      uint8_t* const st = expected.bytes + kFpuStOffset + i * kFpuStSlotSize;
+      StoreLittleEndian(st, mmx_values[i], 8);
+    }
+  }
+  const bool avx = (components & kXstateAvx) != 0;
+  // The loaded values: the x87 control, status and tag words, MXCSR, ST0-ST7,
+  // XMM0-XMM15 and the upper halves of YMM0-YMM15.
+  int64_t status = CompareFpuBytes(expected, before, kFpuFcwOffset, 5);
+  if (status == 0) {
+    status = CompareFpuBytes(expected, before, kFpuMxcsrOffset, 4);
+  }
+  for (int i = 0; i < 8 && status == 0; ++i) {
+    const int st_offset = kFpuStOffset + i * kFpuStSlotSize;
+    status = CompareFpuBytes(expected, before, st_offset, loaded_st_size);
+  }
+  if (status == 0) {
+    status = CompareFpuBytes(expected, before, kFpuXmmOffset, kFpuXmmSize);
+  }
+  if (status == 0 && avx) {
+    const uint64_t saved =
+        LoadLittleEndian(before.bytes + kFpuXstateBvOffset, 8);
+    status = ((saved & kXstateAvx) != 0)
+                 ? CompareFpuBytes(expected, before, ymm_offset, kFpuYmmSize)
+                 : usertest::kFpuCorruptedYmmStatus;
+  }
+  // Everything that the second save stored: the legacy region up to MXCSR
+  // and MXCSR_MASK, ST0-ST7, XMM0-XMM15, XSTATE_BV and the AVX state.
+  if (status == 0) {
+    status = CompareFpuBytes(before, after, 0, kFpuStOffset);
+  }
+  for (int i = 0; i < 8 && status == 0; ++i) {
+    const int st_offset = kFpuStOffset + i * kFpuStSlotSize;
+    status = CompareFpuBytes(before, after, st_offset, kFpuStSize);
+  }
+  if (status == 0) {
+    status = CompareFpuBytes(before, after, kFpuXmmOffset, kFpuXmmSize);
+  }
+  if (status == 0 && components != 0) {
+    status = CompareXstateBv(before, after);
+  }
+  if (status == 0 && avx) {
+    status = CompareFpuBytes(before, after, ymm_offset, kFpuYmmSize);
+  }
+  return status;
+}
+
+// Runs `Mode::kFpuHold` with `seed`.
+static int64_t FpuHold(const uint64_t seed) {
+  const uint64_t components = FpuComponents();
+  const int ymm_offset = YmmOffset();
+  if ((components & kXstateAvx) != 0 && ymm_offset == 0) {
+    return usertest::kFpuLayoutUnsupportedStatus;
+  }
+  for (int64_t round = 0;; ++round) {
+    // New values every round, so that registers that the kernel restored
+    // from a save of an earlier round can't pass the check.
+    BuildFpuImage(seed,          //
+                  round,         //
+                  components,    //
+                  ymm_offset,    //
+                  &g_fpu_image,  //
+                  g_fpu_mmx_values);
+    // Odd rounds put MMX values into the x87 registers.
+    const uint64_t* const mmx_values =
+        ((round & 1) != 0) ? g_fpu_mmx_values : nullptr;
+    ZeroBytes(g_fpu_before.bytes, kFpuAreaSize);
+    ZeroBytes(g_fpu_after.bytes, kFpuAreaSize);
+    const FpuHoldParams params = {
+        .image = &g_fpu_image,
+        .mmx_values = mmx_values,
+        .before = &g_fpu_before,
+        .after = &g_fpu_after,
+        .components = components,
+        .syscalls = usertest::kFpuHoldSyscalls,
+        .iterations = usertest::kFpuHoldIterations,
+    };
+    FpuHoldRound(&params);
+    const int64_t status = CheckFpuHoldRound(g_fpu_image,   //
+                                             mmx_values,    //
+                                             g_fpu_before,  //
+                                             g_fpu_after,   //
+                                             components,    //
+                                             ymm_offset);
+    if (status != 0) {
+      return status;
+    }
+  }
+}
+
+// Runs `Mode::kFpuDirty` with `seed`.
+static int64_t FpuDirty(const uint64_t seed) {
+  const uint64_t components = FpuComponents();
+  const int ymm_offset = YmmOffset();
+  if ((components & kXstateAvx) != 0 && ymm_offset == 0) {
+    return usertest::kFpuLayoutUnsupportedStatus;
+  }
+  BuildFpuImage(seed,          //
+                /*round=*/0,   //
+                components,    //
+                ymm_offset,    //
+                &g_fpu_image,  //
+                g_fpu_mmx_values);
+  const FpuHoldParams params = {
+      .image = &g_fpu_image,
+      .mmx_values = nullptr,
+      .before = &g_fpu_before,
+      .after = &g_fpu_after,
+      .components = components,
+      .syscalls = INT64_MAX,
+      .iterations = usertest::kFpuHoldIterations,
+  };
+  // Returns only after 2^63 - 1 system calls.
+  FpuHoldRound(&params);
+  return -1;
+}
+
+// Runs the checks of `Mode::kFpuInitialState` on `g_initial_fpu_state` and
+// returns 0 if all pass, else the number of the first failed check. XSAVE
+// leaves out a state component in its initial configuration (XSTATE_BV bit
+// clear), whose fields then need no check; MXCSR it always saves.
+static int64_t CheckInitialFpuState() {
+  const uint8_t* const state = g_initial_fpu_state;
+  const uint64_t components = FpuComponents();
+  const uint64_t saved = (components == 0)
+                             ? (kXstateX87 | kXstateSse)
+                             : LoadLittleEndian(state + kFpuXstateBvOffset, 8);
+  const bool x87 = (saved & kXstateX87) != 0;
+  const bool sse = (saved & kXstateSse) != 0;
+  const bool avx = (components & kXstateAvx) != 0 && (saved & kXstateAvx) != 0;
+  if (x87 && LoadLittleEndian(state + kFpuFcwOffset, 2) != kInitialFcw) {
+    return 1;
+  }
+  if (x87 && LoadLittleEndian(state + kFpuFswOffset, 2) != 0) {
+    return 2;
+  }
+  // All registers empty.
+  if (x87 && state[kFpuFtwOffset] != 0) {
+    return 3;
+  }
+  if (x87 &&
+      !AllZero(state + kFpuLastInstructionOffset, kFpuLastInstructionSize)) {
+    return 4;
+  }
+  for (int i = 0; i < 8; ++i) {
+    if (x87 &&
+        !AllZero(state + kFpuStOffset + i * kFpuStSlotSize, kFpuStSize)) {
+      return 5;
+    }
+  }
+  if (LoadLittleEndian(state + kFpuMxcsrOffset, 4) != kInitialMxcsr) {
+    return 6;
+  }
+  if (sse && !AllZero(state + kFpuXmmOffset, kFpuXmmSize)) {
+    return 7;
+  }
+  if (avx) {
+    const int ymm_offset = YmmOffset();
+    if (ymm_offset == 0 || !AllZero(state + ymm_offset, kFpuYmmSize)) {
+      return 8;
+    }
+  }
+  return 0;
+}
+
+// RFLAGS.AC (alignment check), which user code may set and clear. The kernel
+// leaves CR0.AM clear, so the flag has no effect in user mode, and preserves
+// it across system calls like the other flags (syscall_abi.h).
+constexpr uint64_t kRflagsAlignmentCheck = uint64_t{1} << 18;
+// Neither a user nor a kernel address: between the halves of the address
+// space.
+constexpr uintptr_t kNonCanonicalAddress = 0x0000800000000000ULL;
+// The start of the user half (paging.h), where usertest maps nothing.
+constexpr uintptr_t kUnmappedUserAddress = 0xFFFF800000000000ULL;
+// The lowest page of the stack, and the unmapped guard page below it.
+constexpr uintptr_t kStackBottom =
+    usertest::kStackTop - usertest::kStackPages * kPageSize;
+constexpr uintptr_t kStackGuardPage = kStackBottom - kPageSize;
+// The rounds of computation of `kBufferChecks` with RFLAGS.AC set, and the
+// iterations of each: about 8 timer ticks of computation under QEMU's TCG,
+// almost all of the program's time in user mode, so that timer interrupts
+// arrive while the flag is set (the boot self-test checks that some did).
+constexpr int kAlignmentCheckRounds = 512;
+constexpr int64_t kAlignmentCheckIterations = int64_t{1} << 16;
+// What `kFpuLongSyscall` adds to its seed for the values of its x87/SSE/AVX
+// registers, so that they differ from those of the `kFpuHold` processes of
+// the boot self-tests, whose seeds are below 2^32.
+constexpr uint64_t kFpuLongSyscallSeedBase = uint64_t{0x10C5} << 40;
+// The x87 status word bits: zero-divide exception, and exception summary
+// (an unmasked exception is pending).
+constexpr uint16_t kX87StatusZeroDivide = 1 << 2;
+constexpr uint16_t kX87StatusErrorSummary = 1 << 7;
+
+// The 4096 NUL bytes that `kBufferChecks` writes from its data.
+const char g_nul_page[kSyscallWriteMaxSize] = {};
+
+// Returns true if a spin() call of `ticks` timer ticks on the `size` bytes at
+// `buffer` returns their checksum.
+static bool SpinMatches(const uint8_t* const buffer,  //
+                        const int64_t size,           //
+                        const int64_t ticks) {
+  return SpinOnBuffer(buffer, size, ticks) == SyscallSpinChecksum(buffer, size);
+}
+
+static bool AlignmentCheckFlagSet() {
+  return (ReadRflags() & kRflagsAlignmentCheck) != 0;
+}
+
+static void SetAlignmentCheckFlag() {
+  asm volatile("pushfq\n\tor dword ptr [rsp], 0x40000\n\tpopfq"
+               :
+               :
+               : "memory", "cc");
+}
+
+static void ClearAlignmentCheckFlag() {
+  asm volatile("pushfq\n\tand dword ptr [rsp], 0xFFFBFFFF\n\tpopfq"
+               :
+               :
+               : "memory", "cc");
+}
+
+// Runs the checks of `Mode::kBufferChecks` and returns 0 if all pass, else
+// the number of the first failed check.
+static int64_t RunBufferChecks() {
+  const void* const kernel_address =
+      reinterpret_cast<const void*>(usertest::kKernelAddress);
+  int64_t check = 1;
+  if (SpinOnBuffer(nullptr, 8, 0) != kSyscallErrorFault) {
+    return check;
+  }
+  ++check;
+  // Mapped, but for the kernel only: the kernel must not read it for the
+  // program.
+  if (!SpinFaults(usertest::kKernelAddress, 8)) {
+    return check;
+  }
+  ++check;
+  if (!SpinFaults(kNonCanonicalAddress, 8) ||
+      Write(reinterpret_cast<const void*>(kNonCanonicalAddress), 8) !=
+          kSyscallErrorFault) {
+    return check;
+  }
+  ++check;
+  if (!SpinFaults(kUnmappedUserAddress, 8)) {
+    return check;
+  }
+  ++check;
+  if (!SpinFaults(0xFFFFFFFFFFFFFFF8ULL, 16)) {
+    return check;
+  }
+  ++check;
+  // From the top bytes of the stack into the unmapped page above.
+  if (!SpinFaults(usertest::kStackTop - 4, 8) ||
+      !SpinFaults(usertest::kStackTop, 1)) {
+    return check;
+  }
+  ++check;
+  // In the guard page, and from its end into the stack.
+  if (!SpinFaults(kStackGuardPage, 8) || !SpinFaults(kStackBottom - 8, 16)) {
+    return check;
+  }
+  ++check;
+  // Invalid sizes and ticks fail as invalid, even with a buffer that user
+  // code may not read.
+  if (SpinOnBuffer(kNulBytes, -1, 0) != kSyscallErrorInvalid ||
+      SpinOnBuffer(kNulBytes, INT64_MIN, 0) != kSyscallErrorInvalid ||
+      SpinOnBuffer(kNulBytes, kSyscallSpinMaxSize + 1, 0) !=
+          kSyscallErrorInvalid ||
+      SpinOnBuffer(kNulBytes, kNulByteCount, -1) != kSyscallErrorInvalid ||
+      SpinOnBuffer(kNulBytes, kNulByteCount, kSyscallSpinMaxTicks + 1) !=
+          kSyscallErrorInvalid ||
+      SpinOnBuffer(nullptr, -1, 0) != kSyscallErrorInvalid ||
+      SpinOnBuffer(kernel_address, 8, -1) != kSyscallErrorInvalid) {
+    return check;
+  }
+  ++check;
+  // Read-only data, the program's code, an odd address, ranges across a page
+  // boundary (the longest one too), the lowest and the highest bytes of the
+  // stack, and no bytes at a kernel address, which the kernel must not read.
+  FillBuffer(g_kernel_spin_buffer, 2 * kPageSize, 0x0B0F'FE45);
+  const uint8_t* const read_only =
+      reinterpret_cast<const uint8_t*>(&kReadOnlyWord);
+  const uint8_t* const code =
+      reinterpret_cast<const uint8_t*>(&SyscallChangedRegisterBits);
+  const uint8_t* const stack_bottom =
+      reinterpret_cast<const uint8_t*>(kStackBottom);
+  const uint8_t* const stack_top =
+      reinterpret_cast<const uint8_t*>(usertest::kStackTop - 8);
+  if (!SpinMatches(read_only, sizeof(kReadOnlyWord), 0) ||
+      !SpinMatches(code, 64, 0) ||
+      !SpinMatches(g_kernel_spin_buffer + 1, 7, 0) ||
+      !SpinMatches(g_kernel_spin_buffer + kPageSize - 3, 6, 1) ||
+      !SpinMatches(g_kernel_spin_buffer + 1, kSyscallSpinMaxSize, 0) ||
+      !SpinMatches(stack_bottom, 8, 0) || !SpinMatches(stack_top, 8, 0) ||
+      SpinOnBuffer(kernel_address, 0, 0) != kSyscallSpinChecksumInit) {
+    return check;
+  }
+  ++check;
+  // write() leaves out NUL bytes, so these print nothing.
+  char on_stack[kSyscallWriteMaxSize];
+  ZeroBytes(reinterpret_cast<uint8_t*>(on_stack), kSyscallWriteMaxSize);
+  if (Write(g_nul_page, kSyscallWriteMaxSize) != kSyscallWriteMaxSize ||
+      Write(Launder(on_stack), kSyscallWriteMaxSize) != kSyscallWriteMaxSize) {
+    return check;
+  }
+  ++check;
+  if (Write(nullptr, kNulByteCount) != kSyscallErrorFault) {
+    return check;
+  }
+  ++check;
+  // Failing calls preserve every register but rax too.
+  int64_t fault_result = 0;
+  int64_t invalid_result = 0;
+  const uint64_t fault_changed =
+      SyscallSpinChangedRegisterBits(kernel_address, 8, 0, &fault_result, 0x12);
+  const uint64_t invalid_changed =
+      SyscallSpinChangedRegisterBits(kNulBytes, -1, 0, &invalid_result, 0x34);
+  if (fault_changed != 0 || fault_result != kSyscallErrorFault ||
+      invalid_changed != 0 || invalid_result != kSyscallErrorInvalid) {
+    return check;
+  }
+  ++check;
+  // RFLAGS.AC stays set across system calls, also one that lasts 2 timer
+  // ticks, and across the timer interrupts during computation in user mode.
+  SetAlignmentCheckFlag();
+  bool kept = AlignmentCheckFlagSet();
+  kept = kept && SpinMatches(g_kernel_spin_buffer + 5, 100, 2) &&
+         AlignmentCheckFlagSet();
+  kept = kept && Write(kNulBytes, kNulByteCount) == kNulByteCount &&
+         AlignmentCheckFlagSet();
+  const int cpu = GetCpu();
+  kept = kept && cpu >= 0 && cpu < kMaxCpus && AlignmentCheckFlagSet();
+  for (int i = 0; i < kAlignmentCheckRounds && kept; ++i) {
+    kept = SpinChangedRegisterBits(kAlignmentCheckIterations,
+                                   static_cast<uint64_t>(i)) == 0 &&
+           AlignmentCheckFlagSet();
+  }
+  ClearAlignmentCheckFlag();
+  if (!kept || AlignmentCheckFlagSet()) {
+    return check;
+  }
+  static_assert(usertest::kBufferCheckCount == 13);
+  return 0;
+}
+
+// Runs `Mode::kFpuLongSyscall` as `arg` (`usertest::FpuLongSyscallArg()`)
+// says.
+static int64_t FpuLongSyscall(const uint64_t arg) {
+  const int64_t ticks = usertest::KernelSpinTicks(arg);
+  const int64_t rounds = usertest::KernelSpinCalls(arg);
+  const uint64_t seed = usertest::KernelSpinSeed(arg);
+  const uint64_t components = FpuComponents();
+  const int ymm_offset = YmmOffset();
+  if ((components & kXstateAvx) != 0 && ymm_offset == 0) {
+    return usertest::kFpuLayoutUnsupportedStatus;
+  }
+  // Odd, because XorShift() must not start from 0.
+  uint64_t state = (seed << 1) | 1;
+  // Registers of another process, with another seed, fail the check.
+  const uint64_t register_seed = state * kRegisterSeedMultiplier;
+  for (int64_t round = 0; rounds == 0 || round < rounds; ++round) {
+    BuildFpuImage(kFpuLongSyscallSeedBase + seed,  //
+                  round,                           //
+                  components,                      //
+                  ymm_offset,                      //
+                  &g_fpu_image,                    //
+                  g_fpu_mmx_values);
+    // Odd rounds put MMX values into the x87 registers.
+    const uint64_t* const mmx_values =
+        ((round & 1) != 0) ? g_fpu_mmx_values : nullptr;
+    state = XorShift(state);
+    const int64_t offset =
+        static_cast<int64_t>(state % static_cast<uint64_t>(kPageSize));
+    const int64_t size =
+        1 + static_cast<int64_t>((state >> 12) %
+                                 static_cast<uint64_t>(kSyscallSpinMaxSize));
+    uint8_t* const buffer = g_kernel_spin_buffer + offset;
+    state = FillBuffer(buffer, size, state);
+    const int64_t checksum = SyscallSpinChecksum(buffer, size);
+    ZeroBytes(g_fpu_before.bytes, kFpuAreaSize);
+    ZeroBytes(g_fpu_after.bytes, kFpuAreaSize);
+    FpuSpinParams params = {
+        .image = &g_fpu_image,
+        .mmx_values = mmx_values,
+        .before = &g_fpu_before,
+        .after = &g_fpu_after,
+        .components = components,
+        .buffer = buffer,
+        .size = size,
+        .ticks = ticks,
+        .register_seed = register_seed + static_cast<uint64_t>(round),
+        .result = 0,
+        .changed_bits = 0,
+    };
+    FpuSpinRound(&params);
+    if (params.changed_bits != 0) {
+      return usertest::kFpuLongSyscallRegistersChangedStatus;
+    }
+    if (params.result < 0 && params.result >= -4095) {
+      return usertest::kFpuLongSyscallErrorStatus;
+    }
+    if (params.result != checksum) {
+      return usertest::kFpuLongSyscallChecksumStatus;
+    }
+    if (SyscallSpinChecksum(buffer, size) != checksum) {
+      return usertest::kFpuLongSyscallBufferChangedStatus;
+    }
+    const int64_t status = CheckFpuHoldRound(g_fpu_image,   //
+                                             mmx_values,    //
+                                             g_fpu_before,  //
+                                             g_fpu_after,   //
+                                             components,    //
+                                             ymm_offset);
+    if (status == usertest::kFpuCorruptedX87RegistersStatus &&
+        mmx_values != nullptr) {
+      return usertest::kFpuLongSyscallMmxStatus;
+    }
+    if (status != 0) {
+      return status;
+    }
+  }
+  return 0;
+}
+
+// Runs `Mode::kX87PendingException` with rounds of at least `round_cycles`
+// TSC cycles (`usertest::X87PendingArg()`).
+static int64_t X87PendingException(const int64_t round_cycles) {
+  uint16_t status_word = 0;
+  asm volatile("fnstsw %0" : "=a"(status_word));
+  if (status_word != 0) {
+    return usertest::kX87PendingInitialStatusWordStatus;
+  }
+  X87PendingZeroDivide(&status_word, usertest::kX87PendingRounds,
+                       usertest::kX87PendingIterations, round_cycles);
+  // FWAIT returned.
+  constexpr uint16_t kPending = kX87StatusZeroDivide | kX87StatusErrorSummary;
+  if ((status_word & kPending) != kPending) {
+    return usertest::kX87PendingNotRaisedStatus;
+  }
+  return usertest::kX87PendingContinuedStatus;
+}
+
 }  // namespace
 
 int64_t Main(const uint64_t arg) {
-  switch (static_cast<Mode>(arg & 0xFF)) {
+  const Mode mode = static_cast<Mode>(arg & 0xFF);
+  // The state that the entry point saved before any compiled code ran, which
+  // kFpuInitialState checks as its mode (usertest.h).
+  if (mode != Mode::kFpuInitialState) {
+    const int64_t failed_check = CheckInitialFpuState();
+    if (failed_check != 0) {
+      return usertest::kFpuInitialStateMismatchStatusBase + failed_check;
+    }
+  }
+  switch (mode) {
     case Mode::kExit:
       return usertest::kExitStatus;
     case Mode::kSyscalls:
@@ -245,6 +1595,24 @@ int64_t Main(const uint64_t arg) {
       return static_cast<int64_t>(Recurse(0));
     case Mode::kSpin:
       return Spin(arg >> 8);
+    case Mode::kKernelSpin:
+      return KernelSpin(arg);
+    case Mode::kSpinWithoutSyscalls:
+      return SpinWithoutSyscalls(arg >> 8);
+    case Mode::kFpuHold:
+      return FpuHold(arg >> 8);
+    case Mode::kFpuDirty:
+      return FpuDirty(arg >> 8);
+    case Mode::kFpuInitialState:
+      return CheckInitialFpuState();
+    case Mode::kFpuFeatures:
+      return static_cast<int64_t>(EnabledXstateComponents() & 0xFFFFFFFF);
+    case Mode::kBufferChecks:
+      return RunBufferChecks();
+    case Mode::kFpuLongSyscall:
+      return FpuLongSyscall(arg);
+    case Mode::kX87PendingException:
+      return X87PendingException(usertest::X87PendingRoundCycles(arg));
   }
   // The mode should have faulted, or it is unknown.
   return -1;
