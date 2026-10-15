@@ -270,9 +270,9 @@ TEST(MultibootTest, Multiboot2ParseLogsEntriesAndReservesInfoBlock) {
   info.entries[2] = {0x7FE0000, 0x20000, kMemoryTypeAcpiNvs, 0};
 
   MultibootMemoryMap parsed = {};
-  ASSERT_TRUE(MultibootParseMemoryMap(kMultiboot2Magic,              //
-                                      AddrOf(&info),                 //
-                                      kMaxCanonicalIdentityAddress,  //
+  ASSERT_TRUE(MultibootParseMemoryMap(kMultiboot2Magic,   //
+                                      AddrOf(&info),      //
+                                      kIdentityMapLimit,  //
                                       &parsed));
   ASSERT_THAT(parsed.region_count, t::Eq(3));
   EXPECT_THAT(parsed.regions[1].base, t::Eq(0x100000u));
@@ -311,9 +311,9 @@ TEST(MultibootTest, ParseRejectsUnknownMagicBadInfoAddressAndMappingFailure) {
   MultibootMemoryMap parsed = {};
   const auto parse = [&parsed](const uint32_t magic,
                                const uint64_t multiboot_addr) {
-    return MultibootParseMemoryMap(magic,                         //
-                                   multiboot_addr,                //
-                                   kMaxCanonicalIdentityAddress,  //
+    return MultibootParseMemoryMap(magic,              //
+                                   multiboot_addr,     //
+                                   kIdentityMapLimit,  //
                                    &parsed);
   };
 
@@ -324,9 +324,9 @@ TEST(MultibootTest, ParseRejectsUnknownMagicBadInfoAddressAndMappingFailure) {
                                        info_addr,         //
                                        info_addr,         //
                                        &parsed));
-  EXPECT_FALSE(MultibootParseMemoryMap(kMultiboot2Magic,              //
-                                       info_addr,                     //
-                                       kMaxCanonicalIdentityAddress,  //
+  EXPECT_FALSE(MultibootParseMemoryMap(kMultiboot2Magic,   //
+                                       info_addr,          //
+                                       kIdentityMapLimit,  //
                                        nullptr));
 
   g_env.fail_bootstrap_map = true;
@@ -357,9 +357,9 @@ TEST(MultibootTest, ParseCoalescesEntriesAndRejectsUncoalesceableOverflow) {
                                       0};
 
   MultibootMemoryMap parsed = {};
-  ASSERT_TRUE(MultibootParseMemoryMap(kMultiboot2Magic,              //
-                                      AddrOf(info.get()),            //
-                                      kMaxCanonicalIdentityAddress,  //
+  ASSERT_TRUE(MultibootParseMemoryMap(kMultiboot2Magic,    //
+                                      AddrOf(info.get()),  //
+                                      kIdentityMapLimit,   //
                                       &parsed));
   ASSERT_THAT(parsed.region_count, t::Eq(2));
   EXPECT_THAT(parsed.regions[0].base, t::Eq(kBase));
@@ -375,9 +375,9 @@ TEST(MultibootTest, ParseCoalescesEntriesAndRejectsUncoalesceableOverflow) {
     const uintptr_t base = kBase + static_cast<uintptr_t>(i * 2) * kPageBytes;
     info->entries[i] = {base, kPageBytes, kMemoryTypeAvailable, 0};
   }
-  EXPECT_FALSE(MultibootParseMemoryMap(kMultiboot2Magic,              //
-                                       AddrOf(info.get()),            //
-                                       kMaxCanonicalIdentityAddress,  //
+  EXPECT_FALSE(MultibootParseMemoryMap(kMultiboot2Magic,    //
+                                       AddrOf(info.get()),  //
+                                       kIdentityMapLimit,   //
                                        &parsed));
 }
 
@@ -401,9 +401,9 @@ TEST(MultibootTest, Multiboot2MmapTagSizeExceedingTotalSizeIsRejected) {
   mb2->entry = {0x200000, 8 * kPageBytes, kMemoryTypeAvailable, 0};
 
   MultibootMemoryMap parsed = {};
-  EXPECT_FALSE(MultibootParseMemoryMap(kMultiboot2Magic,              //
-                                       AddrOf(raw_mb2.get()),         //
-                                       kMaxCanonicalIdentityAddress,  //
+  EXPECT_FALSE(MultibootParseMemoryMap(kMultiboot2Magic,       //
+                                       AddrOf(raw_mb2.get()),  //
+                                       kIdentityMapLimit,      //
                                        &parsed));
   EXPECT_THAT(parsed.region_count, t::Eq(0));
 }
@@ -430,9 +430,9 @@ TEST(MultibootTest, Multiboot1MmapParsesEntriesAndReservesInfoAndMmapBuffer) {
   info.mmap_addr = static_cast<uint32_t>(AddrOf(entries));
 
   MultibootMemoryMap parsed = {};
-  ASSERT_TRUE(MultibootParseMemoryMap(kMultiboot1Magic,              //
-                                      AddrOf(&info),                 //
-                                      kMaxCanonicalIdentityAddress,  //
+  ASSERT_TRUE(MultibootParseMemoryMap(kMultiboot1Magic,   //
+                                      AddrOf(&info),      //
+                                      kIdentityMapLimit,  //
                                       &parsed));
   ASSERT_THAT(parsed.region_count, t::Eq(kEntries));
   EXPECT_THAT(parsed.regions[3].base, t::Eq(0xFD00000000u));
@@ -467,9 +467,9 @@ TEST(MultibootTest, Multiboot1MmapEntrySizeExceedingMmapLengthIsRejected) {
   info.mmap_addr = static_cast<uint32_t>(AddrOf(entry));
 
   MultibootMemoryMap parsed = {};
-  EXPECT_FALSE(MultibootParseMemoryMap(kMultiboot1Magic,              //
-                                       AddrOf(&info),                 //
-                                       kMaxCanonicalIdentityAddress,  //
+  EXPECT_FALSE(MultibootParseMemoryMap(kMultiboot1Magic,   //
+                                       AddrOf(&info),      //
+                                       kIdentityMapLimit,  //
                                        &parsed));
   EXPECT_THAT(parsed.region_count, t::Eq(0));
 }
@@ -484,9 +484,9 @@ TEST(MultibootTest, Multiboot1MemBasicFallbackUses1MiBBaseOffsetForMemUpper) {
   mb1.mem_upper = 64;
 
   MultibootMemoryMap parsed = {};
-  ASSERT_TRUE(MultibootParseMemoryMap(kMultiboot1Magic,              //
-                                      AddrOf(&mb1),                  //
-                                      kMaxCanonicalIdentityAddress,  //
+  ASSERT_TRUE(MultibootParseMemoryMap(kMultiboot1Magic,   //
+                                      AddrOf(&mb1),       //
+                                      kIdentityMapLimit,  //
                                       &parsed));
   ASSERT_THAT(parsed.region_count, t::Eq(2));
   EXPECT_THAT(parsed.regions[0].base, t::Eq(0u));
@@ -501,9 +501,9 @@ TEST(MultibootTest, Multiboot1MemBasicFallbackUses1MiBBaseOffsetForMemUpper) {
   Multiboot1Info mb1_empty = {};
   mb1_empty.mem_upper = 64;
   MultibootMemoryMap empty_parsed = {};
-  EXPECT_FALSE(MultibootParseMemoryMap(kMultiboot1Magic,              //
-                                       AddrOf(&mb1_empty),            //
-                                       kMaxCanonicalIdentityAddress,  //
+  EXPECT_FALSE(MultibootParseMemoryMap(kMultiboot1Magic,    //
+                                       AddrOf(&mb1_empty),  //
+                                       kIdentityMapLimit,   //
                                        &empty_parsed));
 }
 
@@ -538,9 +538,9 @@ TEST(MultibootTest, Multiboot2FramebufferTagValidatesPitchAndDimensions) {
   const uintptr_t buf_addr = AddrOf(&buf);
   MultibootMemoryMap parsed = {};
   const auto parse = [&]() {
-    return MultibootParseMemoryMap(kMultiboot2Magic,              //
-                                   buf_addr,                      //
-                                   kMaxCanonicalIdentityAddress,  //
+    return MultibootParseMemoryMap(kMultiboot2Magic,   //
+                                   buf_addr,           //
+                                   kIdentityMapLimit,  //
                                    &parsed);
   };
 
@@ -681,8 +681,8 @@ TEST(MultibootTest, Multiboot2MapInfoMapsTheHeaderAndThenTheWholeStructure) {
   const uintptr_t info_addr = AddrOf(info);
 
   int64_t total_size = -1;
-  EXPECT_THAT(Multiboot2MapInfo(info_addr, kMaxCanonicalIdentityAddress,
-                                &RecordingMapper, &total_size),
+  EXPECT_THAT(Multiboot2MapInfo(info_addr, kIdentityMapLimit, &RecordingMapper,
+                                &total_size),
               t::Eq(info));
   EXPECT_THAT(total_size, t::Eq(48));
   EXPECT_THAT(g_env.map_calls,
@@ -717,7 +717,7 @@ TEST(MultibootTest, Multiboot2MapInfoRejectsBadAddressesSizesAndMapFailures) {
 
   // Bad addresses are rejected before anything is mapped: 0, at or above
   // `max_physical_addr`, or with a header that does not end below it.
-  EXPECT_THAT(map_info(0, kMaxCanonicalIdentityAddress), t::IsNull());
+  EXPECT_THAT(map_info(0, kIdentityMapLimit), t::IsNull());
   EXPECT_THAT(map_info(info_addr, info_addr), t::IsNull());
   EXPECT_THAT(map_info(info_addr, info_addr + 7), t::IsNull());
   EXPECT_THAT(g_env.map_calls, t::IsEmpty());
@@ -725,23 +725,23 @@ TEST(MultibootTest, Multiboot2MapInfoRejectsBadAddressesSizesAndMapFailures) {
   // So are sizes smaller than the header, larger than
   // `kMaxMultibootStructureBytes`, or reaching past `max_physical_addr`.
   set_total_size(7);
-  EXPECT_THAT(map_info(info_addr, kMaxCanonicalIdentityAddress), t::IsNull());
+  EXPECT_THAT(map_info(info_addr, kIdentityMapLimit), t::IsNull());
   set_total_size(static_cast<uint32_t>(kMaxMultibootStructureBytes) + 1);
-  EXPECT_THAT(map_info(info_addr, kMaxCanonicalIdentityAddress), t::IsNull());
+  EXPECT_THAT(map_info(info_addr, kIdentityMapLimit), t::IsNull());
   set_total_size(sizeof(info));
   EXPECT_THAT(map_info(info_addr, info_addr + 47), t::IsNull());
 
   // Either mapping can fail.
   g_env.map_calls.clear();
   g_env.fail_map_call = 0;
-  EXPECT_THAT(map_info(info_addr, kMaxCanonicalIdentityAddress), t::IsNull());
+  EXPECT_THAT(map_info(info_addr, kIdentityMapLimit), t::IsNull());
   g_env.map_calls.clear();
   g_env.fail_map_call = 1;
-  EXPECT_THAT(map_info(info_addr, kMaxCanonicalIdentityAddress), t::IsNull());
+  EXPECT_THAT(map_info(info_addr, kIdentityMapLimit), t::IsNull());
   EXPECT_THAT(g_env.map_calls, t::SizeIs(2));
   g_env.map_calls.clear();
   g_env.fail_map_call = -1;
-  EXPECT_THAT(map_info(info_addr, kMaxCanonicalIdentityAddress), t::Eq(info));
+  EXPECT_THAT(map_info(info_addr, kIdentityMapLimit), t::Eq(info));
 }
 
 }  // namespace

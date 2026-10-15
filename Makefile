@@ -20,7 +20,7 @@ SELFTEST ?= 1
 # /dev/kvm. With USE_DOCKER=1 the container gets the host's /dev/kvm.
 KVM ?= 0
 
-ASFLAGS := --64
+ASFLAGS := --64 -I $(BUILD_DIR)
 # Sources include project headers by their path from the repository root (for
 # example "selftest/stress.h"), also from files in subdirectories.
 PROJECT_INCLUDE_FLAGS := -iquote .
@@ -45,6 +45,25 @@ CXXFLAGS := -m64 -masm=intel -std=c++20 -O2 -Wall -Wextra $(WERROR_FLAG) \
 
 TEST_COMMON_CXXFLAGS := -std=c++20 -Wall -Wextra $(WERROR_FLAG) $(PROJECT_INCLUDE_FLAGS) -pthread -MMD -MP
 TEST_COMMON_LDFLAGS := -lgmock_main -lgmock -lgtest -pthread
+
+# User programs (user/): freestanding static executables for user space, which
+# the kernel image embeds (user_programs.S). user/user.ld links them in the top
+# 2 GiB of the address space, which the kernel code model addresses. Like the
+# kernel, they leave the x87/SSE registers alone, which the kernel does not
+# save (user_mode.h), and GCC must not turn their loops into calls of the
+# memory functions that user/crt.cpp defines with such loops.
+USER_PROGRAMS := init usertest
+USER_CXXFLAGS := -m64 -masm=intel -std=c++20 -O2 -Wall -Wextra $(WERROR_FLAG) \
+                 -ffreestanding -nostdlib -fno-builtin \
+                 -fno-exceptions -fno-rtti -mno-red-zone \
+                 -mgeneral-regs-only -fno-stack-protector -fno-pie \
+                 -mcmodel=kernel -fno-asynchronous-unwind-tables \
+                 -fno-tree-loop-distribute-patterns \
+                 $(PROJECT_INCLUDE_FLAGS) -I$(BUILD_DIR)/include
+USER_LDFLAGS := -m elf_x86_64 -z max-page-size=0x1000 -z noexecstack \
+                -static -nostdlib -T user/user.ld
+USER_HDRS := syscall_abi.h user/syscall.h user/usertest.h
+USER_ELFS := $(patsubst %,$(BUILD_DIR)/user/%.elf,$(USER_PROGRAMS))
 
 TEST_BUILD_MODES := debug opt
 TEST_BUILD_FLAGS_debug := -O0 -g3 -fno-omit-frame-pointer -D_GLIBCXX_ASSERTIONS
@@ -89,11 +108,13 @@ TASK_LAYER_HDRS := \
     preemptive_scheduler.h
 
 # Host tests that link idt.cpp also need the stand-ins for its kernel-only
-# symbols (boot.S's ISR stub table, the CR2 register).
-IDT_TEST_SRCS := idt.cpp idt_host_fakes.cpp
+# symbols (boot.S's ISR stub table, the CR2 register), and gdt.cpp, which sets
+# the kernel stack for interrupts from user mode.
+IDT_TEST_SRCS := idt.cpp idt_host_fakes.cpp gdt.cpp
 
 TEST_EXTRA_SRCS_console_test := console.cpp
 TEST_EXTRA_SRCS_cxx_runtime_test := cxx_runtime.cpp
+TEST_EXTRA_SRCS_elf_test := elf.cpp
 TEST_EXTRA_SRCS_gdt_test := gdt.cpp
 TEST_EXTRA_SRCS_heap_test := heap.cpp
 TEST_EXTRA_SRCS_idt_test := $(IDT_TEST_SRCS)
@@ -101,7 +122,7 @@ TEST_EXTRA_SRCS_multiboot_test := multiboot.cpp console.cpp
 TEST_EXTRA_SRCS_pmm_test := pmm.cpp console.cpp
 TEST_EXTRA_SRCS_random_test := random.cpp
 TEST_EXTRA_SRCS_selftest_test := selftest/selftest.cpp
-TEST_EXTRA_SRCS_smp_test := smp.cpp smp_hardware_fake.cpp gdt.cpp multiboot.cpp console.cpp $(IDT_TEST_SRCS)
+TEST_EXTRA_SRCS_smp_test := smp.cpp smp_hardware_fake.cpp multiboot.cpp console.cpp $(IDT_TEST_SRCS)
 TEST_EXTRA_SRCS_task_stack_test := task_stack.cpp
 TEST_EXTRA_SRCS_vga_test := vga.cpp
 # Host fakes for the scheduler tests (see scheduler_test_support.h). Tests that
@@ -134,7 +155,10 @@ CXX_SRCS := \
     smp_hardware.cpp \
     $(TASK_LAYER_SRCS) \
     task_stack.cpp \
+    address_space.cpp \
     task.cpp \
+    elf.cpp \
+    user_mode.cpp \
     random.cpp \
     $(if $(filter 1,$(SELFTEST)),$(SELFTEST_SRCS)) \
     kernel.cpp
@@ -158,14 +182,20 @@ CXX_HDRS := \
     smp_hardware.h \
     task.h \
     task_stack.h \
+    address_space.h \
     $(TASK_LAYER_HDRS) \
     rbtree.h \
     random.h \
+    elf.h \
+    syscall_abi.h \
+    user_mode.h \
+    user_programs.h \
+    user/usertest.h \
     selftest/selftest.h \
     selftest/boot_selftest.h \
     selftest/stress.h
 
-ASM_SRCS := boot.S context_switch.S
+ASM_SRCS := boot.S context_switch.S user_mode_entry.S user_programs.S
 ASM_OBJS := $(patsubst %.S,$(BUILD_DIR)/%.o,$(ASM_SRCS))
 CXX_OBJS := $(patsubst %.cpp,$(BUILD_DIR)/%.o,$(CXX_SRCS))
 OBJS := $(ASM_OBJS) $(CXX_OBJS)
@@ -173,7 +203,7 @@ FREESTANDING_CXX_CONFIG := $(BUILD_DIR)/include/bits/c++config.h
 # Records the kernel build configuration so that changing flags (e.g. WERROR or
 # SELFTEST) rebuilds the kernel.
 KERNEL_CONFIG_STAMP := $(BUILD_DIR)/.kernel-config
-KERNEL_CONFIG := $(CXX) $(CXXFLAGS) | $(AS) $(ASFLAGS) | $(OBJS)
+KERNEL_CONFIG := $(CXX) $(CXXFLAGS) | $(AS) $(ASFLAGS) | $(OBJS) | $(USER_CXXFLAGS) | $(USER_LDFLAGS)
 
 KERNEL_ISO := $(BUILD_DIR)/kernel.iso
 KERNEL_MB1_ISO := $(BUILD_DIR)/kernel-mb1.iso
@@ -307,6 +337,21 @@ $(BUILD_DIR)/%.o: %.S $(KERNEL_CONFIG_STAMP) $(DOCKER_DEPS) | $(BUILD_DIR)
 $(BUILD_DIR)/%.o: %.cpp $(CXX_HDRS) $(FREESTANDING_CXX_CONFIG) $(KERNEL_CONFIG_STAMP) $(DOCKER_DEPS) | $(BUILD_DIR)
 	@mkdir -p $(@D)
 	$(DOCKER_RUN) $(CXX) $(CXXFLAGS) -c $< -o $@
+
+# User programs. These rules have shorter stems than the kernel's, so make
+# prefers them for $(BUILD_DIR)/user/.
+$(BUILD_DIR)/user/%.o: user/%.cpp $(USER_HDRS) $(FREESTANDING_CXX_CONFIG) $(KERNEL_CONFIG_STAMP) $(DOCKER_DEPS) | $(BUILD_DIR)
+	@mkdir -p $(@D)
+	$(DOCKER_RUN) $(CXX) $(USER_CXXFLAGS) -c $< -o $@
+
+$(BUILD_DIR)/user/%.elf: $(BUILD_DIR)/user/%.o $(BUILD_DIR)/user/crt.o user/user.ld $(KERNEL_CONFIG_STAMP) $(DOCKER_DEPS)
+	$(DOCKER_RUN) $(LD) $(USER_LDFLAGS) $(BUILD_DIR)/user/crt.o $< -o $@
+
+# Keep the user program objects, which make would otherwise delete as
+# intermediate files.
+.SECONDARY: $(patsubst %,$(BUILD_DIR)/user/%.o,$(USER_PROGRAMS))
+
+$(BUILD_DIR)/user_programs.o: $(USER_ELFS)
 
 $(BUILD_DIR)/kernel.bin: $(OBJS) linker.ld $(KERNEL_CONFIG_STAMP) $(DOCKER_DEPS) | $(BUILD_DIR)
 	$(DOCKER_RUN) $(LD) $(LDFLAGS) $(OBJS) -o $@

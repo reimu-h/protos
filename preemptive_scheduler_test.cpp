@@ -425,6 +425,8 @@ TEST(ForwardingTaskSchedulerTest,
   Task* const fake_task_a = reinterpret_cast<Task*>(0x1001);
   Task* const fake_task_b = reinterpret_cast<Task*>(0x1002);
   Task* const fake_current = reinterpret_cast<Task*>(0x1003);
+  AddressSpace* const fake_address_space =
+      reinterpret_cast<AddressSpace*>(0x2000);
   int dummy_arg_a = 11;
   int dummy_arg_b = 22;
   InterruptFrame timer_frame = MakeInterruptFrame(kVectorApicTimer);
@@ -491,6 +493,16 @@ TEST(ForwardingTaskSchedulerTest,
     return fake_current;
   });
   EXPECT_THAT(layer.CurrentTask(), t::Eq(fake_current));
+
+  EXPECT_CALL(*mock_inner, SetAddressSpace)
+      .WillOnce([&](AddressSpace* const address_space) {
+        EXPECT_THAT(address_space, t::Eq(fake_address_space));
+      })
+      .WillOnce([](AddressSpace* const address_space) {
+        EXPECT_THAT(address_space, t::IsNull());
+      });
+  layer.SetAddressSpace(fake_address_space);
+  layer.SetAddressSpace(nullptr);
 
   // Scheduler internals.
   EXPECT_CALL(*mock_inner, Init);

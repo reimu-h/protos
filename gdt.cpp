@@ -28,6 +28,9 @@ static_assert(kGdtKernelCodeSelector == kIdtKernelCodeSelector);
 constexpr uint64_t kKernelCodeDescriptor = 0x00AF9B000000FFFFULL;
 // Kernel data: P=1, DPL=0, S=1, read/write, D/B=1, G=1.
 constexpr uint64_t kKernelDataDescriptor = 0x00CF93000000FFFFULL;
+// The same for user code and data, with DPL=3.
+constexpr uint64_t kUserCodeDescriptor = 0x00AFFB000000FFFFULL;
+constexpr uint64_t kUserDataDescriptor = 0x00CFF3000000FFFFULL;
 
 // Type (bits 40..43) of an available 64-bit TSS descriptor. `ltr` changes it
 // to 0xB (busy).
@@ -35,14 +38,23 @@ constexpr uint64_t kTssTypeAvailable = 0x9;
 constexpr uint64_t kDescriptorPresent = 1ULL << 47;
 constexpr uint32_t kMaxDescriptorLimit = 0xFFFFF;
 
-// GDT entries: null, kernel code, kernel data, then two per TSS descriptor.
+// GDT entries: null, kernel code, kernel data, null (see
+// `kGdtUserDataSelector`), user data, user code, then two per TSS descriptor.
 constexpr int kFirstTssEntry = kGdtFirstTssSelector / 8;
 constexpr int kGdtEntryCount = kFirstTssEntry + 2 * kMaxSupportedCpus;
+static_assert(kGdtKernelCodeSelector / 8 == 1);
+static_assert(kGdtKernelDataSelector / 8 == 2);
+static_assert(kGdtUserDataSelector / 8 == 4);
+static_assert(kGdtUserCodeSelector / 8 == 5);
+static_assert(kFirstTssEntry == 6);
 
 // Writable, because `ltr` marks the descriptor it loads busy.
 alignas(16) uint64_t g_gdt[kGdtEntryCount] = {0,                      //
                                               kKernelCodeDescriptor,  //
-                                              kKernelDataDescriptor};
+                                              kKernelDataDescriptor,  //
+                                              0,                      //
+                                              kUserDataDescriptor,    //
+                                              kUserCodeDescriptor};
 alignas(16) TaskStateSegment g_tss[kMaxSupportedCpus] = {};
 
 #if __STDC_HOSTED__
@@ -113,6 +125,12 @@ GdtPointer GdtGetPointer() {
 const TaskStateSegment* GdtGetTss(const int cpu_index) {
   DCHECK(cpu_index >= 0 && cpu_index < kMaxSupportedCpus);
   return &g_tss[cpu_index];
+}
+
+void GdtSetKernelStack(const uintptr_t rsp0) {
+  DCHECK(!AreInterruptsEnabled());
+  DCHECK(rsp0 != 0 && (rsp0 & 0xFu) == 0);
+  g_tss[CurrentCpuIdIrqsOff()].rsp[0] = rsp0;
 }
 
 #if !__STDC_HOSTED__

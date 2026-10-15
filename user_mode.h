@@ -1,0 +1,168 @@
+#ifndef PROTOS_USER_MODE_H_
+#define PROTOS_USER_MODE_H_
+
+#include <atomic>
+#include <cstdint>
+#include <memory>
+
+namespace protos {
+
+class AddressSpace;
+struct ElfExecutable;
+struct InterruptFrame;
+struct Task;
+
+// User mode
+// =========
+//
+// A user process runs a user program: an ELF executable (elf.h) in kernel
+// memory, such as the programs in user/ that the kernel image embeds
+// (user_programs.h). Each process is a kernel task that runs the program in
+// an address space of its own (address_space.h): its code and data at the
+// addresses the executable gives, and its stack below `kUserStackTop`.
+//
+// The task enters user mode (CPL 3) at the program's entry point with
+// interrupts enabled. From then on the CPU returns to the kernel on every
+// interrupt, exception and system call, on the task's kernel stack:
+// `TSS.rsp0` (`GdtSetKernelStack()`) points right below the kernel context
+// that the task saved when it entered user mode. The program ends when it
+// calls exit() (syscall_abi.h) or raises an exception, which kills it, and
+// the task then continues in the kernel after the point where it entered user
+// mode.
+//
+// User programs must not use x87, MMX or SSE registers: the kernel doesn't
+// save them when it switches tasks. (Build them with -mgeneral-regs-only like
+// the kernel.)
+
+// The top of the user stack: the initial stack pointer of a program is 8 bytes
+// below it, where a call would have pushed a return address. The stack takes
+// `kUserStackPages` pages below it. The page above is unmapped, and so is the
+// page below the stack, which catches stack overflows.
+constexpr uintptr_t kUserStackTop = 0xFFFFFFFF7FFFF000ULL;
+constexpr int64_t kUserStackPages = 4;
+
+// The most pages that a program's segments may take.
+constexpr int64_t kUserProgramMaxPages = 4096;
+
+// A user program: an ELF executable at `[image, image + size)`.
+struct UserProgram {
+  const uint8_t* image = nullptr;
+  int64_t size = 0;
+};
+
+// How a user program ended.
+enum class UserProgramOutcome : uint8_t {
+  // It called exit(); `UserProgramResult::exit_status` holds the status.
+  kExited,
+  // It raised a CPU exception, which killed it; the `fault_*` fields of
+  // `UserProgramResult` describe the exception.
+  kFaulted,
+  // `UserProcess::Kill()` killed it.
+  kKilled,
+  // It never ran: its executable is invalid (elf.h) or memory ran out.
+  kLoadFailed,
+};
+
+struct UserProgramResult {
+  UserProgramOutcome outcome = UserProgramOutcome::kLoadFailed;
+  int64_t exit_status = 0;
+  // The exception vector (idt.h), error code and the address of the faulting
+  // instruction.
+  int fault_vector = -1;
+  uint64_t fault_error_code = 0;
+  uint64_t fault_rip = 0;
+  // For page faults, the address whose access faulted (CR2), else 0.
+  uint64_t fault_address = 0;
+};
+
+// Registers the system call handler (`kVectorSyscall`) and the handler that
+// kills a user program on a CPU exception (`IdtSetUserFaultHandler()`). Must
+// be called once, after `IdtInit()`, before the first `UserProcess::Start()`.
+void UserModeInit();
+
+// Writes how a program ended with `write` (for example `ConsoleWrite()` from
+// console.h), such as "exited with status 0" or "killed by CPU exception 14
+// (#PF) at rip=0x... error=0x6 address=0x...", without a newline.
+void WriteUserProgramResult(const UserProgramResult& result,
+                            void (*write)(const char* text));
+
+// A user process: a task that loads a user program into a new address space,
+// runs it, and keeps the result. The object must outlive the task, so if
+// `Wait()` has not run, the destructor kills the program (see `Kill()`) and
+// waits for the task.
+class UserProcess {
+ public:
+  // Starts a process that runs `program` (which must stay in memory until the
+  // process has ended) with `arg` in the program's rdi, on a CPU that the
+  // scheduler (task.h) chooses. Returns nullptr if the task can't be
+  // created; a program that can't be loaded ends with `kLoadFailed`. Must
+  // not be called while holding an `IrqSpinLock` (see `CreateTask()`).
+  static std::unique_ptr<UserProcess> Start(const UserProgram& program,
+                                            uint64_t arg);
+
+  ~UserProcess();
+
+  UserProcess(const UserProcess&) = delete;
+  UserProcess& operator=(const UserProcess&) = delete;
+
+  // Waits until the program has ended, reclaims the task and returns how the
+  // program ended. Must be called at most once, by one task.
+  UserProgramResult Wait();
+
+  // Asks for the program to be killed (`kKilled`), which happens when it
+  // next makes a system call, unless it has ended by then. May be called by
+  // any task, any number of times.
+  void Kill();
+
+  // The number of system calls that the program has made so far.
+  int64_t syscall_count() const {
+    return syscall_count_.load(std::memory_order_acquire);
+  }
+
+  // The CPU that served the program's latest system call, or -1 before the
+  // first one.
+  int last_syscall_cpu() const {
+    return last_syscall_cpu_.load(std::memory_order_acquire);
+  }
+
+ private:
+  friend void UserModeInit();
+
+  UserProcess(const UserProgram& program, uint64_t arg);
+
+  static void TaskEntry(void* raw_process);
+  // Loads the program and runs it until it ends, leaving the result in
+  // `result_`.
+  void Run();
+  // Maps and fills the segments of `executable` and the stack in `space`.
+  bool Load(const ElfExecutable& executable, AddressSpace& space) const;
+
+  // Interrupt handlers (see `UserModeInit()`). The process whose program
+  // raised the interrupt is in the slot above `frame`, which the task pushed
+  // when it entered user mode (user_mode_entry.S).
+  static void OnSyscall(InterruptFrame* frame);
+  static void OnUserFault(InterruptFrame* frame);
+  static UserProcess* FromFrame(const InterruptFrame* frame);
+  // Serves write(): returns the result for rax.
+  int64_t Write(uintptr_t buffer, int64_t size) const;
+  // Ends the program with `result` and returns to the kernel after the point
+  // where the task entered user mode.
+  [[noreturn]] void End(const InterruptFrame* frame,
+                        const UserProgramResult& result);
+
+  const UserProgram program_;
+  const uint64_t arg_;
+  Task* task_ = nullptr;
+  bool waited_ = false;
+  // The address space while the program runs, else nullptr.
+  AddressSpace* space_ = nullptr;
+  // Written by the task (and its interrupt handlers); read after `Join()`.
+  UserProgramResult result_;
+  std::atomic<bool> kill_requested_{false};
+  std::atomic<int64_t> syscall_count_{0};
+  std::atomic<int> last_syscall_cpu_{-1};
+};
+
+}  // namespace protos
+
+#endif  // PROTOS_USER_MODE_H_

@@ -12,8 +12,9 @@ namespace {
 
 namespace t = ::testing;
 
-// The GDT entries before the first TSS descriptor: null, kernel code, data.
-constexpr int kFirstTssEntry = 3;
+// The GDT entries before the first TSS descriptor: null, kernel code, kernel
+// data, null, user data, user code.
+constexpr int kFirstTssEntry = 6;
 constexpr int kGdtEntryCount = kFirstTssEntry + 2 * kMaxSupportedCpus;
 
 static const uint64_t* GdtEntries() {
@@ -63,32 +64,64 @@ TEST_F(GdtTest, EncodeTssDescriptorRejectsNonCanonicalBasesAndLongLimits) {
                "Check failed: limit <= kMaxDescriptorLimit");
 }
 
-TEST_F(GdtTest, TssSelectorsFollowTheKernelSegmentsSixteenBytesApart) {
+TEST_F(GdtTest, TssSelectorsFollowTheUserSegmentsSixteenBytesApart) {
   EXPECT_THAT(GdtTssSelector(0), t::Eq(kGdtFirstTssSelector));
-  EXPECT_THAT(GdtTssSelector(0), t::Eq(0x18));
-  EXPECT_THAT(GdtTssSelector(1), t::Eq(0x28));
+  EXPECT_THAT(GdtTssSelector(0), t::Eq(0x30));
+  EXPECT_THAT(GdtTssSelector(1), t::Eq(0x40));
   EXPECT_THAT(GdtTssSelector(kMaxSupportedCpus - 1),
-              t::Eq(0x18 + 16 * (kMaxSupportedCpus - 1)));
+              t::Eq(0x30 + 16 * (kMaxSupportedCpus - 1)));
   EXPECT_DEATH(GdtTssSelector(-1), "Check failed: cpu_index >= 0");
   EXPECT_DEATH(GdtTssSelector(kMaxSupportedCpus),
                "Check failed: cpu_index >= 0");
 }
 
-TEST_F(GdtTest, GdtHasTheBootSegmentsAndATssSlotForEveryCpu) {
+TEST_F(GdtTest, GdtHasTheKernelAndUserSegmentsAndATssSlotForEveryCpu) {
   const GdtPointer gdtr = GdtGetPointer();
   EXPECT_THAT(gdtr.limit, t::Eq(kGdtEntryCount * 8 - 1));
   EXPECT_THAT(gdtr.base % 16, t::Eq(0u));
-  // The same entries as boot.S's gdt64, at the same selectors.
+  // The kernel segments are the same as boot.S's gdt64, at the same selectors.
   const uint64_t* const entries = GdtEntries();
   EXPECT_THAT(entries[0], t::Eq(0u));
   EXPECT_THAT(entries[kGdtKernelCodeSelector / 8],
               t::Eq(0x00AF9B000000FFFFULL));
   EXPECT_THAT(entries[kGdtKernelDataSelector / 8],
               t::Eq(0x00CF93000000FFFFULL));
+  // The user segments: DPL 3, and where SYSRET expects them, user data 8 bytes
+  // and user code 16 bytes after the (null) 32-bit user code entry.
+  EXPECT_THAT(kGdtUserDataSelector & 3, t::Eq(3));
+  EXPECT_THAT(kGdtUserCodeSelector & 3, t::Eq(3));
+  EXPECT_THAT(entries[3], t::Eq(0u));
+  EXPECT_THAT(entries[kGdtUserDataSelector / 8], t::Eq(0x00CFF3000000FFFFULL));
+  EXPECT_THAT(entries[kGdtUserCodeSelector / 8], t::Eq(0x00AFFB000000FFFFULL));
+  EXPECT_THAT(kGdtUserDataSelector / 8, t::Eq(3 + 1));
+  EXPECT_THAT(kGdtUserCodeSelector / 8, t::Eq(3 + 2));
   // No TSS descriptor before a CPU loads its TSS.
   for (int i = kFirstTssEntry; i < kGdtEntryCount; ++i) {
     EXPECT_THAT(entries[i], t::Eq(0u)) << "entry " << i;
   }
+}
+
+TEST_F(GdtTest, SetKernelStackSetsTheCallingCpusRsp0) {
+  CpuLocal cpus[2];
+  for (int i = 0; i < 2; ++i) {
+    cpus[i].self = &cpus[i];
+    cpus[i].cpu_id = i;
+  }
+  SetInterruptsEnabledForTest(false);
+  BindCpuLocal(&cpus[1]);
+  GdtSetKernelStack(0x7FF0);
+  EXPECT_THAT(Rsp(GdtGetTss(1), 0), t::Eq(0x7FF0u));
+  EXPECT_THAT(Rsp(GdtGetTss(0), 0), t::Eq(0u));
+  BindCpuLocal(&cpus[0]);
+  GdtSetKernelStack(0x9000);
+  EXPECT_THAT(Rsp(GdtGetTss(0), 0), t::Eq(0x9000u));
+  EXPECT_THAT(Rsp(GdtGetTss(1), 0), t::Eq(0x7FF0u));
+  EXPECT_DEATH(GdtSetKernelStack(0), "Check failed: rsp0 != 0");
+  EXPECT_DEATH(GdtSetKernelStack(0x9008), "Check failed: rsp0 != 0");
+  SetInterruptsEnabledForTest(true);
+  EXPECT_DEATH(GdtSetKernelStack(0x9000),
+               "Check failed: !AreInterruptsEnabled\\(\\)");
+  ResetCpuLocalForTest();
 }
 
 TEST_F(GdtTest, LoadForCpuSetsUpItsTssAndDescriptorAndLoadsIt) {

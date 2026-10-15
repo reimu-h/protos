@@ -5,6 +5,7 @@
 
 namespace protos {
 
+class AddressSpace;
 struct InterruptFrame;
 struct Task;
 
@@ -156,6 +157,17 @@ class TaskScheduler {
 
   // Returns the opaque `Task*` currently executing on the calling CPU in O(1).
   virtual Task* CurrentTask() const = 0;
+
+  // Runs the calling task in `address_space` (address_space.h) from now on:
+  // switches the calling CPU to its page tables at once, and whichever CPU the
+  // task runs on later switches to them whenever it resumes the task. nullptr
+  // returns the task to the kernel's page tables, in which every task starts.
+  // The kernel is mapped the same in every address space, so the task's kernel
+  // code, data and stack stay where they are. The address space must outlive
+  // its use by the task, which ends when the task switches to another address
+  // space or exits. Must not be called from an idle task or an interrupt
+  // handler, or while holding an `IrqSpinLock`.
+  virtual void SetAddressSpace(AddressSpace* address_space) = 0;
 
  private:
   // Scheduler internals

@@ -268,7 +268,7 @@ static bool ParseMemoryMapImpl(const uint32_t multiboot_magic,
             reinterpret_cast<const Multiboot2TagFramebuffer*>(&tag);
         if (fb_tag->framebuffer_type == kMultiboot2FramebufferTypeRgb &&
             fb_tag->framebuffer_addr != 0 &&
-            fb_tag->framebuffer_addr < kMaxCanonicalIdentityAddress &&
+            fb_tag->framebuffer_addr < kIdentityMapLimit &&
             fb_tag->framebuffer_width > 0 && fb_tag->framebuffer_height > 0 &&
             fb_tag->framebuffer_pitch <= static_cast<uint32_t>(INT32_MAX) &&
             fb_tag->framebuffer_width <= static_cast<uint32_t>(INT32_MAX) &&

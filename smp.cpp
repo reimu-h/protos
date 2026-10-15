@@ -1253,8 +1253,8 @@ uintptr_t SmpFindRsdpInMemoryRange(const uintptr_t range_start,
   DCHECK(range_start != 0);
   DCHECK(range_length > 0);
   constexpr int64_t kV1Size = sizeof(AcpiRsdpV1);
-  if (range_length < kV1Size || range_start >= kMaxCanonicalIdentityAddress ||
-      (kMaxCanonicalIdentityAddress - range_start) <
+  if (range_length < kV1Size || range_start >= kIdentityMapLimit ||
+      (kIdentityMapLimit - range_start) <
           static_cast<uintptr_t>(range_length) ||
       MapPhysical<uint8_t>(range_start, range_length) == nullptr) {
     return 0;
@@ -1266,11 +1266,7 @@ uintptr_t SmpFindRsdpInMemoryRange(const uintptr_t range_start,
        addr += kRsdpScanAlignment) {
     uintptr_t rsdt = 0;
     uintptr_t xsdt = 0;
-    if (ParseRsdpBounded(addr,                          //
-                         range_end,                     //
-                         kMaxCanonicalIdentityAddress,  //
-                         &rsdt,                         //
-                         &xsdt)) {
+    if (ParseRsdpBounded(addr, range_end, kIdentityMapLimit, &rsdt, &xsdt)) {
       return addr;
     }
   }
@@ -1621,12 +1617,12 @@ void SmpInit(const uint32_t multiboot_magic,
 
   // The CPUID initial APIC ID only selects a provisional BSP entry, which is
   // enough to find the Local APIC. Its ID register is authoritative.
-  CHECK(SmpDiscoverTopology(multiboot_magic,               //
-                            multiboot_info_addr,           //
-                            ebda_base,                     //
-                            bios_rom_base,                 //
-                            kMaxCanonicalIdentityAddress,  //
-                            bsp_initial_apic_id,           //
+  CHECK(SmpDiscoverTopology(multiboot_magic,      //
+                            multiboot_info_addr,  //
+                            ebda_base,            //
+                            bios_rom_base,        //
+                            kIdentityMapLimit,    //
+                            bsp_initial_apic_id,  //
                             &g_topology));
 
   g_x2apic_mode = IsX2ApicSupported();
@@ -1646,12 +1642,12 @@ void SmpInit(const uint32_t multiboot_magic,
     UartWrite(" differs from its CPUID initial APIC ID ");
     UartWriteDec(g_topology.bsp_apic_id);
     UartWrite("; using the Local APIC ID\n");
-    CHECK(SmpDiscoverTopology(multiboot_magic,               //
-                              multiboot_info_addr,           //
-                              ebda_base,                     //
-                              bios_rom_base,                 //
-                              kMaxCanonicalIdentityAddress,  //
-                              bsp_apic_id,                   //
+    CHECK(SmpDiscoverTopology(multiboot_magic,      //
+                              multiboot_info_addr,  //
+                              ebda_base,            //
+                              bios_rom_base,        //
+                              kIdentityMapLimit,    //
+                              bsp_apic_id,          //
                               &g_topology));
     DCHECK(g_topology.local_apic_phys_addr == lapic_base);
   }

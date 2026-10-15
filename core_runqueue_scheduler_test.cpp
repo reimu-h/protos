@@ -35,6 +35,19 @@ static int MaxConsecutiveRun(const std::vector<int>& trace, const int id) {
   return longest;
 }
 
+// Returns a distinct fake address space for each `index`. The core only stores,
+// compares and passes on address space pointers, so they need not point to
+// real address spaces.
+static AddressSpace* FakeAddressSpace(const int index) {
+  return reinterpret_cast<AddressSpace*>(0x10000 + index * 0x1000);
+}
+
+// Returns the address space that the fake ActivateAddressSpace() last switched
+// CPU `cpu` to (nullptr: the kernel's page tables).
+static const AddressSpace* ActiveAddressSpace(const int cpu) {
+  return g_env.active_address_space[cpu].load(std::memory_order_acquire);
+}
+
 // ============================================================================
 // 1. `Init()` and Topology Initialization (1..4 and 128 CPUs)
 // ============================================================================
@@ -1081,7 +1094,7 @@ TEST(CoreRunqueueSchedulerTest,
 
 // ============================================================================
 // 8. Multi-Threaded SMP Concurrency Test (`Yield`, `StealTask`,
-// `OnTimerInterrupt`)
+// `OnTimerInterrupt`, `SetAddressSpace`)
 // ============================================================================
 
 struct MtCoreSharedCtx {
@@ -1093,6 +1106,8 @@ struct MtCoreSharedCtx {
   // Times a task saw its own CPU reported idle, or an idle loop saw its CPU
   // reported busy.
   std::atomic<int64_t> busy_state_violations{0};
+  // Times a task found its CPU in another address space than its own.
+  std::atomic<int64_t> address_space_violations{0};
 };
 
 struct MtCoreTaskArg {
@@ -1110,6 +1125,11 @@ static void MtCoreConcurrencyWorker(void* const raw_arg) {
   timer_frame.vector = kVectorApicTimer;
   timer_frame.rflags = kRflagsInterruptEnableBit;
 
+  // Each task runs in an address space of its own, which every CPU that runs
+  // the task must switch to.
+  AddressSpace* const address_space = FakeAddressSpace(arg->task_index);
+  sched->SetAddressSpace(address_space);
+
   for (int round = 0; round < 6; ++round) {
     const int cpu = CurrentCpuId();
     shared->cpu_mask.fetch_or(1u << static_cast<uint32_t>(cpu),
@@ -1119,6 +1139,9 @@ static void MtCoreConcurrencyWorker(void* const raw_arg) {
     }
     if (!TaskSchedulerInternals::IsCpuBusy(*sched, cpu)) {
       shared->busy_state_violations.fetch_add(1, std::memory_order_acq_rel);
+    }
+    if (ActiveAddressSpace(cpu) != address_space) {
+      shared->address_space_violations.fetch_add(1, std::memory_order_acq_rel);
     }
     arg->iterations.fetch_add(1, std::memory_order_acq_rel);
     shared->total_iterations.fetch_add(1, std::memory_order_acq_rel);
@@ -1252,6 +1275,9 @@ TEST(CoreRunqueueSchedulerTest,
   EXPECT_THAT(shared.remote_executions.load(), t::Gt(0));
   EXPECT_THAT(shared.cpu_mask.load() & ~1u, t::Ne(0u));
   EXPECT_THAT(shared.busy_state_violations.load(), t::Eq(0));
+  EXPECT_THAT(shared.address_space_violations.load(), t::Eq(0));
+  // The bootstrap task never left the kernel's page tables.
+  EXPECT_THAT(ActiveAddressSpace(0), t::IsNull());
 
   for (int c = 0; c < kNumCpus; ++c) {
     EXPECT_THAT(TaskSchedulerInternals::RunqueueLoad(*core, c), t::Eq(0));
@@ -1536,6 +1562,80 @@ TEST(CoreRunqueueSchedulerDeathTest, DetachAndReapZombiesPanic) {
 
   // The death tests ran in child processes; the task is still queued here.
   core->Join(task);
+}
+
+// ============================================================================
+// 11. Address Spaces (`SetAddressSpace`)
+// ============================================================================
+
+struct AddressSpaceTaskCtx {
+  TaskScheduler* sched = nullptr;
+  AddressSpace* address_space = nullptr;
+  // The address space that CPU 0 used when the task started.
+  const AddressSpace* active_at_start = FakeAddressSpace(0);
+  // Times the task found CPU 0 in another address space than its own after
+  // its SetAddressSpace() call.
+  int mismatches = 0;
+};
+
+static void AddressSpaceWorker(void* const raw_arg) {
+  AddressSpaceTaskCtx* const ctx = static_cast<AddressSpaceTaskCtx*>(raw_arg);
+  ctx->active_at_start = ActiveAddressSpace(0);
+  ctx->sched->SetAddressSpace(ctx->address_space);
+  for (int i = 0; i < 4; ++i) {
+    if (ActiveAddressSpace(0) != ctx->address_space) {
+      ++ctx->mismatches;
+    }
+    ctx->sched->Yield();
+  }
+  if (ActiveAddressSpace(0) != ctx->address_space) {
+    ++ctx->mismatches;
+  }
+}
+
+TEST(CoreRunqueueSchedulerTest,
+     SetAddressSpaceSwitchesTheCpuWithTheTaskThatRunsOnIt) {
+  SetupEnv(1);
+  const std::shared_ptr<TaskScheduler> core = CreateCoreRunqueueScheduler();
+  TaskSchedulerInternals::Init(*core);
+  AddressSpace* const bootstrap_space = FakeAddressSpace(1);
+
+  // The calling task's CPU switches at once, but only if the address space
+  // changes.
+  EXPECT_THAT(ActiveAddressSpace(0), t::IsNull());
+  core->SetAddressSpace(bootstrap_space);
+  EXPECT_THAT(ActiveAddressSpace(0), t::Eq(bootstrap_space));
+  EXPECT_THAT(g_env.address_space_switches.load(), t::Eq(1));
+  core->SetAddressSpace(bootstrap_space);
+  EXPECT_THAT(g_env.address_space_switches.load(), t::Eq(1));
+
+  // Tasks start in the kernel's page tables, and CPU 0 always uses the address
+  // space of the task that it runs: of each task once it has called
+  // SetAddressSpace(), and the bootstrap task's again once both tasks have
+  // exited, one of them in its address space.
+  AddressSpaceTaskCtx ctx_a;
+  ctx_a.sched = core.get();
+  ctx_a.address_space = FakeAddressSpace(2);
+  AddressSpaceTaskCtx ctx_b;
+  ctx_b.sched = core.get();
+  ctx_b.address_space = FakeAddressSpace(3);
+  Task* const task_a =
+      core->CreateTask(AddressSpaceWorker, &ctx_a, kDefaultTaskWeight);
+  Task* const task_b =
+      core->CreateTask(AddressSpaceWorker, &ctx_b, kDefaultTaskWeight);
+  ASSERT_THAT(task_a, t::NotNull());
+  ASSERT_THAT(task_b, t::NotNull());
+  core->Join(task_a);
+  core->Join(task_b);
+
+  EXPECT_THAT(ctx_a.active_at_start, t::IsNull());
+  EXPECT_THAT(ctx_b.active_at_start, t::IsNull());
+  EXPECT_THAT(ctx_a.mismatches, t::Eq(0));
+  EXPECT_THAT(ctx_b.mismatches, t::Eq(0));
+  EXPECT_THAT(ActiveAddressSpace(0), t::Eq(bootstrap_space));
+
+  core->SetAddressSpace(nullptr);
+  EXPECT_THAT(ActiveAddressSpace(0), t::IsNull());
 }
 
 }  // namespace

@@ -537,13 +537,11 @@ TEST_F(SmpTest, ParseRsdpValidatesV1AndV2AndRejectsMalformed) {
 
   uintptr_t rsdt = 0;
   uintptr_t xsdt = 0;
-  EXPECT_TRUE(
-      SmpParseRsdpForTest(kV1Addr, kMaxCanonicalIdentityAddress, &rsdt, &xsdt));
+  EXPECT_TRUE(SmpParseRsdpForTest(kV1Addr, kIdentityMapLimit, &rsdt, &xsdt));
   EXPECT_THAT(rsdt, t::Eq(0x12345000u));
   EXPECT_THAT(xsdt, t::Eq(0u));
 
-  EXPECT_TRUE(
-      SmpParseRsdpForTest(kV2Addr, kMaxCanonicalIdentityAddress, &rsdt, &xsdt));
+  EXPECT_TRUE(SmpParseRsdpForTest(kV2Addr, kIdentityMapLimit, &rsdt, &xsdt));
   EXPECT_THAT(rsdt, t::Eq(0x12345000u));
   EXPECT_THAT(xsdt, t::Eq(0x9876543200ULL));
 
@@ -556,8 +554,7 @@ TEST_F(SmpTest, ParseRsdpValidatesV1AndV2AndRejectsMalformed) {
   At(kV2Addr)[37] = 0x13;
   raw_v2->extended_checksum = 0;
   raw_v2->extended_checksum = ComputeChecksumByte(raw_v2, 40);
-  EXPECT_TRUE(
-      SmpParseRsdpForTest(kV2Addr, kMaxCanonicalIdentityAddress, &rsdt, &xsdt));
+  EXPECT_TRUE(SmpParseRsdpForTest(kV2Addr, kIdentityMapLimit, &rsdt, &xsdt));
   EXPECT_THAT(xsdt, t::Eq(0x9876543200ULL));
   WriteRsdpV2(kV2Addr, 0x12345000, 0x9876543200ULL);
 
@@ -566,24 +563,20 @@ TEST_F(SmpTest, ParseRsdpValidatesV1AndV2AndRejectsMalformed) {
 
   // Corrupted v2 extended checksum must be rejected.
   raw_v2->extended_checksum ^= 0xFF;
-  EXPECT_FALSE(
-      SmpParseRsdpForTest(kV2Addr, kMaxCanonicalIdentityAddress, &rsdt, &xsdt));
+  EXPECT_FALSE(SmpParseRsdpForTest(kV2Addr, kIdentityMapLimit, &rsdt, &xsdt));
   raw_v2->extended_checksum ^= 0xFF;
 
   // Invalid v2 length (< 36) must be rejected.
   raw_v2->length = 20;
   raw_v2->extended_checksum = ComputeChecksumByte(raw_v2, sizeof(RawRsdpV2));
-  EXPECT_FALSE(
-      SmpParseRsdpForTest(kV2Addr, kMaxCanonicalIdentityAddress, &rsdt, &xsdt));
+  EXPECT_FALSE(SmpParseRsdpForTest(kV2Addr, kIdentityMapLimit, &rsdt, &xsdt));
 
   // Corrupted v1 checksum or signature must be rejected.
   At<RawRsdpV1>(kV1Addr)->checksum ^= 0x01;
-  EXPECT_FALSE(
-      SmpParseRsdpForTest(kV1Addr, kMaxCanonicalIdentityAddress, &rsdt, &xsdt));
+  EXPECT_FALSE(SmpParseRsdpForTest(kV1Addr, kIdentityMapLimit, &rsdt, &xsdt));
 
   WriteRsdpV1(kV1Addr, 0);
-  EXPECT_FALSE(
-      SmpParseRsdpForTest(kV1Addr, kMaxCanonicalIdentityAddress, &rsdt, &xsdt));
+  EXPECT_FALSE(SmpParseRsdpForTest(kV1Addr, kIdentityMapLimit, &rsdt, &xsdt));
 }
 
 TEST_F(SmpTest, FindRsdpInMemoryRangeHonorsAlignmentAndChecksums) {
@@ -655,47 +648,40 @@ TEST_F(SmpTest, FindRsdpInMultiboot2PrefersAcpiNewAndFallsBackToOld) {
   *reinterpret_cast<uint32_t*>(buf + 4) = 0;
 
   // When both Tag 14 and Tag 15 are valid, Tag 15 (ACPI 2.0+) is preferred.
-  EXPECT_THAT(
-      SmpFindRsdpInMultiboot2ForTest(kMbBase, kMaxCanonicalIdentityAddress),
-      t::Eq(new_rsdp_addr));
+  EXPECT_THAT(SmpFindRsdpInMultiboot2ForTest(kMbBase, kIdentityMapLimit),
+              t::Eq(new_rsdp_addr));
 
   // If Tag 15 claims an RSDP v2 length (e.g. 512) larger than the Multiboot2
   // tag payload size (36), it must be rejected without reading out-of-bounds,
   // falling back to Tag 14.
   At<RawRsdpV2>(new_rsdp_addr)->length = 512;
-  EXPECT_THAT(
-      SmpFindRsdpInMultiboot2ForTest(kMbBase, kMaxCanonicalIdentityAddress),
-      t::Eq(old_rsdp_addr));
+  EXPECT_THAT(SmpFindRsdpInMultiboot2ForTest(kMbBase, kIdentityMapLimit),
+              t::Eq(old_rsdp_addr));
   WriteRsdpV2(new_rsdp_addr, 0xAAAA0000, 0xBBBB0000ULL);
 
   // If Tag 15 has a corrupted extended checksum, fallback to Tag 14 succeeds.
   At<RawRsdpV2>(new_rsdp_addr)->extended_checksum ^= 0xFF;
-  EXPECT_THAT(
-      SmpFindRsdpInMultiboot2ForTest(kMbBase, kMaxCanonicalIdentityAddress),
-      t::Eq(old_rsdp_addr));
+  EXPECT_THAT(SmpFindRsdpInMultiboot2ForTest(kMbBase, kIdentityMapLimit),
+              t::Eq(old_rsdp_addr));
 
   // If Tag 14 is also corrupted, but Tag 15's v1 header (rsdt_address != 0) is
   // still valid, Tag 15's v1 header is used as fallback.
   At<RawRsdpV1>(old_rsdp_addr)->checksum ^= 0xFF;
-  EXPECT_THAT(
-      SmpFindRsdpInMultiboot2ForTest(kMbBase, kMaxCanonicalIdentityAddress),
-      t::Eq(new_rsdp_addr));
+  EXPECT_THAT(SmpFindRsdpInMultiboot2ForTest(kMbBase, kIdentityMapLimit),
+              t::Eq(new_rsdp_addr));
 
   // If Tag 15's v1 checksum is also corrupted, returns 0.
   At<RawRsdpV2>(new_rsdp_addr)->v1.checksum ^= 0xFF;
-  EXPECT_THAT(
-      SmpFindRsdpInMultiboot2ForTest(kMbBase, kMaxCanonicalIdentityAddress),
-      t::Eq(0u));
+  EXPECT_THAT(SmpFindRsdpInMultiboot2ForTest(kMbBase, kIdentityMapLimit),
+              t::Eq(0u));
 
   // Malformed Multiboot2 total_size (< 8 or > 4 MiB) must return 0.
   *reinterpret_cast<uint32_t*>(buf) = 4;
-  EXPECT_THAT(
-      SmpFindRsdpInMultiboot2ForTest(kMbBase, kMaxCanonicalIdentityAddress),
-      t::Eq(0u));
+  EXPECT_THAT(SmpFindRsdpInMultiboot2ForTest(kMbBase, kIdentityMapLimit),
+              t::Eq(0u));
   *reinterpret_cast<uint32_t*>(buf) = 8 * 1024 * 1024;
-  EXPECT_THAT(
-      SmpFindRsdpInMultiboot2ForTest(kMbBase, kMaxCanonicalIdentityAddress),
-      t::Eq(0u));
+  EXPECT_THAT(SmpFindRsdpInMultiboot2ForTest(kMbBase, kIdentityMapLimit),
+              t::Eq(0u));
 }
 
 TEST_F(SmpTest, FindMadtInSdtSearchesXsdtAndFallsBackToRsdt) {
@@ -722,21 +708,19 @@ TEST_F(SmpTest, FindMadtInSdtSearchesXsdtAndFallsBackToRsdt) {
   WriteRsdt(kRsdtAddr, {kFacpAddr, kBadMadtAddr, kGoodMadtAddr});
 
   // Valid XSDT resolves kGoodMadtAddr (skipping FACP and kBadMadtAddr).
-  EXPECT_THAT(SmpFindMadtInSdt(0, kXsdtAddr, kMaxCanonicalIdentityAddress),
+  EXPECT_THAT(SmpFindMadtInSdt(0, kXsdtAddr, kIdentityMapLimit),
               t::Eq(kGoodMadtAddr));
 
   // If XSDT checksum is corrupted, falls back to 32-bit RSDT and resolves
   // kGoodMadtAddr.
   At<RawSdtHeader>(kXsdtAddr)->checksum ^= 0xFF;
-  EXPECT_THAT(
-      SmpFindMadtInSdt(kRsdtAddr, kXsdtAddr, kMaxCanonicalIdentityAddress),
-      t::Eq(kGoodMadtAddr));
+  EXPECT_THAT(SmpFindMadtInSdt(kRsdtAddr, kXsdtAddr, kIdentityMapLimit),
+              t::Eq(kGoodMadtAddr));
 
   // If RSDT checksum is also corrupted, returns 0.
   At<RawSdtHeader>(kRsdtAddr)->checksum ^= 0xFF;
-  EXPECT_THAT(
-      SmpFindMadtInSdt(kRsdtAddr, kXsdtAddr, kMaxCanonicalIdentityAddress),
-      t::Eq(0u));
+  EXPECT_THAT(SmpFindMadtInSdt(kRsdtAddr, kXsdtAddr, kIdentityMapLimit),
+              t::Eq(0u));
 }
 
 TEST_F(SmpTest, ParseMadtHandlesBspReorderingFilteringDuplicatesAndOverrides) {
@@ -772,7 +756,7 @@ TEST_F(SmpTest, ParseMadtHandlesBspReorderingFilteringDuplicatesAndOverrides) {
   WriteMadt(kMadtAddr, 0xFEE00123u, recs);
 
   SmpTopology topo = {};
-  ASSERT_TRUE(SmpParseMadt(kMadtAddr, kMaxCanonicalIdentityAddress, 4, &topo));
+  ASSERT_TRUE(SmpParseMadt(kMadtAddr, kIdentityMapLimit, 4, &topo));
   EXPECT_THAT(topo.local_apic_phys_addr, t::Eq(0xFEE01000ULL));
   EXPECT_THAT(topo.bsp_apic_id, t::Eq(4u));
   ASSERT_THAT(topo.cpu_count, t::Eq(3));
@@ -795,7 +779,7 @@ TEST_F(SmpTest, ParseMadtHandlesBspReorderingFilteringDuplicatesAndOverrides) {
 
   // If bsp_apic_id (e.g. 99) was omitted from the MADT, it is inserted at
   // index 0 and existing CPUs are shifted right.
-  ASSERT_TRUE(SmpParseMadt(kMadtAddr, kMaxCanonicalIdentityAddress, 99, &topo));
+  ASSERT_TRUE(SmpParseMadt(kMadtAddr, kIdentityMapLimit, 99, &topo));
   ASSERT_THAT(topo.cpu_count, t::Eq(4));
   EXPECT_THAT(topo.cpus[0].apic_id, t::Eq(99u));
   EXPECT_THAT(topo.cpus[0].acpi_processor_id, t::Eq(0u));
@@ -820,14 +804,14 @@ TEST_F(SmpTest, ParseMadtIgnoresProcessorsThatAreOnlyOnlineCapable) {
   WriteMadt(kMadtAddr, kDefaultLocalApicPhysAddr, recs);
 
   SmpTopology topo = {};
-  ASSERT_TRUE(SmpParseMadt(kMadtAddr, kMaxCanonicalIdentityAddress, 0, &topo));
+  ASSERT_TRUE(SmpParseMadt(kMadtAddr, kIdentityMapLimit, 0, &topo));
   ASSERT_THAT(topo.cpu_count, t::Eq(3));
   EXPECT_THAT(topo.cpus[0].apic_id, t::Eq(0u));
   EXPECT_THAT(topo.cpus[1].apic_id, t::Eq(2u));
   EXPECT_THAT(topo.cpus[2].apic_id, t::Eq(4u));
 
   // A BSP that is listed only as Online Capable is still placed at index 0.
-  ASSERT_TRUE(SmpParseMadt(kMadtAddr, kMaxCanonicalIdentityAddress, 1, &topo));
+  ASSERT_TRUE(SmpParseMadt(kMadtAddr, kIdentityMapLimit, 1, &topo));
   ASSERT_THAT(topo.cpu_count, t::Eq(4));
   EXPECT_THAT(topo.cpus[0].apic_id, t::Eq(1u));
   EXPECT_THAT(topo.cpus[0].acpi_processor_id, t::Eq(0u));
@@ -837,7 +821,7 @@ TEST_F(SmpTest, ParseMadtIgnoresProcessorsThatAreOnlyOnlineCapable) {
   AppendLapicRecord(&recs, 0, 0, 2);
   AppendX2ApicRecord(&recs, 1, 1, 2);
   WriteMadt(kMadtAddr, kDefaultLocalApicPhysAddr, recs);
-  EXPECT_FALSE(SmpParseMadt(kMadtAddr, kMaxCanonicalIdentityAddress, 0, &topo));
+  EXPECT_FALSE(SmpParseMadt(kMadtAddr, kIdentityMapLimit, 0, &topo));
 }
 
 TEST_F(SmpTest, ParseMadtHandlesMalformedEntriesAndCapsCpuCount) {
@@ -855,7 +839,7 @@ TEST_F(SmpTest, ParseMadtHandlesMalformedEntriesAndCapsCpuCount) {
   WriteMadt(kMadtAddr, kDefaultLocalApicPhysAddr, recs);
 
   SmpTopology topo = {};
-  ASSERT_TRUE(SmpParseMadt(kMadtAddr, kMaxCanonicalIdentityAddress, 0, &topo));
+  ASSERT_TRUE(SmpParseMadt(kMadtAddr, kIdentityMapLimit, 0, &topo));
   EXPECT_THAT(topo.cpu_count, t::Eq(2));
 
   // Truncated Type 0 entry (length == 4 < 8) stops parsing cleanly.
@@ -865,7 +849,7 @@ TEST_F(SmpTest, ParseMadtHandlesMalformedEntriesAndCapsCpuCount) {
   recs.insert(recs.end(), short_type0, short_type0 + sizeof(short_type0));
   AppendLapicRecord(&recs, 2, 2, 1);
   WriteMadt(kMadtAddr, kDefaultLocalApicPhysAddr, recs);
-  ASSERT_TRUE(SmpParseMadt(kMadtAddr, kMaxCanonicalIdentityAddress, 0, &topo));
+  ASSERT_TRUE(SmpParseMadt(kMadtAddr, kIdentityMapLimit, 0, &topo));
   EXPECT_THAT(topo.cpu_count, t::Eq(1));
 
   // MADT with only disabled CPUs must return false.
@@ -873,7 +857,7 @@ TEST_F(SmpTest, ParseMadtHandlesMalformedEntriesAndCapsCpuCount) {
   AppendLapicRecord(&recs, 0, 0, 0);
   AppendLapicRecord(&recs, 1, 1, 0);
   WriteMadt(kMadtAddr, kDefaultLocalApicPhysAddr, recs);
-  EXPECT_FALSE(SmpParseMadt(kMadtAddr, kMaxCanonicalIdentityAddress, 0, &topo));
+  EXPECT_FALSE(SmpParseMadt(kMadtAddr, kIdentityMapLimit, 0, &topo));
 
   // MADT with more enabled processors than kMaxSupportedCpus: the BSP, listed
   // last, still gets index 0, followed by the first kMaxSupportedCpus - 1 other
@@ -888,7 +872,7 @@ TEST_F(SmpTest, ParseMadtHandlesMalformedEntriesAndCapsCpuCount) {
   }
   AppendLapicRecord(&recs, 0x77, 0, 1);
   WriteMadt(kMadtAddr, kDefaultLocalApicPhysAddr, recs);
-  ASSERT_TRUE(SmpParseMadt(kMadtAddr, kMaxCanonicalIdentityAddress, 0, &topo));
+  ASSERT_TRUE(SmpParseMadt(kMadtAddr, kIdentityMapLimit, 0, &topo));
   ASSERT_THAT(topo.cpu_count, t::Eq(kMaxSupportedCpus));
   EXPECT_THAT(topo.ignored_cpu_count,
               t::Eq(kListedCpuCount - kMaxSupportedCpus));
@@ -903,7 +887,7 @@ TEST_F(SmpTest, ParseMadtHandlesMalformedEntriesAndCapsCpuCount) {
   // Exactly kMaxSupportedCpus processors fit without ignoring any.
   WriteMadt(kMadtAddr, kDefaultLocalApicPhysAddr,
             LapicRecords(kMaxSupportedCpus));
-  ASSERT_TRUE(SmpParseMadt(kMadtAddr, kMaxCanonicalIdentityAddress, 0, &topo));
+  ASSERT_TRUE(SmpParseMadt(kMadtAddr, kIdentityMapLimit, 0, &topo));
   EXPECT_THAT(topo.cpu_count, t::Eq(kMaxSupportedCpus));
   EXPECT_THAT(topo.ignored_cpu_count, t::Eq(0));
 }
@@ -930,10 +914,7 @@ TEST_F(SmpTest, ParseMadtKeeps32BitX2ApicIdsAndProcessorUids) {
   WriteMadt(kMadtAddr, kDefaultLocalApicPhysAddr, recs);
 
   SmpTopology topo = {};
-  ASSERT_TRUE(SmpParseMadt(kMadtAddr,                     //
-                           kMaxCanonicalIdentityAddress,  //
-                           0x12345678u,                   //
-                           &topo));
+  ASSERT_TRUE(SmpParseMadt(kMadtAddr, kIdentityMapLimit, 0x12345678u, &topo));
   EXPECT_THAT(topo.bsp_apic_id, t::Eq(0x12345678u));
   ASSERT_THAT(topo.cpu_count, t::Eq(5));
 
@@ -1849,7 +1830,7 @@ TEST_F(SmpTest, PreconditionViolationsTriggerDcheck) {
       "Check failed: bsp_apic_id != kInvalidX2ApicId";
   constexpr const char* kNullTopology = "Check failed: out_topology != nullptr";
 
-  EXPECT_DEATH(SmpFindRsdpInMultiboot2ForTest(0, kMaxCanonicalIdentityAddress),
+  EXPECT_DEATH(SmpFindRsdpInMultiboot2ForTest(0, kIdentityMapLimit),
                "Check failed: multiboot_info_addr != 0");
   EXPECT_DEATH(SmpFindRsdpInMultiboot2ForTest(kAddr, 0), kZeroMaxPhysicalAddr);
 
@@ -1860,49 +1841,43 @@ TEST_F(SmpTest, PreconditionViolationsTriggerDcheck) {
   EXPECT_DEATH(SmpFindRsdpInMemoryRange(kAddr, -16),
                "Check failed: range_length > 0");
 
-  EXPECT_DEATH(
-      SmpParseRsdpForTest(0, kMaxCanonicalIdentityAddress, &rsdt, &xsdt),
-      "Check failed: rsdp_addr != 0");
+  EXPECT_DEATH(SmpParseRsdpForTest(0, kIdentityMapLimit, &rsdt, &xsdt),
+               "Check failed: rsdp_addr != 0");
   EXPECT_DEATH(SmpParseRsdpForTest(kAddr, 0, &rsdt, &xsdt),
                kZeroMaxPhysicalAddr);
-  EXPECT_DEATH(
-      SmpParseRsdpForTest(kAddr, kMaxCanonicalIdentityAddress, nullptr, &xsdt),
-      "Check failed: out_rsdt_addr != nullptr");
-  EXPECT_DEATH(
-      SmpParseRsdpForTest(kAddr, kMaxCanonicalIdentityAddress, &rsdt, nullptr),
-      "Check failed: out_xsdt_addr != nullptr");
+  EXPECT_DEATH(SmpParseRsdpForTest(kAddr, kIdentityMapLimit, nullptr, &xsdt),
+               "Check failed: out_rsdt_addr != nullptr");
+  EXPECT_DEATH(SmpParseRsdpForTest(kAddr, kIdentityMapLimit, &rsdt, nullptr),
+               "Check failed: out_xsdt_addr != nullptr");
 
-  EXPECT_DEATH(SmpFindMadtInSdt(0, 0, kMaxCanonicalIdentityAddress),
+  EXPECT_DEATH(SmpFindMadtInSdt(0, 0, kIdentityMapLimit),
                "Check failed: rsdt_addr != 0 \\|\\| xsdt_addr != 0");
   EXPECT_DEATH(SmpFindMadtInSdt(kAddr, 0, 0), kZeroMaxPhysicalAddr);
 
-  EXPECT_DEATH(SmpParseMadt(0, kMaxCanonicalIdentityAddress, 0, &topo),
+  EXPECT_DEATH(SmpParseMadt(0, kIdentityMapLimit, 0, &topo),
                "Check failed: madt_addr != 0");
   EXPECT_DEATH(SmpParseMadt(kAddr, 0, 0, &topo), kZeroMaxPhysicalAddr);
-  EXPECT_DEATH(SmpParseMadt(kAddr,                         //
-                            kMaxCanonicalIdentityAddress,  //
-                            kInvalidX2ApicId,              //
-                            &topo),
+  EXPECT_DEATH(SmpParseMadt(kAddr, kIdentityMapLimit, kInvalidX2ApicId, &topo),
                kInvalidBspApicId);
-  EXPECT_DEATH(SmpParseMadt(kAddr, kMaxCanonicalIdentityAddress, 0, nullptr),
+  EXPECT_DEATH(SmpParseMadt(kAddr, kIdentityMapLimit, 0, nullptr),
                kNullTopology);
 
   EXPECT_DEATH(SmpDiscoverTopology(kMultiboot2Magic, 0, 0, 0, 0, 0, &topo),
                kZeroMaxPhysicalAddr);
-  EXPECT_DEATH(SmpDiscoverTopology(kMultiboot2Magic,              //
-                                   0,                             //
-                                   0,                             //
-                                   0,                             //
-                                   kMaxCanonicalIdentityAddress,  //
-                                   kInvalidX2ApicId,              //
+  EXPECT_DEATH(SmpDiscoverTopology(kMultiboot2Magic,   //
+                                   0,                  //
+                                   0,                  //
+                                   0,                  //
+                                   kIdentityMapLimit,  //
+                                   kInvalidX2ApicId,   //
                                    &topo),
                kInvalidBspApicId);
-  EXPECT_DEATH(SmpDiscoverTopology(kMultiboot2Magic,              //
-                                   0,                             //
-                                   0,                             //
-                                   0,                             //
-                                   kMaxCanonicalIdentityAddress,  //
-                                   0,                             //
+  EXPECT_DEATH(SmpDiscoverTopology(kMultiboot2Magic,   //
+                                   0,                  //
+                                   0,                  //
+                                   0,                  //
+                                   kIdentityMapLimit,  //
+                                   0,                  //
                                    nullptr),
                kNullTopology);
 

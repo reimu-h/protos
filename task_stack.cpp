@@ -155,6 +155,11 @@ int TaskStackAllocator::SlotOfStack(const uintptr_t stack_base) const {
 #if !__STDC_HOSTED__
 namespace {
 
+// The task stack area lies in the kernel virtual ranges (paging.h).
+static_assert(kTaskStackAreaBase >= kKernelVirtualBase);
+static_assert(kKernelVirtualEnd - kTaskStackAreaBase >=
+              static_cast<uintptr_t>(kTaskStackSlotCount * kTaskStackSlotSize));
+
 class KernelTaskStackMemory final : public TaskStackMemory {
  public:
   bool ReserveRange(const uintptr_t virt_addr, const int64_t size) override {

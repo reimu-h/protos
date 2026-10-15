@@ -276,9 +276,9 @@ TEST(VgaTest, InitFramebufferRejectsUnsupportedFramebuffersWithoutSideEffects) {
        kFbHeight, 32},
       {"misaligned 32-bpp pitch", sentinel, kFbWidth * 4 + 2, kFbWidth,
        kFbHeight, 32},
-      {"non-canonical address", kMaxCanonicalIdentityAddress, kFbWidth * 4,
+      {"address beyond the identity map", kIdentityMapLimit, kFbWidth * 4,
        kFbWidth, kFbHeight, 32},
-      {"end past the canonical limit", kMaxCanonicalIdentityAddress - 4096,
+      {"end past the identity map limit", kIdentityMapLimit - 4096,
        kFbWidth * 4, kFbWidth, kFbHeight, 32},
   };
   for (const BadFramebuffer& bad : kBadFramebuffers) {

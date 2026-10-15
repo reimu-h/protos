@@ -239,10 +239,10 @@ static FreeRunNode* PmmCoalesceFreeRun(const uintptr_t base_addr,
 // `kLowerMemoryLimit` into `g_usable_intervals`, keeping the table sorted and
 // merging overlapping or contiguous intervals.
 static void AddAvailableRegion(const uintptr_t base, const int64_t length) {
-  if (length < kPageSize || base >= kMaxCanonicalIdentityAddress) {
+  if (length < kPageSize || base >= kIdentityMapLimit) {
     return;
   }
-  const uintptr_t max_len = kMaxCanonicalIdentityAddress - base;
+  const uintptr_t max_len = kIdentityMapLimit - base;
   const uintptr_t raw_len = length;
   const uintptr_t clamped_len = (raw_len > max_len) ? max_len : raw_len;
   uintptr_t start = AlignUp(base, kPageSize);
@@ -299,10 +299,10 @@ static void AddAvailableRegion(const uintptr_t base, const int64_t length) {
 // `g_usable_intervals` (rounding start DOWN and end UP to page boundaries so
 // any partially touched page is conservatively excluded).
 static void CarveExcludedRange(const uintptr_t base, const int64_t length) {
-  if (length <= 0 || base >= kMaxCanonicalIdentityAddress) {
+  if (length <= 0 || base >= kIdentityMapLimit) {
     return;
   }
-  const uintptr_t max_len = kMaxCanonicalIdentityAddress - base;
+  const uintptr_t max_len = kIdentityMapLimit - base;
   const uintptr_t raw_len = length;
   const uintptr_t clamped_len = (raw_len > max_len) ? max_len : raw_len;
   const uintptr_t res_start = AlignDown(base, kPageSize);
@@ -461,8 +461,7 @@ static void CollectUsableRegions(const MultibootMemoryMap& memory_map) {
         memory_map.mb1_mmap_reserved_start,
         memory_map.mb1_mmap_reserved_end - memory_map.mb1_mmap_reserved_start);
   }
-  if (memory_map.fb_addr != 0 &&
-      memory_map.fb_addr < kMaxCanonicalIdentityAddress &&
+  if (memory_map.fb_addr != 0 && memory_map.fb_addr < kIdentityMapLimit &&
       memory_map.fb_pitch > 0 && memory_map.fb_height > 0 &&
       static_cast<int64_t>(memory_map.fb_pitch) <=
           INT64_MAX / static_cast<int64_t>(memory_map.fb_height)) {
@@ -478,9 +477,9 @@ void PmmInit(const uint32_t multiboot_magic,
              const uint64_t multiboot_info_addr) {
   ResetPmmState();
 
-  CHECK(MultibootParseMemoryMap(multiboot_magic,               //
-                                multiboot_info_addr,           //
-                                kMaxCanonicalIdentityAddress,  //
+  CHECK(MultibootParseMemoryMap(multiboot_magic,      //
+                                multiboot_info_addr,  //
+                                kIdentityMapLimit,    //
                                 &g_memory_map));
 
   if (g_memory_map.fb_addr != 0) {

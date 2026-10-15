@@ -5,14 +5,19 @@
 
 namespace protos {
 
-// Segment selectors of the kernel GDT. The code and data segments are the same
-// as in boot.S's `gdt64`, which a CPU uses until it loads this GDT.
+// Segment selectors of the kernel GDT. The kernel code and data segments are
+// the same as in boot.S's `gdt64`, which a CPU uses until it loads this GDT.
 constexpr uint16_t kGdtKernelCodeSelector = 0x08;
 constexpr uint16_t kGdtKernelDataSelector = 0x10;
+// User (DPL 3) data and 64-bit code segments, with RPL 3, as user code loads
+// them. Entry 0x18 stays null: a 32-bit user code segment would go there, so
+// that the user segments are where `SYSRET` expects them (STAR[63:48] = 0x18).
+constexpr uint16_t kGdtUserDataSelector = 0x20 | 3;
+constexpr uint16_t kGdtUserCodeSelector = 0x28 | 3;
 // Selector of CPU 0's TSS descriptor. Every CPU up to `kMaxSupportedCpus`
 // (smp.h) has a 16-byte TSS descriptor; CPU i's is at
 // `kGdtFirstTssSelector + 16 * i`.
-constexpr uint16_t kGdtFirstTssSelector = 0x18;
+constexpr uint16_t kGdtFirstTssSelector = 0x30;
 
 // Interrupt Stack Table (IST) slots (1..7) that the kernel IDT's gates switch
 // to (see `IdtInit()`), so that these vectors never run on the interrupted
@@ -29,9 +34,9 @@ constexpr int64_t kIstStackFrames = 2;
 constexpr int64_t kIstStackSize = kIstStackFrames * 4096;
 
 // 104-byte 64-bit Task State Segment (Intel SDM Vol. 3A, 8.7). In 64-bit mode
-// it only holds stack pointers: `rsp[0..2]` for privilege-level changes
-// (unused, since the kernel runs only at CPL 0) and the IST stacks (`ist[i]`
-// for slot i + 1).
+// it only holds stack pointers: `rsp[0]`, which the CPU switches to when an
+// interrupt or exception arrives in user mode (see `GdtSetKernelStack()`;
+// `rsp[1..2]` are unused), and the IST stacks (`ist[i]` for slot i + 1).
 struct [[gnu::packed]] TaskStateSegment {
   uint32_t reserved0;
   uint64_t rsp[3];
@@ -84,6 +89,13 @@ GdtPointer GdtGetPointer();
 // Returns CPU `cpu_index`'s TSS (`0 <= cpu_index < kMaxSupportedCpus`,
 // `DCHECK`ed).
 const TaskStateSegment* GdtGetTss(int cpu_index);
+
+// Sets the calling CPU's `TSS.rsp0` to `rsp0` (non-zero, 16-byte aligned): the
+// kernel stack that the CPU switches to when an interrupt or exception arrives
+// while it runs user code. A task that runs user code needs it set on every
+// CPU that returns it to user mode (user_mode.h). Interrupts must be disabled
+// (`DCHECK`ed), so that the calling CPU can't change.
+void GdtSetKernelStack(uintptr_t rsp0);
 
 #if !__STDC_HOSTED__
 // Sets up CPU 0 (the BSP) before `IdtInit()`, whose gates need its TSS: unmaps

@@ -10,10 +10,12 @@
 // (non-inline, non-weak) definitions in two source files, and the Makefile
 // links each test with the ones it needs (`TEST_EXTRA_SRCS_<test>`):
 // - scheduler_test_fakes.cpp fakes the PMM, heap, SMP, task stack
-//   (task_stack.h), UART and VGA functions that the scheduler code and these
+//   (task_stack.h), address space switching (`ActivateAddressSpace()`,
+//   address_space.h), UART and VGA functions that the scheduler code and these
 //   tests call. Every test that includes this header links it; none of them
-//   links pmm.cpp, heap.cpp, smp.cpp, task_stack.cpp, uart.cpp or vga.cpp.
-//   Its task stacks come from the fake PMM and have no guard pages.
+//   links pmm.cpp, heap.cpp, smp.cpp, task_stack.cpp, address_space.cpp,
+//   uart.cpp or vga.cpp. Its task stacks come from the fake PMM and have no
+//   guard pages.
 // - scheduler_test_idt_task_fakes.cpp fakes the parts of idt.h and task.h
 //   that SetupEnv() and the scheduler layers use. Only tests that link
 //   neither idt.cpp nor task.cpp use it; task_test and stress_test link
@@ -84,6 +86,11 @@ struct FakeSchedulerEnv {
   std::unique_ptr<std::atomic<int64_t>[]> ipi_sent_count;
   std::unique_ptr<std::atomic<uint8_t>[]> last_ipi_vector;
 
+  // The address space that the fake ActivateAddressSpace() last switched each
+  // CPU to (nullptr: the kernel's page tables), and how many switches it made.
+  std::unique_ptr<std::atomic<const AddressSpace*>[]> active_address_space;
+  std::atomic<int64_t> address_space_switches{0};
+
   // Output of the fake UART and VGA functions, guarded by `log_mutex`.
   std::mutex log_mutex;
   std::string uart_log;
@@ -112,6 +119,7 @@ inline void SetupEnv(const int num_cpus = 1) {
   g_env.allocated_heap_bytes.store(0, std::memory_order_relaxed);
   g_env.allocated_heap_blocks.store(0, std::memory_order_relaxed);
   g_env.eoi_count.store(0, std::memory_order_relaxed);
+  g_env.address_space_switches.store(0, std::memory_order_relaxed);
   {
     const std::lock_guard<std::mutex> lock(g_env.log_mutex);
     g_env.uart_log.clear();
@@ -125,6 +133,8 @@ inline void SetupEnv(const int num_cpus = 1) {
   g_env.null_cpu_local.reset(new bool[num_cpus]());
   g_env.ipi_sent_count.reset(new std::atomic<int64_t>[num_cpus]());
   g_env.last_ipi_vector.reset(new std::atomic<uint8_t>[num_cpus]());
+  g_env.active_address_space.reset(
+      new std::atomic<const AddressSpace*>[num_cpus]());
 
   for (int i = 0; i < num_cpus; ++i) {
     const uintptr_t stack_base =
@@ -181,6 +191,7 @@ class MockTaskScheduler : public TaskScheduler {
   MOCK_METHOD(void, OnTimerInterrupt, (InterruptFrame*), (override));
   MOCK_METHOD(void, OnWakeupIpi, (InterruptFrame*), (override));
   MOCK_METHOD(Task*, CurrentTask, (), (const, override));
+  MOCK_METHOD(void, SetAddressSpace, (AddressSpace*), (override));
 };
 
 }  // namespace protos

@@ -1,5 +1,6 @@
-// Host fakes for the PMM, heap, SMP, task stack, UART and VGA modules, used by
-// the scheduler unit tests. See scheduler_test_support.h.
+// Host fakes for the PMM, heap, SMP, task stack, address space switching, UART
+// and VGA modules, used by the scheduler unit tests. See
+// scheduler_test_support.h.
 
 #include <atomic>
 #include <cstddef>
@@ -9,6 +10,7 @@
 #include <mutex>
 #include <string>
 
+#include "address_space.h"
 #include "check.h"
 #include "heap.h"
 #include "idt.h"
@@ -93,6 +95,14 @@ uintptr_t TaskStackAlloc() { return PmmAllocFrames(kTaskStackFrames); }
 
 void TaskStackFree(const uintptr_t stack_base) {
   PmmFreeFrames(stack_base, kTaskStackFrames);
+}
+
+// Records the switch instead of loading CR3. The scheduler calls it with
+// interrupts disabled, on the CPU that switches.
+void ActivateAddressSpace(const AddressSpace* const address_space) {
+  g_env.active_address_space[CurrentCpuIdIrqsOff()].store(
+      address_space, std::memory_order_release);
+  g_env.address_space_switches.fetch_add(1, std::memory_order_acq_rel);
 }
 
 void* KmallocAligned(const int64_t size, const int64_t alignment) {

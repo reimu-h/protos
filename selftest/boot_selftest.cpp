@@ -5,6 +5,7 @@
 #include <memory>
 #include <new>
 
+#include "address_space.h"
 #include "check.h"
 #include "format.h"
 #include "gdt.h"
@@ -20,6 +21,9 @@
 #include "task.h"
 #include "task_stack.h"
 #include "uart.h"
+#include "user/usertest.h"
+#include "user_mode.h"
+#include "user_programs.h"
 #include "vga.h"
 
 namespace protos {
@@ -817,9 +821,9 @@ static bool TestMultibootMmapEdgeCases() {
   const uintptr_t fb_buf_addr = reinterpret_cast<uintptr_t>(&fb_buf);
   constexpr uint32_t kOverInt32Max = static_cast<uint32_t>(INT32_MAX) + 1u;
   const auto parse_fb_buf = [&]() {
-    return MultibootParseMemoryMapQuiet(kMultiboot2Magic,              //
-                                        fb_buf_addr,                   //
-                                        kMaxCanonicalIdentityAddress,  //
+    return MultibootParseMemoryMapQuiet(kMultiboot2Magic,   //
+                                        fb_buf_addr,        //
+                                        kIdentityMapLimit,  //
                                         map.get());
   };
   SELFTEST_EXPECT(parse_fb_buf());
@@ -918,31 +922,37 @@ static bool TestEdgeCasesAndOom() {
 }
 
 // Verifies that PagingMarkPageUncacheable rejects physical page 0 (at offsets
-// 0, 0x400, and kPageSize - 1) and non-canonical addresses, and that the
-// kernel virtual page functions reject addresses outside the upper half,
-// unaligned addresses and pages without page tables, all without allocating
-// page tables.
+// 0, 0x400, and kPageSize - 1) and addresses beyond the identity map, that the
+// kernel virtual page functions reject addresses outside the kernel virtual
+// ranges, unaligned addresses and pages without page tables, all without
+// allocating page tables, and that nothing is mapped in user space.
 static bool TestPagingEdgeCases() {
   const int64_t pmm_free_before = PmmFreeFrameCount();
   SELFTEST_EXPECT(!PagingMarkPageUncacheable(0));
   SELFTEST_EXPECT(!PagingMarkPageUncacheable(0x400));
   SELFTEST_EXPECT(!PagingMarkPageUncacheable(kPageSize - 1));
-  SELFTEST_EXPECT(!PagingMarkPageUncacheable(kMaxCanonicalIdentityAddress));
+  SELFTEST_EXPECT(!PagingMarkPageUncacheable(kIdentityMapLimit));
 
-  // The first page of the upper half has no page tables: nothing maps it.
+  // The first kernel virtual page has no page tables: nothing maps it.
   const uintptr_t frame = kBootstrapIdentityMapSize - kPageSize;
   SELFTEST_EXPECT(!PagingReserveKernelRange(kPageSize, kPageSize));
+  SELFTEST_EXPECT(
+      !PagingReserveKernelRange(kKernelVirtualBase - kPageSize, kPageSize));
   SELFTEST_EXPECT(!PagingReserveKernelRange(kKernelVirtualBase + 8, kPageSize));
   SELFTEST_EXPECT(!PagingReserveKernelRange(kKernelVirtualBase, 0));
   SELFTEST_EXPECT(!PagingReserveKernelRange(kKernelVirtualBase, 100));
   SELFTEST_EXPECT(
-      !PagingReserveKernelRange(0xFFFFFFFFFFFFF000ULL, 2 * kPageSize));
+      !PagingReserveKernelRange(kKernelVirtualEnd - kPageSize, 2 * kPageSize));
+  SELFTEST_EXPECT(!PagingReserveKernelRange(kUserSpaceBase, kPageSize));
+  SELFTEST_EXPECT(!PagingReserveKernelRange(kUserSpaceEnd, kPageSize));
   SELFTEST_EXPECT(!PagingMapKernelPage(frame, frame));
   SELFTEST_EXPECT(!PagingMapKernelPage(kKernelVirtualBase, frame));
   SELFTEST_EXPECT(!PagingMapKernelPage(kKernelVirtualBase, frame + 8));
+  SELFTEST_EXPECT(!PagingMapKernelPage(kUserSpaceBase, frame));
   SELFTEST_EXPECT(PagingKernelPageFrame(kKernelVirtualBase) == 0);
   SELFTEST_EXPECT(PagingUnmapKernelPage(kKernelVirtualBase) == 0);
   SELFTEST_EXPECT(PagingUnmapKernelPage(frame) == 0);
+  SELFTEST_EXPECT(PagingUserSpaceIsEmpty());
   SELFTEST_EXPECT(PmmFreeFrameCount() == pmm_free_before);
   return true;
 }
@@ -1717,7 +1727,10 @@ static bool TestIdtPerCpuAndLapicTimer() {
     SELFTEST_EXPECT(gate != nullptr);
     SELFTEST_EXPECT(gate->selector == kIdtKernelCodeSelector);
     SELFTEST_EXPECT(gate->ist == ExpectedIstSlot(v));
-    SELFTEST_EXPECT(gate->type_attr == kIdtInterruptGateAttr);
+    // Only system calls may come from user code.
+    SELFTEST_EXPECT(gate->type_attr == ((v == kVectorSyscall)
+                                            ? kIdtUserInterruptGateAttr
+                                            : kIdtInterruptGateAttr));
     SELFTEST_EXPECT(gate->reserved == 0);
     SELFTEST_EXPECT(IdtDecodeGateOffset(*gate) == g_isr_stub_table[v]);
   }
@@ -2358,7 +2371,7 @@ static bool TestTaskSchedulerSmp() {
 }
 
 // A kernel virtual page that only TestTlbShootdown() maps.
-constexpr uintptr_t kTlbTestPage = 0xFFFFFE8000000000ULL;
+constexpr uintptr_t kTlbTestPage = 0x00007E8000000000ULL;
 constexpr uint64_t kTlbTestOldValue = 0x01D0F7A3E0000001ULL;
 constexpr uint64_t kTlbTestNewValue = 0x2E3FB00C10000002ULL;
 constexpr int kShootdownsPerTask = 200;
@@ -2580,6 +2593,398 @@ static bool TestTaskStackGuardPages() {
   return true;
 }
 
+// Contents of the user pages in the address space tests.
+constexpr uint64_t kAddressSpaceTestPattern = 0x05E5A11ED0000000ULL;
+
+// Checks AddressSpace on the calling CPU: it maps new zeroed pages at
+// page-aligned user addresses only, in page tables of its own, which map the
+// kernel like the kernel's page tables do. While the calling task runs in it,
+// its pages appear at their user addresses and kernel memory stays reachable.
+// The kernel's page tables never map a user page, and destroying the address
+// space returns every frame.
+static bool TestAddressSpaces() {
+  TaskScheduler* const scheduler = GetTaskScheduler();
+  SELFTEST_EXPECT(scheduler != nullptr);
+  SELFTEST_EXPECT(PagingActiveRoot() == PagingKernelRoot());
+  const int64_t pmm_free_before = PmmFreeFrameCount();
+  {
+    const std::unique_ptr<AddressSpace> space = AddressSpace::Create();
+    SELFTEST_EXPECT(space != nullptr);
+    SELFTEST_EXPECT(space->root() != PagingKernelRoot());
+
+    constexpr uintptr_t kFirstPage = kUserSpaceBase;
+    constexpr uintptr_t kLastPage = kUserSpaceEnd - kPageSize;
+    // In another page table than `kFirstPage`.
+    constexpr uintptr_t kCodePage = kUserSpaceBase + kHugePageSize;
+    SELFTEST_EXPECT(space->MapNewPage(kFirstPage + 8, UserPageAccess::kRead) ==
+                    0);
+    SELFTEST_EXPECT(space->MapNewPage(kUserSpaceEnd, UserPageAccess::kRead) ==
+                    0);
+    SELFTEST_EXPECT(
+        space->MapNewPage(kKernelVirtualBase, UserPageAccess::kRead) == 0);
+    SELFTEST_EXPECT(space->MapNewPage(0, UserPageAccess::kRead) == 0);
+    SELFTEST_EXPECT(space->PageFrame(kFirstPage) == 0);
+
+    const uintptr_t first =
+        space->MapNewPage(kFirstPage, UserPageAccess::kReadWrite);
+    const uintptr_t last = space->MapNewPage(kLastPage, UserPageAccess::kRead);
+    const uintptr_t code =
+        space->MapNewPage(kCodePage, UserPageAccess::kReadExecute);
+    SELFTEST_EXPECT(first != 0 && last != 0 && code != 0);
+    SELFTEST_EXPECT(space->MapNewPage(kFirstPage, UserPageAccess::kRead) == 0);
+    SELFTEST_EXPECT(space->PageFrame(kFirstPage) == first);
+    SELFTEST_EXPECT(space->PageFrame(kLastPage) == last);
+    SELFTEST_EXPECT(space->PageFrame(kCodePage) == code);
+    SELFTEST_EXPECT(space->PageFrame(kFirstPage + kPageSize) == 0);
+
+    // New pages are zeroed. The kernel fills them through the identity map.
+    const volatile uint64_t* const first_words =
+        reinterpret_cast<const volatile uint64_t*>(first);
+    bool zeroed = true;
+    for (int64_t i = 0; i < kPageSize / 8; ++i) {
+      zeroed = zeroed && first_words[i] == 0;
+    }
+    SELFTEST_EXPECT(zeroed);
+    *reinterpret_cast<volatile uint64_t*>(first) = kAddressSpaceTestPattern;
+    *reinterpret_cast<volatile uint64_t*>(last + kPageSize - 8) =
+        kAddressSpaceTestPattern + 1;
+    SELFTEST_EXPECT(PagingUserSpaceIsEmpty());
+
+    // No check may return between the two SetAddressSpace() calls: the
+    // address space must not be destroyed while this task runs in it.
+    scheduler->SetAddressSpace(space.get());
+    const uintptr_t active_root = PagingActiveRoot();
+    const bool user_space_empty = PagingUserSpaceIsEmpty();
+    const uint64_t first_word =
+        *reinterpret_cast<const volatile uint64_t*>(kFirstPage);
+    const uint64_t last_word =
+        *reinterpret_cast<const volatile uint64_t*>(kLastPage + kPageSize - 8);
+    void* const heap_block = Kmalloc(64);
+    if (heap_block != nullptr) {
+      *static_cast<volatile uint64_t*>(heap_block) = kAddressSpaceTestPattern;
+      Kfree(heap_block);
+    }
+    scheduler->SetAddressSpace(nullptr);
+
+    SELFTEST_EXPECT(active_root == space->root());
+    SELFTEST_EXPECT(!user_space_empty);
+    SELFTEST_EXPECT(first_word == kAddressSpaceTestPattern);
+    SELFTEST_EXPECT(last_word == kAddressSpaceTestPattern + 1);
+    SELFTEST_EXPECT(heap_block != nullptr);
+    SELFTEST_EXPECT(PagingActiveRoot() == PagingKernelRoot());
+    SELFTEST_EXPECT(PagingUserSpaceIsEmpty());
+  }
+  SELFTEST_EXPECT(PmmFreeFrameCount() == pmm_free_before);
+  return true;
+}
+
+// The number of slices that each task of TestAddressSpaceSwitching() runs.
+constexpr int kAddressSpaceSwitchingSlices = 64;
+
+struct AddressSpaceSwitchingArg {
+  AddressSpace* space = nullptr;
+  // What the task expects at `kUserSpaceBase` in `space`.
+  uint64_t expected = 0;
+  // Whether the task leaves `space` before it returns, rather than exiting in
+  // it.
+  bool leave_before_exit = false;
+  AtomicCpuMask128* cpus = nullptr;
+  std::atomic<int>* mismatches = nullptr;
+};
+
+static void AddressSpaceSwitchingWorker(void* const raw_arg) {
+  const AddressSpaceSwitchingArg* const arg =
+      static_cast<const AddressSpaceSwitchingArg*>(raw_arg);
+  TaskScheduler* const scheduler = GetTaskScheduler();
+  scheduler->SetAddressSpace(arg->space);
+  for (int slice = 0; slice < kAddressSpaceSwitchingSlices; ++slice) {
+    // Whichever CPU runs the task, it must use the task's page tables.
+    arg->cpus->Add(CurrentCpuId());
+    if (PagingActiveRoot() != arg->space->root() ||
+        *reinterpret_cast<const volatile uint64_t*>(kUserSpaceBase) !=
+            arg->expected) {
+      arg->mismatches->fetch_add(1, std::memory_order_relaxed);
+    }
+    scheduler->Yield();
+  }
+  if (arg->leave_before_exit) {
+    scheduler->SetAddressSpace(nullptr);
+    if (PagingActiveRoot() != PagingKernelRoot()) {
+      arg->mismatches->fetch_add(1, std::memory_order_relaxed);
+    }
+  }
+}
+
+// Checks that the page tables of each task follow it: tasks in address spaces
+// of their own, which all map a page at `kUserSpaceBase` to a frame of their
+// own, share the CPUs and move between them, and each must always find its own
+// page there. Half of the tasks leave their address space before they exit,
+// the others exit in it. Afterwards the bootstrap task still uses the kernel's
+// page tables, and destroying the address spaces returns every frame.
+static bool TestAddressSpaceSwitching() {
+  const int cpu_count = SmpCpuCount();
+  TaskScheduler* const scheduler = GetTaskScheduler();
+  SELFTEST_EXPECT(scheduler != nullptr);
+  const int64_t pmm_free_before = PmmFreeFrameCount();
+  const int task_count =
+      (2 * cpu_count <= kMaxPhaseTasks) ? 2 * cpu_count : kMaxPhaseTasks;
+  std::atomic<int> mismatches{0};
+  AtomicCpuMask128 cpus;
+  {
+    // Declared before `tasks`, so that the tasks are joined before their
+    // address spaces are destroyed, also when a check below fails.
+    const std::unique_ptr<std::unique_ptr<AddressSpace>[]> spaces(
+        new std::unique_ptr<AddressSpace>[task_count]);
+    const std::unique_ptr<AddressSpaceSwitchingArg[]> args(
+        new AddressSpaceSwitchingArg[task_count]);
+    for (int i = 0; i < task_count; ++i) {
+      spaces[i] = AddressSpace::Create();
+      SELFTEST_EXPECT(spaces[i] != nullptr);
+      const uintptr_t frame =
+          spaces[i]->MapNewPage(kUserSpaceBase, UserPageAccess::kReadWrite);
+      SELFTEST_EXPECT(frame != 0);
+      AddressSpaceSwitchingArg& arg = args[i];
+      arg.space = spaces[i].get();
+      arg.expected = kAddressSpaceTestPattern + static_cast<uint64_t>(i);
+      arg.leave_before_exit = (i % 2) == 0;
+      arg.cpus = &cpus;
+      arg.mismatches = &mismatches;
+      *reinterpret_cast<volatile uint64_t*>(frame) = arg.expected;
+    }
+    PhaseTaskGroup tasks(*scheduler, nullptr);
+    for (int i = 0; i < task_count; ++i) {
+      Task* const task =
+          scheduler->CreateTaskOnCpu(AddressSpaceSwitchingWorker,  //
+                                     &args[i],                     //
+                                     kDefaultTaskWeight,           //
+                                     i % cpu_count);
+      SELFTEST_EXPECT(tasks.Add(task));
+    }
+    tasks.JoinAll();
+  }
+  const CpuMask128 used = cpus.Load();
+  int cpus_used = 0;
+  for (int cpu = 0; cpu < cpu_count; ++cpu) {
+    cpus_used += used.Contains(cpu) ? 1 : 0;
+  }
+  SELFTEST_EXPECT(mismatches.load(std::memory_order_relaxed) == 0);
+  SELFTEST_EXPECT(cpus_used >= ((cpu_count > 1) ? 2 : 1));
+  SELFTEST_EXPECT(PagingActiveRoot() == PagingKernelRoot());
+  SELFTEST_EXPECT(PagingUserSpaceIsEmpty());
+  SELFTEST_EXPECT(PmmFreeFrameCount() == pmm_free_before);
+  return true;
+}
+
+// Page-fault error code bits (Intel SDM Vol. 3A, 4.7).
+constexpr uint64_t kPageFaultPresent = 1 << 0;
+constexpr uint64_t kPageFaultWrite = 1 << 1;
+constexpr uint64_t kPageFaultUser = 1 << 2;
+constexpr uint64_t kPageFaultInstructionFetch = 1 << 4;
+// The bits that tell how the faulting access went: present page, write, user
+// mode.
+constexpr uint64_t kPageFaultAccessBits =
+    kPageFaultPresent | kPageFaultWrite | kPageFaultUser;
+constexpr uint64_t kPageFaultUserFetch =
+    kPageFaultInstructionFetch | kPageFaultUser;
+
+// `usertest::Mode::kKernelInterrupt` raises a vector whose gate has DPL 0.
+static_assert(usertest::kKernelOnlyVector == kVectorWakeupIpi);
+
+// Runs user/usertest.cpp in `mode` in a process of its own until it ends, and
+// stores how it ended in `*result`. Returns false if the process can't be
+// started.
+static bool RunUserTest(const usertest::Mode mode,
+                        UserProgramResult* const result) {
+  const std::unique_ptr<UserProcess> process =
+      UserProcess::Start(UserTestProgram(), usertest::Arg(mode));
+  if (process == nullptr) {
+    return false;
+  }
+  *result = process->Wait();
+  return true;
+}
+
+// Logs `result` over UART as the result of a user program that ended
+// otherwise than expected.
+static void LogUnexpectedResult(const UserProgramResult& result) {
+  UartWrite("[TEST] unexpected user program result: ");
+  WriteUserProgramResult(result, UartWrite);
+  UartWrite("\n");
+}
+
+// Returns true if `result` says that the program exited with `status`, and
+// logs the result otherwise.
+static bool ExitedWith(const UserProgramResult& result, const int64_t status) {
+  if (result.outcome == UserProgramOutcome::kExited &&
+      result.exit_status == status) {
+    return true;
+  }
+  LogUnexpectedResult(result);
+  return false;
+}
+
+// Returns true if `result` says that CPU exception `vector` killed the
+// program with an error code whose `error_code_mask` bits are
+// `error_code_bits`, and logs the result otherwise.
+static bool FaultedWith(const UserProgramResult& result,  //
+                        const int vector,                 //
+                        const uint64_t error_code_mask,   //
+                        const uint64_t error_code_bits) {
+  if (result.outcome == UserProgramOutcome::kFaulted &&
+      result.fault_vector == vector &&
+      (result.fault_error_code & error_code_mask) == error_code_bits &&
+      IsUserRange(result.fault_rip, 1)) {
+    return true;
+  }
+  LogUnexpectedResult(result);
+  return false;
+}
+
+// Checks user processes with user/usertest.cpp: the exit status reaches the
+// kernel, system calls work and reject bad arguments, and each kind of fault
+// kills the program that raised it, reported with the right vector, error
+// code and address, while the kernel carries on. An invalid executable does
+// not load. Afterwards the kernel's page tables are active again and every
+// frame is back.
+static bool TestUserModePrograms() {
+  using usertest::Mode;
+  SELFTEST_EXPECT(GetTaskScheduler() != nullptr);
+  const int64_t pmm_free_before = PmmFreeFrameCount();
+  UserProgramResult result;
+
+  SELFTEST_EXPECT(RunUserTest(Mode::kExit, &result));
+  SELFTEST_EXPECT(ExitedWith(result, usertest::kExitStatus));
+  SELFTEST_EXPECT(RunUserTest(Mode::kSyscalls, &result));
+  SELFTEST_EXPECT(ExitedWith(result, 0));
+
+  SELFTEST_EXPECT(RunUserTest(Mode::kPrivilegedInstruction, &result));
+  SELFTEST_EXPECT(FaultedWith(result, kVectorGeneralProtection, ~0ULL, 0));
+  // Kernel memory is mapped, but not for user code.
+  SELFTEST_EXPECT(RunUserTest(Mode::kReadKernelMemory, &result));
+  SELFTEST_EXPECT(FaultedWith(result,                //
+                              kVectorPageFault,      //
+                              kPageFaultAccessBits,  //
+                              kPageFaultPresent | kPageFaultUser));
+  SELFTEST_EXPECT(result.fault_address == usertest::kKernelAddress);
+  SELFTEST_EXPECT(RunUserTest(Mode::kWriteReadOnlyData, &result));
+  SELFTEST_EXPECT(FaultedWith(result,                //
+                              kVectorPageFault,      //
+                              kPageFaultAccessBits,  //
+                              kPageFaultAccessBits));
+  SELFTEST_EXPECT(IsUserRange(result.fault_address, 8));
+  SELFTEST_EXPECT(RunUserTest(Mode::kExecuteData, &result));
+  if (PagingNoExecuteEnabled()) {
+    SELFTEST_EXPECT(FaultedWith(result,               //
+                                kVectorPageFault,     //
+                                kPageFaultUserFetch,  //
+                                kPageFaultUserFetch));
+    SELFTEST_EXPECT(result.fault_address == result.fault_rip);
+  } else {
+    SELFTEST_EXPECT(ExitedWith(result, 0));
+  }
+  SELFTEST_EXPECT(RunUserTest(Mode::kInvalidOpcode, &result));
+  SELFTEST_EXPECT(FaultedWith(result, kVectorInvalidOpcode, 0, 0));
+  // The error code names the gate that user code may not use: its vector and
+  // the IDT bit. (QEMU 7.2, whose TCG the Docker image runs, reports the
+  // gate's offset in the IDT instead of its vector.)
+  SELFTEST_EXPECT(RunUserTest(Mode::kKernelInterrupt, &result));
+  SELFTEST_EXPECT(FaultedWith(result, kVectorGeneralProtection, 0, 0));
+  constexpr uint64_t kKernelOnlyVector = usertest::kKernelOnlyVector;
+  SELFTEST_EXPECT(result.fault_error_code == ((kKernelOnlyVector << 3) | 2) ||
+                  result.fault_error_code == ((kKernelOnlyVector << 4) | 2));
+  // A stack overflow faults in the unmapped page below the user stack.
+  SELFTEST_EXPECT(RunUserTest(Mode::kStackOverflow, &result));
+  SELFTEST_EXPECT(FaultedWith(result,                              //
+                              kVectorPageFault,                    //
+                              kPageFaultPresent | kPageFaultUser,  //
+                              kPageFaultUser));
+  constexpr uintptr_t kStackGuardPage =
+      kUserStackTop - (kUserStackPages + 1) * kPageSize;
+  SELFTEST_EXPECT(result.fault_address >= kStackGuardPage &&
+                  result.fault_address < kStackGuardPage + kPageSize);
+
+  // Not an ELF file.
+  static const uint8_t kNotAnExecutable[64] = {0x7F, 'E', 'L', 'F'};
+  {
+    const std::unique_ptr<UserProcess> process = UserProcess::Start(
+        UserProgram{kNotAnExecutable, sizeof(kNotAnExecutable)}, 0);
+    SELFTEST_EXPECT(process != nullptr);
+    result = process->Wait();
+    SELFTEST_EXPECT(result.outcome == UserProgramOutcome::kLoadFailed);
+    SELFTEST_EXPECT(process->syscall_count() == 0);
+  }
+
+  SELFTEST_EXPECT(PagingActiveRoot() == PagingKernelRoot());
+  SELFTEST_EXPECT(PagingUserSpaceIsEmpty());
+  SELFTEST_EXPECT(PmmFreeFrameCount() == pmm_free_before);
+  return true;
+}
+
+// The most processes that TestUserModePreemption() runs.
+constexpr int kMaxUserSpinners = 16;
+// System calls that each spinner of TestUserModePreemption() makes before the
+// spinners are killed: one per round of computation.
+constexpr int64_t kUserSpinnerSyscalls = 8;
+
+// Checks that the timer preempts user code: twice as many processes as CPUs
+// compute without ever yielding or ending, so all of them can make progress
+// only if the CPUs switch between them. Each checks its registers, stack and
+// data in every round, and they run on several CPUs. Then they are killed;
+// none of them must have ended otherwise.
+static bool TestUserModePreemption() {
+  TaskScheduler* const scheduler = GetTaskScheduler();
+  SELFTEST_EXPECT(scheduler != nullptr);
+  const int cpu_count = SmpCpuCount();
+  const int process_count =
+      (2 * cpu_count < kMaxUserSpinners) ? 2 * cpu_count : kMaxUserSpinners;
+  const int64_t pmm_free_before = PmmFreeFrameCount();
+  AtomicCpuMask128 cpus;
+  {
+    // On an early return, the destructors kill the processes and wait for
+    // them.
+    std::unique_ptr<UserProcess> processes[kMaxUserSpinners];
+    for (int i = 0; i < process_count; ++i) {
+      processes[i] = UserProcess::Start(
+          UserTestProgram(),
+          usertest::Arg(usertest::Mode::kSpin,
+                        0x5EED0000 + static_cast<uint64_t>(i)));
+      SELFTEST_EXPECT(processes[i] != nullptr);
+    }
+    // Without preemption, this loop would never end: the CPUs would never
+    // switch away from the first spinners, or back to this task.
+    for (bool done = false; !done;) {
+      done = true;
+      for (int i = 0; i < process_count; ++i) {
+        const int cpu = processes[i]->last_syscall_cpu();
+        if (cpu >= 0) {
+          cpus.Add(cpu);
+        }
+        done = done && processes[i]->syscall_count() >= kUserSpinnerSyscalls;
+      }
+      scheduler->Yield();
+    }
+    for (int i = 0; i < process_count; ++i) {
+      processes[i]->Kill();
+    }
+    for (int i = 0; i < process_count; ++i) {
+      const UserProgramResult result = processes[i]->Wait();
+      if (result.outcome != UserProgramOutcome::kKilled) {
+        LogUnexpectedResult(result);
+      }
+      SELFTEST_EXPECT(result.outcome == UserProgramOutcome::kKilled);
+    }
+  }
+  const CpuMask128 used = cpus.Load();
+  int cpus_used = 0;
+  for (int cpu = 0; cpu < cpu_count; ++cpu) {
+    cpus_used += used.Contains(cpu) ? 1 : 0;
+  }
+  SELFTEST_EXPECT(cpus_used >= ((cpu_count > 1) ? 2 : 1));
+  SELFTEST_EXPECT(PagingActiveRoot() == PagingKernelRoot());
+  SELFTEST_EXPECT(PmmFreeFrameCount() == pmm_free_before);
+  return true;
+}
+
 struct BootTest {
   const char* name;
   bool (*run)();
@@ -2606,6 +3011,10 @@ constexpr BootTest kBootTests[] = {
     {"task_scheduler_smp", TestTaskSchedulerSmp},
     {"tlb_shootdown", TestTlbShootdown},
     {"task_stack_guard_pages", TestTaskStackGuardPages},
+    {"address_spaces", TestAddressSpaces},
+    {"address_space_switching", TestAddressSpaceSwitching},
+    {"user_mode_programs", TestUserModePrograms},
+    {"user_mode_preemption", TestUserModePreemption},
 };
 constexpr int kBootTestCount = sizeof(kBootTests) / sizeof(kBootTests[0]);
 

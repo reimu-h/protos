@@ -59,6 +59,10 @@ constexpr int kLegacyPicVectorCount = 16;
 // Local APIC interrupt vectors (32..255).
 constexpr uint8_t kVectorApicTimer = 0x20;
 constexpr uint8_t kVectorWakeupIpi = 0x21;
+// System calls (user_mode.h): the only vector whose gate user code may invoke
+// (DPL 3), with `int 0x80`. A software interrupt, so `IdtDispatch` sends no
+// Local APIC EOI for it.
+constexpr uint8_t kVectorSyscall = 0x80;
 // TLB shootdown IPI (`SmpTlbShootdown()` in smp.h), in the highest Local APIC
 // priority class so that it is delivered ahead of pending timer and wakeup
 // interrupts.
@@ -141,7 +145,9 @@ const char* IdtExceptionMnemonic(int vector);
 // calling CPU (BSP) via `IdtLoad()`. The gates of #DF, NMI and #MC switch to
 // the IST stacks `kIstDoubleFault`, `kIstNmi` and `kIstMachineCheck` (gdt.h),
 // so every CPU must load its TSS (`GdtLoadForCpu()`) before it loads the IDT;
-// all other gates run on the interrupted stack (IST 0).
+// all other gates run on the interrupted stack (IST 0), or on the task's
+// kernel stack (`GdtSetKernelStack()`) if the CPU was running user code. Only
+// the gate of `kVectorSyscall` admits `int` from user code (DPL 3).
 void IdtInit();
 
 // Loads the 256-entry 64-bit IDT into the calling CPU's `IDTR` via `lidt`.
@@ -173,8 +179,28 @@ void IdtUnregisterHandler(int vector);
 // preconditions with `DCHECK`.
 InterruptHandlerFn IdtGetHandler(int vector);
 
+// Returns true if `frame` interrupted user code (CPL 3).
+inline bool IsUserFrame(const InterruptFrame& frame) {
+  return (frame.cs & 3) == 3;
+}
+
+// Registers `handler` for the CPU exceptions that user code causes and that
+// have no handler of their own (`IdtRegisterHandler()`), which would otherwise
+// panic. `handler` must end the user program and not return (user_mode.h).
+// Double faults and machine checks still panic: they mean that the kernel's
+// state is broken. `nullptr` unregisters the handler.
+void IdtSetUserFaultHandler(InterruptHandlerFn handler);
+
+// Returns CR2, the linear address whose access caused the most recent page
+// fault on the calling CPU. Host tests link a fake instead
+// (idt_host_fakes.h).
+uint64_t ReadCr2();
+
 // C++ interrupt and exception dispatch entry point invoked by `isr_common_stub`
-// in `boot.S` with `rdi = rsp` (`InterruptFrame*`).
+// in `boot.S` with `rdi = rsp` (`InterruptFrame*`). Before it returns to user
+// code (`IsUserFrame()`), which may happen on another CPU than the one that
+// took the interrupt, it points that CPU's `TSS.rsp0` back at the top of the
+// task's interrupt frame (`GdtSetKernelStack()`).
 extern "C" void IdtDispatch(InterruptFrame* frame);
 
 #if __STDC_HOSTED__

@@ -849,11 +849,11 @@ TEST(JoinLifecycleSchedulerTest,
   EXPECT_THAT(HeapTotalFreeBytes(), t::Eq(heap_before));
 }
 
-// 12. Yield(), SetPreemptEnabled(), IsPreemptEnabled(), CurrentTask() and the
-//     scheduler internals other than Init() (OnTimerInterrupt(),
-//     OnWakeupIpi(), PollIdleCpu(), RunqueueLoad(), IsCpuBusy() and
-//     StealTask()) are forwarded to inner once each, with unchanged arguments
-//     and result.
+// 12. Yield(), SetPreemptEnabled(), IsPreemptEnabled(), CurrentTask(),
+//     SetAddressSpace() and the scheduler internals other than Init()
+//     (OnTimerInterrupt(), OnWakeupIpi(), PollIdleCpu(), RunqueueLoad(),
+//     IsCpuBusy() and StealTask()) are forwarded to inner once each, with
+//     unchanged arguments and result.
 TEST(JoinLifecycleSchedulerTest,
      ForwardsOtherMethodsToInnerOnceWithUnchangedArgumentsAndResult) {
   ResetTestEnv();
@@ -887,6 +887,18 @@ TEST(JoinLifecycleSchedulerTest,
     return fake_current;
   });
   EXPECT_THAT(sched->CurrentTask(), t::Eq(fake_current));
+
+  AddressSpace* const fake_address_space =
+      reinterpret_cast<AddressSpace*>(0x2000);
+  EXPECT_CALL(*mock_inner, SetAddressSpace)
+      .WillOnce([&](AddressSpace* const address_space) {
+        EXPECT_THAT(address_space, t::Eq(fake_address_space));
+      })
+      .WillOnce([](AddressSpace* const address_space) {
+        EXPECT_THAT(address_space, t::IsNull());
+      });
+  sched->SetAddressSpace(fake_address_space);
+  sched->SetAddressSpace(nullptr);
 
   EXPECT_CALL(*mock_inner, OnTimerInterrupt)
       .WillOnce([&](InterruptFrame* const frame) {

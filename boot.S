@@ -12,6 +12,8 @@
  * 0x80000001 reports EDX.NX. */
 .set MSR_IA32_EFER, 0xC0000080
 .set MSR_IA32_GS_BASE, 0xC0000101
+/* The GS base that swapgs exchanges with IA32_GS_BASE (see the ISR stubs). */
+.set MSR_IA32_KERNEL_GS_BASE, 0xC0000102
 .set EFER_LME, (1 << 8)
 .set EFER_NXE, (1 << 11)
 .set CPUID_80000001_EDX_NX, (1 << 20)
@@ -279,6 +281,13 @@ long_mode_start:
     push 0
     popfq
 
+    /* While a CPU runs kernel code, IA32_KERNEL_GS_BASE holds the user GS
+     * base, which is always 0 (see the ISR stubs). */
+    mov ecx, MSR_IA32_KERNEL_GS_BASE
+    xor eax, eax
+    xor edx, edx
+    wrmsr
+
     /* Populate 32-entry 64-bit IDT (vectors 0..31) so bare-metal NMIs do not
      * cause a double/triple fault reset. */
     lea rdi, [idt64]
@@ -481,6 +490,11 @@ ap_long_mode_entry:
     mov eax, dword ptr [g_ap_boot_cpu_local]
     mov edx, dword ptr [g_ap_boot_cpu_local + 4]
     wrmsr
+    /* The user GS base, 0, goes to IA32_KERNEL_GS_BASE (see the ISR stubs). */
+    mov ecx, MSR_IA32_KERNEL_GS_BASE
+    xor eax, eax
+    xor edx, edx
+    wrmsr
 
     /* Switch to the kernel IDT */
     lidt [idt64_pointer]
@@ -509,6 +523,13 @@ ap_long_mode_entry:
  * registers into an InterruptFrame, aligns RSP to 16 bytes per the System V
  * AMD64 ABI, calls IdtDispatch(InterruptFrame* frame), restores registers,
  * and returns via iretq.
+ *
+ * GS: the kernel finds the calling CPU's CpuLocal through the GS base
+ * (smp.h), while user code runs with a GS base of 0. Every switch between
+ * user and kernel mode therefore exchanges IA32_GS_BASE with
+ * IA32_KERNEL_GS_BASE (swapgs), which holds the other mode's GS base. The
+ * user GS base is always 0: user code can only load the flat user data
+ * segment or a null selector into GS, and CR4.FSGSBASE is clear.
  * ========================================================================= */
 .macro ISR_NOERR_STUB vec
 .align 16
@@ -527,9 +548,37 @@ isr_stub_\vec:
     jmp isr_common_stub
 .endm
 
+/* The stubs of the vectors with IST stacks (NMI, #DF and #MC) enter
+ * isr_paranoid_stub instead. */
+.macro ISR_PARANOID_NOERR_STUB vec
+.align 16
+.global isr_stub_\vec
+isr_stub_\vec:
+    push 0
+    push \vec
+    jmp isr_paranoid_stub
+.endm
+
+.macro ISR_PARANOID_ERR_STUB vec
+.align 16
+.global isr_stub_\vec
+isr_stub_\vec:
+    push \vec
+    jmp isr_paranoid_stub
+.endm
+
+/* The interrupted code's privilege level decides the GS swaps: the CPL in the
+ * saved CS ([rsp + 24] on entry, below the vector, error code and RIP) is 3
+ * if the interrupt arrived in user mode. Maskable interrupts and the
+ * exceptions that kernel code can raise never arrive between a swapgs and the
+ * following iretq, so the CPL tells which GS base is loaded. */
 .align 16
 .extern IdtDispatch
 isr_common_stub:
+    test byte ptr [rsp + 24], 3
+    jz 1f
+    swapgs
+1:
     push rax
     push rbx
     push rcx
@@ -568,19 +617,87 @@ isr_common_stub:
     pop rcx
     pop rbx
     pop rax
+    test byte ptr [rsp + 24], 3
+    jz 2f
+    swapgs
+2:
+    add rsp, 16
+    iretq
+
+/* NMIs and machine checks can arrive anywhere, also between a swapgs and the
+ * following iretq, where the saved CS doesn't tell which GS base is loaded;
+ * a double fault could follow a fault there. This stub reads the GS base
+ * instead: the user GS base is always 0, while the kernel's (a CpuLocal) never
+ * is, so a GS base of 0 is swapped for the kernel's and back afterwards. rbx,
+ * which IdtDispatch preserves, remembers whether the stub swapped. (Before
+ * the BSP binds its CpuLocal, both bases are 0, and the swaps change nothing.)
+ * IdtDispatch reaches no TSS.rsp0 update for these vectors (idt.cpp): their
+ * frames are on the IST stacks. */
+.align 16
+isr_paranoid_stub:
+    push rax
+    push rbx
+    push rcx
+    push rdx
+    push rsi
+    push rdi
+    push rbp
+    push r8
+    push r9
+    push r10
+    push r11
+    push r12
+    push r13
+    push r14
+    push r15
+
+    cld
+    xor ebx, ebx
+    mov ecx, MSR_IA32_GS_BASE
+    rdmsr
+    or eax, edx
+    jnz 1f
+    swapgs
+    mov ebx, 1
+1:
+    mov rdi, rsp
+    mov rbp, rsp
+    and rsp, -16
+    call IdtDispatch
+    mov rsp, rbp
+    test ebx, ebx
+    jz 2f
+    swapgs
+2:
+
+    pop r15
+    pop r14
+    pop r13
+    pop r12
+    pop r11
+    pop r10
+    pop r9
+    pop r8
+    pop rbp
+    pop rdi
+    pop rsi
+    pop rdx
+    pop rcx
+    pop rbx
+    pop rax
     add rsp, 16
     iretq
 
 /* CPU Exceptions 0..31 (error code pushed by CPU on 8, 10..14, 17, 21, 29, 30) */
 ISR_NOERR_STUB 0
 ISR_NOERR_STUB 1
-ISR_NOERR_STUB 2
+ISR_PARANOID_NOERR_STUB 2
 ISR_NOERR_STUB 3
 ISR_NOERR_STUB 4
 ISR_NOERR_STUB 5
 ISR_NOERR_STUB 6
 ISR_NOERR_STUB 7
-ISR_ERR_STUB   8
+ISR_PARANOID_ERR_STUB 8
 ISR_NOERR_STUB 9
 ISR_ERR_STUB   10
 ISR_ERR_STUB   11
@@ -590,7 +707,7 @@ ISR_ERR_STUB   14
 ISR_NOERR_STUB 15
 ISR_NOERR_STUB 16
 ISR_ERR_STUB   17
-ISR_NOERR_STUB 18
+ISR_PARANOID_NOERR_STUB 18
 ISR_NOERR_STUB 19
 ISR_NOERR_STUB 20
 ISR_ERR_STUB   21

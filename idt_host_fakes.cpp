@@ -31,7 +31,7 @@ std::atomic<uint64_t> g_fake_cr2{0};
 
 }  // namespace
 
-// Replaces the kernel's CR2 reader (declared in idt.cpp).
+// Replaces the kernel's CR2 reader (idt.h).
 uint64_t ReadCr2() { return g_fake_cr2.load(std::memory_order_relaxed); }
 
 void IdtSetHostCr2ForTest(const uint64_t cr2) {

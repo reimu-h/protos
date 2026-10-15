@@ -13,6 +13,7 @@
 #include "check.h"
 #include "gdt.h"
 #include "idt_host_fakes.h"
+#include "interrupts.h"
 #include "smp.h"
 #include "uart.h"
 #include "vga.h"
@@ -135,7 +136,10 @@ TEST(IdtTest, IdtInitPopulatesAll256EntriesAndLoadsIdtr) {
         v != kVectorMachineCheck) {
       EXPECT_THAT(gate->ist, t::Eq(0u)) << "vector " << v;
     }
-    EXPECT_THAT(gate->type_attr, t::Eq(kIdtInterruptGateAttr));
+    EXPECT_THAT(gate->type_attr,
+                t::Eq(v == kVectorSyscall ? kIdtUserInterruptGateAttr
+                                          : kIdtInterruptGateAttr))
+        << "vector " << v;
     EXPECT_THAT(gate->reserved, t::Eq(0u));
     EXPECT_THAT(IdtDecodeGateOffset(*gate), t::Eq(g_isr_stub_table[v]));
     EXPECT_THAT(IdtGetHandler(v), t::IsNull());
@@ -452,6 +456,200 @@ TEST(IdtDeathTest, UnhandledCpuExceptionsLogDiagnosticsAndPanic) {
       },
       "^\\[FATAL\\] Unhandled CPU exception 0 \\(#DE\\) err=0x0 rip=0x0 "
       "rsp=0x0 rflags=0x0 cr2=0x0 cpu=unbound\n$");
+}
+
+// The code segment selectors in frames from user mode and from the kernel.
+constexpr uint64_t kUserCs = kGdtUserCodeSelector;
+constexpr uint64_t kKernelCs = kGdtKernelCodeSelector;
+
+// Thrown by the user fault handlers of the tests, which must not return.
+struct UserFaultHandled {
+  uint64_t vector = 0;
+};
+
+[[noreturn]] static void ThrowingUserFaultHandler(InterruptFrame* const frame) {
+  throw UserFaultHandled{frame->vector};
+}
+
+// Returns CPU `cpu`'s TSS.rsp0 (a field of a packed struct, which a matcher
+// can't take by reference).
+static uint64_t Rsp0(const int cpu) { return GdtGetTss(cpu)->rsp[0]; }
+
+TEST(IdtTest, IsUserFrameChecksTheInterruptedPrivilegeLevel) {
+  InterruptFrame frame = {};
+  frame.cs = kUserCs;
+  EXPECT_TRUE(IsUserFrame(frame));
+  frame.cs = kKernelCs;
+  EXPECT_FALSE(IsUserFrame(frame));
+  frame.cs = 0;
+  EXPECT_FALSE(IsUserFrame(frame));
+}
+
+TEST(IdtTest, OnlyTheSyscallGateAdmitsUserCodeAndSyscallsGetNoEoi) {
+  ResetEnv();
+  IdtInit();
+  EXPECT_THAT(IdtGetGate(kVectorSyscall)->type_attr,
+              t::Eq(kIdtUserInterruptGateAttr));
+  EXPECT_THAT(IdtGetGate(kVectorBreakpoint)->type_attr,
+              t::Eq(kIdtInterruptGateAttr));
+
+  static int syscalls = 0;
+  syscalls = 0;
+  IdtRegisterHandler(kVectorSyscall, [](InterruptFrame* const frame) {
+    ++syscalls;
+    frame->rax = frame->rdi + 1;
+  });
+  InterruptFrame frame = {};
+  frame.vector = kVectorSyscall;
+  frame.rdi = 41;
+  IdtDispatch(&frame);
+  EXPECT_THAT(syscalls, t::Eq(1));
+  EXPECT_THAT(frame.rax, t::Eq(42u));
+  // `int 0x80` sets no in-service bit that an EOI would clear.
+  EXPECT_THAT(g_env.eoi_count.load(), t::Eq(0));
+  IdtUnregisterHandler(kVectorSyscall);
+}
+
+TEST(IdtTest, UserFaultHandlerTakesTheUnhandledExceptionsOfUserCode) {
+  ResetEnv();
+  GdtResetForTest();
+  IdtInit();
+  CpuLocal cpu = {};
+  cpu.self = &cpu;
+  cpu.cpu_id = 1;
+  BindCpuLocal(&cpu);
+  SetInterruptsEnabledForTest(false);
+  IdtSetUserFaultHandler(ThrowingUserFaultHandler);
+
+  for (const int vector :
+       {kVectorDivideError, kVectorBreakpoint, kVectorInvalidOpcode,
+        kVectorGeneralProtection, kVectorPageFault, kVectorAlignmentCheck}) {
+    alignas(16) InterruptFrame frame = {};
+    frame.vector = static_cast<uint64_t>(vector);
+    frame.cs = kUserCs;
+    try {
+      IdtDispatch(&frame);
+      ADD_FAILURE() << "vector " << vector << " did not reach the handler";
+    } catch (const UserFaultHandled& handled) {
+      EXPECT_THAT(handled.vector, t::Eq(static_cast<uint64_t>(vector)));
+    }
+  }
+
+  // A handler of the vector itself comes first, and then the frame returns to
+  // user mode.
+  static int breakpoints = 0;
+  breakpoints = 0;
+  IdtRegisterHandler(kVectorBreakpoint,
+                     [](InterruptFrame* const) { ++breakpoints; });
+  alignas(16) InterruptFrame frame = {};
+  frame.vector = kVectorBreakpoint;
+  frame.cs = kUserCs;
+  IdtDispatch(&frame);
+  EXPECT_THAT(breakpoints, t::Eq(1));
+  EXPECT_THAT(Rsp0(1), t::Eq(reinterpret_cast<uintptr_t>(&frame + 1)));
+  IdtUnregisterHandler(kVectorBreakpoint);
+
+  IdtSetUserFaultHandler(nullptr);
+  SetInterruptsEnabledForTest(true);
+  ResetCpuLocalForTest();
+}
+
+TEST(IdtDeathTest, ExceptionsThatTheUserFaultHandlerMustNotEndStillPanic) {
+  ResetEnv();
+  IdtInit();
+  g_env.stderr_console = PanicConsole::kUart;
+  IdtSetUserFaultHandler(ThrowingUserFaultHandler);
+
+  // Double faults and machine checks mean that the kernel is broken, also when
+  // they interrupt user code.
+  EXPECT_DEATH(
+      {
+        InterruptFrame frame = {};
+        frame.vector = kVectorDoubleFault;
+        frame.cs = kUserCs;
+        IdtDispatch(&frame);
+      },
+      "Unhandled CPU exception 8 \\(#DF\\)");
+  EXPECT_DEATH(
+      {
+        InterruptFrame frame = {};
+        frame.vector = kVectorMachineCheck;
+        frame.cs = kUserCs;
+        IdtDispatch(&frame);
+      },
+      "Unhandled CPU exception 18 \\(#MC\\)");
+  // So does a fault of kernel code.
+  EXPECT_DEATH(
+      {
+        InterruptFrame frame = {};
+        frame.vector = kVectorGeneralProtection;
+        frame.cs = kKernelCs;
+        IdtDispatch(&frame);
+      },
+      "Unhandled CPU exception 13 \\(#GP\\)");
+  // The user fault handler must not return.
+  EXPECT_DEATH(
+      {
+        IdtSetUserFaultHandler([](InterruptFrame* const) {});
+        InterruptFrame frame = {};
+        frame.vector = kVectorGeneralProtection;
+        frame.cs = kUserCs;
+        IdtDispatch(&frame);
+      },
+      "the user fault handler returned");
+  IdtSetUserFaultHandler(nullptr);
+}
+
+TEST(IdtTest, ReturnsToUserModeWithTheKernelStackRightAboveTheFrame) {
+  ResetEnv();
+  GdtResetForTest();
+  IdtInit();
+  static CpuLocal cpus[2];
+  for (int i = 0; i < 2; ++i) {
+    cpus[i].self = &cpus[i];
+    cpus[i].cpu_id = 2 + i;
+  }
+  BindCpuLocal(&cpus[0]);
+  SetInterruptsEnabledForTest(false);
+  constexpr uintptr_t kOldRsp0 = 0x10000;
+  GdtSetKernelStack(kOldRsp0);
+
+  // An interrupt of kernel code leaves TSS.rsp0 alone.
+  alignas(16) InterruptFrame frame = {};
+  frame.vector = 0x50;
+  frame.cs = kKernelCs;
+  IdtDispatch(&frame);
+  EXPECT_THAT(Rsp0(2), t::Eq(kOldRsp0));
+
+  // On the way back to user code, the next interrupt from user mode must push
+  // its frame where this one is.
+  const uintptr_t frame_top = reinterpret_cast<uintptr_t>(&frame + 1);
+  frame.cs = kUserCs;
+  IdtDispatch(&frame);
+  EXPECT_THAT(Rsp0(2), t::Eq(frame_top));
+  GdtSetKernelStack(kOldRsp0);
+  frame.vector = kVectorSyscall;
+  IdtDispatch(&frame);
+  EXPECT_THAT(Rsp0(2), t::Eq(frame_top));
+
+  // The frames of the IST vectors are on the IST stacks.
+  GdtSetKernelStack(kOldRsp0);
+  frame.vector = kVectorNmi;
+  IdtDispatch(&frame);
+  EXPECT_THAT(Rsp0(2), t::Eq(kOldRsp0));
+
+  // A handler that switched tasks may return on another CPU, whose TSS gets
+  // the frame then.
+  IdtRegisterHandler(0x51,
+                     [](InterruptFrame* const) { BindCpuLocal(&cpus[1]); });
+  frame.vector = 0x51;
+  IdtDispatch(&frame);
+  EXPECT_THAT(Rsp0(2), t::Eq(kOldRsp0));
+  EXPECT_THAT(Rsp0(3), t::Eq(frame_top));
+  IdtUnregisterHandler(0x51);
+
+  SetInterruptsEnabledForTest(true);
+  ResetCpuLocalForTest();
 }
 
 TEST(IdtTest, EnterPanicLetsOnlyTheFirstCpuPrint) {

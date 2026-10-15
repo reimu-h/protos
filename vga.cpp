@@ -204,8 +204,7 @@ static bool IsSupportedFramebuffer(const uintptr_t addr,  //
     return false;
   }
   const uint64_t fb_bytes = static_cast<uint64_t>(pitch) * height;
-  return addr < kMaxCanonicalIdentityAddress &&
-         fb_bytes <= kMaxCanonicalIdentityAddress - addr;
+  return addr < kIdentityMapLimit && fb_bytes <= kIdentityMapLimit - addr;
 }
 
 static void UartWriteInt(const int value) {

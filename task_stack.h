@@ -79,7 +79,7 @@ class TaskStackAllocator {
   static constexpr int kRecycleBatch = 64;
 
   // Manages the `slot_count` (> 0) slots of `kTaskStackSlotSize` bytes that
-  // start at page-aligned `area_base` (at least `kKernelVirtualBase`, paging.h)
+  // start at page-aligned `area_base` (in the kernel virtual ranges, paging.h)
   // through `memory`.
   TaskStackAllocator(std::shared_ptr<TaskStackMemory> memory,  //
                      uintptr_t area_base,                      //
@@ -150,9 +150,10 @@ class TaskStackAllocator {
 };
 
 // The kernel's task stack area: `kTaskStackSlotCount` slots from
-// `kTaskStackAreaBase` on (80 MiB of address space), so at most 4096 tasks can
-// have a stack at the same time. Its page tables take 42 frames.
-constexpr uintptr_t kTaskStackAreaBase = 0xFFFFFF0000000000ULL;
+// `kTaskStackAreaBase` on (80 MiB of address space in the kernel virtual
+// ranges, paging.h), so at most 4096 tasks can have a stack at the same time.
+// Its page tables take 42 frames.
+constexpr uintptr_t kTaskStackAreaBase = 0x00007F0000000000ULL;
 constexpr int kTaskStackSlotCount = 4096;
 
 // The kernel's task stacks, which the core scheduler allocates and frees.

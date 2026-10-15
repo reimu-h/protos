@@ -52,6 +52,10 @@ class ForwardingTaskScheduler : public TaskScheduler {
   bool IsPreemptEnabled() const override { return inner_->IsPreemptEnabled(); }
   Task* CurrentTask() const override { return inner_->CurrentTask(); }
 
+  void SetAddressSpace(AddressSpace* const address_space) override {
+    inner_->SetAddressSpace(address_space);
+  }
+
  protected:
   // Scheduler internals:
   void Init() override { TaskSchedulerInternals::Init(*inner_); }

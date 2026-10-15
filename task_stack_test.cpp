@@ -21,7 +21,7 @@ namespace {
 
 namespace t = ::testing;
 
-constexpr uintptr_t kAreaBase = 0xFFFFFF8000000000ULL;
+constexpr uintptr_t kAreaBase = 0x00007F8000000000ULL;
 constexpr uintptr_t kFirstFakeFrame = 0x100000;
 
 // Stack base of slot `slot` of the area at kAreaBase.

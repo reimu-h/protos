@@ -65,6 +65,12 @@ namespace protos {
 // `TaskStackFree()` when its task exits. Each stack also has a canary at its
 // lowest address. The core CHECK-fails if a task overwrote it (overflowed its
 // stack) when the task is switched out or exits.
+//
+// Address spaces: the core records the address space of each task
+// (`SetAddressSpace()`) and calls `ActivateAddressSpace()` (address_space.h)
+// when a CPU switches to a task whose address space differs from the one the
+// CPU uses. Every task starts in the kernel's page tables, and idle tasks
+// always run in them.
 std::shared_ptr<TaskScheduler> CreateCoreRunqueueScheduler();
 
 #if __STDC_HOSTED__

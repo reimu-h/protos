@@ -18,6 +18,7 @@
 #endif
 #endif
 
+#include "address_space.h"
 #include "check.h"
 #include "heap.h"
 #include "idt.h"
@@ -79,6 +80,9 @@ struct Task {
 
   TaskFn entry = nullptr;
   void* arg = nullptr;
+  // Set by `SetAddressSpace()`; nullptr while the task runs in the kernel's
+  // page tables.
+  AddressSpace* address_space = nullptr;
 
   int64_t weight = kDefaultTaskWeight;
   int64_t vruntime = 0;
@@ -164,6 +168,9 @@ struct alignas(64) CpuRunqueue {
   // Whether `current_task` is a task other than the idle task. Written with
   // `current_task` under `lock`, read without the lock by `IsCpuBusy()`.
   std::atomic<bool> busy{false};
+  // The address space whose page tables this CPU uses (nullptr: the kernel's,
+  // which every CPU starts on). Written under `lock` by this CPU only.
+  const AddressSpace* active_address_space = nullptr;
 
   Task* pending_handoff_task = nullptr;
   TaskState pending_handoff_state = TaskState::kReady;
@@ -325,6 +332,18 @@ static void EnqueueTaskLocked(CpuRunqueue* const rq,  //
   UpdateRunqueueMinVruntime(rq);
 }
 
+// Switches the CPU of `rq`, which must be the calling CPU, to the page tables
+// of `address_space` (nullptr: the kernel's) unless it uses them already.
+static void SwitchAddressSpaceLocked(CpuRunqueue* const rq,
+                                     const AddressSpace* const address_space) {
+  DCHECK(rq != nullptr);
+  DCHECK(!AreInterruptsEnabled());
+  if (rq->active_address_space != address_space) {
+    ActivateAddressSpace(address_space);
+    rq->active_address_space = address_space;
+  }
+}
+
 class CoreRunqueueTaskScheduler final : public TaskScheduler {
  public:
   CoreRunqueueTaskScheduler() = default;
@@ -475,6 +494,21 @@ class CoreRunqueueTaskScheduler final : public TaskScheduler {
     Task* const curr = rq.current_task;
     DCHECK(curr != nullptr);
     return curr;
+  }
+
+  void SetAddressSpace(AddressSpace* const address_space) override {
+    DCHECK(initialized_.load(std::memory_order_acquire));
+    DCHECK(!HoldsAnyIrqSpinLock());
+    const ScopedIrqDisable irq_guard;
+    const int cpu_id = CurrentCpuIdIrqsOff();
+    DCHECK(cpu_id >= 0 && cpu_id < cpu_count_);
+    CpuRunqueue& rq = runqueues_[cpu_id];
+    const IrqSpinLockGuard lock_guard(rq.lock);
+    Task* const curr = rq.current_task;
+    DCHECK(curr != nullptr);
+    DCHECK(!curr->is_idle);
+    curr->address_space = address_space;
+    SwitchAddressSpaceLocked(&rq, address_space);
   }
 
  private:
@@ -886,6 +920,10 @@ class CoreRunqueueTaskScheduler final : public TaskScheduler {
       rq.current_task = next;
       rq.busy.store(!next->is_idle, std::memory_order_release);
       UpdateRunqueueMinVruntime(&rq);
+      // Switch to `next`'s page tables while still on `prev`'s stack: the
+      // kernel, both stacks included, is mapped the same in every address
+      // space.
+      SwitchAddressSpaceLocked(&rq, next->address_space);
 
       // SMP stack-safety caveat: Do NOT re-insert `prev` into `rq.tree` (or
       // free its stack on `kExited`) before `TaskContextSwitch` switches `%rsp`

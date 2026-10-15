@@ -16,10 +16,6 @@
 
 namespace protos {
 
-// Returns CR2, the linear address of the most recent page fault. Host tests
-// link a fake instead (idt_host_fakes.cpp).
-uint64_t ReadCr2();
-
 #if !__STDC_HOSTED__
 uint64_t ReadCr2() {
   uint64_t cr2 = 0;
@@ -36,6 +32,8 @@ alignas(16) IdtGateDescriptor g_idt[kIdtEntryCount] = {};
 IdtPointer g_idt_pointer = {};
 std::atomic<InterruptHandlerFn> g_handlers[kIdtEntryCount] = {};
 std::atomic<bool> g_idt_initialized{false};
+// See `IdtSetUserFaultHandler()`.
+std::atomic<InterruptHandlerFn> g_user_fault_handler{nullptr};
 
 #if __STDC_HOSTED__
 std::atomic<int> g_host_idt_load_count{0};
@@ -277,10 +275,12 @@ const char* IdtExceptionMnemonic(const int vector) {
 void IdtInit() {
   for (int v = 0; v < kIdtEntryCount; ++v) {
     g_handlers[v].store(nullptr, std::memory_order_relaxed);
+    const uint8_t type_attr = (v == kVectorSyscall) ? kIdtUserInterruptGateAttr
+                                                    : kIdtInterruptGateAttr;
     g_idt[v] = IdtEncodeGate(g_isr_stub_table[v],     //
                              kIdtKernelCodeSelector,  //
                              IstSlotForVector(v),     //
-                             kIdtInterruptGateAttr);
+                             type_attr);
   }
   g_idt_pointer.limit = static_cast<uint16_t>(sizeof(g_idt) - 1);
   g_idt_pointer.base = reinterpret_cast<uint64_t>(&g_idt[0]);
@@ -331,11 +331,15 @@ InterruptHandlerFn IdtGetHandler(const int vector) {
   return g_handlers[vector].load(std::memory_order_acquire);
 }
 
-extern "C" void IdtDispatch(InterruptFrame* const frame) {
-  DCHECK(g_idt_initialized.load(std::memory_order_acquire));
-  DCHECK(frame != nullptr);
-  DCHECK(frame->vector < static_cast<uint64_t>(kIdtEntryCount));
+void IdtSetUserFaultHandler(const InterruptHandlerFn handler) {
+  g_user_fault_handler.store(handler, std::memory_order_release);
+}
 
+namespace {
+
+// Calls the handler of `frame->vector`, sends the Local APIC EOI if the vector
+// needs one, and panics on CPU exceptions that nothing handles.
+static void DispatchToHandler(InterruptFrame* const frame) {
   const int vector = static_cast<int>(frame->vector);
   const InterruptHandlerFn handler =
       g_handlers[vector].load(std::memory_order_acquire);
@@ -351,6 +355,15 @@ extern "C" void IdtDispatch(InterruptFrame* const frame) {
     if (handler != nullptr) {
       handler(frame);
       return;
+    }
+    // A fault of user code ends the user program instead, unless it is a
+    // double fault or machine check, which mean that the kernel is broken.
+    const InterruptHandlerFn user_fault_handler =
+        g_user_fault_handler.load(std::memory_order_acquire);
+    if (IsUserFrame(*frame) && user_fault_handler != nullptr &&
+        vector != kVectorDoubleFault && vector != kVectorMachineCheck) {
+      user_fault_handler(frame);
+      PANIC("the user fault handler returned");
     }
     PanicUnhandledException(frame);
   }
@@ -386,6 +399,15 @@ extern "C" void IdtDispatch(InterruptFrame* const frame) {
     return;
   }
 
+  if (vector == static_cast<int>(kVectorSyscall)) {
+    // `int 0x80` sets no Local APIC in-service bit: an EOI would acknowledge
+    // whichever interrupt is in service instead.
+    if (handler != nullptr) {
+      handler(frame);
+    }
+    return;
+  }
+
   if (vector >= kVectorLegacyPicBase &&
       vector < kVectorLegacyPicBase + kLegacyPicVectorCount) {
     // Legacy 8259 PIC vector (see kVectorLegacyPicBase): no Local APIC EOI.
@@ -404,12 +426,33 @@ extern "C" void IdtDispatch(InterruptFrame* const frame) {
   }
 }
 
+}  // namespace
+
+extern "C" void IdtDispatch(InterruptFrame* const frame) {
+  DCHECK(g_idt_initialized.load(std::memory_order_acquire));
+  DCHECK(frame != nullptr);
+  DCHECK(frame->vector < static_cast<uint64_t>(kIdtEntryCount));
+
+  DispatchToHandler(frame);
+
+  // The interrupted user code resumes when the stub returns, maybe on another
+  // CPU than the one that took the interrupt (the handler may have switched
+  // tasks). The next interrupt there must again push its frame where this one
+  // is, at the top of the task's interrupt stack (user_mode.h). Frames of the
+  // IST vectors are not on that stack, and their handlers don't switch tasks.
+  if (IsUserFrame(*frame) &&
+      IstSlotForVector(static_cast<int>(frame->vector)) == 0) {
+    GdtSetKernelStack(reinterpret_cast<uintptr_t>(frame + 1));
+  }
+}
+
 #if __STDC_HOSTED__
 void IdtResetForTest() {
   for (int v = 0; v < kIdtEntryCount; ++v) {
     g_idt[v] = {};
     g_handlers[v].store(nullptr, std::memory_order_relaxed);
   }
+  g_user_fault_handler.store(nullptr, std::memory_order_relaxed);
   g_idt_pointer = {};
   g_idt_initialized.store(false, std::memory_order_release);
   g_host_idt_load_count.store(0, std::memory_order_relaxed);

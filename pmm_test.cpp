@@ -279,8 +279,7 @@ TEST(PmmTest, InitPassesMultibootArgumentsToParser) {
   EXPECT_THAT(g_env.parse_calls, t::Eq(1));
   EXPECT_THAT(g_env.parsed_magic, t::Eq(kMultiboot2Magic));
   EXPECT_THAT(g_env.parsed_info_addr, t::Eq(0x12345000u));
-  EXPECT_THAT(g_env.parsed_max_physical_addr,
-              t::Eq(kMaxCanonicalIdentityAddress));
+  EXPECT_THAT(g_env.parsed_max_physical_addr, t::Eq(kIdentityMapLimit));
   EXPECT_THAT(PmmFreeFrameCount(), t::Eq(8));
   EXPECT_FALSE(g_env.fb_attached);
 }
@@ -1062,28 +1061,27 @@ TEST(PmmTest, CollectUsableIntervalsMergesUnsortedOverlappingRegions) {
           PmmIntervalForTest{kBase + 70 * kPageSize, kBase + 72 * kPageSize}));
 }
 
-TEST(PmmTest, CollectUsableIntervalsClampsRegionsAtCanonicalLimit) {
+TEST(PmmTest, CollectUsableIntervalsClampsRegionsAtIdentityMapLimit) {
   ResetFakeEnv(0);
-  constexpr uintptr_t kTopBase = kMaxCanonicalIdentityAddress - 8 * kPageSize;
+  constexpr uintptr_t kTopBase = kIdentityMapLimit - 8 * kPageSize;
   MultibootMemoryMap map = MakeMemoryMap({
-      // An available region that extends far past the canonical limit is
+      // An available region that extends far past the identity map limit is
       // clamped to it; one that starts at the limit is ignored.
       {kTopBase, INT64_MAX, kMemoryTypeAvailable},
-      {kMaxCanonicalIdentityAddress, 16 * kPageSize, kMemoryTypeAvailable},
+      {kIdentityMapLimit, 16 * kPageSize, kMemoryTypeAvailable},
       {0x200000, 16 * kPageSize, kMemoryTypeAvailable},
       // Regions with a non-positive length are ignored.
       {0x300000, -kPageSize, kMemoryTypeAvailable},
       {0x204000, -kPageSize, kMemoryTypeReserved},
       // A reserved region that starts at the limit is ignored.
-      {kMaxCanonicalIdentityAddress, INT64_MAX, kMemoryTypeReserved},
+      {kIdentityMapLimit, INT64_MAX, kMemoryTypeReserved},
   });
   EXPECT_THAT(PmmCollectUsableIntervalsForTest(map),
-              t::ElementsAre(
-                  PmmIntervalForTest{0x200000, 0x210000},
-                  PmmIntervalForTest{kTopBase, kMaxCanonicalIdentityAddress}));
+              t::ElementsAre(PmmIntervalForTest{0x200000, 0x210000},
+                             PmmIntervalForTest{kTopBase, kIdentityMapLimit}));
 
-  // A reserved region that extends past the canonical limit is clamped to it
-  // and excludes everything from its base up.
+  // A reserved region that extends past the identity map limit is clamped to
+  // it and excludes everything from its base up.
   map.regions[map.region_count] = {0x208000, INT64_MAX, kMemoryTypeReserved};
   ++map.region_count;
   EXPECT_THAT(PmmCollectUsableIntervalsForTest(map),
