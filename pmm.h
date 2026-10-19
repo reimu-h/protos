@@ -72,6 +72,28 @@ void PmmFreeFrames(uintptr_t base_addr, int64_t count);
 // Frees a single 4 KiB physical frame at page-aligned `frame_addr`.
 void PmmFreeFrame(uintptr_t frame_addr);
 
+// Accumulates single 4 KiB physical frames to free in one batch without
+// taking the PMM lock on each frame. `Add` coalesces adjacent frames into
+// runs and links the runs through the last 16 bytes of each run's first
+// frame, so the caller must own every frame added and must not touch its last
+// 16 bytes afterwards, and any `FreeRunNode` at offset 0 of an accidentally
+// double-freed frame is left intact for `PmmFreeFrameList` to detect.
+struct PmmFrameList {
+  uintptr_t head_addr = 0;
+  uintptr_t tail_addr = 0;
+  uintptr_t cur_base = 0;
+  int64_t cur_count = 0;
+
+  void Add(uintptr_t frame_addr);
+};
+
+// Frees all frames accumulated in `*list` and resets `*list` to empty. If the
+// PMM lock is uncontended, coalesces the runs into the free-run tree
+// immediately; if another CPU holds the lock, enqueues the runs on an atomic
+// lock-free list that the next lock holder drains before allocating, freeing,
+// or counting frames (and before releasing the PMM lock).
+void PmmFreeFrameList(PmmFrameList* list);
+
 // Returns true if `[addr, addr + size)` lies strictly within a usable RAM
 // region above 1 MiB and does not overlap the kernel image, framebuffer, or
 // Multiboot data.
@@ -98,6 +120,16 @@ int64_t PmmTotalUsableFrameCount();
 // Resets PMM internal state (`g_pmm_initialized`, free-run tree, and frame
 // counters) for hermetic host unit tests.
 void PmmResetForTest();
+
+// Acquires and releases the PMM spinlock directly for host tests that verify
+// lock-free queueing when `PmmFreeFrameList` observes a contended lock.
+void PmmLockForTest();
+void PmmUnlockForTest();
+void PmmDrainAndUnlockForTest();
+
+// Returns the number of queued frames that no lock holder has added to the
+// free runs yet. Requires `PmmLockForTest()`.
+int64_t PmmQueuedFrameCountForTest();
 
 // Half-open physical address interval `[start, end)`.
 struct PmmIntervalForTest {

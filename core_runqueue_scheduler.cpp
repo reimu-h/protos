@@ -937,16 +937,16 @@ class CoreRunqueueTaskScheduler final : public TaskScheduler {
       }
       // We need to do a context switch.
 
+      next->state.store(TaskState::kRunning, std::memory_order_release);
+      next->running_cpu.store(cpu_id, std::memory_order_release);
+      rq.current_task = next;
+      rq.busy.store(!next->is_idle, std::memory_order_release);
       if (!next->is_idle) {
         rq.tree.Erase(next);
         if (!next->is_bootstrap) {
           rq.runnable_count.fetch_sub(1, std::memory_order_release);
         }
       }
-      next->state.store(TaskState::kRunning, std::memory_order_release);
-      next->running_cpu.store(cpu_id, std::memory_order_release);
-      rq.current_task = next;
-      rq.busy.store(!next->is_idle, std::memory_order_release);
       // Lets code that runs on this CPU tell whether the CPU switched tasks
       // between two points, and count the timer interrupts of the running
       // task (cpu_clock.h).

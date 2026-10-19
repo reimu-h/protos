@@ -16,10 +16,12 @@
 #include "gdt.h"
 #include "idt.h"
 #include "interrupts.h"
+#include "kill_delay_injection.h"
 #include "paging.h"
 #include "pmm.h"
 #include "smp.h"
 #include "spinlock.h"
+#include "steal_time.h"
 #include "syscall_abi.h"
 #include "task.h"
 #include "user_access.h"
@@ -190,7 +192,6 @@ void UserProcess::Kill() {
   int running_cpu = -1;
   {
     const IrqSpinLockGuard guard(kill_lock_);
-    const int64_t now = GlobalTimerTicks();
     // The first request before Wait() records what the program is doing
     // before the request is published: until then the program can't react
     // to it (leave its system call, stop running or end), so the record
@@ -198,9 +199,12 @@ void UserProcess::Kill() {
     // (for example while the host deschedules its vCPU).
     if (!task_reclaimed_ && kill_tick_.load(std::memory_order_relaxed) < 0) {
       DCHECK(task_ != nullptr);
+      const int64_t cpu0_steal_ns = SmpStealNsOfCpu(0);
+      const int64_t now = GlobalTimerTicks();
       kill_running_cpu_.store(TaskRunningCpu(task_), std::memory_order_relaxed);
       kill_in_syscall_.store(in_syscall_.load(std::memory_order_acquire),
                              std::memory_order_relaxed);
+      killer_steal_ns_at_kill_.store(cpu0_steal_ns, std::memory_order_relaxed);
       kill_tick_.store(now, std::memory_order_release);
     }
     // Sequentially consistent, like the load in TaskRunningCpu(): if the task
@@ -242,6 +246,29 @@ UserProcessStats UserProcess::stats() const {
   snapshot.end_vector = end_vector_.load(std::memory_order_acquire);
   snapshot.end_tick = end_tick_.load(std::memory_order_acquire);
   snapshot.fpu_state = fpu_state_.load(std::memory_order_acquire);
+  if (snapshot.kill_tick >= 0 && snapshot.end_tick >= 0) {
+    snapshot.kill_notice_tick =
+        kill_notice_tick_.load(std::memory_order_acquire);
+    snapshot.kill_end_cpu = kill_end_cpu_.load(std::memory_order_relaxed);
+    KillStealRecord rec;
+    rec.killer_steal_ns_at_kill =
+        killer_steal_ns_at_kill_.load(std::memory_order_relaxed);
+    rec.killer_steal_ns_at_observe = SmpStealNsOfCpu(0);
+    rec.killed_steal_ns_at_notice =
+        killed_steal_ns_at_notice_.load(std::memory_order_relaxed);
+    rec.killed_steal_ns_at_end =
+        killed_steal_ns_at_end_.load(std::memory_order_relaxed);
+    rec.notice_cpu = kill_notice_cpu_.load(std::memory_order_relaxed);
+    rec.end_cpu = snapshot.kill_end_cpu;
+    rec.notice_switches = kill_notice_switches_.load(std::memory_order_relaxed);
+    rec.end_switches = kill_end_switches_.load(std::memory_order_relaxed);
+    snapshot.kill_same_cpu_no_switch =
+        rec.notice_cpu >= 0 && rec.notice_cpu == rec.end_cpu &&
+        rec.notice_switches >= 0 && rec.notice_switches == rec.end_switches;
+    const int64_t excluded_ns = KillExcludedStealNs(rec);
+    snapshot.kill_steal_ticks =
+        StealNsToTicks(excluded_ns, SmpTimerTickNsUpperBound());
+  }
   return snapshot;
 }
 
@@ -249,7 +276,7 @@ void UserProcess::TaskEntry(void* const raw_process) {
   UserProcess* const process = static_cast<UserProcess*>(raw_process);
   process->Run();
   // Nothing of the program is left but this task, which exits next.
-  process->end_tick_.store(GlobalTimerTicks(), std::memory_order_release);
+  process->RecordEnd();
 }
 
 void UserProcess::Run() {
@@ -280,12 +307,38 @@ void UserProcess::Run() {
   // ends it at its first interrupt from user mode at the latest
   // (OnReturnToUser()): Kill() kicks the CPU that is about to enter it.
   if (IsKillRequested()) {
+    {
+      const ScopedIrqDisable irq_disable;
+      RecordKillNoticeIrqsOff();
+    }
     result_.outcome = UserProgramOutcome::kKilled;
   } else {
     // Returns once an interrupt handler has stored the result and called
     // End().
     UserModeEnter(executable.entry, kUserStackTop - 8, arg_, this);
   }
+#if PROTOS_INJECT_KILL_DELAY != 0
+  if (result_.outcome == UserProgramOutcome::kKilled) {
+    if (kActiveKillDelayInjection == KillDelayInjection::kTeardown) {
+      const int64_t delay =
+          injected_kill_delay_ticks_.exchange(0, std::memory_order_acq_rel);
+      if (delay > 0) {
+        space->SetInjectTeardownDelayTicks(delay);
+      }
+    } else if (kActiveKillDelayInjection == KillDelayInjection::kSpinner ||
+               kActiveKillDelayInjection ==
+                   KillDelayInjection::kConcurrentKillers ||
+               kActiveKillDelayInjection == KillDelayInjection::kBusyKiller ||
+               kActiveKillDelayInjection == KillDelayInjection::kRunaway ||
+               kActiveKillDelayInjection == KillDelayInjection::kShutdown) {
+      const int64_t delay =
+          injected_kill_delay_ticks_.exchange(0, std::memory_order_acq_rel);
+      if (delay > 0) {
+        BusyWaitKillMeasureTicks(delay);
+      }
+    }
+  }
+#endif
   // The registers keep the program's values until a task with a state of its
   // own runs here; nothing saves them anymore.
   scheduler->SetFpuState(nullptr);
@@ -459,6 +512,22 @@ int64_t UserProcess::Spin(const uintptr_t buffer,  //
     DCHECK(again == checksum);
     meter->Add(ReadCpuClock());
   }
+  if (IsKillRequested()) {
+    {
+      const ScopedIrqDisable irq_disable;
+      const_cast<UserProcess*>(this)->RecordKillNoticeIrqsOff();
+    }
+#if PROTOS_INJECT_KILL_DELAY != 0
+    if (kActiveKillDelayInjection == KillDelayInjection::kMidSyscall) {
+      const int64_t delay =
+          const_cast<UserProcess*>(this)->injected_kill_delay_ticks_.exchange(
+              0, std::memory_order_acq_rel);
+      if (delay > 0) {
+        BusyWaitKillMeasureTicks(delay);
+      }
+    }
+#endif
+  }
   return checksum;
 }
 
@@ -473,6 +542,39 @@ void UserProcess::RecordSyscall(const TickMeter& meter) {
     syscalls_migrated_.fetch_add(1, std::memory_order_release);
   }
   syscall_timer_ticks_.fetch_add(meter.ticks(), std::memory_order_release);
+}
+
+void UserProcess::RecordKillNoticeIrqsOff() {
+  DCHECK(!AreInterruptsEnabled());
+  if (kill_notice_tick_.load(std::memory_order_relaxed) >= 0) {
+    return;
+  }
+  const CpuLocal* const cpu = CurrentCpuOrNullIrqsOff();
+  const int cpu_id = (cpu != nullptr) ? cpu->cpu_id : -1;
+  const int64_t switches =
+      (cpu != nullptr) ? cpu->context_switches.load(std::memory_order_relaxed)
+                       : -1;
+  const int64_t steal_ns = SmpOwnStealNsIrqsOff();
+  const int64_t now = GlobalTimerTicks();
+  killed_steal_ns_at_notice_.store(steal_ns, std::memory_order_relaxed);
+  kill_notice_cpu_.store(cpu_id, std::memory_order_relaxed);
+  kill_notice_switches_.store(switches, std::memory_order_relaxed);
+  kill_notice_tick_.store(now, std::memory_order_release);
+}
+
+void UserProcess::RecordEnd() {
+  const ScopedIrqDisable irq_disable;
+  const CpuLocal* const cpu = CurrentCpuOrNullIrqsOff();
+  const int cpu_id = (cpu != nullptr) ? cpu->cpu_id : -1;
+  const int64_t switches =
+      (cpu != nullptr) ? cpu->context_switches.load(std::memory_order_relaxed)
+                       : -1;
+  const int64_t steal_ns = SmpOwnStealNsIrqsOff();
+  const int64_t now = GlobalTimerTicks();
+  killed_steal_ns_at_end_.store(steal_ns, std::memory_order_relaxed);
+  kill_end_cpu_.store(cpu_id, std::memory_order_relaxed);
+  kill_end_switches_.store(switches, std::memory_order_relaxed);
+  end_tick_.store(now, std::memory_order_release);
 }
 
 void UserProcess::OnUserFault(InterruptFrame* const frame) {
@@ -499,6 +601,7 @@ void UserProcess::OnReturnToUser(InterruptFrame* const frame) {
 }
 
 void UserProcess::EndKilled(const InterruptFrame* const frame) {
+  RecordKillNoticeIrqsOff();
   end_vector_.store(static_cast<int>(frame->vector), std::memory_order_release);
   UserProgramResult result;
   result.outcome = UserProgramOutcome::kKilled;

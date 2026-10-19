@@ -153,16 +153,31 @@ class IrqSpinLock {
     }
 #endif
 
-    DCHECK(!locked_);
-    DCHECK(owner_.load(std::memory_order_relaxed) == 0);
-    DCHECK(!internal::LocalAreInterruptsEnabled());
+    FinishAcquire(current_owner, irq_was_enabled);
+  }
 
-    IrqSpinLock** const top_slot = internal::TopHeldLockSlot();
-    prev_held_lock_ = *top_slot;
-    *top_slot = this;
-    saved_irq_enabled_ = irq_was_enabled;
-    locked_ = true;
-    owner_.store(current_owner, std::memory_order_relaxed);
+  // Attempts to acquire the lock without spinning. If the lock is uncontended
+  // (`next_ticket_ == serving_ticket_`), disables local interrupts, claims the
+  // serving ticket, and returns true; otherwise restores the caller's
+  // interrupt state and returns false without advancing `next_ticket_`, so
+  // FIFO ticket ordering of `Lock()` waiters is preserved.
+  bool TryLock() {
+    const bool irq_was_enabled = internal::LocalSaveAndDisableInterrupts();
+    const uintptr_t current_owner = internal::CurrentOwnerId();
+    DCHECK(current_owner != 0);
+    DCHECK(owner_.load(std::memory_order_relaxed) != current_owner);
+
+    int64_t expected = serving_ticket_.load(std::memory_order_acquire);
+    if (next_ticket_.load(std::memory_order_relaxed) != expected ||
+        !next_ticket_.compare_exchange_strong(expected, expected + 1,
+                                              std::memory_order_acquire,
+                                              std::memory_order_relaxed)) {
+      internal::LocalRestoreInterrupts(irq_was_enabled);
+      return false;
+    }
+
+    FinishAcquire(current_owner, irq_was_enabled);
+    return true;
   }
 
   void Unlock() {
@@ -218,6 +233,20 @@ class IrqSpinLock {
   }
 
  private:
+  void FinishAcquire(const uintptr_t current_owner,
+                     const bool irq_was_enabled) {
+    DCHECK(!locked_);
+    DCHECK(owner_.load(std::memory_order_relaxed) == 0);
+    DCHECK(!internal::LocalAreInterruptsEnabled());
+
+    IrqSpinLock** const top_slot = internal::TopHeldLockSlot();
+    prev_held_lock_ = *top_slot;
+    *top_slot = this;
+    saved_irq_enabled_ = irq_was_enabled;
+    locked_ = true;
+    owner_.store(current_owner, std::memory_order_relaxed);
+  }
+
   std::atomic<int64_t> next_ticket_{0};
   std::atomic<int64_t> serving_ticket_{0};
   std::atomic<uintptr_t> owner_{0};

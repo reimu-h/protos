@@ -13,10 +13,12 @@
 #include "gdt.h"
 #include "heap.h"
 #include "idt.h"
+#include "kill_delay_injection.h"
 #include "multiboot.h"
 #include "paging.h"
 #include "pmm.h"
 #include "rbtree.h"
+#include "selftest/line_buffer.h"
 #include "selftest/stress.h"
 #include "smp.h"
 #include "spinlock.h"
@@ -172,33 +174,6 @@ static bool CheckExpectation(const bool ok,           //
       return false;           \
     }                         \
   } while (false)
-
-// Fixed-capacity text line, so that a line printed by one CPU goes out in a
-// single write instead of interleaving with the output of other CPUs.
-class LineBuffer {
- public:
-  LineBuffer() { buf_[0] = '\0'; }
-
-  LineBuffer& Append(const char* str) {
-    while (*str != '\0' && len_ + 1 < kCapacity) {
-      buf_[len_++] = *str++;
-    }
-    buf_[len_] = '\0';
-    return *this;
-  }
-
-  LineBuffer& AppendDec(const uint64_t value) {
-    char digits[kFormatDecBufferSize];
-    return Append(FormatDec(value, digits));
-  }
-
-  const char* c_str() const { return buf_; }
-
- private:
-  static constexpr int kCapacity = 96;
-  char buf_[kCapacity];
-  int len_ = 0;
-};
 
 // Frames that TestPmmAllocAndBounds() allocates and TestPmmFreeAndReuse()
 // frees again.
@@ -730,6 +705,27 @@ static bool TestRbTreeEdgeCases() {
   tree.Erase(group.n0);
   tree.Erase(group.n2);
   SELFTEST_EXPECT(tree.root() == nullptr);
+
+#if defined(PROTOS_INJECT_FLAKY_TEST) && PROTOS_INJECT_FLAKY_TEST > 0
+  // Flake injection for checking the deflaking tool, never in default builds
+  // (see INJECT_FLAKY_TEST in the Makefile): after the checks above, fails the
+  // test in about one boot in kInjectedFlakeOneIn, decided by a fresh hardware
+  // entropy draw that every boot logs.
+  constexpr int kInjectedFlakeOneIn = PROTOS_INJECT_FLAKY_TEST;
+  static_assert(kInjectedFlakeOneIn >= 1, "INJECT_FLAKY_TEST must be >= 1");
+  const uint64_t injected_flake_seed = HarvestHardwareEntropySeed();
+  char seed_hex[kFormatHexBufferSize];
+  LineBuffer line;
+  line.Append("[TEST] rbtree_edge_cases: injected flake one_in=")
+      .AppendDec(static_cast<uint64_t>(kInjectedFlakeOneIn))
+      .Append(" seed=")
+      .Append(FormatHex(injected_flake_seed, seed_hex))
+      .Append("\n");
+  UartWrite(line.c_str());
+  const bool injected_failure =
+      injected_flake_seed % static_cast<uint64_t>(kInjectedFlakeOneIn) == 0;
+  SELFTEST_EXPECT(!injected_failure);
+#endif
   return true;
 }
 
@@ -1849,7 +1845,8 @@ struct SchedulerTestContext {
   std::atomic<int> stress_completed{0};
   std::atomic<int64_t> stress_child_completed{0};
   std::atomic<bool> stress_failed{false};
-  // Indices of the spinners that have started (not CPUs).
+  // Indices of the spinners that have started (not CPUs): counted their first
+  // iteration (SpinnerWorker()).
   AtomicCpuMask128 spinner_started_mask;
   std::unique_ptr<std::atomic<int64_t>[]> spinner_iters;
   std::atomic<int> progress_done{0};
@@ -2066,6 +2063,26 @@ static void WeightedYieldWorker(void* const raw_arg) {
   arg->ctx->weighted_completed.fetch_add(1, std::memory_order_acq_rel);
 }
 
+static void RecordStealWorkerSlice(SchedulerTestContext* const ctx) {
+  const int cpu = CurrentCpuId();
+  ctx->stolen_cpu_mask.Add(cpu);
+  ctx->observed_cpu_mask.Add(cpu);
+  if (cpu != 0) {
+    ctx->remote_steal_slices.fetch_add(1, std::memory_order_acq_rel);
+  }
+}
+
+static bool WorkStealingStarted(const SchedulerTestContext& ctx,
+                                const TscDeadline& start_deadline) {
+  if ((ctx.expected_cpu_mask.low & ~1ULL) == 0 &&
+      ctx.expected_cpu_mask.high == 0) {
+    return true;
+  }
+  const CpuMask128 stolen = ctx.stolen_cpu_mask.Load();
+  return (stolen.low & ~1ULL) != 0 || stolen.high != 0 ||
+         start_deadline.Expired();
+}
+
 static void StealWorker(void* const raw_arg) {
   StealWorkerArg* const arg = static_cast<StealWorkerArg*>(raw_arg);
   if (arg == nullptr || arg->ctx == nullptr) {
@@ -2073,25 +2090,22 @@ static void StealWorker(void* const raw_arg) {
   }
 
   TaskScheduler* const scheduler = GetTaskScheduler();
+  const TscDeadline start_deadline(kSelfTestWaitTimeoutTscCycles);
   for (int s = 0; s < kStealWorkerSlices; ++s) {
-    const int cpu = CurrentCpuId();
-    arg->ctx->stolen_cpu_mask.Add(cpu);
-    arg->ctx->observed_cpu_mask.Add(cpu);
-    if (cpu != 0) {
-      arg->ctx->remote_steal_slices.fetch_add(1, std::memory_order_acq_rel);
-    }
+    RecordStealWorkerSlice(arg->ctx);
     for (int spin = 0; spin < 2000; ++spin) {
       asm volatile("pause" : : : "memory");
+    }
+    // Start barrier: keep tasks in CPU 0's runqueue until at least one remote
+    // CPU wakes and steals a slice, or `start_deadline` expires.
+    while (s == 0 && !WorkStealingStarted(*arg->ctx, start_deadline)) {
+      scheduler->Yield();
+      RecordStealWorkerSlice(arg->ctx);
     }
     scheduler->Yield();
   }
 
-  const int cpu = CurrentCpuId();
-  arg->ctx->stolen_cpu_mask.Add(cpu);
-  arg->ctx->observed_cpu_mask.Add(cpu);
-  if (cpu != 0) {
-    arg->ctx->remote_steal_slices.fetch_add(1, std::memory_order_acq_rel);
-  }
+  RecordStealWorkerSlice(arg->ctx);
   arg->done.store(true, std::memory_order_release);
   arg->ctx->steal_completed.fetch_add(1, std::memory_order_acq_rel);
 }
@@ -2105,7 +2119,6 @@ static void SpinnerWorker(void* const raw_arg) {
   SchedulerTestContext* const ctx = arg->ctx;
   const int idx = arg->spinner_index;
   ctx->observed_cpu_mask.Add(CurrentCpuId());
-  ctx->spinner_started_mask.Add(idx);
 
   // CPU-bound spinner that NEVER calls Yield(); relies strictly on Local APIC
   // timer (0x20) preemption so PreemptProgressWorker tasks can run.
@@ -2115,7 +2128,17 @@ static void SpinnerWorker(void* const raw_arg) {
     ctx->observed_cpu_mask.Add(CurrentCpuId());
     const int64_t iters =
         ctx->spinner_iters[idx].fetch_add(1, std::memory_order_relaxed) + 1;
+    // Start barrier: a spinner counts as started only once it has counted an
+    // iteration, and no spinner sets `stop_spinners` (below) before all have
+    // started. A spinner held off its CPU before its first iteration (by
+    // another task, or by the host descheduling its virtual CPU) thus delays
+    // the stop instead of ending without an iteration; if it never spins, the
+    // deadline fails the phase.
+    if (iters == 1) {
+      ctx->spinner_started_mask.Add(idx);
+    }
     if (iters >= 64 && AllSpinnersStarted(ctx) &&
+        ctx->observed_cpu_mask.Load().ContainsAll(ctx->expected_cpu_mask) &&
         ctx->progress_done.load(std::memory_order_acquire) ==
             kPreemptProgressTasks) {
       ctx->preempt_verified.store(true, std::memory_order_release);
@@ -2706,7 +2729,32 @@ struct AddressSpaceSwitchingArg {
   bool leave_before_exit = false;
   AtomicCpuMask128* cpus = nullptr;
   std::atomic<int>* mismatches = nullptr;
+  // Every CPU: each task starts its second slice only once each of them has
+  // run one of the tasks, or once `start_deadline` has expired.
+  CpuMask128 all_cpus;
+  const TscDeadline* start_deadline = nullptr;
 };
+
+// Records the calling CPU, and counts a mismatch unless the calling task runs
+// in its own page tables, which map its page at `kUserSpaceBase`: whichever
+// CPU runs the task, it must use the task's page tables.
+static void CheckAddressSpaceSwitchingSlice(
+    const AddressSpaceSwitchingArg& arg) {
+  arg.cpus->Add(CurrentCpuId());
+  uint64_t word = 0;
+  const bool copied = CopyFromUser(&word, kUserSpaceBase, sizeof(word));
+  if (PagingActiveRoot() != arg.space->root() || !copied ||
+      word != arg.expected) {
+    arg.mismatches->fetch_add(1, std::memory_order_relaxed);
+  }
+}
+
+// Returns true once every CPU has run one of the tasks, or once the tasks
+// have waited for that for kSelfTestWaitTimeoutTscCycles.
+static bool AddressSpaceSwitchingStarted(const AddressSpaceSwitchingArg& arg) {
+  return arg.cpus->Load().ContainsAll(arg.all_cpus) ||
+         arg.start_deadline->Expired();
+}
 
 static void AddressSpaceSwitchingWorker(void* const raw_arg) {
   const AddressSpaceSwitchingArg* const arg =
@@ -2714,13 +2762,17 @@ static void AddressSpaceSwitchingWorker(void* const raw_arg) {
   TaskScheduler* const scheduler = GetTaskScheduler();
   scheduler->SetAddressSpace(arg->space);
   for (int slice = 0; slice < kAddressSpaceSwitchingSlices; ++slice) {
-    // Whichever CPU runs the task, it must use the task's page tables.
-    arg->cpus->Add(CurrentCpuId());
-    uint64_t word = 0;
-    const bool copied = CopyFromUser(&word, kUserSpaceBase, sizeof(word));
-    if (PagingActiveRoot() != arg->space->root() || !copied ||
-        word != arg->expected) {
-      arg->mismatches->fetch_add(1, std::memory_order_relaxed);
+    CheckAddressSpaceSwitchingSlice(*arg);
+    // Start barrier. The whole run can take less time than a halted CPU needs
+    // to wake up (a virtual CPU that the host doesn't run at once), and a CPU
+    // whose queue is empty takes the tasks that still wait on other CPUs
+    // (work_stealing_scheduler.cpp), so without it a CPU could find its tasks
+    // gone, or all of them done, by the time it wakes up. Waiting, yielding,
+    // until every CPU has run a task keeps the tasks there for the CPUs that
+    // come late; each time the task resumes, it checks its page tables again.
+    while (slice == 0 && !AddressSpaceSwitchingStarted(*arg)) {
+      scheduler->Yield();
+      CheckAddressSpaceSwitchingSlice(*arg);
     }
     scheduler->Yield();
   }
@@ -2754,6 +2806,7 @@ static bool TestAddressSpaceSwitching() {
         new std::unique_ptr<AddressSpace>[task_count]);
     const std::unique_ptr<AddressSpaceSwitchingArg[]> args(
         new AddressSpaceSwitchingArg[task_count]);
+    const TscDeadline start_deadline(kSelfTestWaitTimeoutTscCycles);
     for (int i = 0; i < task_count; ++i) {
       spaces[i] = AddressSpace::Create();
       SELFTEST_EXPECT(spaces[i] != nullptr);
@@ -2766,6 +2819,8 @@ static bool TestAddressSpaceSwitching() {
       arg.leave_before_exit = (i % 2) == 0;
       arg.cpus = &cpus;
       arg.mismatches = &mismatches;
+      arg.all_cpus = CpuMask128::FirstCpus(cpu_count);
+      arg.start_deadline = &start_deadline;
       *reinterpret_cast<volatile uint64_t*>(frame) = arg.expected;
     }
     PhaseTaskGroup tasks(*scheduler, nullptr);
@@ -2991,8 +3046,14 @@ static bool TestUserModePrograms() {
   return true;
 }
 
-// The most processes that TestUserModePreemption() runs.
-constexpr int kMaxUserSpinners = 16;
+// Heap-allocated arrays of processes, which may hold up to 3 × CPUs processes
+// (too many for the 16 KiB boot stack on machines with many CPUs).
+using ProcessArray = std::unique_ptr<std::unique_ptr<UserProcess>[]>;
+
+static ProcessArray MakeProcessArray(const int count) {
+  return std::make_unique<std::unique_ptr<UserProcess>[]>(count);
+}
+
 // System calls that each spinner of TestUserModePreemption() makes before the
 // spinners are killed: one per round of computation.
 constexpr int64_t kUserSpinnerSyscalls = 8;
@@ -3006,14 +3067,13 @@ static bool TestUserModePreemption() {
   TaskScheduler* const scheduler = GetTaskScheduler();
   SELFTEST_EXPECT(scheduler != nullptr);
   const int cpu_count = SmpCpuCount();
-  const int process_count =
-      (2 * cpu_count < kMaxUserSpinners) ? 2 * cpu_count : kMaxUserSpinners;
+  const int process_count = 2 * cpu_count;
   const int64_t pmm_free_before = PmmFreeFrameCount();
   AtomicCpuMask128 cpus;
   {
     // On an early return, the destructors kill the processes and wait for
     // them.
-    std::unique_ptr<UserProcess> processes[kMaxUserSpinners];
+    const ProcessArray processes = MakeProcessArray(process_count);
     for (int i = 0; i < process_count; ++i) {
       processes[i] = UserProcess::Start(
           UserTestProgram(),
@@ -3040,8 +3100,10 @@ static bool TestUserModePreemption() {
       processes[i]->Kill();
     }
     // Not in Wait() right away, which would never return if a kill got lost.
-    SELFTEST_EXPECT(
-        WaitForProcesses(processes, process_count, HasEnded, WaitMode::kYield));
+    SELFTEST_EXPECT(WaitForProcesses(processes.get(),  //
+                                     process_count,    //
+                                     HasEnded,         //
+                                     WaitMode::kYield));
     for (int i = 0; i < process_count; ++i) {
       const UserProgramResult result = processes[i]->Wait();
       if (result.outcome != UserProgramOutcome::kKilled) {
@@ -3111,13 +3173,6 @@ static bool StartProcessesOnOwnCpus(
 // Returns the larger of `a` and `b`.
 static int64_t Max(const int64_t a, const int64_t b) { return (a > b) ? a : b; }
 
-// Returns `count`, but at most `limit`.
-static int AtMost(const int count, const int limit) {
-  return (count < limit) ? count : limit;
-}
-
-// The most processes that TestUserModePreemptibleSyscalls() runs at once.
-constexpr int kMaxSyscallSpinners = 31;
 // The spin() calls of each process of TestUserModePreemptibleSyscalls() that
 // has a CPU to itself, and the timer ticks of each call.
 constexpr int64_t kLongSyscalls = 2;
@@ -3145,7 +3200,7 @@ static bool RunSyscallSpinRound(const int count,      //
                                 const uint64_t seed,  //
                                 SyscallSpinTotals* const totals) {
   // On an early return, the destructors kill the processes and wait for them.
-  std::unique_ptr<UserProcess> processes[kMaxSyscallSpinners];
+  const ProcessArray processes = MakeProcessArray(count);
   for (int i = 0; i < count; ++i) {
     processes[i] = UserProcess::Start(
         UserTestProgram(),
@@ -3159,7 +3214,7 @@ static bool RunSyscallSpinRound(const int count,      //
   // when this task yields, the others when they go idle
   // (work_stealing_scheduler.cpp).
   SELFTEST_EXPECT(
-      WaitForProcesses(processes, count, HasEnded, WaitMode::kYield));
+      WaitForProcesses(processes.get(), count, HasEnded, WaitMode::kYield));
   for (int i = 0; i < count; ++i) {
     SELFTEST_EXPECT(ExitedWith(processes[i]->Wait(), 0));
     const UserProcessStats stats = processes[i]->stats();
@@ -3189,22 +3244,24 @@ static bool TestUserModePreemptibleSyscalls() {
   const int64_t pmm_free_before = PmmFreeFrameCount();
   const int64_t heap_free_before = HeapTotalFreeBytes();
 
-  const int long_count =
-      AtMost((cpu_count > 1) ? cpu_count - 1 : 1, kMaxSyscallSpinners);
+  const int long_count = (cpu_count > 1) ? cpu_count - 1 : 1;
   int64_t min_long_call_ticks = -1;
   {
-    std::unique_ptr<UserProcess> processes[kMaxSyscallSpinners];
+    const ProcessArray processes = MakeProcessArray(long_count);
     const auto arg_of = [](const int i) {
       return usertest::KernelSpinArg(kLongSyscallTicks,  //
                                      kLongSyscalls,      //
                                      static_cast<uint64_t>(i + 1));
     };
     // Once a process runs, it keeps its CPU: nothing else is queued there.
-    SELFTEST_EXPECT(StartProcessesOnOwnCpus(processes, long_count, arg_of));
+    SELFTEST_EXPECT(
+        StartProcessesOnOwnCpus(processes.get(), long_count, arg_of));
     // A process whose calls never end fails the test here instead of hanging
     // in Wait().
-    SELFTEST_EXPECT(
-        WaitForProcesses(processes, long_count, HasEnded, WaitMode::kSpin));
+    SELFTEST_EXPECT(WaitForProcesses(processes.get(),  //
+                                     long_count,       //
+                                     HasEnded,         //
+                                     WaitMode::kSpin));
     for (int i = 0; i < long_count; ++i) {
       SELFTEST_EXPECT(ExitedWith(processes[i]->Wait(), 0));
       const UserProcessStats stats = processes[i]->stats();
@@ -3224,15 +3281,14 @@ static bool TestUserModePreemptibleSyscalls() {
     }
   }
 
-  const int round_count = AtMost(2 * cpu_count - 1, kMaxSyscallSpinners);
+  const int round_count = 2 * cpu_count - 1;
   // Some CPU runs fewer of the processes than another one and takes a waiting
   // one from it once it has run its own.
   const bool expect_migration = cpu_count > 1 && round_count > cpu_count;
   SyscallSpinTotals totals;
   int rounds = 0;
   do {
-    const uint64_t seed =
-        static_cast<uint64_t>(kMaxSyscallSpinners * (rounds + 1) + 1);
+    const uint64_t seed = static_cast<uint64_t>(round_count * (rounds + 1) + 1);
     SELFTEST_EXPECT(RunSyscallSpinRound(round_count, seed, &totals));
     ++rounds;
   } while (expect_migration && totals.migrated == 0 &&
@@ -3266,8 +3322,6 @@ static bool TestUserModePreemptibleSyscalls() {
 // program that runs, in user mode or in the middle of a system call, to the
 // end of its process.
 constexpr int64_t kKillDeadlineTicks = 10;
-// The most processes that a phase of TestUserModeKill() runs at once.
-constexpr int kMaxKillTestProcesses = 16;
 // The processes that TestUserModeKill() kills right after it started them.
 constexpr int kKillsBeforeEntry = 3;
 
@@ -3277,9 +3331,15 @@ struct KillTestReport {
   // Pure spinners killed while each ran on a CPU of its own.
   int spinners = 0;
   int64_t spinner_ticks = 0;
+  int64_t spinner_raw_ticks = 0;
+  int64_t spinner_steal_ticks = 0;
+  int64_t spinner_notice_ticks = 0;
   // Processes killed in the middle of a long spin() call.
   int mid_syscall = 0;
   int64_t mid_syscall_ticks = 0;
+  int64_t mid_syscall_raw_ticks = 0;
+  int64_t mid_syscall_steal_ticks = 0;
+  int64_t mid_syscall_notice_ticks = 0;
   // Processes killed while more of them than CPUs were runnable, and those
   // that no CPU was running at their kill.
   int waiting = 0;
@@ -3307,19 +3367,29 @@ static bool EndedKilled(const std::unique_ptr<UserProcess>& process,
   return true;
 }
 
-// Returns the timer ticks from the kill request to the end of the process.
+// Returns the timer ticks from the kill request to the end of the process,
+// excluding any hypervisor steal ticks proven to have occurred on the
+// target CPU while the process remained continuously resident without noticing
+// the kill.
 static int64_t KillTicks(const UserProcessStats& stats) {
-  return stats.end_tick - stats.kill_tick;
+  const int64_t raw_ticks = stats.end_tick - stats.kill_tick;
+  const int64_t adjusted = raw_ticks - stats.kill_steal_ticks;
+  return Max(0, adjusted);
 }
 
 // Logs the timer ticks of a kill of `phase` that missed kKillDeadlineTicks,
 // before the expectation fails, so that a failing pass says by how much.
-// `stats` is that of a process that EndedKilled() accepted.
+// `stats` is that of a process that EndedKilled() accepted. Prints three
+// lines, each of which fits in a LineBuffer whatever the values.
 static void LogLateKill(const char* const phase,
                         const UserProcessStats& stats) {
   if (KillTicks(stats) <= kKillDeadlineTicks) {
     return;
   }
+  const int64_t raw_ticks = stats.end_tick - stats.kill_tick;
+  const int64_t notice_ticks = (stats.kill_notice_tick >= stats.kill_tick)
+                                   ? (stats.kill_notice_tick - stats.kill_tick)
+                                   : -1;
   LineBuffer line;
   line.Append("[USER] user_mode_kill: missed deadline phase=")
       .Append(phase)
@@ -3327,6 +3397,22 @@ static void LogLateKill(const char* const phase,
       .AppendDec(static_cast<uint64_t>(KillTicks(stats)))
       .Append("\n");
   UartWrite(line.c_str());
+  LineBuffer ticks_line;
+  ticks_line.Append("[USER] user_mode_kill: raw_ticks=")
+      .AppendDec(static_cast<uint64_t>(Max(0, raw_ticks)))
+      .Append(" steal_ticks=")
+      .AppendDec(static_cast<uint64_t>(Max(0, stats.kill_steal_ticks)))
+      .Append("\n");
+  UartWrite(ticks_line.c_str());
+  LineBuffer cpu_line;
+  cpu_line.Append("[USER] user_mode_kill: notice_ticks=")
+      .AppendDec(static_cast<uint64_t>(Max(0, notice_ticks)))
+      .Append(" cpu=")
+      .AppendDec(static_cast<uint64_t>(Max(0, stats.kill_end_cpu)))
+      .Append(" same_cpu=")
+      .AppendDec(stats.kill_same_cpu_no_switch ? 1 : 0)
+      .Append("\n");
+  UartWrite(cpu_line.c_str());
 }
 
 // Kills pure spinners, which never make a system call, while each runs on a
@@ -3339,22 +3425,28 @@ static void LogLateKill(const char* const phase,
 static bool TestKillRunningPhase(const int cpu_count,
                                  KillTestReport* const report) {
   using usertest::Mode;
-  const int count =
-      AtMost((cpu_count > 1) ? cpu_count - 1 : 1, kMaxKillTestProcesses);
-  std::unique_ptr<UserProcess> spinners[kMaxKillTestProcesses];
+  TaskScheduler* const scheduler = GetTaskScheduler();
+  const int count = (cpu_count > 1) ? cpu_count - 1 : 1;
+  const ProcessArray spinners = MakeProcessArray(count);
   const auto arg_of = [](const int i) {
     return usertest::Arg(Mode::kSpinWithoutSyscalls,
                          0xA11CE + static_cast<uint64_t>(i));
   };
-  SELFTEST_EXPECT(StartProcessesOnOwnCpus(spinners, count, arg_of));
-  SELFTEST_EXPECT(
-      WaitForProcesses(spinners, count, HasRunInUserMode, WaitMode::kSpin));
+  SELFTEST_EXPECT(StartProcessesOnOwnCpus(spinners.get(), count, arg_of));
+  SELFTEST_EXPECT(WaitForProcesses(spinners.get(),    //
+                                   count,             //
+                                   HasRunInUserMode,  //
+                                   WaitMode::kSpin));
 
   for (int i = 0; i < kKillsBeforeEntry; ++i) {
+    scheduler->SetPreemptEnabled(false);
     const std::unique_ptr<UserProcess> process = UserProcess::Start(
         UserTestProgram(), usertest::Arg(Mode::kSpinWithoutSyscalls));
+    if (process != nullptr) {
+      process->Kill();
+    }
+    scheduler->SetPreemptEnabled(true);
     SELFTEST_EXPECT(process != nullptr);
-    process->Kill();
     UserProcessStats stats;
     SELFTEST_EXPECT(EndedKilled(process, &stats));
     SELFTEST_EXPECT(stats.syscalls == 0);
@@ -3371,6 +3463,10 @@ static bool TestKillRunningPhase(const int cpu_count,
         WaitForProcesses(&process, 1, HasRunUserCode, WaitMode::kYield));
   }
 
+  if constexpr (kInjectedKillDelay == KillDelayInjection::kSpinner ||
+                kInjectedKillDelay == KillDelayInjection::kTeardown) {
+    spinners[0]->ArmInjectedKillDelay(2 * kKillDeadlineTicks + 5);
+  }
   for (int i = 0; i < count; ++i) {
     spinners[i]->Kill();
   }
@@ -3385,6 +3481,15 @@ static bool TestKillRunningPhase(const int cpu_count,
     LogLateKill("spinner", stats);
     SELFTEST_EXPECT(KillTicks(stats) <= kKillDeadlineTicks);
     report->spinner_ticks = Max(report->spinner_ticks, KillTicks(stats));
+    report->spinner_raw_ticks =
+        Max(report->spinner_raw_ticks, stats.end_tick - stats.kill_tick);
+    report->spinner_steal_ticks =
+        Max(report->spinner_steal_ticks, stats.kill_steal_ticks);
+    if (stats.kill_notice_tick >= stats.kill_tick) {
+      report->spinner_notice_ticks =
+          Max(report->spinner_notice_ticks,
+              stats.kill_notice_tick - stats.kill_tick);
+    }
   }
   report->spinners = count;
   SELFTEST_EXPECT(report->before_entry >= 1);
@@ -3397,17 +3502,19 @@ static bool TestKillRunningPhase(const int cpu_count,
 // to user mode.
 static bool TestKillInSyscallPhase(const int cpu_count,
                                    KillTestReport* const report) {
-  const int count =
-      AtMost((cpu_count > 1) ? cpu_count - 1 : 1, kMaxKillTestProcesses);
-  std::unique_ptr<UserProcess> processes[kMaxKillTestProcesses];
+  const int count = (cpu_count > 1) ? cpu_count - 1 : 1;
+  const ProcessArray processes = MakeProcessArray(count);
   const auto arg_of = [](const int i) {
     return usertest::KernelSpinArg(kSyscallSpinMaxTicks,  //
                                    1,                     //
                                    0xB0B + static_cast<uint64_t>(i));
   };
-  SELFTEST_EXPECT(StartProcessesOnOwnCpus(processes, count, arg_of));
+  SELFTEST_EXPECT(StartProcessesOnOwnCpus(processes.get(), count, arg_of));
   SELFTEST_EXPECT(
-      WaitForProcesses(processes, count, IsInSyscall, WaitMode::kSpin));
+      WaitForProcesses(processes.get(), count, IsInSyscall, WaitMode::kSpin));
+  if constexpr (kInjectedKillDelay == KillDelayInjection::kMidSyscall) {
+    processes[0]->ArmInjectedKillDelay(2 * kKillDeadlineTicks + 5);
+  }
   for (int i = 0; i < count; ++i) {
     processes[i]->Kill();
   }
@@ -3424,6 +3531,15 @@ static bool TestKillInSyscallPhase(const int cpu_count,
     SELFTEST_EXPECT(KillTicks(stats) <= kKillDeadlineTicks);
     report->mid_syscall_ticks =
         Max(report->mid_syscall_ticks, KillTicks(stats));
+    report->mid_syscall_raw_ticks =
+        Max(report->mid_syscall_raw_ticks, stats.end_tick - stats.kill_tick);
+    report->mid_syscall_steal_ticks =
+        Max(report->mid_syscall_steal_ticks, stats.kill_steal_ticks);
+    if (stats.kill_notice_tick >= stats.kill_tick) {
+      report->mid_syscall_notice_ticks =
+          Max(report->mid_syscall_notice_ticks,
+              stats.kill_notice_tick - stats.kill_tick);
+    }
   }
   report->mid_syscall = count;
   return true;
@@ -3450,16 +3566,25 @@ static uint64_t WaitingKillTestArg(const int i) {
 // nothing.
 static bool TestKillWaitingPhase(const int cpu_count,
                                  KillTestReport* const report) {
-  const int count = AtMost(3 * cpu_count, kMaxKillTestProcesses);
-  std::unique_ptr<UserProcess> processes[kMaxKillTestProcesses];
+  const int count = 3 * cpu_count;
+  const ProcessArray processes = MakeProcessArray(count);
   for (int i = 0; i < count; ++i) {
     processes[i] = UserProcess::Start(UserTestProgram(), WaitingKillTestArg(i));
     SELFTEST_EXPECT(processes[i] != nullptr);
   }
-  SELFTEST_EXPECT(
-      WaitForProcesses(processes, count, HasRunUserCode, WaitMode::kYield));
-  for (int i = 0; i < count; ++i) {
-    processes[i]->Kill();
+  SELFTEST_EXPECT(WaitForProcesses(processes.get(),  //
+                                   count,            //
+                                   HasRunUserCode,   //
+                                   WaitMode::kYield));
+  {
+    // Kill from back to front with interrupts disabled on CPU 0 so that CPU 0
+    // is not preempted mid-loop and queued processes at the tail of each
+    // runqueue are marked killed before the running ones at the front vacate
+    // their CPUs.
+    const ScopedIrqDisable irq_disable;
+    for (int i = count - 1; i >= 0; --i) {
+      processes[i]->Kill();
+    }
   }
   processes[0]->Kill();
   int not_running = 0;
@@ -3541,6 +3666,18 @@ static bool TestUserModeKill() {
   UartWriteDec(static_cast<uint64_t>(kKillsBeforeEntry));
   UartWrite(" heap_grew=");
   UartWriteDec(heap_grew ? 1 : 0);
+  UartWrite(" spinner_raw_ticks=");
+  UartWriteDec(static_cast<uint64_t>(report.spinner_raw_ticks));
+  UartWrite(" spinner_steal_ticks=");
+  UartWriteDec(static_cast<uint64_t>(report.spinner_steal_ticks));
+  UartWrite(" spinner_notice_ticks=");
+  UartWriteDec(static_cast<uint64_t>(report.spinner_notice_ticks));
+  UartWrite(" mid_syscall_raw_ticks=");
+  UartWriteDec(static_cast<uint64_t>(report.mid_syscall_raw_ticks));
+  UartWrite(" mid_syscall_steal_ticks=");
+  UartWriteDec(static_cast<uint64_t>(report.mid_syscall_steal_ticks));
+  UartWrite(" mid_syscall_notice_ticks=");
+  UartWriteDec(static_cast<uint64_t>(report.mid_syscall_notice_ticks));
   UartWrite("\n");
 
   SELFTEST_EXPECT(PagingActiveRoot() == PagingKernelRoot());
@@ -4547,59 +4684,130 @@ static void RunUserPageProbeRound(const UserPageProbeTaskArg& arg,
   }
 }
 
+// Returns true if every probe kind enabled in `arg.setup` has faulted as
+// expected on every CPU in `mask`.
+static bool UserPageProbesCoveredOn(const UserPageProbeTaskArg& arg,
+                                    const CpuMask128& mask) {
+  const UserPageProbeSetup& setup = *arg.setup;
+  const UserPageProbeCounters& counters = *arg.counters;
+  if (!counters.expected[static_cast<int>(UserPageProbe::kNotPresentRead)]
+           .Load()
+           .ContainsAll(mask)) {
+    return false;
+  }
+  if (setup.smap &&
+      (!counters.expected[static_cast<int>(UserPageProbe::kSmapRead)]
+            .Load()
+            .ContainsAll(mask) ||
+       !counters.expected[static_cast<int>(UserPageProbe::kSmapWrite)]
+            .Load()
+            .ContainsAll(mask))) {
+    return false;
+  }
+  if (setup.smep &&
+      !counters.expected[static_cast<int>(UserPageProbe::kSmepExecute)]
+           .Load()
+           .ContainsAll(mask)) {
+    return false;
+  }
+  return true;
+}
+
+static bool CurrentCpuUserPageProbesCovered(const UserPageProbeTaskArg& arg) {
+  const int cpu = CurrentCpuId();
+  CpuMask128 current;
+  if (cpu >= 0 && cpu < 64) {
+    current.low = 1ULL << static_cast<uint32_t>(cpu);
+  } else if (cpu >= 64 && cpu < 128) {
+    current.high = 1ULL << static_cast<uint32_t>(cpu - 64);
+  }
+  return UserPageProbesCoveredOn(arg, current);
+}
+
+static bool UserPageProbesStarted(const UserPageProbeTaskArg& arg,
+                                  const CpuMask128& all_cpus,
+                                  const TscDeadline& start_deadline) {
+  return UserPageProbesCoveredOn(arg, all_cpus) || start_deadline.Expired();
+}
+
 // Runs kUserPageProbeRounds rounds in the probe address space.
 static void UserPageProbeTask(void* const raw_arg) {
   const UserPageProbeTaskArg* const arg =
       static_cast<const UserPageProbeTaskArg*>(raw_arg);
   TaskScheduler* const scheduler = GetTaskScheduler();
+  const CpuMask128 all_cpus = CpuMask128::FirstCpus(SmpCpuCount());
+  const TscDeadline start_deadline(kSelfTestWaitTimeoutTscCycles /
+                                   kMaxUserPageProbeBatches);
   scheduler->SetAddressSpace(arg->setup->space);
   for (int round = 0; round < kUserPageProbeRounds; ++round) {
     RunUserPageProbeRound(*arg, round);
+    // Start barrier: keep probe tasks alive (so covered CPUs keep a queued task
+    // alongside their watched user process and do not steal queued probe tasks
+    // from host-descheduled APs) until every CPU has recorded its probes or the
+    // per-batch start deadline expires.
+    while (round == 0 &&
+           !UserPageProbesStarted(*arg, all_cpus, start_deadline)) {
+      scheduler->Yield();
+      if (!CurrentCpuUserPageProbesCovered(*arg)) {
+        RunUserPageProbeRound(*arg, round);
+      }
+    }
     scheduler->Yield();
   }
   scheduler->SetAddressSpace(nullptr);
   arg->counters->done.fetch_add(1, std::memory_order_release);
 }
 
-// Runs probe tasks until each CPU ran the not-present probe as expected: one
-// task per CPU (CreateTaskOnCpu()), then, at most kMaxUserPageProbeBatches - 1
-// more times, one per CPU that no task probed on yet (a task may run on
-// another CPU than it was queued on). Waits by spinning, so that CPU 0 doesn't
-// take the tasks queued on other CPUs. Fails if a task can't be created or a
-// wait times out.
+// The CPU of the probe task that RunUserPageProbesOnEveryCpu() places at
+// countdown index `i` (cpu_count - 1 down to 0) of a batch: CPUs
+// cpu_count - 1 down to 2, then CPU 0, then CPU 1.
+static int UserPageProbeTaskCpu(const int cpu_count, const int i) {
+  return (cpu_count > 1 && i <= 1) ? (1 - i) : i;
+}
+
+// Runs probe tasks until each CPU ran the enabled probes as expected, in at
+// most kMaxUserPageProbeBatches batches; stops early once every enabled probe
+// kind has covered every CPU. One task per CPU (CreateTaskOnCpu()) per batch,
+// in descending CPU order (with CPU 0 before CPU 1) so single-process CPUs
+// have a queued probe task before CPU 0 and CPU 1 reach a load that
+// timer-interrupt work stealing would take from. Yields on CPU 0 until CPU 0
+// is covered, then waits by spinning so CPU 0 doesn't take the tasks queued on
+// other CPUs. Fails if a task can't be created or a wait times out.
 static bool RunUserPageProbesOnEveryCpu(const UserPageProbeSetup& setup,
                                         UserPageProbeCounters* const counters) {
   TaskScheduler* const scheduler = GetTaskScheduler();
   const int cpu_count = SmpCpuCount();
   const CpuMask128 all = CpuMask128::FirstCpus(cpu_count);
-  const int not_present = static_cast<int>(UserPageProbe::kNotPresentRead);
   const std::unique_ptr<UserPageProbeTaskArg[]> args(
       new UserPageProbeTaskArg[cpu_count]);
   SELFTEST_EXPECT(args != nullptr);
   for (int batch = 0; batch < kMaxUserPageProbeBatches; ++batch) {
-    const CpuMask128 covered = counters->expected[not_present].Load();
-    if (covered.ContainsAll(all)) {
+    if (UserPageProbesCoveredOn(UserPageProbeTaskArg{&setup, 0, counters},
+                                all)) {
       break;
     }
     const int done_before = counters->done.load(std::memory_order_acquire);
     int started = 0;
     PhaseTaskGroup tasks(*scheduler, nullptr);
-    for (int cpu = 0; cpu < cpu_count; ++cpu) {
-      if (covered.Contains(cpu)) {
-        continue;
-      }
-      args[cpu].setup = &setup;
-      args[cpu].slot = cpu;
-      args[cpu].counters = counters;
+    for (int i = cpu_count - 1; i >= 0; --i) {
+      const int cpu = UserPageProbeTaskCpu(cpu_count, i);
+      args[cpu] = UserPageProbeTaskArg{&setup, cpu, counters};
       SELFTEST_EXPECT(tasks.Add(scheduler->CreateTaskOnCpu(
           UserPageProbeTask, &args[cpu], kDefaultTaskWeight, cpu)));
       ++started;
     }
+    // The caller is the bootstrap task, which never leaves CPU 0, so the
+    // coverage check of the current CPU below checks CPU 0.
+    DCHECK(CurrentCpuId() == 0);
     const TscDeadline deadline(kSelfTestWaitTimeoutTscCycles);
     while (counters->done.load(std::memory_order_acquire) <
            done_before + started) {
       SELFTEST_EXPECT(!deadline.Expired());
-      asm volatile("pause" : : : "memory");
+      if (!CurrentCpuUserPageProbesCovered(args[0])) {
+        scheduler->Yield();
+      } else {
+        asm volatile("pause" : : : "memory");
+      }
     }
     tasks.JoinAll();
   }
@@ -4783,10 +4991,9 @@ static bool ProbeNmiInUserAccessWindow(bool* const checked) {
   return true;
 }
 
-// The spin() programs of TestSmapSmepProtection(): timer ticks per call, at
-// most this many programs, and the seed of the first.
+// The spin() programs of TestSmapSmepProtection(): timer ticks per call, and
+// the seed of the first.
 constexpr int64_t kProbeSyscallTicks = 2;
-constexpr int kMaxProbeTestProcesses = 16;
 constexpr uint64_t kProbeTestSeed = 0x5A1;
 
 // Creates the address space of the probe tasks (UserPageProbeSetup): the user
@@ -4866,7 +5073,7 @@ static bool TestSmapSmepProtection() {
   SELFTEST_EXPECT(scheduler != nullptr);
   const CpuConfig& config = CpuGetConfig();
   const int cpu_count = SmpCpuCount();
-  const int process_count = AtMost(cpu_count, kMaxProbeTestProcesses);
+  const int process_count = cpu_count;
   const int64_t pmm_free_before = PmmFreeFrameCount();
   const int64_t heap_free_before = HeapTotalFreeBytes();
   bool window_checked = false;
@@ -4884,7 +5091,7 @@ static bool TestSmapSmepProtection() {
 
     // On an early return, the destructors kill the programs and wait for
     // them, before `space` goes.
-    std::unique_ptr<UserProcess> processes[kMaxProbeTestProcesses];
+    const ProcessArray processes = MakeProcessArray(process_count);
     for (int i = 0; i < process_count; ++i) {
       processes[i] = UserProcess::Start(
           UserTestProgram(),
@@ -4895,11 +5102,12 @@ static bool TestSmapSmepProtection() {
     }
     // Each program finished a call and started the next.
     SELFTEST_EXPECT(WaitForProcesses(
-        processes,                                                          //
+        processes.get(),                                                    //
         process_count,                                                      //
         [](const UserProcessStats& stats) { return stats.syscalls >= 2; },  //
         WaitMode::kSpin));
-    int64_t switched_before[kMaxProbeTestProcesses] = {};
+    const std::unique_ptr<int64_t[]> switched_before =
+        std::make_unique<int64_t[]>(process_count);
     for (int i = 0; i < process_count; ++i) {
       switched_before[i] = processes[i]->stats().syscalls_switched_out;
     }
@@ -4912,13 +5120,14 @@ static bool TestSmapSmepProtection() {
     setup.data_frame = data_frame;
     setup.smap = config.smap;
     setup.smep = config.smep;
-    setup.watched = processes;
+    setup.watched = processes.get();
     setup.watched_count = process_count;
     SELFTEST_EXPECT(RunUserPageProbesOnEveryCpu(setup, &counters));
 
     // System calls keep working after the faults: each program starts two
     // more calls, and the kSyscalls program passes its checks.
-    int64_t syscalls_after_probes[kMaxProbeTestProcesses] = {};
+    const std::unique_ptr<int64_t[]> syscalls_after_probes =
+        std::make_unique<int64_t[]>(process_count);
     for (int i = 0; i < process_count; ++i) {
       syscalls_after_probes[i] = processes[i]->stats().syscalls;
     }
@@ -5042,14 +5251,6 @@ static_assert(usertest::kStackPages == kUserStackPages);
 // many processes back to back, may take twice as long.
 constexpr int64_t kE2eKillTicks = 5 * kKillDeadlineTicks;
 constexpr int64_t kE2eShutdownTicks = 10 * kKillDeadlineTicks;
-
-// The arrays of processes of the end-to-end tests, which may hold 3 × CPUs
-// processes, too many for the 16 KiB boot stack on machines with many CPUs.
-using ProcessArray = std::unique_ptr<std::unique_ptr<UserProcess>[]>;
-
-static ProcessArray MakeProcessArray(const int count) {
-  return std::make_unique<std::unique_ptr<UserProcess>[]>(count);
-}
 
 // Returns true once timer interrupts have interrupted the program's user code
 // twice, or once it has ended (otherwise than the test expects, which the
@@ -5200,9 +5401,6 @@ static bool RunUserPageProbesUntilCovered(const UserPageProbeSetup& setup,  //
   return true;
 }
 
-// The most processes that a phase of TestUserModeKillEdgeCases() runs at
-// once.
-constexpr int kMaxKillEdgeProcesses = 16;
 // The timer ticks for which KillBehindBusyKiller() keeps CPU 0 busy.
 constexpr int64_t kBusyKillerTicks = 3;
 // Not an ELF file.
@@ -5368,21 +5566,24 @@ static void ConcurrentKillTask(void* const raw_arg) {
 static bool KillWithConcurrentKillers(const int cpu_count,
                                       KillEdgeReport* const report) {
   TaskScheduler* const scheduler = GetTaskScheduler();
-  const int count = AtMost(cpu_count, kMaxKillEdgeProcesses);
-  std::unique_ptr<UserProcess> spinners[kMaxKillEdgeProcesses];
+  const int count = cpu_count;
+  const ProcessArray spinners = MakeProcessArray(count);
   for (int i = 0; i < count; ++i) {
     spinners[i] = UserProcess::Start(
         UserTestProgram(), usertest::Arg(usertest::Mode::kSpinWithoutSyscalls,
                                          0xD1CE + static_cast<uint64_t>(i)));
     SELFTEST_EXPECT(spinners[i] != nullptr);
   }
-  SELFTEST_EXPECT(WaitForProcesses(spinners,                 //
+  SELFTEST_EXPECT(WaitForProcesses(spinners.get(),           //
                                    count,                    //
                                    HasRunInUserModeOrEnded,  //
                                    WaitMode::kYield));
+  if constexpr (kInjectedKillDelay == KillDelayInjection::kConcurrentKillers) {
+    spinners[0]->ArmInjectedKillDelay(2 * kE2eKillTicks + 5);
+  }
   const int helpers = cpu_count - 1;
   ConcurrentKillContext context;
-  context.processes = spinners;
+  context.processes = spinners.get();
   context.count = count;
   context.killers = helpers + 1;
   ConcurrentKillTaskArg args[kMaxSupportedCpus];
@@ -5440,18 +5641,21 @@ static bool DestroyRunningSpinner(KillEdgeReport* const report) {
 // without yielding: each still ends as killed within kE2eKillTicks.
 static bool KillBehindBusyKiller(const int cpu_count,
                                  KillEdgeReport* const report) {
-  const int count = AtMost(cpu_count, kMaxKillEdgeProcesses);
-  std::unique_ptr<UserProcess> spinners[kMaxKillEdgeProcesses];
+  const int count = cpu_count;
+  const ProcessArray spinners = MakeProcessArray(count);
   for (int i = 0; i < count; ++i) {
     spinners[i] = UserProcess::Start(
         UserTestProgram(), usertest::Arg(usertest::Mode::kSpinWithoutSyscalls,
                                          0xB05E + static_cast<uint64_t>(i)));
     SELFTEST_EXPECT(spinners[i] != nullptr);
   }
-  SELFTEST_EXPECT(WaitForProcesses(spinners,                 //
+  SELFTEST_EXPECT(WaitForProcesses(spinners.get(),           //
                                    count,                    //
                                    HasRunInUserModeOrEnded,  //
                                    WaitMode::kYield));
+  if constexpr (kInjectedKillDelay == KillDelayInjection::kBusyKiller) {
+    spinners[0]->ArmInjectedKillDelay(2 * kE2eKillTicks + 5);
+  }
   for (int i = 0; i < count; ++i) {
     spinners[i]->Kill();
   }
@@ -5533,24 +5737,20 @@ static bool TestUserModeKillEdgeCases() {
   return true;
 }
 
-// The most kBufferChecks processes that TestUserModeSyscallBufferChecks()
-// runs at once.
-constexpr int kMaxBufferCheckProcesses = 16;
-
 // Runs `count` kBufferChecks processes at once, which must all exit with 0
 // and must each have taken a timer interrupt in user mode: almost all of
 // their time in user mode is the computation with RFLAGS.AC set. Lowers
 // `*min_user_ticks` to the fewest timer interrupts of the user code of one.
 static bool RunBufferCheckProcesses(const int count,
                                     int64_t* const min_user_ticks) {
-  std::unique_ptr<UserProcess> processes[kMaxBufferCheckProcesses];
+  const ProcessArray processes = MakeProcessArray(count);
   for (int i = 0; i < count; ++i) {
     processes[i] = UserProcess::Start(
         UserTestProgram(), usertest::Arg(usertest::Mode::kBufferChecks));
     SELFTEST_EXPECT(processes[i] != nullptr);
   }
   SELFTEST_EXPECT(
-      WaitForProcesses(processes, count, HasEnded, WaitMode::kYield));
+      WaitForProcesses(processes.get(), count, HasEnded, WaitMode::kYield));
   for (int i = 0; i < count; ++i) {
     SELFTEST_EXPECT(ExitedWith(processes[i]->Wait(), 0));
     const int64_t user_ticks = processes[i]->stats().user_timer_ticks;
@@ -5618,7 +5818,7 @@ static bool TestUserModeSyscallBufferChecks() {
   SELFTEST_EXPECT(GetTaskScheduler() != nullptr);
   const int cpu_count = SmpCpuCount();
   const bool smap = CpuGetConfig().smap;
-  const int count = AtMost(cpu_count, kMaxBufferCheckProcesses);
+  const int count = cpu_count;
   int64_t pmm_free_before = 0;
   int64_t heap_free_before = 0;
   int64_t min_user_ticks = -1;
@@ -5719,10 +5919,15 @@ static bool KillFpuHolds(const int count, const uint64_t seed_base) {
   return KillAll(holds.get(), count, nullptr);
 }
 
-// The spin() calls of kFpuLongSyscall process `i` of a batch of
-// RunFpuLongSyscallBatches(): 2 to 4, so that the processes end at different
-// times and CPUs that run out of work take waiting ones from other CPUs.
-static int64_t LifecycleRounds(const int i) { return 2 + i % 3; }
+// The spin() calls of kFpuLongSyscall process `i` of `batch` of
+// RunFpuLongSyscallBatches() on `cpu_count` CPUs: 2 to 4, so that the
+// processes on at least one CPU finish before another CPU ends its
+// two-process phase and the idle CPU steals a waiting mid-syscall process.
+static int64_t LifecycleRounds(const int i,          //
+                               const int cpu_count,  //
+                               const int batch) {
+  return FpuLifecycleRounds(i, cpu_count, batch);
+}
 
 // (c) Runs batches of 2 × CPUs kFpuLongSyscall processes, each with values of
 // its own in the registers, until the spin() calls of the batches were
@@ -5747,11 +5952,11 @@ static bool RunFpuLongSyscallBatches(const int cpu_count,
     const ProcessArray processes = MakeProcessArray(count);
     const uint64_t seed_base =
         kLifecycleSyscallSeedBase + static_cast<uint64_t>(batch * count);
-    SELFTEST_EXPECT(
-        StartProcesses(processes.get(), count, [seed_base](const int i) {
+    SELFTEST_EXPECT(StartProcesses(
+        processes.get(), count, [seed_base, cpu_count, batch](const int i) {
           return usertest::FpuLongSyscallArg(
-              kLifecycleSyscallTicks,  //
-              LifecycleRounds(i),      //
+              kLifecycleSyscallTicks,                //
+              LifecycleRounds(i, cpu_count, batch),  //
               seed_base + static_cast<uint64_t>(i));
         }));
     SELFTEST_EXPECT(
@@ -5760,7 +5965,8 @@ static bool RunFpuLongSyscallBatches(const int cpu_count,
       SELFTEST_EXPECT(ExitedWith(processes[i]->Wait(), 0));
       const UserProcessStats stats = processes[i]->stats();
       // The spin() calls and exit().
-      SELFTEST_EXPECT(stats.syscalls == LifecycleRounds(i) + 1);
+      SELFTEST_EXPECT(stats.syscalls ==
+                      LifecycleRounds(i, cpu_count, batch) + 1);
       report->switched += stats.syscalls_switched_out;
       report->migrated += stats.syscalls_migrated;
     }
@@ -5936,10 +6142,8 @@ constexpr int kTenantKinds = 4;
 // The timer ticks of each spin() call of the loopers and of the
 // kFpuLongSyscall tenants.
 constexpr int64_t kTenantSyscallTicks = 2;
-// The batches of short processes that TestUserModeMixedWorkload() runs, and
-// the most processes of a batch.
+// The batches of short processes that TestUserModeMixedWorkload() runs.
 constexpr int kChurnBatches = 4;
-constexpr int kMaxChurnProcesses = 16;
 // The first seed of the tenants (below 2^20), and what the kFpuHold tenants
 // add to theirs.
 constexpr uint64_t kTenantSeedBase = 0x2000;
@@ -6020,23 +6224,24 @@ static bool StartTenants(const int cpu_count, MixedWorkload* const workload) {
   return true;
 }
 
-// P2: runs `batches` batches of as many short processes as CPUs (at most
-// kMaxChurnProcesses), kFpuInitialState and kSyscalls in turn, each batch at
-// once and waited for: each must exit with 0, so it started with the initial
-// x87/SSE/AVX state and saw the documented system call results. Adds their
-// number to `*count`.
+// P2: runs `batches` batches of as many short processes as CPUs,
+// kFpuInitialState and kSyscalls in turn, each batch at once and waited for:
+// each must exit with 0, so it started with the initial x87/SSE/AVX state and
+// saw the documented system call results. Adds their number to `*count`.
 static bool RunChurn(const int cpu_count, const int batches, int* const count) {
-  const int batch_size = AtMost(cpu_count, kMaxChurnProcesses);
+  const int batch_size = cpu_count;
   for (int batch = 0; batch < batches; ++batch) {
-    std::unique_ptr<UserProcess> processes[kMaxChurnProcesses];
-    SELFTEST_EXPECT(
-        StartProcesses(processes, batch_size, [batch, batch_size](const int i) {
+    const ProcessArray processes = MakeProcessArray(batch_size);
+    SELFTEST_EXPECT(StartProcesses(
+        processes.get(), batch_size, [batch, batch_size](const int i) {
           return usertest::Arg(((batch * batch_size + i) % 2 == 0)
                                    ? usertest::Mode::kFpuInitialState
                                    : usertest::Mode::kSyscalls);
         }));
-    SELFTEST_EXPECT(
-        WaitForProcesses(processes, batch_size, HasEnded, WaitMode::kYield));
+    SELFTEST_EXPECT(WaitForProcesses(processes.get(),  //
+                                     batch_size,       //
+                                     HasEnded,         //
+                                     WaitMode::kYield));
     for (int i = 0; i < batch_size; ++i) {
       SELFTEST_EXPECT(ExitedWith(processes[i]->Wait(), 0));
     }
@@ -6138,6 +6343,9 @@ static bool RunMixedWorkload(const int cpu_count,  //
     runaway = (workload.kinds[i] == TenantKind::kSpinner) ? i : -1;
   }
   SELFTEST_EXPECT(runaway >= 0);
+  if constexpr (kInjectedKillDelay == KillDelayInjection::kRunaway) {
+    workload.tenants[runaway]->ArmInjectedKillDelay(2 * kE2eKillTicks + 5);
+  }
   workload.tenants[runaway]->Kill();
   UserProcessStats runaway_stats;
   SELFTEST_EXPECT(EndedKilled(workload.tenants[runaway], &runaway_stats));
@@ -6154,8 +6362,15 @@ static bool RunMixedWorkload(const int cpu_count,  //
   // would mean that it found a corrupted register or result).
   const std::unique_ptr<UserProcessStats[]> stats =
       std::make_unique<UserProcessStats[]>(workload.count);
+  bool armed_shutdown_delay = false;
   for (int i = 0; i < workload.count; ++i) {
     if (i != runaway) {
+      if constexpr (kInjectedKillDelay == KillDelayInjection::kShutdown) {
+        if (!armed_shutdown_delay) {
+          workload.tenants[i]->ArmInjectedKillDelay(2 * kE2eShutdownTicks + 5);
+          armed_shutdown_delay = true;
+        }
+      }
       workload.tenants[i]->Kill();
     }
   }

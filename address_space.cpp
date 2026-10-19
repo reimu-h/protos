@@ -5,6 +5,7 @@
 #include <new>
 
 #include "check.h"
+#include "kill_delay_injection.h"
 #include "paging.h"
 #include "pmm.h"
 
@@ -27,7 +28,14 @@ AddressSpace::AddressSpace(const uintptr_t root) : root_(root) {
   DCHECK(root_ != 0);
 }
 
-AddressSpace::~AddressSpace() { PagingDestroyUserRoot(root_); }
+AddressSpace::~AddressSpace() {
+#if PROTOS_INJECT_KILL_DELAY != 0
+  if (inject_teardown_delay_ticks_ > 0) {
+    BusyWaitKillMeasureTicks(inject_teardown_delay_ticks_);
+  }
+#endif
+  PagingDestroyUserRoot(root_);
+}
 
 uintptr_t AddressSpace::MapNewPage(const uintptr_t user_addr,
                                    const UserPageAccess access) {

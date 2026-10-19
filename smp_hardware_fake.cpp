@@ -403,13 +403,34 @@ CpuidResult FakeSmpHardware::Cpuid(const uint32_t leaf,
       cpu.is_bsp ? options_.bsp_cpuid_apic_id.value_or(cpu.apic_id)
                  : cpu.apic_id;
   CpuidResult result;
-  if (leaf == 0) {
+  const bool hyperv =
+      options_.hyperv_tsc_hz != 0 || options_.hyperv_apic_timer_hz != 0;
+  const bool kvm = options_.kvm_base_leaf != 0;
+  if (kvm && leaf == options_.kvm_base_leaf) {
+    result.eax = options_.kvm_base_leaf + 1;
+    result.ebx = 0x4B4D564B;
+    result.ecx = 0x564B4D56;
+    result.edx = 0x0000004D;
+  } else if (kvm && leaf == options_.kvm_base_leaf + 1) {
+    result.eax = options_.kvm_steal_time ? (1u << 5) : 0;
+  } else if (hyperv && leaf == 0x40000000) {
+    // The highest hypervisor leaf and "Microsoft Hv".
+    result.eax = 0x40000006;
+    result.ebx = 0x7263694D;
+    result.ecx = 0x666F736F;
+    result.edx = 0x76482074;
+  } else if (hyperv && leaf == 0x40000003) {
+    // Access to the frequency MSRs; the TSC frequency MSR is available.
+    result.eax = 1u << 11;
+    result.edx = 1u << 8;
+  } else if (leaf == 0) {
     result.eax = options_.cpuid_max_leaf;
   } else if (leaf > options_.cpuid_max_leaf) {
     return result;
   } else if (leaf == 1) {
     result.ebx = (initial_apic_id & 0xFFu) << 24;
-    result.ecx = options_.x2apic_supported ? (1u << 21) : 0;
+    result.ecx = (options_.x2apic_supported ? (1u << 21) : 0) |
+                 ((hyperv || kvm) ? (1u << 31) : 0);
   } else if (leaf == 0x0B && options_.cpuid_leaf_0b && subleaf == 0) {
     // Level 0: SMT, one logical processor.
     result.eax = 0;
@@ -434,6 +455,12 @@ uint64_t FakeSmpHardware::ReadMsr(const uint32_t msr) {
   }
   if (msr == kMsrEfer) {
     return kEferLongMode;
+  }
+  if (msr == 0x40000022) {
+    return options_.hyperv_tsc_hz;
+  }
+  if (msr == 0x40000023) {
+    return options_.hyperv_apic_timer_hz;
   }
   if (IsX2ApicMsr(msr)) {
     EXPECT_TRUE(cpu.x2apic())
@@ -493,7 +520,7 @@ void FakeSmpHardware::WriteLapicMmio(const uintptr_t /*lapic_base*/,
 
 uint8_t FakeSmpHardware::InByte(const uint16_t port) {
   const std::lock_guard<std::mutex> lock(mutex_);
-  if (port != kPitSpeakerPort) {
+  if (port != kPitSpeakerPort || !options_.pit_present) {
     return 0xFF;
   }
   if (pit_counting_ && !pit_out2_ && options_.pit_responds) {
@@ -511,6 +538,9 @@ uint8_t FakeSmpHardware::InByte(const uint16_t port) {
 
 void FakeSmpHardware::OutByte(const uint16_t port, const uint8_t value) {
   const std::lock_guard<std::mutex> lock(mutex_);
+  if (!options_.pit_present) {
+    return;
+  }
   if (port == kPitCommandPort) {
     pit_command_ = value;
     pit_reload_bytes_ = 0;
@@ -518,6 +548,11 @@ void FakeSmpHardware::OutByte(const uint16_t port, const uint8_t value) {
   } else if (port == kPitChannel2Port) {
     pit_reload_ |= static_cast<uint32_t>(value) << (8 * pit_reload_bytes_);
     ++pit_reload_bytes_;
+    // In mode 0, writing the count drives OUT2 low.
+    if (pit_reload_bytes_ == 2 && pit_command_ == kPitChannel2Mode0) {
+      pit_out2_ = false;
+      pit_counting_ = false;
+    }
   } else if (port == kPitSpeakerPort) {
     const bool gate_rises = (port61_ & kPitGate2) == 0 && (value & kPitGate2);
     port61_ = static_cast<uint8_t>(value & 0x0F);

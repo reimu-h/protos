@@ -150,6 +150,12 @@ struct UserProcessStats {
   // state is freed, so that a test can tell whether a later process got the
   // same memory.
   uintptr_t fpu_state = 0;
+  // Excluded steal-time ticks (`floor(max(0, E1 - B0) / P_conv)`) and
+  // diagnostics for a killed process once `end_tick >= 0`.
+  int64_t kill_steal_ticks = 0;
+  int64_t kill_notice_tick = -1;
+  int kill_end_cpu = -1;
+  bool kill_same_cpu_no_switch = false;
 };
 
 // A user process: a task that loads a user program into a new address space,
@@ -186,6 +192,12 @@ class UserProcess {
   // `Wait()` has started, it only sets the request. Must not be called by an
   // interrupt handler: it takes a lock that the interrupted code may hold.
   void Kill();
+
+  // Arms a synthetic post-kill delay of `ticks` non-stolen timer ticks for the
+  // delay-injection proofs (`INJECT_KILL_DELAY=<variant>`).
+  void ArmInjectedKillDelay(int64_t ticks) {
+    injected_kill_delay_ticks_.store(ticks, std::memory_order_release);
+  }
 
   // The number of system calls that the program has made so far.
   int64_t syscall_count() const {
@@ -241,6 +253,8 @@ class UserProcess {
                TickMeter* meter) const;
   // Adds a finished system call, which `meter` measured, to the counters.
   void RecordSyscall(const TickMeter& meter);
+  void RecordKillNoticeIrqsOff();
+  void RecordEnd();
   // Ends the killed program on the way back from the interrupt or system call
   // of `frame`.
   [[noreturn]] void EndKilled(const InterruptFrame* frame);
@@ -271,6 +285,7 @@ class UserProcess {
   std::atomic<int64_t> kill_tick_{-1};
   std::atomic<int> kill_running_cpu_{-1};
   std::atomic<bool> kill_in_syscall_{false};
+  std::atomic<int64_t> killer_steal_ns_at_kill_{-1};
   // Written only by the task (and its interrupt handlers); read by stats().
   std::atomic<int64_t> syscalls_switched_out_{0};
   std::atomic<int64_t> syscalls_migrated_{0};
@@ -281,6 +296,14 @@ class UserProcess {
   std::atomic<int> end_vector_{-1};
   std::atomic<int64_t> end_tick_{-1};
   std::atomic<uintptr_t> fpu_state_{0};
+  std::atomic<int64_t> kill_notice_tick_{-1};
+  std::atomic<int64_t> killed_steal_ns_at_notice_{-1};
+  std::atomic<int> kill_notice_cpu_{-1};
+  std::atomic<int64_t> kill_notice_switches_{-1};
+  std::atomic<int64_t> killed_steal_ns_at_end_{-1};
+  std::atomic<int> kill_end_cpu_{-1};
+  std::atomic<int64_t> kill_end_switches_{-1};
+  std::atomic<int64_t> injected_kill_delay_ticks_{0};
 };
 
 }  // namespace protos

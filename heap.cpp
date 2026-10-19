@@ -1,5 +1,6 @@
 #include "heap.h"
 
+#include <atomic>
 #include <cstddef>
 #include <cstdint>
 #include <new>
@@ -78,6 +79,11 @@ using FreeBlockTree =
 // operations. When `Kmalloc` triggers `HeapExpand -> PmmAllocFrames`, lock
 // acquisition follows the strict order `g_heap_lock -> g_pmm_lock`.
 IrqSpinLock g_heap_lock;
+
+// Lock-free singly-linked list of blocks freed while `g_heap_lock` was
+// contended, linked through `block->rb_node.left`. Drained under `g_heap_lock`
+// at the start and end of every locked heap critical section.
+std::atomic<HeapBlockHeader*> g_queued_frees{nullptr};
 
 // Intrusive Red-Black Tree containing all currently FREE heap blocks across all
 // PMM arenas, keyed by each block header's physical address (`uintptr_t`) and
@@ -400,63 +406,14 @@ static void* KmallocAlignedLocked(const int64_t size, const int64_t alignment) {
   return reinterpret_cast<void*>(candidate + 1);
 }
 
-}  // namespace
-
-void HeapInit() {
-  const IrqSpinLockGuard lock_guard(g_heap_lock);
-  g_free_tree.Clear();
-  g_total_free_bytes = 0;
-  g_heap_initialized = false;
-  g_max_phys_addr = PmmMaxPhysicalAddress();
-
-  const uintptr_t arena_addr = PmmAllocFrames(kInitialHeapFrames);
-  CHECK(arena_addr != 0);
-  HeapInsertArena(arena_addr, kInitialHeapFrames * kPageSize);
-  g_heap_initialized = true;
-}
-
-int64_t HeapTotalFreeBytes() {
-  const IrqSpinLockGuard lock_guard(g_heap_lock);
-  return g_total_free_bytes;
-}
-
-void* KmallocAligned(const int64_t size, const int64_t alignment) {
-  const IrqSpinLockGuard lock_guard(g_heap_lock);
-  return KmallocAlignedLocked(size, alignment);
-}
-
-// Address-ordered first-fit allocator over `g_free_tree`:
-// 1. Rounds `size` up to a non-zero multiple of `kHeapAlignment` (16 bytes).
-// 2. Queries `g_free_tree.FindFirstAugmented` in O(log n) time for the lowest-
-//    address free block with `size >= aligned_size`, removes it from the free
-//    tree, splits off any excess tail via `HeapSplitBlock`, and returns the
-//    payload pointer (`candidate + 1`).
-// 3. If no existing free block fits, expands the heap via `HeapExpand`.
-void* Kmalloc(const int64_t size) {
-  const IrqSpinLockGuard lock_guard(g_heap_lock);
-  DCHECK(g_heap_initialized);
-  DCHECK(size >= 0);
-  return KmallocAlignedLocked(size, kHeapAlignment);
-}
-
-// Validates that `ptr` points to a live, 16-byte-aligned payload preceded by a
-// valid in-use `HeapBlockHeader`, restores any shifted alignment header,
-// inserts the block into `g_free_tree`, and coalesces it with physically
-// adjacent free neighbors in O(log n) time. Double frees fail the header's
-// `magic`/`is_free` checks, which is best effort: once a freed block has been
-// coalesced or reused, its old header bytes may have been overwritten.
-void Kfree(void* const ptr) {
-  if (ptr == nullptr) {
-    return;
-  }
-  const IrqSpinLockGuard lock_guard(g_heap_lock);
+static HeapBlockHeader* LiveBlockOf(void* const ptr) {
   DCHECK(g_heap_initialized);
   const uintptr_t ptr_addr = reinterpret_cast<uintptr_t>(ptr);
   DCHECK(ptr_addr >= kLowerMemoryLimit + kBlockHeaderSize);
   DCHECK(ptr_addr < g_max_phys_addr);
   DCHECK((ptr_addr & (kHeapAlignment - 1)) == 0);
 
-  HeapBlockHeader* block = reinterpret_cast<HeapBlockHeader*>(ptr) - 1;
+  HeapBlockHeader* const block = reinterpret_cast<HeapBlockHeader*>(ptr) - 1;
   CHECK(block->magic == kHeapBlockMagic);
   CHECK(block->is_free == 0);
   DCHECK(block->size >= kHeapAlignment);
@@ -466,7 +423,12 @@ void Kfree(void* const ptr) {
   DCHECK((block->align_offset & (kHeapAlignment - 1)) == 0);
   DCHECK(ptr_addr >= kLowerMemoryLimit + kBlockHeaderSize +
                          static_cast<uintptr_t>(block->align_offset));
+  return block;
+}
 
+static void ReturnBlockToHeapLocked(HeapBlockHeader* block) {
+  CHECK(block->magic == kHeapBlockMagic);
+  CHECK(block->is_free == 0);
   if (block->align_offset > 0) {
     const int64_t shift = block->align_offset;
     const int64_t restored_size = block->size + shift;
@@ -490,6 +452,107 @@ void Kfree(void* const ptr) {
   HeapCoalesceBlock(block);
 }
 
+static void AddQueuedFreesLocked() {
+  if (!g_heap_initialized) {
+    return;
+  }
+  while (g_queued_frees.load(std::memory_order_relaxed) != nullptr) {
+    HeapBlockHeader* block =
+        g_queued_frees.exchange(nullptr, std::memory_order_acquire);
+    while (block != nullptr) {
+      HeapBlockHeader* const next =
+          reinterpret_cast<HeapBlockHeader*>(block->rb_node.left);
+      block->rb_node.left = nullptr;
+      ReturnBlockToHeapLocked(block);
+      block = next;
+    }
+  }
+}
+
+class HeapLockGuard {
+ public:
+  HeapLockGuard() {
+    g_heap_lock.Lock();
+    AddQueuedFreesLocked();
+  }
+
+  ~HeapLockGuard() {
+    AddQueuedFreesLocked();
+    g_heap_lock.Unlock();
+  }
+
+  HeapLockGuard(const HeapLockGuard&) = delete;
+  HeapLockGuard& operator=(const HeapLockGuard&) = delete;
+};
+
+}  // namespace
+
+void HeapInit() {
+  const IrqSpinLockGuard lock_guard(g_heap_lock);
+  g_queued_frees.store(nullptr, std::memory_order_relaxed);
+  g_free_tree.Clear();
+  g_total_free_bytes = 0;
+  g_heap_initialized = false;
+  g_max_phys_addr = PmmMaxPhysicalAddress();
+
+  const uintptr_t arena_addr = PmmAllocFrames(kInitialHeapFrames);
+  CHECK(arena_addr != 0);
+  HeapInsertArena(arena_addr, kInitialHeapFrames * kPageSize);
+  g_heap_initialized = true;
+}
+
+int64_t HeapTotalFreeBytes() {
+  const HeapLockGuard lock_guard;
+  return g_total_free_bytes;
+}
+
+void* KmallocAligned(const int64_t size, const int64_t alignment) {
+  const HeapLockGuard lock_guard;
+  return KmallocAlignedLocked(size, alignment);
+}
+
+// Address-ordered first-fit allocator over `g_free_tree`:
+// 1. Rounds `size` up to a non-zero multiple of `kHeapAlignment` (16 bytes).
+// 2. Queries `g_free_tree.FindFirstAugmented` in O(log n) time for the lowest-
+//    address free block with `size >= aligned_size`, removes it from the free
+//    tree, splits off any excess tail via `HeapSplitBlock`, and returns the
+//    payload pointer (`candidate + 1`).
+// 3. If no existing free block fits, expands the heap via `HeapExpand`.
+void* Kmalloc(const int64_t size) {
+  const HeapLockGuard lock_guard;
+  DCHECK(g_heap_initialized);
+  DCHECK(size >= 0);
+  return KmallocAlignedLocked(size, kHeapAlignment);
+}
+
+// Validates that `ptr` points to a live, 16-byte-aligned payload preceded by a
+// valid in-use `HeapBlockHeader`, restores any shifted alignment header,
+// inserts the block into `g_free_tree`, and coalesces it with physically
+// adjacent free neighbors in O(log n) time. If another CPU holds `g_heap_lock`,
+// queues the validated block on `g_queued_frees` for the lock holder to drain.
+// Double frees fail the header's `magic`/`is_free` checks, which is best
+// effort: once a freed block has been coalesced or reused, its old header bytes
+// may have been overwritten.
+void Kfree(void* const ptr) {
+  if (ptr == nullptr) {
+    return;
+  }
+  HeapBlockHeader* const block = LiveBlockOf(ptr);
+  if (g_heap_lock.TryLock()) {
+    AddQueuedFreesLocked();
+    ReturnBlockToHeapLocked(block);
+    AddQueuedFreesLocked();
+    g_heap_lock.Unlock();
+    return;
+  }
+
+  HeapBlockHeader* head = g_queued_frees.load(std::memory_order_relaxed);
+  do {
+    block->rb_node.left = reinterpret_cast<RbNode*>(head);
+  } while (!g_queued_frees.compare_exchange_weak(
+      head, block, std::memory_order_release, std::memory_order_relaxed));
+}
+
 void* KmallocForNewNothrow(const size_t size, const size_t alignment) noexcept {
   if (size > static_cast<size_t>(INT64_MAX) ||
       alignment > static_cast<size_t>(kPageSize)) {
@@ -505,6 +568,28 @@ void* KmallocForNew(const size_t size, const size_t alignment) {
         "operator new: heap exhausted or alignment above kPageSize");
   return ptr;
 }
+
+#if __STDC_HOSTED__
+void HeapLockForTest() { g_heap_lock.Lock(); }
+
+void HeapUnlockForTest() { g_heap_lock.Unlock(); }
+
+void HeapDrainAndUnlockForTest() {
+  AddQueuedFreesLocked();
+  g_heap_lock.Unlock();
+}
+
+int64_t HeapQueuedFreeCountForTest() {
+  DCHECK(g_heap_lock.IsLockedByCurrentCpu());
+  int64_t count = 0;
+  for (HeapBlockHeader* node = g_queued_frees.load(std::memory_order_acquire);
+       node != nullptr;
+       node = reinterpret_cast<HeapBlockHeader*>(node->rb_node.left)) {
+    ++count;
+  }
+  return count;
+}
+#endif
 
 }  // namespace protos
 

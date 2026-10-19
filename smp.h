@@ -10,6 +10,7 @@
 #include "check.h"
 #include "gdt.h"
 #include "interrupts.h"
+#include "steal_time.h"
 
 namespace protos {
 
@@ -96,8 +97,12 @@ struct alignas(64) CpuLocal {
   // every switch must go through it. Code that reads it at two points learns
   // how many timer interrupts interrupted it in between (cpu_clock.h).
   std::atomic<int64_t> task_timer_ticks{0};
+  // 64-byte-aligned KVM paravirtualized steal-time page registered with
+  // `kMsrKvmStealTime` when `SmpHasStealTime()` is true.
+  KvmStealTime kvm_steal_time = {};
 };
 static_assert(offsetof(CpuLocal, self) == 0);
+static_assert((offsetof(CpuLocal, kvm_steal_time) % 64) == 0);
 static_assert(alignof(CpuLocal) == 64);
 static_assert(std::is_standard_layout_v<CpuLocal>);
 
@@ -455,6 +460,28 @@ void SmpStopOtherCpusForPanic();
 // (`DCHECK`) and flushes only the calling CPU's TLB. Fails a `CHECK` if a CPU
 // does not respond within 10 s.
 void SmpTlbShootdown();
+
+// Returns true if `SmpInit()` detected `KVM_FEATURE_STEAL_TIME` and registered
+// each CPU's `CpuLocal::kvm_steal_time` page via `kMsrKvmStealTime`.
+bool SmpHasStealTime();
+
+// Returns the calling CPU's cumulative KVM steal time in nanoseconds, 0 if
+// steal time is not enabled, or -1 if no `CpuLocal` is bound or no consistent
+// snapshot was obtained. Requires local interrupts to be disabled (`DCHECK`).
+int64_t SmpOwnStealNsIrqsOff();
+
+// Returns CPU `cpu_index`'s cumulative KVM steal time in nanoseconds, 0 if
+// steal time is not enabled, or -1 if `SmpInit()` has not completed,
+// `cpu_index` is out of range, or no consistent snapshot was obtained.
+int64_t SmpStealNsOfCpu(int cpu_index);
+
+// Returns a conservative upper bound (in nanoseconds) on the duration of one
+// `GlobalTimerTicks()` tick (`kApicTimerTargetHz = 250 Hz`, ~4 ms).
+int64_t SmpTimerTickNsUpperBound();
+
+// Returns a conservative lower bound (in nanoseconds) on the duration of one
+// `GlobalTimerTicks()` tick (`kApicTimerTargetHz = 250 Hz`, ~4 ms).
+int64_t SmpTimerTickNsLowerBound();
 
 #if __STDC_HOSTED__
 // Host unit-test wrappers around internal helpers of `SmpDiscoverTopology` and

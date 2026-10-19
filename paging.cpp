@@ -425,11 +425,14 @@ static uint64_t* EnsureUserTableLocked(uint64_t* const entry) {
   return reinterpret_cast<uint64_t*>(*entry & kPteAddressMask);
 }
 
-// Frees the user page table at `table_phys` together with everything below
-// it: the tables it points to and, if it is a PT (`level` 1; 2 for a PD, 3 for
-// a PDPT), the frames that it maps.
-static void FreeUserTable(const uintptr_t table_phys, const int level) {
+// Appends the user page table at `table_phys` and everything below it to
+// `*frames`: the tables it points to and, if it is a PT (`level` 1; 2 for a
+// PD, 3 for a PDPT), the frames that it maps.
+static void CollectUserTable(const uintptr_t table_phys,  //
+                             const int level,             //
+                             PmmFrameList* const frames) {
   DCHECK(level >= 1 && level <= 3);
+  DCHECK(frames != nullptr);
   const uint64_t* const entries = reinterpret_cast<const uint64_t*>(table_phys);
   for (int i = 0; i < kEntriesPerPageTable; ++i) {
     const uint64_t entry = entries[i];
@@ -437,13 +440,13 @@ static void FreeUserTable(const uintptr_t table_phys, const int level) {
       continue;
     }
     if (level == 1) {
-      PmmFreeFrame(entry & kPteAddressMask);
+      frames->Add(entry & kPteAddressMask);
     } else {
       DCHECK((entry & kPteHugePage) == 0);
-      FreeUserTable(entry & kPteAddressMask, level - 1);
+      CollectUserTable(entry & kPteAddressMask, level - 1, frames);
     }
   }
-  PmmFreeFrame(table_phys);
+  frames->Add(table_phys);
 }
 
 // Returns true if user code may access the page at page-aligned `user_page` in
@@ -842,13 +845,15 @@ void PagingDestroyUserRoot(const uintptr_t root) {
   DCHECK(ReadCr3() != root);
   // Nothing else uses `root`, and its user page tables belong to it alone, so
   // the lock is not needed (and not held while many frames are freed).
+  PmmFrameList frames;
   const uint64_t* const pml4 = reinterpret_cast<const uint64_t*>(root);
   for (int i = kFirstUserPml4Entry; i < kEntriesPerPageTable; ++i) {
     if ((pml4[i] & kPtePresent) != 0) {
-      FreeUserTable(pml4[i] & kPteAddressMask, 3);
+      CollectUserTable(pml4[i] & kPteAddressMask, 3, &frames);
     }
   }
-  PmmFreeFrame(root);
+  frames.Add(root);
+  PmmFreeFrameList(&frames);
 }
 
 }  // namespace protos

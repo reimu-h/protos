@@ -48,10 +48,15 @@ class AddressSpace {
   // The root of the page tables: the physical address of the PML4.
   uintptr_t root() const { return root_; }
 
+  void SetInjectTeardownDelayTicks(const int64_t ticks) {
+    inject_teardown_delay_ticks_ = ticks;
+  }
+
  private:
   explicit AddressSpace(uintptr_t root);
 
   const uintptr_t root_;
+  int64_t inject_teardown_delay_ticks_ = 0;
 };
 
 // Switches the calling CPU to the page tables of `address_space`, or to the

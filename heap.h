@@ -81,6 +81,18 @@ void* KmallocForNewNothrow(size_t size, size_t alignment) noexcept;
 // result without checking it.
 void* KmallocForNew(size_t size, size_t alignment);
 
+#if __STDC_HOSTED__
+// Acquires and releases the heap spinlock directly for host tests that verify
+// lock-free queueing when `Kfree` observes a contended lock.
+void HeapLockForTest();
+void HeapUnlockForTest();
+void HeapDrainAndUnlockForTest();
+
+// Returns the number of queued blocks that no lock holder has returned to the
+// free tree yet. Requires `HeapLockForTest()`.
+int64_t HeapQueuedFreeCountForTest();
+#endif
+
 }  // namespace protos
 
 #endif  // PROTOS_HEAP_H_

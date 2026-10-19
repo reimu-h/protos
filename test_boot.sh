@@ -26,9 +26,28 @@
 # SMEP only. Besides the markers that each pass requires, the markers that
 # would contradict its CPU model (a protection, state component or test
 # coverage that the CPU lacks, or a probe that it should run but skipped) must
-# be absent, and each boot report line must not contradict itself.
+# be absent, and each boot report line must not contradict itself. Whether the
+# kernel resets the x87 pointers, which the boot report names as well, must
+# follow the vendor and XSAVEERPTR feature of the vCPUs, which QEMU reports
+# over QMP in every pass (see verify_x87_pointer_reset).
 #
-# Usage: test_boot.sh [kernel.iso [kernel-mb1.iso]]
+# Usage: test_boot.sh [--passes LIST] [--artifact-dir DIR] [--drain-on-fail]
+#                     [kernel.iso [kernel-mb1.iso]]
+#
+# Options (for deflake.py; never passed by make):
+#   --passes LIST      Run only these passes (names from: bios uefi mb1 max
+#                      smep, separated by spaces or commas), in the usual
+#                      order, each with all of its checks (default: all).
+#   --artifact-dir DIR Also save, for each pass that runs, its QEMU command
+#                      line (qemu_argv, NUL-terminated arguments, and
+#                      qemu_cwd), its complete serial log (serial.log), its
+#                      output (output.log) and its result (result: PASS,
+#                      FAIL or SKIPPED) in <dir>/<pass>/.
+#   --drain-on-fail    When the serial log of a pass shows a failure, keep
+#                      QEMU running until the self-tests end, the kernel
+#                      panics, QEMU exits or the timeout expires, so that the
+#                      log also has the results of the later tests. The pass
+#                      fails as before.
 #
 # Environment:
 #   BIOS_TIMEOUT_SECS  Timeout of each legacy BIOS pass (default: 60).
@@ -43,8 +62,10 @@
 #   REQUIRE_UEFI=1     Fail instead of skipping when no OVMF image is found.
 #   KVM=1              Run QEMU with KVM acceleration: -enable-kvm -cpu host in
 #                      every pass (-cpu host,+x2apic in the UEFI pass), so the
-#                      checks that depend on the CPU model are skipped, and so
-#                      is the smep pass, whose CPU model only TCG provides.
+#                      checks that depend on the CPU model are skipped (except
+#                      the x87 pointer reset check, which reads the vendor and
+#                      XSAVEERPTR of the vCPUs from QEMU), and so is the smep
+#                      pass, whose CPU model only TCG provides.
 #                      Needs read and write access to /dev/kvm.
 set -euo pipefail
 
@@ -60,6 +81,55 @@ abs_path() {
     printf '%s\n' "${ORIG_PWD}/$1"
   fi
 }
+
+PASSES_SPEC=""
+PASSES_SET=0
+ARTIFACT_DIR=""
+DRAIN_ON_FAIL=0
+while [[ $# -gt 0 && "$1" == --* ]]; do
+  case "$1" in
+    --passes=*)
+      PASSES_SPEC="${1#*=}"
+      PASSES_SET=1
+      ;;
+    --passes)
+      if [[ $# -lt 2 ]]; then
+        echo "FAIL: --passes requires a pass list (passes: bios uefi mb1 max smep)." >&2
+        exit 1
+      fi
+      PASSES_SPEC="$2"
+      PASSES_SET=1
+      shift
+      ;;
+    --artifact-dir=*)
+      if [[ -z "${1#*=}" ]]; then
+        echo "FAIL: --artifact-dir requires a non-empty directory path." >&2
+        exit 1
+      fi
+      ARTIFACT_DIR="$(abs_path "${1#*=}")"
+      ;;
+    --artifact-dir)
+      if [[ $# -lt 2 || -z "$2" ]]; then
+        echo "FAIL: --artifact-dir requires a non-empty directory path." >&2
+        exit 1
+      fi
+      ARTIFACT_DIR="$(abs_path "$2")"
+      shift
+      ;;
+    --drain-on-fail)
+      DRAIN_ON_FAIL=1
+      ;;
+    --)
+      shift
+      break
+      ;;
+    *)
+      echo "FAIL: Unknown option '$1' (options: --passes LIST, --artifact-dir DIR, --drain-on-fail)." >&2
+      exit 1
+      ;;
+  esac
+  shift
+done
 
 if [[ $# -ge 1 ]]; then
   ISO_FILE="$(abs_path "$1")"
@@ -116,6 +186,8 @@ STRESS_MARKER="[STRESS] random_multicpu_stress: PASS"
 # Any test failure line contains "FAIL"; kernel panics (failed CHECKs and
 # unhandled CPU exceptions) print "[FATAL]".
 FAILURE_PATTERN='FAIL|\[FATAL\]'
+# The end of the self-tests (either result) or a kernel panic.
+SUITE_END_OR_PANIC_PATTERN='\[TEST\] (ALL BOOT SELF-TESTS PASSED|BOOT SELF-TESTS FAILED)|\[FATAL\]'
 
 REQUIRED_MARKERS=(
   "[PMM] mmap entry:"
@@ -173,17 +245,17 @@ REQUIRED_MARKERS=(
 )
 
 # Markers that depend on the CPU model of a pass: the kernel's report of how it
-# keeps the x87/SSE/AVX state, whether it resets the x87 pointers (it must on
-# every pass: under TCG, QEMU 7.2's qemu64 and max models, on which all passes
-# are based, are AMD CPUs without XSaveErPtr; Intel models such as Nehalem
-# would report "disabled") and whether it enabled SMEP and SMAP, whether the
+# keeps the x87/SSE/AVX state and whether it enabled SMEP and SMAP, whether the
 # FPU isolation self-test covered the upper halves of the YMM registers, and
 # which SMAP and SMEP probes the protection self-tests ran and which they
 # skipped. With KVM=1 every pass runs on the host CPU, whose features are
 # unknown, so only the start of each report and probe line, which does not
-# depend on the CPU, is required.
+# depend on the CPU, is required. Whether the kernel resets the x87 pointers
+# depends on the vendor and XSAVEERPTR of the vCPUs, which can differ between
+# QEMU versions for the same model (QEMU 7.2's max lacks XSAVEERPTR, 11.1's has
+# it), so verify_x87_pointer_reset checks that report in every pass, with KVM=1
+# too, against the vCPUs as QEMU reports them.
 FPU_AVX_NOT_COVERED="[TEST] user_mode_fpu_isolation: AVX not covered (CPU has no AVX state)"
-X87_POINTER_RESET="[CPU] x87 pointer reset: enabled"
 SMAP_PROBES_SKIPPED="[TEST] smap_smep_protection: smap probes skipped (SMAP disabled)"
 SMEP_PROBE_SKIPPED="[TEST] smap_smep_protection: smep probe skipped (SMEP disabled)"
 SMEP_PROBE_RAN="[TEST] smap_smep_protection: smep exec probe recovered on 4/4 CPUs (error code 0x11)"
@@ -214,7 +286,6 @@ else
   QEMU64_MARKERS=(
     "[CPU] FPU state: FXSAVE, 512 bytes"
     "${FPU_AVX_NOT_COVERED}"
-    "${X87_POINTER_RESET}"
     "[CPU] SMEP: disabled, SMAP: disabled"
     "[TEST] cpu_protection_features: cpus=4 smep=off smap=off xcr0=none"
     "${SMAP_PROBES_SKIPPED}"
@@ -227,7 +298,6 @@ else
   MAX_MARKERS=(
     "[CPU] FPU state: XSAVE, XCR0=0x7 (x87 SSE AVX)"
     "[TEST] user_mode_fpu_isolation: covered AVX YMM upper halves"
-    "${X87_POINTER_RESET}"
     "[CPU] SMEP: enabled, SMAP: enabled"
     "[TEST] cpu_protection_features: cpus=4 smep=on smap=on xcr0=0x7"
     "[TEST] smap_smep_protection: smap read probe recovered on 4/4 CPUs (error code 0x1)"
@@ -241,7 +311,6 @@ else
   SMEP_MARKERS=(
     "[CPU] FPU state: XSAVE, XCR0=0x3 (x87 SSE)"
     "${FPU_AVX_NOT_COVERED}"
-    "${X87_POINTER_RESET}"
     "[CPU] SMEP: enabled, SMAP: disabled"
     "[TEST] cpu_protection_features: cpus=4 smep=on smap=off xcr0=0x3"
     "${SMEP_PROBE_RAN}"
@@ -305,14 +374,50 @@ for name in "${PASS_NAMES[@]}"; do
   TEMP_FILES+=(
     "${BUILD_DIR}/serial_${name}_output.log"
     "${BUILD_DIR}/qemu_${name}_monitor.sock"
+    "${BUILD_DIR}/qemu_${name}_qmp.sock"
     "${BUILD_DIR}/vga_${name}_dump.bin"
     "${BUILD_DIR}/${name}_pass_stdout.log"
     "${BUILD_DIR}/${name}_pass_result"
   )
 done
 TEMP_FILES+=("${BUILD_DIR}/ovmf_vars.fd")
+if [[ "${PASSES_SET}" -eq 1 ]]; then
+  IFS=', ' read -r -a wanted_passes <<<"${PASSES_SPEC}"
+  for wanted in ${wanted_passes[@]+"${wanted_passes[@]}"}; do
+    if [[ -n "${wanted}" && " ${PASS_NAMES[*]} " != *" ${wanted} "* ]]; then
+      echo "FAIL: --passes names an unknown pass '${wanted}' (passes: ${PASS_NAMES[*]})." >&2
+      exit 1
+    fi
+  done
+  selected_passes=()
+  for name in "${PASS_NAMES[@]}"; do
+    if [[ " ${wanted_passes[*]-} " == *" ${name} "* ]]; then
+      selected_passes+=("${name}")
+    fi
+  done
+  if [[ "${#selected_passes[@]}" -eq 0 ]]; then
+    echo "FAIL: --passes='${PASSES_SPEC}' selects no pass (passes: ${PASS_NAMES[*]})." >&2
+    exit 1
+  fi
+  PASS_NAMES=("${selected_passes[@]}")
+  echo "Running only the passes that --passes selects: ${PASS_NAMES[*]}."
+fi
 
+PASSES_STARTED=0
 cleanup() {
+  if [[ -n "${ARTIFACT_DIR}" && "${PASSES_STARTED}" -eq 1 ]]; then
+    local name
+    for name in "${PASS_NAMES[@]}"; do
+      if [[ ! -f "${ARTIFACT_DIR}/${name}/result" ]]; then
+        { mkdir -p "${ARTIFACT_DIR}/${name}" &&
+          { [[ ! -f "${BUILD_DIR}/serial_${name}_output.log" ]] ||
+            cp "${BUILD_DIR}/serial_${name}_output.log" "${ARTIFACT_DIR}/${name}/serial.log"; } &&
+          { [[ ! -f "${BUILD_DIR}/${name}_pass_stdout.log" ]] ||
+            cp "${BUILD_DIR}/${name}_pass_stdout.log" "${ARTIFACT_DIR}/${name}/output.log"; }; } ||
+          echo "WARNING: Could not save the artifacts of the ${name} pass in '${ARTIFACT_DIR}'." >&2
+      fi
+    done
+  fi
   rm -f "${TEMP_FILES[@]}"
 }
 trap cleanup EXIT
@@ -347,6 +452,7 @@ wait_for_boot() {
   while ((SECONDS < deadline)); do
     if [[ -f "${log}" ]]; then
       if grep -Eq -- "${FAILURE_PATTERN}" "${log}"; then
+        drain_after_failure "${log}" "${pid}" "${deadline}"
         return 1
       fi
       if grep -Fq -- "${EXPECTED_STRING}" "${log}" &&
@@ -361,6 +467,25 @@ wait_for_boot() {
     sleep 0.1
   done
   return 1
+}
+
+# With --drain-on-fail, waits after a failure line in the serial log $1 of QEMU
+# process $2 until the self-tests ended, the kernel panicked, QEMU exited or
+# SECONDS reached $3, then one more second for trailing output, so that the log
+# also has the results of the later tests. The pass fails either way; this only
+# delays stopping QEMU.
+drain_after_failure() {
+  local log="$1" pid="$2" deadline="$3"
+  if [[ "${DRAIN_ON_FAIL}" != "1" ]]; then
+    return 0
+  fi
+  while ((SECONDS < deadline)) && kill -0 "${pid}" 2>/dev/null; do
+    if grep -Eq -- "${SUITE_END_OR_PANIC_PATTERN}" "${log}"; then
+      sleep 1
+      return 0
+    fi
+    sleep 0.1
+  done
 }
 
 # Checks the serial log $1 of QEMU process $2 after wait_for_boot succeeded:
@@ -441,6 +566,120 @@ verify_pass_absent_markers() {
   esac
   verify_consistent_reports "${log}" "${REPORT_PREFIXES[@]}" &&
     verify_absent_markers "${log}" ${absent[@]+"${absent[@]}"}
+}
+
+# Prints "<xsaveerptr> <vendor>" of the vCPUs of the QEMU whose QMP socket is
+# $1, for example "false AuthenticAMD": the QOM properties xsaveerptr and
+# vendor of each vCPU, which are what its CPUID tells the guest. Fails, within
+# 10 seconds, unless QEMU reports exactly $2 vCPUs and all of them agree.
+# Requires python3.
+qmp_vcpu_features() {
+  python3 - "$1" "$2" <<'EOF'
+import json
+import socket
+import sys
+import time
+
+sock_path, cpu_count = sys.argv[1], int(sys.argv[2])
+deadline = time.monotonic() + 10
+conn = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+received = b""
+last_id = 0
+
+
+def receive():
+    """Returns the next QMP message (one JSON object per line)."""
+    global received
+    while b"\n" not in received:
+        conn.settimeout(max(deadline - time.monotonic(), 0.001))
+        data = conn.recv(65536)
+        if not data:
+            raise EOFError("QEMU closed the QMP connection")
+        received += data
+    line, received = received.split(b"\n", 1)
+    return json.loads(line)
+
+
+def execute(command, **arguments):
+    """Runs QMP command `command` and returns its result, skipping events."""
+    global last_id
+    last_id += 1
+    request = {"execute": command, "id": last_id}
+    if arguments:
+        request["arguments"] = arguments
+    conn.sendall(json.dumps(request).encode() + b"\n")
+    reply = receive()
+    while "event" in reply:
+        reply = receive()
+    if reply.get("id") != last_id or "return" not in reply:
+        raise RuntimeError("%s: unexpected reply %r" % (command, reply))
+    return reply["return"]
+
+
+try:
+    conn.settimeout(10)
+    conn.connect(sock_path)
+    if "QMP" not in receive():
+        raise RuntimeError("no QMP greeting")
+    execute("qmp_capabilities")
+    paths = sorted({cpu["qom-path"] for cpu in execute("query-cpus-fast")})
+    if len(paths) != cpu_count:
+        raise RuntimeError("expected %d vCPUs, found %r" % (cpu_count, paths))
+    features = {}
+    for path in paths:
+        xsaveerptr = execute("qom-get", path=path, property="xsaveerptr")
+        vendor = execute("qom-get", path=path, property="vendor")
+        if (not isinstance(xsaveerptr, bool) or not isinstance(vendor, str) or
+                not vendor.strip()):
+            raise RuntimeError(
+                "%s: xsaveerptr=%r vendor=%r" % (path, xsaveerptr, vendor))
+        features[path] = (xsaveerptr, vendor)
+    if len(set(features.values())) != 1:
+        raise RuntimeError("the vCPUs differ: %r" % features)
+except Exception as e:  # Whatever went wrong, the check must fail.
+    print("QMP query of the vCPUs failed: %s" % e, file=sys.stderr)
+    sys.exit(1)
+xsaveerptr, vendor = features[paths[0]]
+print("true" if xsaveerptr else "false", vendor)
+EOF
+}
+
+# Checks the x87 pointer reset report in serial log $1 against the vCPUs of the
+# QEMU whose QMP socket is $2. The kernel resets the x87 pointers exactly on AMD
+# CPUs without XSAVEERPTR, which save and restore them only while an x87
+# exception is pending (CpuChooseConfig in cpu.cpp), so the report must say
+# "enabled" if the vCPUs are AuthenticAMD without XSAVEERPTR and "disabled"
+# otherwise, and the opposite report must be absent. QEMU, not the kernel,
+# tells which; the check fails, never skips, if QEMU can't tell.
+verify_x87_pointer_reset() {
+  local log="$1" sock="$2"
+  if ! command -v python3 >/dev/null 2>&1; then
+    echo "FAIL: python3 not found; the x87 pointer reset check needs it to ask QEMU for the vendor and XSAVEERPTR of the vCPUs." >&2
+    return 1
+  fi
+  local features
+  if ! features="$(qmp_vcpu_features "${sock}" "${VCPUS_PER_PASS}")"; then
+    echo "FAIL: Could not read the vendor and XSAVEERPTR of the vCPUs through QMP, which decide the expected '[CPU] x87 pointer reset:' report." >&2
+    return 1
+  fi
+  local xsaveerptr vendor
+  read -r xsaveerptr vendor <<<"${features}"
+  local expected="disabled" unexpected="enabled"
+  if [[ "${vendor}" == "AuthenticAMD" && "${xsaveerptr}" == "false" ]]; then
+    expected="enabled"
+    unexpected="disabled"
+  fi
+  local cpus="QEMU reports ${VCPUS_PER_PASS} vCPUs ${vendor} with XSAVEERPTR=${xsaveerptr}"
+  local reason="${cpus}, so the kernel must report '[CPU] x87 pointer reset: ${expected}' (it resets the x87 pointers exactly on AMD CPUs without XSAVEERPTR)"
+  if grep -Fq -- "[CPU] x87 pointer reset: ${unexpected}" "${log}"; then
+    echo "FAIL: Unexpected marker '[CPU] x87 pointer reset: ${unexpected}' in serial output: ${reason}." >&2
+    return 1
+  fi
+  if ! grep -Fq -- "[CPU] x87 pointer reset: ${expected}" "${log}"; then
+    echo "FAIL: Missing required marker '[CPU] x87 pointer reset: ${expected}' in serial output: ${reason}." >&2
+    return 1
+  fi
+  echo "Verified '[CPU] x87 pointer reset: ${expected}' in serial output: ${cpus}."
 }
 
 # Sends the QEMU monitor command $2 through the UNIX socket $1 and waits up to
@@ -580,15 +819,50 @@ find_ovmf() {
 start_qemu() {
   local name="$1"
   shift
-  qemu-system-x86_64 \
-    -smp "${VCPUS_PER_PASS}" \
-    -display none \
-    -serial "file:${BUILD_DIR}/serial_${name}_output.log" \
-    -monitor "unix:${BUILD_DIR}/qemu_${name}_monitor.sock,server,nowait" \
-    -no-reboot \
-    "$@" \
-    >/dev/null 2>&1 &
+  local qemu_argv=(
+    qemu-system-x86_64
+    -smp "${VCPUS_PER_PASS}"
+    -display none
+    -serial "file:${BUILD_DIR}/serial_${name}_output.log"
+    -monitor "unix:${BUILD_DIR}/qemu_${name}_monitor.sock,server,nowait"
+    -qmp "unix:${BUILD_DIR}/qemu_${name}_qmp.sock,server,nowait"
+    -no-reboot
+    "$@"
+  )
+  save_qemu_command "${name}" "${qemu_argv[@]}"
+  "${qemu_argv[@]}" >/dev/null 2>&1 &
   QEMU_PID=$!
+}
+
+# With --artifact-dir, saves the QEMU command line $2... of pass $1 and the
+# directory it runs in.
+save_qemu_command() {
+  local name="$1"
+  shift
+  if [[ -z "${ARTIFACT_DIR}" ]]; then
+    return 0
+  fi
+  { mkdir -p "${ARTIFACT_DIR}/${name}" &&
+    printf '%s\0' "$@" >"${ARTIFACT_DIR}/${name}/qemu_argv" &&
+    printf '%s\n' "${PWD}" >"${ARTIFACT_DIR}/${name}/qemu_cwd"; } ||
+    echo "WARNING: Could not save the QEMU command line of the ${name} pass in '${ARTIFACT_DIR}'." >&2
+}
+
+# With --artifact-dir, saves the complete serial log, the output and the result
+# $2 (PASS, FAIL or SKIPPED) of pass $1, whose QEMU has exited.
+save_pass_artifacts() {
+  local name="$1" result="$2"
+  if [[ -z "${ARTIFACT_DIR}" ]]; then
+    return 0
+  fi
+  local dir="${ARTIFACT_DIR}/${name}"
+  local log="${BUILD_DIR}/serial_${name}_output.log"
+  local output="${BUILD_DIR}/${name}_pass_stdout.log"
+  { mkdir -p "${dir}" &&
+    { [[ ! -f "${log}" ]] || cp "${log}" "${dir}/serial.log"; } &&
+    { [[ ! -f "${output}" ]] || cp "${output}" "${dir}/output.log"; } &&
+    printf '%s\n' "${result}" >"${dir}/result"; } ||
+    echo "WARNING: Could not save the artifacts of the ${name} pass in '${ARTIFACT_DIR}'." >&2
 }
 
 kill_qemu() {
@@ -628,6 +902,7 @@ run_bios_pass() {
   fi
   if ! verify_serial_log "${log}" "${QEMU_PID}" "$@" ||
      ! verify_pass_absent_markers "${name}" "${log}" ||
+     ! verify_x87_pointer_reset "${log}" "${BUILD_DIR}/qemu_${name}_qmp.sock" ||
      ! verify_vga_text "${BUILD_DIR}/qemu_${name}_monitor.sock" "${BUILD_DIR}/vga_${name}_dump.bin"; then
     cat "${log}" >&2
     return 1
@@ -669,6 +944,7 @@ run_uefi_pass() {
          "[PMM] mmap entry: base=0x100000000" "[PMM] Framebuffer: addr=" \
          "${QEMU64_MARKERS[@]}" ||
      ! verify_pass_absent_markers "${name}" "${log}" ||
+     ! verify_x87_pointer_reset "${log}" "${BUILD_DIR}/qemu_${name}_qmp.sock" ||
      ! verify_framebuffer "${log}" "${BUILD_DIR}/qemu_${name}_monitor.sock" "${BUILD_DIR}/vga_${name}_dump.bin"; then
     cat "${log}" >&2
     return 1
@@ -715,6 +991,7 @@ run_pass() {
 
 # The passes run in batches of PASS_JOBS, each batch after the one before has
 # ended; PASS_RCS[i] is the exit status of the job that ran PASS_NAMES[i].
+PASSES_STARTED=1
 PASS_RCS=()
 batch_start=0
 while [[ "${batch_start}" -lt "${#PASS_NAMES[@]}" ]]; do
@@ -750,13 +1027,16 @@ for i in "${!PASS_NAMES[@]}"; do
   fi
   if [[ "${rc}" -ne 0 ]]; then
     overall_rc=1
-    summary+=("${name}: FAIL")
+    status="FAIL"
   elif [[ -f "${BUILD_DIR}/${name}_pass_result" ]]; then
-    summary+=("${name}: SKIPPED")
+    status="SKIPPED"
   else
-    summary+=("${name}: PASS")
+    status="PASS"
   fi
+  summary+=("${name}: ${status}")
+  save_pass_artifacts "${name}" "${status}"
 done
+PASSES_STARTED=0
 
 if [[ "${overall_rc}" -ne 0 ]]; then
   echo "FAILURE: boot verification failed (${summary[*]})." >&2

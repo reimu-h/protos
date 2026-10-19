@@ -17,6 +17,7 @@
 #include "pmm.h"
 #include "smp_hardware.h"
 #include "spinlock.h"
+#include "steal_time.h"
 #include "task.h"
 #include "uart.h"
 
@@ -115,6 +116,27 @@ constexpr int64_t kApStartupTimeoutMs = 10000;
 // does not respond. It is deliberately high (8 GHz), so that delays err on the
 // long side.
 constexpr uint64_t kFallbackTscTicksPerMs = 8000000;
+// TSC rates that a calibration may report: 100 MHz to 20 GHz. A rate below
+// would shorten every delay and timeout.
+constexpr uint64_t kMinPlausibleTscTicksPerMs = 100000;
+constexpr uint64_t kMaxPlausibleTscTicksPerMs = 20000000;
+
+// Hyper-V (Microsoft's Hypervisor Top Level Functional Specification), whose
+// generation 2 VMs have no PIT: CPUID.01H:ECX[31] (a hypervisor is present),
+// the hypervisor vendor leaf with the signature "Microsoft Hv", the features
+// leaf, whose EAX bit 11 grants access to the frequency MSRs and whose EDX
+// bit 8 says that the TSC frequency MSR is available, and those MSRs, which
+// hold the TSC and Local APIC timer frequencies in Hz.
+constexpr uint32_t kCpuidEcxHypervisorBit = 1u << 31;
+constexpr uint32_t kCpuidHypervisorVendorLeaf = 0x40000000;
+constexpr uint32_t kHypervSignatureEbx = 0x7263694D;  // "Micr"
+constexpr uint32_t kHypervSignatureEcx = 0x666F736F;  // "osof"
+constexpr uint32_t kHypervSignatureEdx = 0x76482074;  // "t Hv"
+constexpr uint32_t kCpuidHypervFeaturesLeaf = 0x40000003;
+constexpr uint32_t kHypervAccessFrequencyMsrs = 1u << 11;
+constexpr uint32_t kHypervTscFrequencyMsrAvailable = 1u << 8;
+constexpr uint32_t kMsrHypervTscFrequency = 0x40000022;
+constexpr uint32_t kMsrHypervApicFrequency = 0x40000023;
 // Time idle APs get to acknowledge a SmpRunOnAllCpus() wakeup IPI, and how
 // often the IPI is resent meanwhile.
 constexpr int64_t kDispatchAckTimeoutMs = 10000;
@@ -209,6 +231,9 @@ bool g_x2apic_mode = false;
 // TSC ticks per millisecond, which time the delays and timeouts (see
 // ReadClockTicks()).
 uint64_t g_tsc_ticks_per_ms = kFallbackTscTicksPerMs;
+// True if KVM paravirtualized steal time (`KVM_FEATURE_STEAL_TIME`) is
+// supported and registered on every online CPU.
+bool g_steal_time = false;
 
 // Panic-stop state (see SmpStopOtherCpusForPanic()):
 // True once the BSP's Local APIC is enabled, so that the panic path can send
@@ -629,6 +654,7 @@ static void InitCpuLocalSlot(const int cpu_index,              //
   slot.ipi_count.store(0, std::memory_order_relaxed);
   slot.context_switches.store(0, std::memory_order_relaxed);
   slot.task_timer_ticks.store(0, std::memory_order_relaxed);
+  slot.kvm_steal_time = {};
 }
 
 // The stacks of an AP, which SmpInit() allocates as one block of
@@ -673,6 +699,7 @@ static void ResetSmpState() {
   internal::g_cpu_local_bound.store(false, std::memory_order_release);
 #endif
   g_tsc_ticks_per_ms = kFallbackTscTicksPerMs;
+  g_steal_time = false;
   g_x2apic_mode = false;
   g_panic_ipi_ready.store(false, std::memory_order_seq_cst);
   g_panic_stop_requested.store(false, std::memory_order_seq_cst);
@@ -702,6 +729,18 @@ static uint64_t ReadMsr(const uint32_t msr) { return Hardware().ReadMsr(msr); }
 
 static void WriteMsr(const uint32_t msr, const uint64_t value) {
   Hardware().WriteMsr(msr, value);
+}
+
+static void RegisterStealTimeForCurrentCpu() {
+  if (!g_steal_time) {
+    return;
+  }
+  CpuLocal* const cpu = CurrentCpuOrNull();
+  DCHECK(cpu != nullptr);
+  const uintptr_t addr = reinterpret_cast<uintptr_t>(&cpu->kvm_steal_time);
+  DCHECK((addr & 63u) == 0);
+  WriteMsr(kMsrKvmStealTime,
+           static_cast<uint64_t>(addr) | kKvmStealTimeSystemEnabled);
 }
 
 static bool IsX2ApicSupported() {
@@ -743,17 +782,74 @@ static int64_t ApicTimerClockHzFromCpuid() {
   return 0;
 }
 
+// The TSC and Local APIC timer frequencies in Hz that Hyper-V reports, each 0
+// if the kernel does not run on Hyper-V or Hyper-V does not report it.
+struct HypervFrequencies {
+  int64_t tsc_hz = 0;
+  int64_t apic_timer_hz = 0;
+};
+
+static HypervFrequencies ReadHypervFrequencies() {
+  SmpHardware& hw = Hardware();
+  HypervFrequencies frequencies;
+  if ((hw.Cpuid(1, 0).ecx & kCpuidEcxHypervisorBit) == 0) {
+    return frequencies;
+  }
+  const CpuidResult vendor = hw.Cpuid(kCpuidHypervisorVendorLeaf, 0);
+  if (vendor.eax < kCpuidHypervFeaturesLeaf ||
+      vendor.ebx != kHypervSignatureEbx || vendor.ecx != kHypervSignatureEcx ||
+      vendor.edx != kHypervSignatureEdx) {
+    return frequencies;
+  }
+  const CpuidResult features = hw.Cpuid(kCpuidHypervFeaturesLeaf, 0);
+  if ((features.eax & kHypervAccessFrequencyMsrs) == 0) {
+    return frequencies;
+  }
+  // Reading a synthetic MSR that the partition may not access faults, so the
+  // TSC frequency MSR needs its own feature bit (as in Linux).
+  if ((features.edx & kHypervTscFrequencyMsrAvailable) != 0) {
+    frequencies.tsc_hz =
+        static_cast<int64_t>(ReadMsr(kMsrHypervTscFrequency) & INT64_MAX);
+  }
+  frequencies.apic_timer_hz =
+      static_cast<int64_t>(ReadMsr(kMsrHypervApicFrequency) & INT64_MAX);
+  return frequencies;
+}
+
+static bool IsPlausibleTscRate(const uint64_t tsc_ticks_per_ms) {
+  return tsc_ticks_per_ms >= kMinPlausibleTscTicksPerMs &&
+         tsc_ticks_per_ms <= kMaxPlausibleTscTicksPerMs;
+}
+
 // Returns the periodic Local APIC timer initial count for kApicTimerTargetHz:
 // `pit_calibrated_count` if PIT calibration produced one (non-zero), else the
-// count for the timer clock that CPUID reports, else
+// count for the timer clock that Hyper-V or else CPUID reports, else
 // kFallbackApicTimerInitialCount, with a warning since the resulting timer
-// rate is unknown.
+// rate is unknown. Without PIT calibration, it also takes the TSC rate from
+// Hyper-V if Hyper-V reports one.
 static uint32_t ChooseApicTimerInitialCount(
     const uint32_t pit_calibrated_count) {
   if (pit_calibrated_count > 0) {
     return pit_calibrated_count;
   }
+  const HypervFrequencies hyperv = ReadHypervFrequencies();
+  const uint64_t hyperv_tsc_ticks_per_ms =
+      static_cast<uint64_t>(hyperv.tsc_hz) / 1000;
+  if (IsPlausibleTscRate(hyperv_tsc_ticks_per_ms)) {
+    g_tsc_ticks_per_ms = hyperv_tsc_ticks_per_ms;
+    UartWrite("[SMP] No PIT calibration; TSC rate from Hyper-V: ");
+    UartWriteDec(static_cast<uint64_t>(hyperv.tsc_hz));
+    UartWrite(" Hz\n");
+  }
   // The timer divides its input clock by 16 (kLapicTimerDivBy16).
+  const int64_t hyperv_count = hyperv.apic_timer_hz / (16 * kApicTimerTargetHz);
+  if (hyperv_count > 0 && hyperv_count <= static_cast<int64_t>(UINT32_MAX)) {
+    UartWrite(
+        "[SMP] No PIT calibration; Local APIC timer clock from Hyper-V: ");
+    UartWriteDec(static_cast<uint64_t>(hyperv.apic_timer_hz));
+    UartWrite(" Hz\n");
+    return static_cast<uint32_t>(hyperv_count);
+  }
   const int64_t clock_hz = ApicTimerClockHzFromCpuid();
   const int64_t count = clock_hz / (16 * kApicTimerTargetHz);
   if (count > 0 && count <= static_cast<int64_t>(UINT32_MAX)) {
@@ -893,8 +989,9 @@ static uint32_t ReadLapicTimerCurrentCount(const uintptr_t lapic_base) {
 
 // Measures the Local APIC timer, and the TSC rate for ReadClockTicks(), against
 // a one-shot ~10 ms countdown of PIT channel 2. Returns the periodic initial
-// count for kApicTimerTargetHz, or 0 if the PIT did not respond (the TSC rate
-// then stays at kFallbackTscTicksPerMs).
+// count for kApicTimerTargetHz, or 0 if there is no PIT, it did not respond, or
+// the TSC rate it measured is implausible (the TSC rate then stays at
+// kFallbackTscTicksPerMs).
 static uint32_t CalibrateLocalApicTimer(const uintptr_t lapic_base) {
   DCHECK(g_x2apic_mode || lapic_base != 0);
   SmpHardware& hw = Hardware();
@@ -913,6 +1010,13 @@ static uint32_t CalibrateLocalApicTimer(const uintptr_t lapic_base) {
              static_cast<uint8_t>(kPitCalibrationReloadCount & 0xFF));
   hw.OutByte(kPitChannel2DataPort,
              static_cast<uint8_t>((kPitCalibrationReloadCount >> 8) & 0xFF));
+  // In mode 0, writing the count drives OUT2 low, and with GATE2 low the
+  // countdown has not started. A port that reads OUT2 high anyway has no PIT
+  // behind it: it reads 0xFF in Hyper-V generation 2 VMs, for example, and
+  // would otherwise pass for a countdown that ran out at once.
+  if ((hw.InByte(kPitSpeakerPort) & kPitSpeakerOut2Bit) != 0) {
+    return 0;
+  }
 
   // Rising edge on GATE2 starts the 8254 Channel 2 Mode 0 one-shot countdown.
   hw.OutByte(kPitSpeakerPort,
@@ -934,9 +1038,11 @@ static uint32_t CalibrateLocalApicTimer(const uintptr_t lapic_base) {
     const uint64_t tsc_ticks_per_ms =
         tsc_elapsed * static_cast<uint64_t>(kPitBaseFrequencyHz) /
         (static_cast<uint64_t>(kPitCalibrationReloadCount) * 1000);
-    if (tsc_ticks_per_ms > 0) {
-      g_tsc_ticks_per_ms = tsc_ticks_per_ms;
+    if (!IsPlausibleTscRate(tsc_ticks_per_ms)) {
+      // The PIT did not count at its rate, so neither result holds.
+      return 0;
     }
+    g_tsc_ticks_per_ms = tsc_ticks_per_ms;
   }
   return initial_count;
 }
@@ -1225,6 +1331,7 @@ extern "C" void ApKernelEntry(const int cpu_index) {
   // and so do SMEP and SMAP, which must be on before the AP runs a system
   // call.
   CpuInitAp();
+  RegisterStealTimeForCurrentCpu();
   g_cpu_locals[cpu_index].online = true;
   EnableLocalApic(lapic_base);
 
@@ -1700,6 +1807,11 @@ void SmpInit(const uint32_t multiboot_magic,
                    g_topology.cpus[0].stack_base,  //
                    g_topology.cpus[0].stack_top);
   BindCpuLocal(&g_cpu_locals[0]);
+  g_steal_time =
+      HasKvmStealTime([&hw](const uint32_t leaf, const uint32_t subleaf) {
+        return hw.Cpuid(leaf, subleaf);
+      });
+  RegisterStealTimeForCurrentCpu();
   g_online_cpu_count.store(1, std::memory_order_seq_cst);
 
   g_calibrated_timer_initial_count =
@@ -1791,6 +1903,8 @@ void SmpInit(const uint32_t multiboot_magic,
   UartWrite("/");
   UartWriteDec(g_topology.cpu_count);
   UartWrite("\n");
+  UartWrite(g_steal_time ? "[SMP] Steal time: KVM\n"
+                         : "[SMP] Steal time: none\n");
 }
 
 int SmpCpuCount() {
@@ -1972,6 +2086,42 @@ void SmpTlbShootdown() {
       SpinPause();
     }
   }
+}
+
+bool SmpHasStealTime() { return g_steal_time; }
+
+int64_t SmpOwnStealNsIrqsOff() {
+  DCHECK(!AreInterruptsEnabled());
+  if (!g_steal_time) {
+    return 0;
+  }
+  const CpuLocal* const cpu = CurrentCpuOrNullIrqsOff();
+  return (cpu != nullptr) ? ReadKvmStealNs(cpu->kvm_steal_time) : -1;
+}
+
+int64_t SmpStealNsOfCpu(const int cpu_index) {
+  if (!g_smp_initialized || cpu_index < 0 ||
+      cpu_index >= g_topology.cpu_count || g_cpu_locals == nullptr) {
+    return -1;
+  }
+  if (!g_steal_time) {
+    return 0;
+  }
+  return ReadKvmStealNs(g_cpu_locals[cpu_index].kvm_steal_time);
+}
+
+int64_t SmpTimerTickNsUpperBound() {
+  const uint32_t count = (g_calibrated_timer_initial_count > 0)
+                             ? g_calibrated_timer_initial_count
+                             : kFallbackApicTimerInitialCount;
+  return TimerTickNsUpperBound(count);
+}
+
+int64_t SmpTimerTickNsLowerBound() {
+  const uint32_t count = (g_calibrated_timer_initial_count > 0)
+                             ? g_calibrated_timer_initial_count
+                             : kFallbackApicTimerInitialCount;
+  return TimerTickNsLowerBound(count);
 }
 
 #if __STDC_HOSTED__

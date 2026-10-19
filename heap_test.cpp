@@ -4,6 +4,7 @@
 #include <gtest/gtest.h>
 
 #include <atomic>
+#include <chrono>
 #include <cstdint>
 #include <cstring>
 #include <thread>
@@ -952,6 +953,109 @@ TEST(HeapTest, KmallocAlignedFrontSplitHeaderShiftAndCoalescing) {
   Kfree(aligned64_zero_offset);
 
   EXPECT_THAT(HeapTotalFreeBytes(), t::Eq(initial_free));
+}
+
+// Runs `Kfree(ptr)` for each of `ptrs` on another thread while this thread
+// holds the heap lock, and returns whether those calls returned without
+// waiting for the lock. Leaves the lock released without draining
+// (`HeapUnlockForTest()`) so the caller can test entry-drain on the next heap
+// call.
+static bool KfreeWhileLockIsHeld(const std::vector<void*>& ptrs) {
+  HeapLockForTest();
+  std::atomic<bool> returned{false};
+  std::thread freer([&ptrs, &returned]() {
+    for (void* const ptr : ptrs) {
+      Kfree(ptr);
+    }
+    returned.store(true, std::memory_order_release);
+  });
+  for (int i = 0; i < 2000 && !returned.load(std::memory_order_acquire); ++i) {
+    std::this_thread::sleep_for(std::chrono::milliseconds(1));
+  }
+  const bool returned_while_held = returned.load(std::memory_order_acquire);
+  HeapUnlockForTest();
+  freer.join();
+  return returned_while_held;
+}
+
+TEST(HeapTest, KfreeQueuesWithoutWaitingAndDrainsOnExitAndEntry) {
+  ResetFakePmm();
+  HeapInit();
+  const int64_t free_before = HeapTotalFreeBytes();
+  void* const a = Kmalloc(128);
+  void* const b = KmallocAligned(256, 64);
+  ASSERT_THAT(a, t::NotNull());
+  ASSERT_THAT(b, t::NotNull());
+
+  // 1. Exit-drain path: when a locked heap critical section finishes
+  // (`HeapDrainAndUnlockForTest()`), it drains any queued blocks before
+  // releasing `g_heap_lock`.
+  HeapLockForTest();
+  std::atomic<bool> returned{false};
+  std::thread freer([a, &returned]() {
+    Kfree(a);
+    returned.store(true, std::memory_order_release);
+  });
+  for (int i = 0; i < 2000 && !returned.load(std::memory_order_acquire); ++i) {
+    std::this_thread::sleep_for(std::chrono::milliseconds(1));
+  }
+  EXPECT_TRUE(returned.load(std::memory_order_acquire));
+  EXPECT_THAT(HeapQueuedFreeCountForTest(), t::Eq(1));
+  HeapDrainAndUnlockForTest();
+  freer.join();
+
+  HeapLockForTest();
+  EXPECT_THAT(HeapQueuedFreeCountForTest(), t::Eq(0));
+  HeapUnlockForTest();
+  void* const a2 = Kmalloc(128);
+  ASSERT_THAT(a2, t::Eq(a));
+
+  // 2. Entry-drain path: if blocks are queued in the race window right before
+  // `Unlock()`, the next `HeapTotalFreeBytes()` or `Kmalloc()` drains them on
+  // entry.
+  ASSERT_TRUE(KfreeWhileLockIsHeld({b, a2}));
+  HeapLockForTest();
+  EXPECT_THAT(HeapQueuedFreeCountForTest(), t::Eq(2));
+  HeapUnlockForTest();
+
+  EXPECT_THAT(HeapTotalFreeBytes(), t::Eq(free_before));
+  HeapLockForTest();
+  EXPECT_THAT(HeapQueuedFreeCountForTest(), t::Eq(0));
+  HeapUnlockForTest();
+  EXPECT_THAT(Kmalloc(128), t::Eq(a));
+}
+
+TEST(HeapTest, KmallocReusesQueuedBlocksBeforeExpanding) {
+  ResetFakePmm();
+  HeapInit();
+  // Fill the initial arena except for one block, then free it while queued.
+  const int64_t arena_payload = HeapTotalFreeBytes();
+  void* const big = Kmalloc(arena_payload);
+  ASSERT_THAT(big, t::NotNull());
+  const int alloc_calls = g_pmm.alloc_call_count;
+  ASSERT_TRUE(KfreeWhileLockIsHeld({big}));
+  EXPECT_THAT(Kmalloc(arena_payload), t::Eq(big));
+  EXPECT_THAT(g_pmm.alloc_call_count, t::Eq(alloc_calls));
+}
+
+TEST(HeapDeathTest, QueuedDoubleFreePanicsInTheNextLockHolder) {
+  ResetFakePmm();
+  HeapInit();
+  uint8_t* const a = static_cast<uint8_t*>(Kmalloc(128));
+  uint8_t* const b = static_cast<uint8_t*>(Kmalloc(128));
+  ASSERT_THAT(a, t::NotNull());
+  ASSERT_THAT(b, t::NotNull());
+  EXPECT_DEATH(
+      {
+        if (KfreeWhileLockIsHeld({b, b})) {
+          (void)HeapTotalFreeBytes();
+        }
+      },
+      "Check failed: block->(is_free == 0|magic == kHeapBlockMagic) at");
+  // A queued free of an already free block fails at once.
+  Kfree(b);
+  EXPECT_DEATH((void)KfreeWhileLockIsHeld({b}),
+               "Check failed: block->is_free == 0 at");
 }
 
 }  // namespace

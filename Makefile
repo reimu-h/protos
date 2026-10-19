@@ -46,6 +46,18 @@ CXXFLAGS := -m64 -masm=intel -std=c++20 -O2 -Wall -Wextra $(WERROR_FLAG) \
             -DPROTOS_SELFTEST=$(if $(filter 1,$(SELFTEST)),1,0) \
             $(PROJECT_INCLUDE_FLAGS) -I$(BUILD_DIR)/include
 
+INJECT_KILL_DELAY ?=
+INJECT_KILL_DELAY_CHECKS := spinner mid_syscall teardown concurrent_killers \
+                            busy_killer runaway shutdown
+ifneq ($(strip $(INJECT_KILL_DELAY)),)
+INJECT_KILL_DELAY_ID := $(strip $(foreach i,1 2 3 4 5 6 7,$(if $(filter \
+    $(strip $(INJECT_KILL_DELAY)),$(word $(i),$(INJECT_KILL_DELAY_CHECKS))),$(i))))
+ifeq ($(INJECT_KILL_DELAY_ID),)
+$(error INJECT_KILL_DELAY must be one of: $(INJECT_KILL_DELAY_CHECKS))
+endif
+CXXFLAGS += -DPROTOS_INJECT_KILL_DELAY=$(INJECT_KILL_DELAY_ID)
+endif
+
 TEST_COMMON_CXXFLAGS := -std=c++20 -Wall -Wextra $(WERROR_FLAG) $(PROJECT_INCLUDE_FLAGS) -pthread -MMD -MP
 TEST_COMMON_LDFLAGS := -lgmock_main -lgmock -lgtest -pthread
 
@@ -194,6 +206,8 @@ CXX_HDRS := \
     cxx_runtime.h \
     smp.h \
     smp_hardware.h \
+    steal_time.h \
+    kill_delay_injection.h \
     cpu_clock.h \
     task.h \
     task_stack.h \
@@ -209,6 +223,8 @@ CXX_HDRS := \
     user/usertest.h \
     selftest/selftest.h \
     selftest/boot_selftest.h \
+    selftest/fpu_lifecycle_layout.h \
+    selftest/line_buffer.h \
     selftest/stress.h
 
 ASM_SRCS := boot.S context_switch.S user_mode_entry.S user_programs.S fault_probe.S
@@ -216,6 +232,17 @@ ASM_OBJS := $(patsubst %.S,$(BUILD_DIR)/%.o,$(ASM_SRCS))
 CXX_OBJS := $(patsubst %.cpp,$(BUILD_DIR)/%.o,$(CXX_SRCS))
 OBJS := $(ASM_OBJS) $(CXX_OBJS)
 FREESTANDING_CXX_CONFIG := $(BUILD_DIR)/include/bits/c++config.h
+# Flake injection for checking the deflaking tool; never set by `make test` or
+# `make run-boot-test`. INJECT_FLAKY_TEST=<n> makes the boot self-test
+# rbtree_edge_cases fail in about one boot in n, decided by a hardware entropy
+# draw that the kernel logs. Build such a kernel in a BUILD_DIR of its own:
+#   make USE_DOCKER=0 BUILD_DIR=build/inject-flaky INJECT_FLAKY_TEST=20 \
+#       build/inject-flaky/kernel.iso
+# (Before KERNEL_CONFIG, which must record the define.)
+INJECT_FLAKY_TEST ?= 0
+ifneq ($(filter-out 0,$(INJECT_FLAKY_TEST)),)
+CXXFLAGS += -DPROTOS_INJECT_FLAKY_TEST=$(INJECT_FLAKY_TEST)
+endif
 # Records the kernel build configuration so that changing flags (e.g. WERROR or
 # SELFTEST) rebuilds the kernel.
 KERNEL_CONFIG_STAMP := $(BUILD_DIR)/.kernel-config
@@ -284,6 +311,9 @@ LDFLAGS := -m elf_x86_64 -z max-page-size=0x1000 $(LD_NO_WARN_RWX) -T linker.ld
 # (including -k, so that `make -k ... USE_DOCKER=1` keeps going there too).
 INNER_MAKE := make --no-print-directory WERROR=$(WERROR) SELFTEST=$(SELFTEST) \
               $(if $(findstring k,$(firstword -$(MAKEFLAGS))),-k)
+ifneq ($(strip $(INJECT_KILL_DELAY)),)
+INNER_MAKE += INJECT_KILL_DELAY=$(strip $(INJECT_KILL_DELAY))
+endif
 # Boot-test settings forwarded into the container (see test_boot.sh).
 BOOT_TEST_ENV_VARS := BIOS_TIMEOUT_SECS UEFI_TIMEOUT_SECS MIN_STRESS_PASSES OVMF OVMF_VARS REQUIRE_UEFI BOOT_TEST_JOBS
 
@@ -315,6 +345,11 @@ ifeq ($(filter -j% --jobserver%,$(MAKEFLAGS)),)
 MAKEFLAGS += -j$(NPROC) $(OUTPUT_SYNC)
 endif
 endif
+endif
+
+# The make in the Docker container builds the same flake-injected kernel.
+ifneq ($(filter-out 0,$(INJECT_FLAKY_TEST)),)
+INNER_MAKE += INJECT_FLAKY_TEST=$(INJECT_FLAKY_TEST)
 endif
 
 QEMU_RUN_FLAGS ?= -smp 4 -m 256M -serial mon:stdio
@@ -453,6 +488,15 @@ endif
 endef
 
 $(foreach t,$(HOST_TESTS),$(eval $(call DEFINE_HOST_TEST_SUITE,$(t))))
+
+# The unit tests of the deflaking tool (deflake.py), a python3 script like the
+# QEMU monitor helpers in test_boot.sh. They run with the C++ unit tests (make
+# test, make unit-test, and in Docker with the image's python3); -B keeps
+# python3 from writing __pycache__ into the source tree.
+.PHONY: run-deflake_test
+run-deflake_test: $(DOCKER_DEPS)
+	$(DOCKER_RUN) python3 -B deflake_test.py
+HOST_TEST_ALL_RUNS += run-deflake_test
 
 test-rbtree: test-rbtree_test
 test-spinlock: test-spinlock_test

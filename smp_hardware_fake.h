@@ -80,6 +80,19 @@ class FakeSmpHardware final : public SmpHardware {
     uint32_t lapic_timer_calibration_ticks = 625000;
     // Whether PIT channel 2 ever reaches terminal count.
     bool pit_responds = true;
+    // Whether there is a PIT at all. Without one, port 0x61 reads 0xFF (as in
+    // Hyper-V generation 2 VMs) and writes to the PIT ports are lost.
+    bool pit_present = true;
+    // The TSC and Local APIC timer frequencies that the hypervisor reports as
+    // Hyper-V (CPUID leaves 0x40000000 and 0x40000003, MSRs 0x40000022 and
+    // 0x40000023). Both 0: no hypervisor.
+    uint64_t hyperv_tsc_hz = 0;
+    uint64_t hyperv_apic_timer_hz = 0;
+    // If non-zero, exposes the KVM hypervisor signature at `kvm_base_leaf` and
+    // `KVM_FEATURE_STEAL_TIME` at `kvm_base_leaf + 1` (if `kvm_steal_time` is
+    // true).
+    uint32_t kvm_base_leaf = 0;
+    bool kvm_steal_time = false;
     // Physical address at which MapPhysicalMemory(), MapLocalApicPage() and
     // UnmapGuardPage() fail (0: none).
     uintptr_t map_failure_addr = 0;

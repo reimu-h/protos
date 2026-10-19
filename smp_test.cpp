@@ -25,6 +25,7 @@
 #include "smp_hardware.h"
 #include "smp_hardware_fake.h"
 #include "spinlock.h"
+#include "steal_time.h"
 #include "task.h"
 #include "uart.h"
 #include "vga.h"
@@ -1131,6 +1132,39 @@ TEST_F(SmpTest, DelaysUseTheTscRateMeasuredAgainstThePit) {
   EXPECT_THAT(SmpOnlineCpuCount(), t::Eq(2));
 }
 
+TEST_F(SmpTest, WithoutAPitTheRatesComeFromHyperVOrStayAtTheirFallbacks) {
+  // Hyper-V generation 2 VMs have no PIT: port 0x61 reads 0xFF, so OUT2 reads
+  // high before any countdown. That must not pass for a finished calibration,
+  // which would shrink every delay and timeout.
+  FakeSmpHardware::Options options = DefaultOptions();
+  options.pit_present = false;
+  {
+    const FakeSmpHardware& hw = InitSmp(LapicRecords(2), options);
+    const std::vector<Event> ipis = IpisTo(hw, 1);
+    ASSERT_THAT(ipis.size(), t::Eq(3u));
+    EXPECT_GE(ipis[2].time_ns - ipis[1].time_ns, 80000000u);
+    EXPECT_THAT(SmpCalibratedTimerInitialCount(),
+                t::Eq(kFallbackApicTimerInitialCount));
+    EXPECT_THAT(SmpOnlineCpuCount(), t::Eq(2));
+  }
+  // Hyper-V reports a 2 GHz TSC (twice the fake's clock), so the 10 ms delay
+  // takes 20 ms, and a 200 MHz Local APIC timer clock.
+  options.hyperv_tsc_hz = 2000000000;
+  options.hyperv_apic_timer_hz = 200000000;
+  const FakeSmpHardware& hw = InitSmp(LapicRecords(2), options);
+  const std::vector<Event> ipis = IpisTo(hw, 1);
+  ASSERT_THAT(ipis.size(), t::Eq(3u));
+  EXPECT_GE(ipis[2].time_ns - ipis[1].time_ns, 20000000u);
+  EXPECT_THAT(SmpCalibratedTimerInitialCount(),
+              t::Eq(200000000u / 16 / kApicTimerTargetHz));
+  EXPECT_THAT(g_state.uart_log,
+              t::HasSubstr("TSC rate from Hyper-V: 2000000000 Hz"));
+  EXPECT_THAT(
+      g_state.uart_log,
+      t::HasSubstr("Local APIC timer clock from Hyper-V: 200000000 Hz"));
+  EXPECT_THAT(SmpOnlineCpuCount(), t::Eq(2));
+}
+
 TEST_F(SmpTest, SmpInitDoesNotStartProcessorsThatAreOnlyOnlineCapable) {
   std::vector<uint8_t> recs;
   AppendLapicRecord(&recs, 0, 0, 1);
@@ -2175,6 +2209,69 @@ TEST_F(SmpTest, StopOtherCpusForPanicSendsAnNmiToAllOtherCpus) {
     ASSERT_THAT(ipis.size(), t::Eq(ipi_count + 1));
     EXPECT_THAT(ipis.back().value, t::Eq(0x000C4400ULL));
   }
+}
+
+TEST_F(SmpTest, KvmStealTimeRegistrationAndQueriesOnBspAndAps) {
+  // Without KVM steal-time CPUID feature, SmpHasStealTime() is false,
+  // SmpOwnStealNsIrqsOff() and SmpStealNsOfCpu() return 0, and MSR 0x4b564d03
+  // is never written.
+  {
+    const FakeSmpHardware& hw = InitSmp(LapicRecords(2));
+    EXPECT_FALSE(SmpHasStealTime());
+    SetInterruptsEnabledForTest(false);
+    EXPECT_THAT(SmpOwnStealNsIrqsOff(), t::Eq(0));
+    SetInterruptsEnabledForTest(true);
+    EXPECT_THAT(SmpStealNsOfCpu(0), t::Eq(0));
+    EXPECT_THAT(SmpStealNsOfCpu(1), t::Eq(0));
+    EXPECT_THAT(g_state.uart_log, t::HasSubstr("[SMP] Steal time: none"));
+    for (const Event& ev : hw.Events()) {
+      if (ev.kind == Event::Kind::kMsrWrite) {
+        EXPECT_THAT(ev.reg, t::Ne(kMsrKvmStealTime));
+      }
+    }
+  }
+
+  // With KVM steal-time exposed at 0x40000100 (e.g. when Hyper-V occupies
+  // 0x40000000), both BSP and APs write MSR_KVM_STEAL_TIME with the 64-byte
+  // aligned address of their CpuLocal::kvm_steal_time |
+  // kKvmStealTimeSystemEnabled.
+  FakeSmpHardware::Options options = DefaultOptions();
+  options.kvm_base_leaf = 0x40000100;
+  options.kvm_steal_time = true;
+  const FakeSmpHardware& hw = InitSmp(LapicRecords(3), options);
+  EXPECT_TRUE(SmpHasStealTime());
+  EXPECT_THAT(g_state.uart_log, t::HasSubstr("[SMP] Steal time: KVM"));
+
+  for (int cpu = 0; cpu < 3; ++cpu) {
+    SCOPED_TRACE(cpu);
+    CpuLocal* const local = SmpGetCpuLocal(cpu);
+    ASSERT_THAT(local, t::NotNull());
+    const uint64_t expected_msr =
+        reinterpret_cast<uintptr_t>(&local->kvm_steal_time) |
+        kKvmStealTimeSystemEnabled;
+    EXPECT_THAT(MsrWrites(hw, cpu),
+                t::Contains(t::Pair(kMsrKvmStealTime, expected_msr)));
+
+    local->kvm_steal_time.version = 2;
+    local->kvm_steal_time.steal = 4000000ULL * (cpu + 1);
+    EXPECT_THAT(SmpStealNsOfCpu(cpu), t::Eq(4000000LL * (cpu + 1)));
+  }
+
+  // Out-of-bounds CPU returns -1.
+  EXPECT_THAT(SmpStealNsOfCpu(-1), t::Eq(-1));
+  EXPECT_THAT(SmpStealNsOfCpu(3), t::Eq(-1));
+
+  // SmpOwnStealNsIrqsOff reads the bound current CPU's steal time.
+  BindCpuLocal(SmpGetCpuLocal(1));
+  SetInterruptsEnabledForTest(false);
+  EXPECT_THAT(SmpOwnStealNsIrqsOff(), t::Eq(8000000));
+  SetInterruptsEnabledForTest(true);
+  BindCpuLocal(SmpGetCpuLocal(0));
+
+  // Timer tick bounds are positive and conservatively bracket 4,000,000 ns.
+  EXPECT_GT(SmpTimerTickNsUpperBound(), 4000000);
+  EXPECT_LT(SmpTimerTickNsLowerBound(), 4000000);
+  EXPECT_GT(SmpTimerTickNsLowerBound(), 0);
 }
 
 }  // namespace

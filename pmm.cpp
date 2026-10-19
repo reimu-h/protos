@@ -1,5 +1,6 @@
 #include "pmm.h"
 
+#include <atomic>
 #include <cstdint>
 
 #include "check.h"
@@ -40,7 +41,22 @@ struct FreeRunNode {
   RbNode rb_node;
 };
 
-static_assert(sizeof(FreeRunNode) <= kPageSize);
+// Link node written at the end of a run's first 4 KiB frame by `PmmFrameList`
+// and `g_pmm_queued_runs`. Keeping it disjoint from `FreeRunNode` at offset 0
+// ensures that building a `PmmFrameList` never clobbers the `FreeRunNode` of a
+// frame that is already in `g_free_run_tree`, so double-free `CHECK`s still
+// catch it when the list is drained.
+struct QueuedRunNode {
+  uintptr_t next_addr;
+  int64_t frame_count;
+};
+
+static_assert(sizeof(FreeRunNode) + sizeof(QueuedRunNode) <= kPageSize);
+
+static QueuedRunNode* QueuedRunAt(const uintptr_t run_base_addr) {
+  return reinterpret_cast<QueuedRunNode*>(run_base_addr + kPageSize -
+                                          sizeof(QueuedRunNode));
+}
 
 struct FreeRunRbTraits {
   static uintptr_t GetKey(const FreeRunNode& node) {
@@ -79,6 +95,14 @@ constexpr int kMaxUsableIntervals = kMaxMemoryRegions * 2 + 16;
 // concurrent multi-CPU calls. The remaining state is written only by
 // `PmmInit` (before other CPUs start) and `PmmResetForTest`.
 IrqSpinLock g_pmm_lock;
+
+// Lock-free singly-linked list of runs queued by `PmmFreeFrameList` when
+// `g_pmm_lock` was contended, linked through `QueuedRunAt(run_base_addr)`.
+// Drained under `g_pmm_lock` at the start and end of every locked PMM critical
+// section so queued runs are always counted by `PmmFreeFrameCount()`,
+// immediately allocatable (including coalesced multi-frame runs), and never
+// left undrained after the contending lock holder releases `g_pmm_lock`.
+std::atomic<uintptr_t> g_pmm_queued_runs{0};
 
 // Intrusive Red-Black Tree containing all currently FREE contiguous physical
 // frame runs across usable RAM, keyed by each run's base physical address
@@ -120,6 +144,7 @@ static uintptr_t KernelEndAddr() {
 }
 
 static void ResetPmmState() {
+  g_pmm_queued_runs.store(0, std::memory_order_relaxed);
   g_free_run_tree.Clear();
   g_usable_interval_count = 0;
   g_max_managed_phys_addr = 0;
@@ -423,6 +448,55 @@ static void PmmFreeFramesLocked(const uintptr_t base_addr,
   PmmCoalesceFreeRun(base_addr, count);
 }
 
+static void AddQueuedRunsLocked() {
+  if (!g_pmm_initialized) {
+    return;
+  }
+  while (g_pmm_queued_runs.load(std::memory_order_relaxed) != 0) {
+    uintptr_t addr = g_pmm_queued_runs.exchange(0, std::memory_order_acquire);
+    while (addr != 0) {
+      QueuedRunNode* const node = QueuedRunAt(addr);
+      const uintptr_t next = node->next_addr;
+      const int64_t count = node->frame_count;
+      node->next_addr = 0;
+      node->frame_count = 0;
+      PmmFreeFramesLocked(addr, count);
+      addr = next;
+    }
+  }
+}
+
+class PmmLockGuard {
+ public:
+  PmmLockGuard() {
+    g_pmm_lock.Lock();
+    AddQueuedRunsLocked();
+  }
+
+  ~PmmLockGuard() {
+    AddQueuedRunsLocked();
+    g_pmm_lock.Unlock();
+  }
+
+  PmmLockGuard(const PmmLockGuard&) = delete;
+  PmmLockGuard& operator=(const PmmLockGuard&) = delete;
+};
+
+static void FlushCurrentRun(PmmFrameList* const list) {
+  if (list->cur_count == 0) {
+    return;
+  }
+  QueuedRunNode* const node = QueuedRunAt(list->cur_base);
+  node->next_addr = list->head_addr;
+  node->frame_count = list->cur_count;
+  list->head_addr = list->cur_base;
+  if (list->tail_addr == 0) {
+    list->tail_addr = list->cur_base;
+  }
+  list->cur_base = 0;
+  list->cur_count = 0;
+}
+
 // Fills `g_usable_intervals` with the available regions of `memory_map` minus
 // its non-available regions, lower memory, the kernel image, the Multiboot
 // information structures, and the framebuffer. Multiboot modules and the
@@ -578,41 +652,94 @@ void PmmInit(const uint32_t multiboot_magic,
 }
 
 uintptr_t PmmAllocFrames(const int64_t count) {
-  const IrqSpinLockGuard lock_guard(g_pmm_lock);
+  const PmmLockGuard lock_guard;
   return PmmAllocFramesLocked(count);
 }
 
 uintptr_t PmmAllocFrame() {
-  const IrqSpinLockGuard lock_guard(g_pmm_lock);
+  const PmmLockGuard lock_guard;
   return PmmAllocFramesLocked(1);
 }
 
 bool PmmRangeIsValidUsableRam(const uintptr_t addr, const int64_t size) {
-  const IrqSpinLockGuard lock_guard(g_pmm_lock);
+  const PmmLockGuard lock_guard;
   return PmmRangeIsValidUsableRamLocked(addr, size);
 }
 
 void PmmFreeFrames(const uintptr_t base_addr, const int64_t count) {
-  const IrqSpinLockGuard lock_guard(g_pmm_lock);
+  const PmmLockGuard lock_guard;
   PmmFreeFramesLocked(base_addr, count);
 }
 
 void PmmFreeFrame(const uintptr_t frame_addr) {
-  const IrqSpinLockGuard lock_guard(g_pmm_lock);
+  const PmmLockGuard lock_guard;
   PmmFreeFramesLocked(frame_addr, 1);
+}
+
+void PmmFrameList::Add(const uintptr_t frame_addr) {
+  DCHECK(frame_addr >= kLowerMemoryLimit);
+  DCHECK((frame_addr & (kPageSize - 1)) == 0);
+  DCHECK(frame_addr < g_max_managed_phys_addr);
+  if (cur_count > 0 &&
+      cur_base + static_cast<uintptr_t>(cur_count) * kPageSize == frame_addr) {
+    ++cur_count;
+    return;
+  }
+  if (cur_count > 0 &&
+      frame_addr + static_cast<uintptr_t>(kPageSize) == cur_base) {
+    cur_base = frame_addr;
+    ++cur_count;
+    return;
+  }
+  FlushCurrentRun(this);
+  cur_base = frame_addr;
+  cur_count = 1;
+}
+
+void PmmFreeFrameList(PmmFrameList* const list) {
+  DCHECK(list != nullptr);
+  FlushCurrentRun(list);
+  uintptr_t addr = list->head_addr;
+  const uintptr_t tail_addr = list->tail_addr;
+  *list = {};
+  if (addr == 0) {
+    return;
+  }
+  if (g_pmm_lock.TryLock()) {
+    AddQueuedRunsLocked();
+    while (addr != 0) {
+      QueuedRunNode* const node = QueuedRunAt(addr);
+      const uintptr_t next = node->next_addr;
+      const int64_t count = node->frame_count;
+      node->next_addr = 0;
+      node->frame_count = 0;
+      PmmFreeFramesLocked(addr, count);
+      addr = next;
+    }
+    AddQueuedRunsLocked();
+    g_pmm_lock.Unlock();
+    return;
+  }
+
+  QueuedRunNode* const tail = QueuedRunAt(tail_addr);
+  uintptr_t head = g_pmm_queued_runs.load(std::memory_order_relaxed);
+  do {
+    tail->next_addr = head;
+  } while (!g_pmm_queued_runs.compare_exchange_weak(
+      head, addr, std::memory_order_release, std::memory_order_relaxed));
 }
 
 uintptr_t PmmMaxPhysicalAddress() { return g_max_managed_phys_addr; }
 
 bool PmmIsInitialized() {
-  const IrqSpinLockGuard lock_guard(g_pmm_lock);
+  const PmmLockGuard lock_guard;
   return g_pmm_initialized;
 }
 
 int64_t PmmMaxFrameCount() { return g_max_frames; }
 
 int64_t PmmFreeFrameCount() {
-  const IrqSpinLockGuard lock_guard(g_pmm_lock);
+  const PmmLockGuard lock_guard;
   return g_pmm_free_frames;
 }
 
@@ -622,6 +749,25 @@ int64_t PmmTotalUsableFrameCount() { return g_pmm_total_usable_frames; }
 void PmmResetForTest() {
   const IrqSpinLockGuard lock_guard(g_pmm_lock);
   ResetPmmState();
+}
+
+void PmmLockForTest() { g_pmm_lock.Lock(); }
+
+void PmmUnlockForTest() { g_pmm_lock.Unlock(); }
+
+void PmmDrainAndUnlockForTest() {
+  AddQueuedRunsLocked();
+  g_pmm_lock.Unlock();
+}
+
+int64_t PmmQueuedFrameCountForTest() {
+  DCHECK(g_pmm_lock.IsLockedByCurrentCpu());
+  int64_t frames = 0;
+  for (uintptr_t addr = g_pmm_queued_runs.load(std::memory_order_acquire);
+       addr != 0; addr = QueuedRunAt(addr)->next_addr) {
+    frames += QueuedRunAt(addr)->frame_count;
+  }
+  return frames;
 }
 
 std::vector<PmmIntervalForTest> PmmCollectUsableIntervalsForTest(

@@ -1,6 +1,8 @@
 #ifndef PROTOS_SELFTEST_BOOT_SELFTEST_H_
 #define PROTOS_SELFTEST_BOOT_SELFTEST_H_
 
+#include "selftest/fpu_lifecycle_layout.h"
+
 namespace protos {
 
 // Runs the boot self-test suite and returns true if every check passed.

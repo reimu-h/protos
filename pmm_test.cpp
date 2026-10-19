@@ -5,6 +5,7 @@
 #include <sys/mman.h>
 
 #include <atomic>
+#include <chrono>
 #include <cstdint>
 #include <cstring>
 #include <ostream>
@@ -1111,6 +1112,287 @@ TEST(PmmTest, CollectUsableIntervalsCarvesLowMemoryKernelAndBootStructures) {
                              PmmIntervalForTest{FrameAddr(32), FrameAddr(40)},
                              PmmIntervalForTest{FrameAddr(41), FrameAddr(50)},
                              PmmIntervalForTest{FrameAddr(53), FrameAddr(64)}));
+}
+
+// Runs `PmmFreeFrameList()` with the frames at `frame_indices` on another
+// thread while this thread holds the PMM lock, and returns whether that call
+// returned without waiting for the lock. Leaves the lock released without
+// draining (`PmmUnlockForTest()`) so the caller can test entry-drain on the
+// next PMM call.
+static bool FreeFrameListWhileLockIsHeld(
+    const std::vector<int64_t>& frame_indices) {
+  PmmLockForTest();
+  std::atomic<bool> returned{false};
+  std::thread freer([&frame_indices, &returned]() {
+    PmmFrameList frames;
+    for (const int64_t index : frame_indices) {
+      frames.Add(FrameAddr(index));
+    }
+    PmmFreeFrameList(&frames);
+    returned.store(true, std::memory_order_release);
+  });
+  // A call that waits for the lock would never return while it is held.
+  for (int i = 0; i < 2000 && !returned.load(std::memory_order_acquire); ++i) {
+    std::this_thread::sleep_for(std::chrono::milliseconds(1));
+  }
+  const bool returned_while_held = returned.load(std::memory_order_acquire);
+  PmmUnlockForTest();
+  freer.join();
+  return returned_while_held;
+}
+
+TEST(PmmTest, FrameListMergesFramesThatFollowTheLastRun) {
+  ResetFakeEnv(64);
+  AddRegion(FrameAddr(20), 16 * kPageSize, kMemoryTypeAvailable);
+  PmmInit(0, 0);
+  ASSERT_THAT(PmmAllocFrames(16), t::Eq(FrameAddr(20)));
+
+  PmmFrameList frames;
+  for (const int64_t index : {20, 21, 22, 30, 31, 25}) {
+    frames.Add(FrameAddr(index));
+  }
+  EXPECT_THAT(frames.cur_base, t::Eq(FrameAddr(25)));
+  EXPECT_THAT(frames.cur_count, t::Eq(1));
+
+  PmmFreeFrameList(&frames);
+  EXPECT_THAT(frames.head_addr, t::Eq(0u));
+  EXPECT_THAT(frames.cur_count, t::Eq(0));
+  EXPECT_THAT(PmmFreeFrameCount(), t::Eq(6));
+  // Lowest-address first fit sees the freed runs.
+  EXPECT_THAT(PmmAllocFrames(3), t::Eq(FrameAddr(20)));
+  EXPECT_THAT(PmmAllocFrames(2), t::Eq(FrameAddr(30)));
+  EXPECT_THAT(PmmAllocFrame(), t::Eq(FrameAddr(25)));
+  EXPECT_THAT(PmmFreeFrameCount(), t::Eq(0));
+}
+
+TEST(PmmTest, FrameListFreeCoalescesWithFreeRunsLikePmmFreeFrames) {
+  ResetFakeEnv(64);
+  AddRegion(FrameAddr(20), 8 * kPageSize, kMemoryTypeAvailable);
+  PmmInit(0, 0);
+  ASSERT_THAT(PmmAllocFrames(8), t::Eq(FrameAddr(20)));
+  PmmFreeFrame(FrameAddr(20));
+  PmmFreeFrame(FrameAddr(27));
+
+  // Frames 21..26 in an order that makes several runs; together with the free
+  // frames 20 and 27 they form one run.
+  PmmFrameList frames;
+  for (const int64_t index : {24, 25, 26, 21, 22, 23}) {
+    frames.Add(FrameAddr(index));
+  }
+  PmmFreeFrameList(&frames);
+
+  PmmLockForTest();
+  EXPECT_THAT(PmmQueuedFrameCountForTest(), t::Eq(0));
+  PmmUnlockForTest();
+  EXPECT_THAT(PmmFreeFrameCount(), t::Eq(8));
+  EXPECT_THAT(PmmAllocFrames(8), t::Eq(FrameAddr(20)));
+  // An empty list is a no-op.
+  PmmFrameList empty;
+  PmmFreeFrameList(&empty);
+  EXPECT_THAT(PmmFreeFrameCount(), t::Eq(0));
+}
+
+TEST(PmmTest, FrameListFreeQueuesWithoutWaitingAndDrainsOnExitAndEntry) {
+  ResetFakeEnv(64);
+  AddRegion(FrameAddr(20), 8 * kPageSize, kMemoryTypeAvailable);
+  PmmInit(0, 0);
+  ASSERT_THAT(PmmAllocFrames(8), t::Eq(FrameAddr(20)));
+
+  // 1. Exit-drain path: when a locked PMM critical section finishes
+  // (`PmmDrainAndUnlockForTest()`), it drains any queued runs before
+  // releasing `g_pmm_lock`.
+  PmmLockForTest();
+  std::atomic<bool> returned{false};
+  std::thread freer([&returned]() {
+    PmmFrameList frames;
+    for (const int64_t index : {20, 21}) {
+      frames.Add(FrameAddr(index));
+    }
+    PmmFreeFrameList(&frames);
+    returned.store(true, std::memory_order_release);
+  });
+  for (int i = 0; i < 2000 && !returned.load(std::memory_order_acquire); ++i) {
+    std::this_thread::sleep_for(std::chrono::milliseconds(1));
+  }
+  EXPECT_TRUE(returned.load(std::memory_order_acquire));
+  EXPECT_THAT(PmmQueuedFrameCountForTest(), t::Eq(2));
+  PmmDrainAndUnlockForTest();
+  freer.join();
+
+  PmmLockForTest();
+  EXPECT_THAT(PmmQueuedFrameCountForTest(), t::Eq(0));
+  PmmUnlockForTest();
+  EXPECT_THAT(PmmFreeFrameCount(), t::Eq(2));
+  ASSERT_THAT(PmmAllocFrames(2), t::Eq(FrameAddr(20)));
+
+  // 2. Entry-drain path: if a run is queued in the race window right before
+  // `Unlock()`, the next `PmmFreeFrameCount()` or `PmmAllocFrames()` drains it
+  // on entry.
+  ASSERT_TRUE(FreeFrameListWhileLockIsHeld({23, 24, 25}));
+  PmmLockForTest();
+  EXPECT_THAT(PmmQueuedFrameCountForTest(), t::Eq(3));
+  PmmUnlockForTest();
+
+  EXPECT_THAT(PmmFreeFrameCount(), t::Eq(3));
+  PmmLockForTest();
+  EXPECT_THAT(PmmQueuedFrameCountForTest(), t::Eq(0));
+  PmmUnlockForTest();
+  EXPECT_THAT(PmmAllocFrames(3), t::Eq(FrameAddr(23)));
+}
+
+TEST(PmmTest, QueuedFramesAreAllocatedFirstFitAfterTheLockIsReleased) {
+  ResetFakeEnv(64);
+  AddRegion(FrameAddr(20), 8 * kPageSize, kMemoryTypeAvailable);
+  PmmInit(0, 0);
+  ASSERT_THAT(PmmAllocFrames(4), t::Eq(FrameAddr(20)));
+
+  ASSERT_TRUE(FreeFrameListWhileLockIsHeld({20, 21, 22, 23}));
+  // The allocation adds the queued run first, which coalesces with the free
+  // run [24, 28), so even the whole region is one run again.
+  EXPECT_THAT(PmmAllocFrames(8), t::Eq(FrameAddr(20)));
+  EXPECT_THAT(PmmFreeFrameCount(), t::Eq(0));
+  PmmFreeFrames(FrameAddr(20), 8);
+  EXPECT_THAT(PmmFreeFrameCount(), t::Eq(8));
+}
+
+TEST(PmmTest, ResetDropsQueuedRuns) {
+  ResetFakeEnv(64);
+  AddRegion(FrameAddr(20), 8 * kPageSize, kMemoryTypeAvailable);
+  PmmInit(0, 0);
+  ASSERT_THAT(PmmAllocFrames(8), t::Eq(FrameAddr(20)));
+  ASSERT_TRUE(FreeFrameListWhileLockIsHeld({20, 21}));
+
+  PmmResetForTest();
+  PmmLockForTest();
+  EXPECT_THAT(PmmQueuedFrameCountForTest(), t::Eq(0));
+  PmmUnlockForTest();
+}
+
+TEST(PmmTest, ConcurrentFrameListFreesAllocsAndCountsKeepExactAccounting) {
+  ResetFakeEnv(2560);
+  constexpr int64_t kArenaStartFrame = 32;
+  constexpr int64_t kArenaFrames = 2048;
+  AddRegion(FrameAddr(kArenaStartFrame),  //
+            kArenaFrames * kPageSize,     //
+            kMemoryTypeAvailable);
+  PmmInit(0, 0);
+
+  constexpr int kNumThreads = 8;
+  constexpr int kIterationsPerThread = 60;
+  constexpr int kFramesPerList = 25;
+  std::atomic<bool> start_gate{false};
+  std::vector<std::thread> workers;
+  workers.reserve(kNumThreads);
+  for (int tid = 0; tid < kNumThreads; ++tid) {
+    workers.emplace_back([&, tid]() {
+      while (!start_gate.load(std::memory_order_acquire)) {
+        std::this_thread::yield();
+      }
+      for (int iter = 0; iter < kIterationsPerThread; ++iter) {
+        uintptr_t frames[kFramesPerList];
+        for (int i = 0; i < kFramesPerList; ++i) {
+          frames[i] = PmmAllocFrame();
+          ASSERT_THAT(frames[i], t::Ne(0u));
+          *reinterpret_cast<uint64_t*>(frames[i]) =
+              (static_cast<uint64_t>(tid) << 32) | iter;
+        }
+        for (int i = 0; i < kFramesPerList; ++i) {
+          ASSERT_THAT(*reinterpret_cast<const uint64_t*>(frames[i]),
+                      t::Eq((static_cast<uint64_t>(tid) << 32) | iter));
+        }
+        PmmFrameList list;
+        for (const uintptr_t frame : frames) {
+          list.Add(frame);
+        }
+        PmmFreeFrameList(&list);
+        const int64_t observed_free = PmmFreeFrameCount();
+        EXPECT_GE(observed_free, 0);
+        EXPECT_LE(observed_free, kArenaFrames);
+      }
+    });
+  }
+  start_gate.store(true, std::memory_order_release);
+  for (std::thread& worker : workers) {
+    worker.join();
+  }
+
+  EXPECT_THAT(PmmFreeFrameCount(), t::Eq(kArenaFrames));
+  EXPECT_THAT(PmmAllocFrames(kArenaFrames), t::Eq(FrameAddr(kArenaStartFrame)));
+}
+
+TEST(PmmDeathTest, FrameListAddRejectsInvalidFrames) {
+#ifdef NDEBUG
+  GTEST_SKIP() << "requires DCHECKs (built with NDEBUG)";
+#endif
+  ResetFakeEnv(64);
+  AddRegion(FrameAddr(20), 8 * kPageSize, kMemoryTypeAvailable);
+  PmmInit(0, 0);
+  PmmFrameList frames;
+  EXPECT_DEATH(frames.Add(0),
+               "Check failed: frame_addr >= kLowerMemoryLimit at");
+  EXPECT_DEATH(frames.Add(FrameAddr(20) + 64),
+               "Check failed: \\(frame_addr & \\(kPageSize - 1\\)\\) == 0 at");
+  // The kernel image at frames [16, 20) is not usable RAM.
+  EXPECT_DEATH(
+      {
+        frames.Add(FrameAddr(16));
+        PmmFreeFrameList(&frames);
+      },
+      "Check failed: PmmRangeIsValidUsableRamLocked\\(");
+}
+
+TEST(PmmDeathTest, FrameListWithFreeFramesPanics) {
+  ResetFakeEnv(64);
+  AddRegion(FrameAddr(20), 8 * kPageSize, kMemoryTypeAvailable);
+  PmmInit(0, 0);
+  // Frames [20, 24) are allocated and [24, 28) form one free run.
+  ASSERT_THAT(PmmAllocFrames(4), t::Eq(FrameAddr(20)));
+  constexpr char kOverlapsNextRun[] =
+      "Check failed: next_check == nullptr \\|\\| "
+      "RunBaseAddress\\(next_check\\) "
+      ">= end_addr at";
+  constexpr char kOverlapsPrevRun[] =
+      "Check failed: prev_check == nullptr \\|\\| "
+      "RunEndAddress\\(prev_check\\) "
+      "<= base_addr at";
+
+  EXPECT_DEATH(
+      {
+        PmmFrameList frames;
+        frames.Add(FrameAddr(24));
+        PmmFreeFrameList(&frames);
+      },
+      kOverlapsNextRun);
+  EXPECT_DEATH(
+      {
+        PmmFrameList frames;
+        frames.Add(FrameAddr(22));
+        frames.Add(FrameAddr(26));
+        PmmFreeFrameList(&frames);
+      },
+      kOverlapsPrevRun);
+  // A frame listed twice: backward coalescing merges (21, 20) into [20, 22),
+  // then the second 21 flushes [20, 22) and starts [21, 22), which is freed
+  // first followed by [20, 22) overlapping next_check [21, 22).
+  EXPECT_DEATH(
+      {
+        PmmFrameList frames;
+        frames.Add(FrameAddr(21));
+        frames.Add(FrameAddr(20));
+        frames.Add(FrameAddr(21));
+        PmmFreeFrameList(&frames);
+      },
+      kOverlapsNextRun);
+  // A queued run is checked when the next lock holder adds it. Listing the
+  // first frame of a free run left the tree intact for that check.
+  EXPECT_DEATH(
+      {
+        if (FreeFrameListWhileLockIsHeld({24})) {
+          PmmAllocFrame();
+        }
+      },
+      kOverlapsNextRun);
+  EXPECT_THAT(PmmFreeFrameCount(), t::Eq(4));
 }
 
 }  // namespace
