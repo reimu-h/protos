@@ -7,6 +7,7 @@
 
 #include "address_space.h"
 #include "check.h"
+#include "console.h"
 #include "cpu.h"
 #include "format.h"
 #include "fpu.h"
@@ -2962,17 +2963,37 @@ static bool FaultedWith(const UserProgramResult& result,  //
   return false;
 }
 
-// Checks user processes with user/usertest.cpp: the exit status reaches the
-// kernel, system calls work and reject bad arguments, and each kind of fault
-// kills the program that raised it, reported with the right vector, error
-// code and address, while the kernel carries on. An invalid executable does
-// not load. Afterwards the kernel's page tables are active again and every
-// frame and heap byte is back.
+static bool TestUserModeConsoleRead();
+static bool TestUserModeSpawnAndWait();
+static bool TestUserModeInteractiveShell();
+
+// Checks user processes with user/usertest.cpp, user/init.cpp, and
+// user/sh.cpp: the exit status reaches the kernel, system calls work and
+// reject bad arguments, console read() and process spawn()/wait() work and
+// clean up children across exit/fault/kill, the interactive shell runs
+// built-in commands and child programs, and each kind of fault kills the
+// program that raised it, reported with the right vector, error code and
+// address, while the kernel carries on. An invalid executable does not load.
+// Afterwards the kernel's page tables are active again and every frame and
+// heap byte is back.
 static bool TestUserModePrograms() {
   using usertest::Mode;
   SELFTEST_EXPECT(GetTaskScheduler() != nullptr);
+  const int64_t pmm_free_at_start = PmmFreeFrameCount();
+  const int64_t heap_free_at_start = HeapTotalFreeBytes();
+  // Warm up the kernel heap for multi-CPU console read and multi-process child
+  // spawning before recording the exact frame and heap baseline.
+  SELFTEST_EXPECT(TestUserModeConsoleRead());
+  SELFTEST_EXPECT(TestUserModeSpawnAndWait());
+  SELFTEST_EXPECT(TestUserModeInteractiveShell());
   const int64_t pmm_free_before = PmmFreeFrameCount();
   const int64_t heap_free_before = HeapTotalFreeBytes();
+  const bool heap_grew = pmm_free_before < pmm_free_at_start &&
+                         heap_free_before > heap_free_at_start;
+  if (!heap_grew) {
+    SELFTEST_EXPECT(pmm_free_before == pmm_free_at_start);
+    SELFTEST_EXPECT(heap_free_before == heap_free_at_start);
+  }
   UserProgramResult result;
 
   SELFTEST_EXPECT(RunUserTest(Mode::kExit, &result));
@@ -3037,11 +3058,15 @@ static bool TestUserModePrograms() {
     SELFTEST_EXPECT(process->syscall_count() == 0);
   }
 
+  SELFTEST_EXPECT(TestUserModeConsoleRead());
+  SELFTEST_EXPECT(TestUserModeSpawnAndWait());
+  SELFTEST_EXPECT(TestUserModeInteractiveShell());
+
   SELFTEST_EXPECT(PagingActiveRoot() == PagingKernelRoot());
   SELFTEST_EXPECT(PagingUserSpaceIsEmpty());
   SELFTEST_EXPECT(PmmFreeFrameCount() == pmm_free_before);
-  // Including what the programs that faulted had: their FpuState, address
-  // space and task.
+  // Including what the programs that faulted and spawned children had: their
+  // FpuState, address space and task.
   SELFTEST_EXPECT(HeapTotalFreeBytes() == heap_free_before);
   return true;
 }
@@ -3684,6 +3709,252 @@ static bool TestUserModeKill() {
   SELFTEST_EXPECT(PagingUserSpaceIsEmpty());
   SELFTEST_EXPECT(PmmFreeFrameCount() == pmm_free_before);
   SELFTEST_EXPECT(HeapTotalFreeBytes() == heap_free_before);
+  return true;
+}
+
+static bool ContainsSubstring(const char* const haystack,
+                              const char* const needle) {
+  if (haystack == nullptr || needle == nullptr) {
+    return false;
+  }
+  if (needle[0] == '\0') {
+    return true;
+  }
+  for (int i = 0; haystack[i] != '\0'; ++i) {
+    int j = 0;
+    while (needle[j] != '\0' && haystack[i + j] == needle[j]) {
+      ++j;
+    }
+    if (needle[j] == '\0') {
+      return true;
+    }
+  }
+  return false;
+}
+
+// Verifies kSyscallRead: pre-buffered reads, error validation (invalid sizes
+// and unmapped/kernel/read-only user buffers), streaming multi-chunk reads
+// while blocked in Read(), and Kill() termination within kKillDeadlineTicks
+// while blocked waiting for console input.
+static bool TestUserModeConsoleRead() {
+  using usertest::Mode;
+  ConsoleClearInput();
+
+  // (a) Pre-seeded console input + Read() validation checks.
+  constexpr const char kInputMessage[] = "hello, ring-3 console!\n";
+  constexpr int64_t kInputLen = static_cast<int64_t>(sizeof(kInputMessage)) - 1;
+  ConsolePushInput(kInputMessage, kInputLen);
+  {
+    const std::unique_ptr<UserProcess> reader = UserProcess::Start(
+        UserTestProgram(),
+        usertest::Arg(Mode::kConsoleRead, static_cast<uint64_t>(kInputLen)));
+    SELFTEST_EXPECT(reader != nullptr);
+    SELFTEST_EXPECT(WaitForProcesses(&reader, 1, HasEnded, WaitMode::kYield));
+    const int64_t expected_checksum = SyscallSpinChecksum(
+        reinterpret_cast<const uint8_t*>(kInputMessage), kInputLen);
+    SELFTEST_EXPECT(ExitedWith(reader->Wait(), expected_checksum));
+  }
+
+  // (b) Streaming input fed in two chunks after the process blocks in Read().
+  ConsoleClearInput();
+  {
+    constexpr const char kStreamInput[] = "stream8!";
+    constexpr int64_t kStreamLen = 8;
+    const std::unique_ptr<UserProcess> reader = UserProcess::Start(
+        UserTestProgram(),
+        usertest::Arg(Mode::kConsoleRead, static_cast<uint64_t>(kStreamLen)));
+    SELFTEST_EXPECT(reader != nullptr);
+    SELFTEST_EXPECT(WaitForProcesses(
+        &reader, 1,
+        [](const UserProcessStats& s) { return s.in_syscall || HasEnded(s); },
+        WaitMode::kYield));
+    SELFTEST_EXPECT(!HasEnded(reader->stats()));
+    ConsolePushInput(kStreamInput, 4);
+    GetTaskScheduler()->Yield();
+    ConsolePushInput(kStreamInput + 4, 4);
+    SELFTEST_EXPECT(WaitForProcesses(&reader, 1, HasEnded, WaitMode::kYield));
+    const int64_t expected_checksum = SyscallSpinChecksum(
+        reinterpret_cast<const uint8_t*>(kStreamInput), kStreamLen);
+    SELFTEST_EXPECT(ExitedWith(reader->Wait(), expected_checksum));
+  }
+
+  // (c) Kill() while blocked in Read() terminates within kKillDeadlineTicks.
+  ConsoleClearInput();
+  {
+    const int cpu_count = SmpCpuCount();
+    const int count = (cpu_count > 1) ? cpu_count - 1 : 1;
+    const ProcessArray readers = MakeProcessArray(count);
+    const auto arg_of = [](const int /*i*/) {
+      return usertest::Arg(Mode::kConsoleRead, 0);
+    };
+    SELFTEST_EXPECT(StartProcessesOnOwnCpus(readers.get(), count, arg_of));
+    SELFTEST_EXPECT(
+        WaitForProcesses(readers.get(), count, IsInSyscall, WaitMode::kSpin));
+    for (int i = 0; i < count; ++i) {
+      readers[i]->Kill();
+    }
+    for (int i = 0; i < count; ++i) {
+      UserProcessStats stats;
+      SELFTEST_EXPECT(EndedKilled(readers[i], &stats));
+      SELFTEST_EXPECT(stats.kill_in_syscall);
+      SELFTEST_EXPECT(stats.syscalls == 1);
+      SELFTEST_EXPECT(stats.end_vector == kVectorSyscall);
+      LogLateKill("console_read", stats);
+      SELFTEST_EXPECT(KillTicks(stats) <= kKillDeadlineTicks);
+    }
+  }
+  ConsoleClearInput();
+  return true;
+}
+
+// Verifies kSyscallSpawn and kSyscallWait: error validation, child exit/fault
+// outcomes, child slot exhaustion, Kill() while blocked in Wait(), and
+// automatic orphan child cleanup when a parent exits, faults, or is killed.
+static bool TestUserModeSpawnAndWait() {
+  using usertest::Mode;
+  using usertest::SpawnTestSubmode;
+
+  // (a) Full Spawn/Wait validation, child exit/fault outcomes, slot limits.
+  {
+    const std::unique_ptr<UserProcess> proc = UserProcess::Start(
+        UserTestProgram(),
+        usertest::Arg(
+            Mode::kSpawnAndWait,
+            static_cast<uint64_t>(SpawnTestSubmode::kBasicAndErrors)));
+    SELFTEST_EXPECT(proc != nullptr);
+    SELFTEST_EXPECT(WaitForProcesses(&proc, 1, HasEnded, WaitMode::kYield));
+    SELFTEST_EXPECT(ExitedWith(proc->Wait(), 0));
+  }
+
+  // (b) Kill() while blocked in Wait() kills the parent within deadline and
+  // automatically cleans up the spinning child.
+  {
+    const std::unique_ptr<UserProcess> parent = UserProcess::Start(
+        UserTestProgram(),
+        usertest::Arg(Mode::kSpawnAndWait,
+                      static_cast<uint64_t>(SpawnTestSubmode::kBlockInWait)));
+    SELFTEST_EXPECT(parent != nullptr);
+    SELFTEST_EXPECT(WaitForProcesses(
+        &parent, 1,
+        [](const UserProcessStats& s) {
+          return (s.syscalls >= 2 && s.in_syscall) || HasEnded(s);
+        },
+        WaitMode::kYield));
+    SELFTEST_EXPECT(!HasEnded(parent->stats()));
+    parent->Kill();
+    UserProcessStats stats;
+    SELFTEST_EXPECT(EndedKilled(parent, &stats));
+    SELFTEST_EXPECT(stats.kill_in_syscall);
+    SELFTEST_EXPECT(stats.end_vector == kVectorSyscall);
+    SELFTEST_EXPECT(KillTicks(stats) <= 5 * kKillDeadlineTicks);
+  }
+
+  // (c) Parent exits normally without calling Wait() on two spinning
+  // children: CleanupChildren() kills and reaps both children.
+  {
+    const std::unique_ptr<UserProcess> parent = UserProcess::Start(
+        UserTestProgram(),
+        usertest::Arg(Mode::kSpawnAndWait,
+                      static_cast<uint64_t>(SpawnTestSubmode::kOrphanOnExit)));
+    SELFTEST_EXPECT(parent != nullptr);
+    SELFTEST_EXPECT(WaitForProcesses(&parent, 1, HasEnded, WaitMode::kYield));
+    SELFTEST_EXPECT(ExitedWith(parent->Wait(), 0));
+  }
+
+  // (d) Parent faults (#UD) without calling Wait() on a spinning child:
+  // CleanupChildren() kills and reaps the child.
+  {
+    const std::unique_ptr<UserProcess> parent = UserProcess::Start(
+        UserTestProgram(),
+        usertest::Arg(Mode::kSpawnAndWait,
+                      static_cast<uint64_t>(SpawnTestSubmode::kOrphanOnFault)));
+    SELFTEST_EXPECT(parent != nullptr);
+    SELFTEST_EXPECT(WaitForProcesses(&parent, 1, HasEnded, WaitMode::kYield));
+    SELFTEST_EXPECT(FaultedWith(parent->Wait(), kVectorInvalidOpcode, 0, 0));
+  }
+
+  return true;
+}
+
+// Verifies the end-to-end init -> sh workflow and interactive shell features
+// (prompt, character echoing, '\b' and 0x7F backspace editing with empty-line
+// underflow guard, '\r\n' handling, empty/whitespace lines, built-in commands
+// help/echo/cpu/programs/exit, spawning usertest passing and faulting modes,
+// and unknown command recovery).
+static bool TestUserModeInteractiveShell() {
+  const bool prev_vga_echo = ConsoleVgaEchoEnabled();
+  ConsoleSetVgaEcho(false);
+  ConsoleClearInput();
+  ConsoleResetOutputCapture();
+
+  constexpr const char kShellScript[] =
+      "\n"
+      "   \t  \n"
+      "\b\x7f"
+      "ecoh\b\bho edited_line_ok\r\n"
+      "help\n"
+      "cpu\n"
+      "programs\n"
+      "usertest 1\n"
+      "run usertest 0\n"
+      "usertest 6\n"
+      "nosuchcommand arg1\n"
+      "exit 0\n";
+  ConsolePushInput(kShellScript,
+                   static_cast<int64_t>(sizeof(kShellScript)) - 1);
+
+  const std::unique_ptr<UserProcess> init_proc =
+      UserProcess::Start(InitProgram(), 0);
+  if (init_proc == nullptr) {
+    ConsoleSetVgaEcho(prev_vga_echo);
+    return false;
+  }
+  const bool waited =
+      WaitForProcesses(&init_proc, 1, HasEnded, WaitMode::kYield);
+  const UserProgramResult init_result = init_proc->Wait();
+
+  static char captured[4096];
+  const int64_t captured_len =
+      ConsoleCopyOutputCapture(captured, sizeof(captured));
+
+  // Also verify custom non-zero exit status directly on ShProgram().
+  ConsoleClearInput();
+  constexpr const char kExit42Script[] = "exit 42\n";
+  ConsolePushInput(kExit42Script,
+                   static_cast<int64_t>(sizeof(kExit42Script)) - 1);
+  const std::unique_ptr<UserProcess> sh_proc =
+      UserProcess::Start(ShUserProgram(), 0);
+  bool sh_waited = false;
+  UserProgramResult sh_result;
+  if (sh_proc != nullptr) {
+    sh_waited = WaitForProcesses(&sh_proc, 1, HasEnded, WaitMode::kYield);
+    sh_result = sh_proc->Wait();
+  }
+
+  ConsoleClearInput();
+  ConsoleSetVgaEcho(prev_vga_echo);
+
+  SELFTEST_EXPECT(waited);
+  SELFTEST_EXPECT(ExitedWith(init_result, 0));
+  SELFTEST_EXPECT(captured_len > 0);
+  SELFTEST_EXPECT(ContainsSubstring(captured, "[INIT] hello from ring 3\n"));
+  SELFTEST_EXPECT(ContainsSubstring(captured, "sh> "));
+  SELFTEST_EXPECT(ContainsSubstring(captured, "\b \b"));
+  SELFTEST_EXPECT(ContainsSubstring(captured, "edited_line_ok\n"));
+  SELFTEST_EXPECT(ContainsSubstring(
+      captured, "built-in commands: help echo cpu programs run exit\n"));
+  SELFTEST_EXPECT(ContainsSubstring(captured, "cpu: "));
+  SELFTEST_EXPECT(ContainsSubstring(captured, "programs: init sh usertest\n"));
+  SELFTEST_EXPECT(
+      ContainsSubstring(captured, "sh: usertest exited with status 0\n"));
+  SELFTEST_EXPECT(ContainsSubstring(
+      captured, "sh: usertest exited with status -1250999896491\n"));
+  SELFTEST_EXPECT(ContainsSubstring(captured, "sh: usertest faulted vector=6"));
+  SELFTEST_EXPECT(
+      ContainsSubstring(captured, "sh: unknown command: nosuchcommand\n"));
+  SELFTEST_EXPECT(sh_proc != nullptr);
+  SELFTEST_EXPECT(sh_waited);
+  SELFTEST_EXPECT(ExitedWith(sh_result, 42));
   return true;
 }
 

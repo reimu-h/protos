@@ -13,6 +13,13 @@ g_init_elf_start:
 g_init_elf_end:
 
 .balign 16
+.global g_sh_elf_start
+.global g_sh_elf_end
+g_sh_elf_start:
+    .incbin "user/sh.elf"
+g_sh_elf_end:
+
+.balign 16
 .global g_usertest_elf_start
 .global g_usertest_elf_end
 g_usertest_elf_start:

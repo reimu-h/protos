@@ -59,6 +59,47 @@ inline int64_t SpinOnBuffer(const void* const buffer,  //
                  static_cast<uint64_t>(ticks));
 }
 
+// Reads between 1 and `size` bytes of console input into `buffer`, waiting if
+// none is available yet, and returns the number of bytes read (`0` when
+// `size == 0`), or an error (syscall_abi.h).
+inline int64_t Read(void* const buffer, const int64_t size) {
+  return Syscall(kSyscallRead,                         //
+                 reinterpret_cast<uintptr_t>(buffer),  //
+                 static_cast<uint64_t>(size));
+}
+
+// Starts the embedded user program whose name is the `name_len` bytes at
+// `name` in a new child user process with `arg` in its rdi, and returns the
+// child's process ID (`1 <= pid <= kMaxUserChildProcesses`), or an error.
+inline int64_t Spawn(const char* const name,  //
+                     const int64_t name_len,  //
+                     const uint64_t arg) {
+  return Syscall(kSyscallSpawn,                      //
+                 reinterpret_cast<uintptr_t>(name),  //
+                 static_cast<uint64_t>(name_len),    //
+                 arg);
+}
+
+// Convenience overload for null-terminated `name`.
+inline int64_t Spawn(const char* const name, const uint64_t arg = 0) {
+  if (name == nullptr) {
+    return Spawn(nullptr, 1, arg);
+  }
+  int64_t length = 0;
+  while (name[length] != '\0') {
+    ++length;
+  }
+  return Spawn(name, length, arg);
+}
+
+// Waits until child process `pid` has ended, writes its `UserProgramResult` to
+// `*result`, and returns 0, or an error.
+inline int64_t Wait(const int64_t pid, UserProgramResult* const result) {
+  return Syscall(kSyscallWait,                //
+                 static_cast<uint64_t>(pid),  //
+                 reinterpret_cast<uintptr_t>(result));
+}
+
 // Each user program defines its main function, which the entry point
 // (user/crt.cpp) calls with the argument that the kernel passed in rdi. The
 // program exits with the status that it returns.

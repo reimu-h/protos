@@ -396,5 +396,43 @@ TEST(VgaTest, ConcurrentWritersKeepTheCursorInBounds) {
   EXPECT_THAT(std::memcmp(g_fb32_a, g_fb32_b, sizeof(g_fb32_a)), t::Eq(0));
 }
 
+TEST(VgaTest, BackspaceMovesCursorLeftWithinRowAndAllowsOverwriting) {
+  ResetEnv();
+  AttachAndClear(kFb32A);
+
+  // Backspace at column 0 is a no-op and keeps the cursor at (0, 0).
+  VgaWrite("\b\b");
+  EXPECT_THAT(VgaGetCursorRow(), t::Eq(0));
+  EXPECT_THAT(VgaGetCursorCol(), t::Eq(0));
+
+  // Write "F0", erase '0' with "\b \b", and overwrite column 1 with '$'.
+  VgaWrite("F0");
+  EXPECT_THAT(VgaGetCursorRow(), t::Eq(0));
+  EXPECT_THAT(VgaGetCursorCol(), t::Eq(2));
+  VgaWrite("\b \b");
+  EXPECT_THAT(VgaGetCursorRow(), t::Eq(0));
+  EXPECT_THAT(VgaGetCursorCol(), t::Eq(1));
+  EXPECT_THAT(CellRows(kFb32A, 0, 0), t::Contains(".######."));
+  EXPECT_THAT(CellRows(kFb32A, 0, 1), t::Each(t::Eq("........")));
+
+  VgaPutc('$');
+  EXPECT_THAT(VgaGetCursorRow(), t::Eq(0));
+  EXPECT_THAT(VgaGetCursorCol(), t::Eq(2));
+  EXPECT_THAT(CellRows(kFb32A, 0, 1), t::Contains("..#####."));
+
+  // Backspace at column 0 of row 1 stays on row 1, column 0.
+  VgaWrite("\n\b");
+  EXPECT_THAT(VgaGetCursorRow(), t::Eq(1));
+  EXPECT_THAT(VgaGetCursorCol(), t::Eq(0));
+
+  std::memset(g_fb32_b, kUntouchedByte, sizeof(g_fb32_b));
+  ASSERT_TRUE(VgaInitFramebuffer(kFb32B.addr(),  //
+                                 kPitch32,       //
+                                 kFbWidth,       //
+                                 kFbHeight,      //
+                                 32));
+  EXPECT_THAT(std::memcmp(g_fb32_a, g_fb32_b, sizeof(g_fb32_a)), t::Eq(0));
+}
+
 }  // namespace
 }  // namespace protos

@@ -6,6 +6,7 @@
 #include <memory>
 
 #include "spinlock.h"
+#include "syscall_abi.h"
 
 namespace protos {
 
@@ -65,30 +66,7 @@ struct UserProgram {
   int64_t size = 0;
 };
 
-// How a user program ended.
-enum class UserProgramOutcome : uint8_t {
-  // It called exit(); `UserProgramResult::exit_status` holds the status.
-  kExited,
-  // It raised a CPU exception, which killed it; the `fault_*` fields of
-  // `UserProgramResult` describe the exception.
-  kFaulted,
-  // `UserProcess::Kill()` killed it.
-  kKilled,
-  // It never ran: its executable is invalid (elf.h) or memory ran out.
-  kLoadFailed,
-};
-
-struct UserProgramResult {
-  UserProgramOutcome outcome = UserProgramOutcome::kLoadFailed;
-  int64_t exit_status = 0;
-  // The exception vector (idt.h), error code and the address of the faulting
-  // instruction.
-  int fault_vector = -1;
-  uint64_t fault_error_code = 0;
-  uint64_t fault_rip = 0;
-  // For page faults, the address whose access faulted (CR2), else 0.
-  uint64_t fault_address = 0;
-};
+// `UserProgramOutcome` and `UserProgramResult` are defined in syscall_abi.h.
 
 // Registers the system call handler (`kVectorSyscall`), the handler that
 // kills a user program on a CPU exception (`IdtSetUserFaultHandler()`), and
@@ -239,9 +217,12 @@ class UserProcess {
   bool IsKillRequested() const {
     return kill_requested_.load(std::memory_order_acquire);
   }
-  // Returns true if user code may read the `size` (> 0) bytes at `buffer`.
+  // Returns true if user code may read/write the `size` (> 0) bytes at
+  // `buffer`.
   bool MayRead(uintptr_t buffer, int64_t size) const;
-  // Serve write() and spin() (syscall_abi.h): return the result for rax.
+  bool MayWrite(uintptr_t buffer, int64_t size) const;
+  // Serve write(), spin(), read(), spawn() and wait() (syscall_abi.h): return
+  // the result for rax.
   // `meter` measures the system call from its start; spin() lasts until
   // `meter` has counted `ticks` timer interrupts that interrupted the task,
   // on whichever CPUs: other runnable tasks on its CPU make it last longer in
@@ -251,6 +232,10 @@ class UserProcess {
                int64_t size,      //
                int64_t ticks,     //
                TickMeter* meter) const;
+  int64_t Read(uintptr_t buffer, int64_t size);
+  int64_t Spawn(uintptr_t name_ptr, int64_t name_len, uint64_t arg);
+  int64_t WaitChild(int64_t pid, uintptr_t result_ptr);
+  void CleanupChildren();
   // Adds a finished system call, which `meter` measured, to the counters.
   void RecordSyscall(const TickMeter& meter);
   void RecordKillNoticeIrqsOff();
@@ -304,6 +289,7 @@ class UserProcess {
   std::atomic<int> kill_end_cpu_{-1};
   std::atomic<int64_t> kill_end_switches_{-1};
   std::atomic<int64_t> injected_kill_delay_ticks_{0};
+  std::unique_ptr<UserProcess> children_[kMaxUserChildProcesses];
 };
 
 }  // namespace protos

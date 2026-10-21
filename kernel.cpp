@@ -26,10 +26,21 @@ namespace protos {
 // Runs the first user process, init (user/init.cpp), in an address space of
 // its own until it ends, and reports how it ended.
 static void RunInitProcess() {
+#if PROTOS_SELFTEST
+  constexpr char kBootShellScript[] =
+      "help\necho boot_sh_ok\nusertest 0\nexit 0\n";
+  ConsoleClearInput();
+  ConsolePushInput(kBootShellScript,
+                   static_cast<int64_t>(sizeof(kBootShellScript) - 1));
+  ConsoleSetVgaEcho(false);
+#endif
   const std::unique_ptr<UserProcess> init =
       UserProcess::Start(InitProgram(), /*arg=*/0);
   CHECK(init != nullptr);
   const UserProgramResult result = init->Wait();
+#if PROTOS_SELFTEST
+  ConsoleSetVgaEcho(true);
+#endif
   ConsoleWrite("[INIT] ");
   WriteUserProgramResult(result, ConsoleWrite);
   ConsoleWrite("\n");

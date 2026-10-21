@@ -21,6 +21,16 @@ void UartWriteDec(uint64_t value);
 // lock, which a stopped CPU may hold.
 void UartPanicWrite(const char* str);
 
+// Polls COM1 for any received bytes and pops the next byte from the software
+// RX ring buffer into `*out`. Returns false if no byte is available.
+bool UartTryGetc(char* out);
+// Appends up to `size` bytes from `data` into the software RX ring buffer
+// (dropping any excess once the buffer is full).
+void UartPushRx(const char* data, int64_t size);
+// Drains any pending hardware COM1 RX bytes and clears the software RX ring
+// buffer.
+void UartClearRx();
+
 }  // namespace protos
 
 #endif  // PROTOS_UART_H_

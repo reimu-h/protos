@@ -120,6 +120,33 @@ enum class Mode : uint8_t {
   // the program). Exits with a `kX87Pending*Status` if a check fails or FWAIT
   // returns.
   kX87PendingException,
+  // Validates read() error cases (invalid sizes -> kSyscallErrorInvalid,
+  // null/kernel/non-canonical/unmapped/wrapping/guard-page/read-only user
+  // buffers -> kSyscallErrorFault), then reads `arg >> 8` bytes from the
+  // console (or blocks in read() until killed if `arg >> 8` is 0) and exits
+  // with `SyscallSpinChecksum()` of the bytes read.
+  kConsoleRead,
+  // Exercises spawn() and wait() according to the sub-mode in `arg >> 8`
+  // (`SpawnTestSubmode`):
+  //   0 (`kBasicAndErrors`): validates bad lengths/names/PIDs
+  //     (kSyscallErrorInvalid) and bad/read-only pointers
+  //     (kSyscallErrorFault), spawns child usertest processes that exit,
+  //     fault with #UD, and fault with #PF, tests child slot exhaustion and
+  //     double-wait rejection, and exits with 0.
+  //   1 (`kBlockInWait`): spawns a spinning child and blocks in wait() until
+  //     the parent is killed.
+  //   2 (`kOrphanOnExit`): spawns two spinning children and exits with 0
+  //     without waiting for them.
+  //   3 (`kOrphanOnFault`): spawns a spinning child and faults (#UD) without
+  //     waiting for it.
+  kSpawnAndWait,
+};
+
+enum class SpawnTestSubmode : uint8_t {
+  kBasicAndErrors = 0,
+  kBlockInWait = 1,
+  kOrphanOnExit = 2,
+  kOrphanOnFault = 3,
 };
 
 constexpr int64_t kExitStatus = -0x123456789AB;

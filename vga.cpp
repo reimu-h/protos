@@ -270,6 +270,12 @@ static void VgaPutcLocked(const char ch) {
     g_cursor_col = 0;
     return;
   }
+  if (ch == '\b') {
+    if (g_cursor_col > 0) {
+      --g_cursor_col;
+    }
+    return;
+  }
   if (ch == '\n') {
     g_cursor_col = 0;
     ++g_cursor_row;

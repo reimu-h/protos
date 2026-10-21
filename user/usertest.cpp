@@ -11,6 +11,9 @@
 
 static_assert(protos::kSyscallGetCpu == 2);
 static_assert(protos::kSyscallSpin == 3);
+static_assert(protos::kSyscallRead == 4);
+static_assert(protos::kSyscallSpawn == 5);
+static_assert(protos::kSyscallWait == 6);
 // `KernelSpinArg()` can ask for the longest spin() call.
 static_assert(protos::kSyscallSpinMaxTicks <=
               protos::usertest::kKernelSpinMaxTicks);
@@ -738,6 +741,29 @@ static int64_t RunSyscallChecks() {
                               kNulByteCount)) {
     return check;
   }
+  ++check;
+  char scratch[8] = {};
+  UserProgramResult wait_result;
+  if (Read(nullptr, 0) != 0 || Read(scratch, -1) != kSyscallErrorInvalid ||
+      Read(scratch, kSyscallReadMaxSize + 1) != kSyscallErrorInvalid ||
+      Read(nullptr, -1) != kSyscallErrorInvalid ||
+      Read(nullptr, 8) != kSyscallErrorFault ||
+      Read(reinterpret_cast<void*>(usertest::kKernelAddress), 8) !=
+          kSyscallErrorFault ||
+      Read(const_cast<char*>(kNulBytes), 8) != kSyscallErrorFault ||
+      Spawn(nullptr, 0, 0) != kSyscallErrorInvalid ||
+      Spawn("usertest", -1, 0) != kSyscallErrorInvalid ||
+      Spawn("usertest", kSyscallSpawnMaxNameLength + 1, 0) !=
+          kSyscallErrorInvalid ||
+      Spawn("no_such_program", 15, 0) != kSyscallErrorInvalid ||
+      Spawn(reinterpret_cast<const char*>(usertest::kKernelAddress), 4, 0) !=
+          kSyscallErrorFault ||
+      Wait(0, &wait_result) != kSyscallErrorInvalid ||
+      Wait(-1, &wait_result) != kSyscallErrorInvalid ||
+      Wait(kMaxUserChildProcesses + 1, &wait_result) != kSyscallErrorInvalid ||
+      Wait(1, &wait_result) != kSyscallErrorInvalid) {
+    return check;
+  }
   return 0;
 }
 
@@ -1420,7 +1446,13 @@ static int64_t RunBufferChecks() {
     return check;
   }
   ++check;
-  if (Write(nullptr, kNulByteCount) != kSyscallErrorFault) {
+  if (Write(nullptr, kNulByteCount) != kSyscallErrorFault ||
+      Read(nullptr, kNulByteCount) != kSyscallErrorFault ||
+      Read(const_cast<uint64_t*>(&kReadOnlyWord), sizeof(kReadOnlyWord)) !=
+          kSyscallErrorFault ||
+      Read(reinterpret_cast<void*>(&SyscallChangedRegisterBits), 8) !=
+          kSyscallErrorFault ||
+      Read(nullptr, -1) != kSyscallErrorInvalid) {
     return check;
   }
   ++check;
@@ -1556,6 +1588,207 @@ static int64_t X87PendingException(const int64_t round_cycles) {
   return usertest::kX87PendingContinuedStatus;
 }
 
+// Runs `Mode::kConsoleRead`: if `expected_bytes == 0`, blocks immediately in
+// Read() so kill-in-syscall tests see `stats.syscalls == 1` and
+// `stats.in_syscall == true`. Otherwise validates Read() error paths first,
+// then reads `expected_bytes` from the console and returns their
+// `SyscallSpinChecksum()`.
+static int64_t RunConsoleRead(const int64_t expected_bytes) {
+  uint8_t buffer[128] = {};
+  if (expected_bytes <= 0) {
+    (void)Read(buffer, sizeof(buffer));
+    return -100;
+  }
+  if (expected_bytes > static_cast<int64_t>(sizeof(buffer))) {
+    return -1;
+  }
+  // 1. Invalid sizes fail with kSyscallErrorInvalid, even with bad pointers.
+  if (Read(buffer, -1) != kSyscallErrorInvalid ||
+      Read(buffer, INT64_MIN) != kSyscallErrorInvalid ||
+      Read(buffer, kSyscallReadMaxSize + 1) != kSyscallErrorInvalid ||
+      Read(nullptr, -1) != kSyscallErrorInvalid ||
+      Read(reinterpret_cast<void*>(usertest::kKernelAddress), -1) !=
+          kSyscallErrorInvalid) {
+    return -2;
+  }
+  // 2. Zero-byte read succeeds immediately with 0.
+  if (Read(nullptr, 0) != 0 || Read(buffer, 0) != 0) {
+    return -3;
+  }
+  // 3. Unmapped, kernel, non-canonical, wrapping, guard-page, and read-only
+  // (.rodata and .text) pointers fail with kSyscallErrorFault.
+  if (Read(nullptr, 8) != kSyscallErrorFault ||
+      Read(reinterpret_cast<void*>(usertest::kKernelAddress), 8) !=
+          kSyscallErrorFault ||
+      Read(reinterpret_cast<void*>(kNonCanonicalAddress), 8) !=
+          kSyscallErrorFault ||
+      Read(reinterpret_cast<void*>(kUnmappedUserAddress), 8) !=
+          kSyscallErrorFault ||
+      Read(reinterpret_cast<void*>(0xFFFFFFFFFFFFFFF8ULL), 16) !=
+          kSyscallErrorFault ||
+      Read(reinterpret_cast<void*>(kStackGuardPage), 8) != kSyscallErrorFault ||
+      Read(reinterpret_cast<void*>(usertest::kStackTop - 4), 8) !=
+          kSyscallErrorFault ||
+      Read(const_cast<uint64_t*>(&kReadOnlyWord), sizeof(kReadOnlyWord)) !=
+          kSyscallErrorFault ||
+      Read(reinterpret_cast<void*>(&SyscallChangedRegisterBits), 8) !=
+          kSyscallErrorFault) {
+    return -4;
+  }
+  // 4. Read `expected_bytes` from console input (potentially across multiple
+  // chunks) and return their FNV-1a spin checksum.
+  int64_t total = 0;
+  while (total < expected_bytes) {
+    const int64_t n = Read(buffer + total, expected_bytes - total);
+    if (n <= 0 || n > expected_bytes - total) {
+      return -5;
+    }
+    total += n;
+  }
+  return SyscallSpinChecksum(buffer, total);
+}
+
+// Runs `Mode::kSpawnAndWait` according to `submode` (`arg >> 8`).
+static int64_t RunSpawnAndWait(const usertest::SpawnTestSubmode submode) {
+  using usertest::SpawnTestSubmode;
+  if (submode == SpawnTestSubmode::kBlockInWait) {
+    const int64_t pid =
+        Spawn("usertest", usertest::Arg(Mode::kSpinWithoutSyscalls, 0x777));
+    if (pid < 1) {
+      return 1;
+    }
+    UserProgramResult result;
+    (void)Wait(pid, &result);
+    return 2;
+  }
+  if (submode == SpawnTestSubmode::kOrphanOnExit) {
+    const int64_t pid0 =
+        Spawn("usertest", usertest::Arg(Mode::kSpinWithoutSyscalls, 0x888));
+    const int64_t pid1 = Spawn(
+        "usertest", usertest::KernelSpinArg(kSyscallSpinMaxTicks, 1, 0x999));
+    if (pid0 < 1 || pid1 < 1 || pid0 == pid1) {
+      return 1;
+    }
+    return 0;
+  }
+  if (submode == SpawnTestSubmode::kOrphanOnFault) {
+    const int64_t pid =
+        Spawn("usertest", usertest::Arg(Mode::kSpinWithoutSyscalls, 0xAAA));
+    if (pid < 1) {
+      return 1;
+    }
+    asm volatile("ud2");
+    return 2;
+  }
+
+  // submode == SpawnTestSubmode::kBasicAndErrors:
+  int64_t check = 1;
+  if (Spawn(nullptr, 0, 0) != kSyscallErrorInvalid ||
+      Spawn("usertest", -1, 0) != kSyscallErrorInvalid ||
+      Spawn("usertest", kSyscallSpawnMaxNameLength + 1, 0) !=
+          kSyscallErrorInvalid ||
+      Spawn(nullptr, -1, 0) != kSyscallErrorInvalid ||
+      Spawn("nonexistent_prog", 16, 0) != kSyscallErrorInvalid) {
+    return check;
+  }
+  ++check;
+  if (Spawn(nullptr, 4, 0) != kSyscallErrorFault ||
+      Spawn(reinterpret_cast<const char*>(usertest::kKernelAddress), 4, 0) !=
+          kSyscallErrorFault ||
+      Spawn(reinterpret_cast<const char*>(kNonCanonicalAddress), 4, 0) !=
+          kSyscallErrorFault ||
+      Spawn(reinterpret_cast<const char*>(kUnmappedUserAddress), 4, 0) !=
+          kSyscallErrorFault ||
+      Spawn(reinterpret_cast<const char*>(0xFFFFFFFFFFFFFFF8ULL), 16, 0) !=
+          kSyscallErrorFault ||
+      Spawn(reinterpret_cast<const char*>(kStackGuardPage), 4, 0) !=
+          kSyscallErrorFault) {
+    return check;
+  }
+  ++check;
+  UserProgramResult result;
+  if (Wait(0, &result) != kSyscallErrorInvalid ||
+      Wait(-1, &result) != kSyscallErrorInvalid ||
+      Wait(kMaxUserChildProcesses + 1, &result) != kSyscallErrorInvalid ||
+      Wait(1, &result) != kSyscallErrorInvalid) {
+    return check;
+  }
+  ++check;
+  // Spawn a child that exits with `usertest::kExitStatus`.
+  const int64_t exit_pid = Spawn("usertest", usertest::Arg(Mode::kExit));
+  if (exit_pid < 1 || exit_pid > kMaxUserChildProcesses) {
+    return check;
+  }
+  ++check;
+  // Bad / read-only `result` pointers on a valid PID must return
+  // kSyscallErrorFault without reaping the child.
+  if (Wait(exit_pid, nullptr) != kSyscallErrorFault ||
+      Wait(exit_pid, reinterpret_cast<UserProgramResult*>(
+                         usertest::kKernelAddress)) != kSyscallErrorFault ||
+      Wait(exit_pid, reinterpret_cast<UserProgramResult*>(
+                         kNonCanonicalAddress)) != kSyscallErrorFault ||
+      Wait(exit_pid, reinterpret_cast<UserProgramResult*>(
+                         kUnmappedUserAddress)) != kSyscallErrorFault ||
+      Wait(exit_pid, reinterpret_cast<UserProgramResult*>(const_cast<uint64_t*>(
+                         &kReadOnlyWord))) != kSyscallErrorFault ||
+      Wait(exit_pid, reinterpret_cast<UserProgramResult*>(
+                         &SyscallChangedRegisterBits)) != kSyscallErrorFault) {
+    return check;
+  }
+  ++check;
+  if (Wait(exit_pid, &result) != 0 ||
+      result.outcome != UserProgramOutcome::kExited ||
+      result.exit_status != usertest::kExitStatus) {
+    return check;
+  }
+  ++check;
+  // Waiting a second time on an already-reaped PID must fail with
+  // kSyscallErrorInvalid.
+  if (Wait(exit_pid, &result) != kSyscallErrorInvalid) {
+    return check;
+  }
+  ++check;
+  // Spawn a child that faults with #UD (vector 6).
+  const int64_t ud_pid = Spawn("usertest", usertest::Arg(Mode::kInvalidOpcode));
+  if (ud_pid < 1 || Wait(ud_pid, &result) != 0 ||
+      result.outcome != UserProgramOutcome::kFaulted ||
+      result.fault_vector != 6) {
+    return check;
+  }
+  ++check;
+  // Spawn a child that faults with #PF (vector 14) on kKernelAddress.
+  const int64_t pf_pid =
+      Spawn("usertest", usertest::Arg(Mode::kReadKernelMemory));
+  if (pf_pid < 1 || Wait(pf_pid, &result) != 0 ||
+      result.outcome != UserProgramOutcome::kFaulted ||
+      result.fault_vector != 14 ||
+      result.fault_address != usertest::kKernelAddress) {
+    return check;
+  }
+  ++check;
+  // Fill all `kMaxUserChildProcesses` child slots simultaneously, verify
+  // the (kMaxUserChildProcesses + 1)-th spawn returns kSyscallErrorInvalid,
+  // then wait for all children.
+  int64_t pids[kMaxUserChildProcesses] = {};
+  for (int i = 0; i < kMaxUserChildProcesses; ++i) {
+    pids[i] = Spawn("usertest", usertest::Arg(Mode::kFpuInitialState));
+    if (pids[i] < 1 || pids[i] > kMaxUserChildProcesses) {
+      return check;
+    }
+  }
+  if (Spawn("usertest", usertest::Arg(Mode::kExit)) != kSyscallErrorInvalid) {
+    return check;
+  }
+  for (int i = 0; i < kMaxUserChildProcesses; ++i) {
+    if (Wait(pids[i], &result) != 0 ||
+        result.outcome != UserProgramOutcome::kExited ||
+        result.exit_status != 0) {
+      return check;
+    }
+  }
+  return 0;
+}
+
 }  // namespace
 
 int64_t Main(const uint64_t arg) {
@@ -1613,6 +1846,11 @@ int64_t Main(const uint64_t arg) {
       return FpuLongSyscall(arg);
     case Mode::kX87PendingException:
       return X87PendingException(usertest::X87PendingRoundCycles(arg));
+    case Mode::kConsoleRead:
+      return RunConsoleRead(static_cast<int64_t>(arg >> 8));
+    case Mode::kSpawnAndWait:
+      return RunSpawnAndWait(
+          static_cast<usertest::SpawnTestSubmode>((arg >> 8) & 0xFF));
   }
   // The mode should have faulted, or it is unknown.
   return -1;

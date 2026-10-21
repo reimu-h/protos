@@ -68,7 +68,7 @@ TEST_COMMON_LDFLAGS := -lgmock_main -lgmock -lgtest -pthread
 # inline assembly, which the kernel keeps for each process (user_mode.h), so
 # GCC may use SSE in them. GCC must not turn their loops into calls of the
 # memory functions that user/crt.cpp defines with such loops.
-USER_PROGRAMS := init usertest
+USER_PROGRAMS := init sh usertest
 USER_CXXFLAGS := -m64 -masm=intel -std=c++20 -O2 -Wall -Wextra $(WERROR_FLAG) \
                  -ffreestanding -nostdlib -fno-builtin \
                  -fno-exceptions -fno-rtti -mno-red-zone \
@@ -78,7 +78,7 @@ USER_CXXFLAGS := -m64 -masm=intel -std=c++20 -O2 -Wall -Wextra $(WERROR_FLAG) \
                  $(PROJECT_INCLUDE_FLAGS) -I$(BUILD_DIR)/include
 USER_LDFLAGS := -m elf_x86_64 -z max-page-size=0x1000 -z noexecstack \
                 -static -nostdlib -T user/user.ld
-USER_HDRS := syscall_abi.h user/syscall.h user/usertest.h
+USER_HDRS := syscall_abi.h user/syscall.h user/sh_lib.h user/usertest.h
 USER_ELFS := $(patsubst %,$(BUILD_DIR)/user/%.elf,$(USER_PROGRAMS))
 
 TEST_BUILD_MODES := debug opt
@@ -220,6 +220,8 @@ CXX_HDRS := \
     user_mode.h \
     user_access.h \
     user_programs.h \
+    user/syscall.h \
+    user/sh_lib.h \
     user/usertest.h \
     selftest/selftest.h \
     selftest/boot_selftest.h \

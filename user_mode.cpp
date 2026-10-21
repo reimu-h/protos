@@ -25,6 +25,7 @@
 #include "syscall_abi.h"
 #include "task.h"
 #include "user_access.h"
+#include "user_programs.h"
 
 // user_mode_entry.S.
 extern "C" void UserModeEnter(uint64_t rip,  //
@@ -47,6 +48,8 @@ static_assert((kUserStackTop & kPageMask) == 0);
 static_assert(IsUserRange(kUserStackTop - kUserStackSize, kUserStackSize));
 // write() copies the user buffer to the console in chunks of this size.
 constexpr int kWriteChunkSize = 128;
+// read() copies console input to the user buffer in chunks of this size.
+constexpr int kReadChunkSize = 128;
 // spin() reads the user buffer in chunks of this size.
 constexpr int kSpinChunkSize = 256;
 
@@ -71,6 +74,20 @@ static void ReadUserMemory(void* const dst,               //
   DCHECK(size >= 0);
   // Part of the user range that MayRead() checked.
   const bool copied = CopyFromUser(dst, user_address, size);
+  DCHECK(copied);
+}
+
+// Copies the `size` bytes at `src` to `user_address` in the address space of
+// the running program. Every kernel write to user memory goes through here,
+// and from here through CopyToUser(), the only code that writes user pages
+// while SMAP is enabled (user_access.h). The caller has checked that the
+// program may write them (`MayWrite()`).
+static void WriteUserMemory(const uintptr_t user_address,  //
+                            const void* const src,         //
+                            const int64_t size) {
+  DCHECK(size >= 0);
+  // Part of the user range that MayWrite() checked.
+  const bool copied = CopyToUser(user_address, src, size);
   DCHECK(copied);
 }
 
@@ -344,6 +361,7 @@ void UserProcess::Run() {
   scheduler->SetFpuState(nullptr);
   scheduler->SetAddressSpace(nullptr);
   space_ = nullptr;
+  CleanupChildren();
 }
 
 bool UserProcess::Load(const ElfExecutable& executable,
@@ -437,6 +455,17 @@ void UserProcess::OnSyscall(InterruptFrame* const frame) {
                           static_cast<int64_t>(frame->rdx),  //
                           &meter);
       break;
+    case kSyscallRead:
+      ret = process->Read(frame->rdi, static_cast<int64_t>(frame->rsi));
+      break;
+    case kSyscallSpawn:
+      ret = process->Spawn(frame->rdi,                        //
+                           static_cast<int64_t>(frame->rsi),  //
+                           frame->rdx);
+      break;
+    case kSyscallWait:
+      ret = process->WaitChild(static_cast<int64_t>(frame->rdi), frame->rsi);
+      break;
     default:
       break;
   }
@@ -456,6 +485,15 @@ bool UserProcess::MayRead(const uintptr_t buffer, const int64_t size) const {
                                    buffer,          //
                                    size,            //
                                    /*write=*/false);
+}
+
+bool UserProcess::MayWrite(const uintptr_t buffer, const int64_t size) const {
+  DCHECK(size > 0);
+  return IsUserRange(buffer, size) &&
+         PagingUserRangeAccessible(space_->root(),  //
+                                   buffer,          //
+                                   size,            //
+                                   /*write=*/true);
 }
 
 int64_t UserProcess::Write(const uintptr_t buffer, const int64_t size) const {
@@ -529,6 +567,165 @@ int64_t UserProcess::Spin(const uintptr_t buffer,  //
 #endif
   }
   return checksum;
+}
+
+int64_t UserProcess::Read(const uintptr_t buffer, const int64_t size) {
+  if (size < 0 || size > kSyscallReadMaxSize) {
+    return kSyscallErrorInvalid;
+  }
+  if (size == 0) {
+    return 0;
+  }
+  if (!MayWrite(buffer, size)) {
+    return kSyscallErrorFault;
+  }
+  char first = 0;
+  while (!ConsoleTryReadc(&first)) {
+    if (IsKillRequested()) {
+      {
+        const ScopedIrqDisable irq_disable;
+        RecordKillNoticeIrqsOff();
+      }
+#if PROTOS_INJECT_KILL_DELAY != 0
+      if (kActiveKillDelayInjection == KillDelayInjection::kMidSyscall) {
+        const int64_t delay =
+            injected_kill_delay_ticks_.exchange(0, std::memory_order_acq_rel);
+        if (delay > 0) {
+          BusyWaitKillMeasureTicks(delay);
+        }
+      }
+#endif
+      return 0;
+    }
+    TaskScheduler* const scheduler = GetTaskScheduler();
+    if (scheduler != nullptr) {
+      scheduler->Yield();
+    }
+    asm volatile("pause" : : : "memory");
+  }
+
+  char chunk[kReadChunkSize];
+  chunk[0] = first;
+  int chunk_len = 1;
+  int64_t done = 0;
+  while (done + chunk_len < size && !IsKillRequested()) {
+    char next = 0;
+    if (!ConsoleTryReadc(&next)) {
+      break;
+    }
+    chunk[chunk_len++] = next;
+    if (chunk_len == kReadChunkSize) {
+      WriteUserMemory(buffer + static_cast<uintptr_t>(done), chunk, chunk_len);
+      done += chunk_len;
+      chunk_len = 0;
+    }
+  }
+  if (chunk_len > 0) {
+    WriteUserMemory(buffer + static_cast<uintptr_t>(done), chunk, chunk_len);
+    done += chunk_len;
+  }
+  if (IsKillRequested()) {
+    const ScopedIrqDisable irq_disable;
+    RecordKillNoticeIrqsOff();
+  }
+  return done;
+}
+
+int64_t UserProcess::Spawn(const uintptr_t name_ptr,  //
+                           const int64_t name_len,    //
+                           const uint64_t arg) {
+  if (name_len <= 0 || name_len > kSyscallSpawnMaxNameLength) {
+    return kSyscallErrorInvalid;
+  }
+  if (!MayRead(name_ptr, name_len)) {
+    return kSyscallErrorFault;
+  }
+  char name[kSyscallSpawnMaxNameLength];
+  ReadUserMemory(name, name_ptr, name_len);
+  UserProgram program;
+  if (!FindUserProgram(name, name_len, &program)) {
+    return kSyscallErrorInvalid;
+  }
+  int64_t slot = -1;
+  for (int64_t i = 0; i < kMaxUserChildProcesses; ++i) {
+    if (children_[i] == nullptr) {
+      slot = i;
+      break;
+    }
+  }
+  if (slot < 0) {
+    return kSyscallErrorInvalid;
+  }
+  if (IsKillRequested()) {
+    const ScopedIrqDisable irq_disable;
+    RecordKillNoticeIrqsOff();
+    return kSyscallErrorInvalid;
+  }
+  std::unique_ptr<UserProcess> child = UserProcess::Start(program, arg);
+  if (child == nullptr) {
+    return kSyscallErrorInvalid;
+  }
+  children_[slot] = std::move(child);
+  return slot + 1;
+}
+
+int64_t UserProcess::WaitChild(const int64_t pid, const uintptr_t result_ptr) {
+  if (pid < 1 || pid > kMaxUserChildProcesses) {
+    return kSyscallErrorInvalid;
+  }
+  const int64_t slot = pid - 1;
+  UserProcess* const child = children_[slot].get();
+  if (child == nullptr) {
+    return kSyscallErrorInvalid;
+  }
+  if (!MayWrite(result_ptr, sizeof(UserProgramResult))) {
+    return kSyscallErrorFault;
+  }
+  while (child->stats().end_tick < 0) {
+    if (IsKillRequested()) {
+      {
+        const ScopedIrqDisable irq_disable;
+        RecordKillNoticeIrqsOff();
+      }
+#if PROTOS_INJECT_KILL_DELAY != 0
+      if (kActiveKillDelayInjection == KillDelayInjection::kMidSyscall) {
+        const int64_t delay =
+            injected_kill_delay_ticks_.exchange(0, std::memory_order_acq_rel);
+        if (delay > 0) {
+          BusyWaitKillMeasureTicks(delay);
+        }
+      }
+#endif
+      return 0;
+    }
+    TaskScheduler* const scheduler = GetTaskScheduler();
+    if (scheduler != nullptr) {
+      scheduler->Yield();
+    }
+    asm volatile("pause" : : : "memory");
+  }
+  const UserProgramResult child_result = child->Wait();
+  children_[slot].reset();
+  WriteUserMemory(result_ptr, &child_result, sizeof(child_result));
+  if (IsKillRequested()) {
+    const ScopedIrqDisable irq_disable;
+    RecordKillNoticeIrqsOff();
+  }
+  return 0;
+}
+
+void UserProcess::CleanupChildren() {
+  for (int64_t i = 0; i < kMaxUserChildProcesses; ++i) {
+    if (children_[i] != nullptr) {
+      children_[i]->Kill();
+    }
+  }
+  for (int64_t i = 0; i < kMaxUserChildProcesses; ++i) {
+    if (children_[i] != nullptr) {
+      (void)children_[i]->Wait();
+      children_[i].reset();
+    }
+  }
 }
 
 void UserProcess::RecordSyscall(const TickMeter& meter) {
