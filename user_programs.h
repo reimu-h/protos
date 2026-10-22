@@ -12,6 +12,8 @@ extern "C" const uint8_t g_sh_elf_start[];
 extern "C" const uint8_t g_sh_elf_end[];
 extern "C" const uint8_t g_usertest_elf_start[];
 extern "C" const uint8_t g_usertest_elf_end[];
+extern "C" const uint8_t g_usbkbd_elf_start[];
+extern "C" const uint8_t g_usbkbd_elf_end[];
 
 namespace protos {
 
@@ -34,6 +36,13 @@ inline UserProgram UserTestProgram() {
                      g_usertest_elf_end - g_usertest_elf_start};
 }
 inline UserProgram UsertestUserProgram() { return UserTestProgram(); }
+
+// user/usbkbd.cpp: the ring-3 xHCI USB keyboard driver.
+inline UserProgram UsbkbdProgram() {
+  return UserProgram{g_usbkbd_elf_start, g_usbkbd_elf_end - g_usbkbd_elf_start};
+}
+inline UserProgram UsbKbdProgram() { return UsbkbdProgram(); }
+inline UserProgram UsbkbdUserProgram() { return UsbkbdProgram(); }
 
 // Returns true if `[name, name + name_len)` equals the null-terminated string
 // `literal`.
@@ -66,6 +75,8 @@ inline bool FindUserProgram(const char* const name,  //
     found = ShProgram();
   } else if (UserProgramNameEquals(name, name_len, "usertest")) {
     found = UserTestProgram();
+  } else if (UserProgramNameEquals(name, name_len, "usbkbd")) {
+    found = UsbkbdProgram();
   } else {
     return false;
   }

@@ -9,6 +9,8 @@
 #include "check.h"
 #include "console.h"
 #include "cpu.h"
+#include "device_irq.h"
+#include "driver.h"
 #include "format.h"
 #include "fpu.h"
 #include "gdt.h"
@@ -17,6 +19,7 @@
 #include "kill_delay_injection.h"
 #include "multiboot.h"
 #include "paging.h"
+#include "pci.h"
 #include "pmm.h"
 #include "rbtree.h"
 #include "selftest/line_buffer.h"
@@ -2395,6 +2398,747 @@ static bool TestTaskSchedulerSmp() {
   SELFTEST_EXPECT(PmmFreeFrameCount() == pmm_free_before);
   SELFTEST_EXPECT(HeapTotalFreeBytes() == heap_free_before);
   SELFTEST_EXPECT(SmpOnlineCpuCount() == cpu_count);
+  return true;
+}
+
+// Vector of the wake IPIs of TestSchedulerBlockWake(). No kernel subsystem
+// uses it (device interrupts get vectors from 0x30 up), so every delivery is
+// one of the test's IPIs.
+constexpr uint8_t kVectorSelfTestWakeIpi = 0x2F;
+// Turns that each of the two ping-pong tasks waits for, blocked.
+constexpr int kBlockWakePingPongRounds = 500;
+// Wake IPIs, sent to every CPU in turn.
+constexpr int kBlockWakeIpiRounds = 2 * kMaxSupportedCpus;
+// CPU 0 ticks (0.5 s) during which a blocked task must take no tick at all.
+constexpr int64_t kBlockWakeIdleWindowTicks = 125;
+// CPU 0 ticks during which a spinning task's live tick count must follow its
+// CPU's, how many such windows the test tries to get an undisturbed one, and
+// how often it tries to read both counts without a tick of that CPU between
+// the reads.
+constexpr int64_t kBlockWakeLiveWindowTicks = 25;
+constexpr int kBlockWakeLiveWindowAttempts = 4;
+constexpr int kBlockWakeLiveSampleAttempts = 1000;
+// Timeout (in CPU 0 ticks) of the timed wait that runs out, how late after
+// its deadline the waiter may return, and the timeout of the timed wait that
+// a Wake() ends long before its deadline.
+constexpr int64_t kBlockWakeTimedWaitTicks = 25;
+constexpr int64_t kBlockWakeTimedWaitSlackTicks = 125;
+constexpr int64_t kBlockWakeLongTimedWaitTicks = 2500;
+// Most tasks one phase of TestSchedulerBlockWake() creates.
+constexpr int kBlockWakeMaxPhaseTasks = 2;
+
+static int64_t Cpu0TimerTicks() {
+  return SmpGetCpuLocal(0)->timer_ticks.load(std::memory_order_acquire);
+}
+
+// Owns the tasks of one phase of TestSchedulerBlockWake() and joins them when
+// it goes out of scope, also on an early `return false`. Its tasks block, so
+// they would never notice a stop flag by themselves: the group first sets
+// `*abort`, which each task checks after every wakeup, and wakes each task
+// until it has set its `done` flag. A task that is still not done after
+// kSelfTestWaitTimeoutTscCycles is a kernel bug that would leave it running
+// on the phase's stack frame, so the group then PANICs.
+class BlockingTaskGroup {
+ public:
+  BlockingTaskGroup(TaskScheduler& scheduler, std::atomic<bool>* const abort)
+      : scheduler_(scheduler), abort_(abort) {}
+
+  ~BlockingTaskGroup() { JoinAll(); }
+
+  BlockingTaskGroup(const BlockingTaskGroup&) = delete;
+  BlockingTaskGroup& operator=(const BlockingTaskGroup&) = delete;
+
+  // Takes ownership of `task`, which sets `*done` (true) just before it
+  // returns. Returns false if `task` is null, i.e. if creating it failed.
+  bool Add(Task* const task, const std::atomic<bool>* const done) {
+    if (task == nullptr) {
+      return false;
+    }
+    CHECK(count_ < kBlockWakeMaxPhaseTasks);
+    tasks_[count_] = task;
+    done_[count_] = done;
+    ++count_;
+    return true;
+  }
+
+  // Stops (if needed) and joins every task added so far.
+  void JoinAll() {
+    if (count_ == 0) {
+      return;
+    }
+    abort_->store(true, std::memory_order_release);
+    const TscDeadline deadline(kSelfTestWaitTimeoutTscCycles);
+    for (int i = 0; i < count_; ++i) {
+      while (!done_[i]->load(std::memory_order_acquire)) {
+        if (deadline.Expired()) {
+          PANIC("scheduler_block_wake: a task did not finish after wakeups");
+        }
+        scheduler_.Wake(tasks_[i]);
+        scheduler_.Yield();
+      }
+    }
+    for (int i = 0; i < count_; ++i) {
+      scheduler_.Join(tasks_[i]);
+    }
+    count_ = 0;
+  }
+
+ private:
+  TaskScheduler& scheduler_;
+  std::atomic<bool>* const abort_;
+  Task* tasks_[kBlockWakeMaxPhaseTasks] = {};
+  const std::atomic<bool>* done_[kBlockWakeMaxPhaseTasks] = {};
+  int count_ = 0;
+};
+
+// Disables preemption for its lifetime, then restores the previous setting.
+class ScopedPreemptionOff {
+ public:
+  explicit ScopedPreemptionOff(TaskScheduler& scheduler)
+      : scheduler_(scheduler), was_enabled_(scheduler.IsPreemptEnabled()) {
+    scheduler_.SetPreemptEnabled(false);
+  }
+
+  ~ScopedPreemptionOff() { scheduler_.SetPreemptEnabled(was_enabled_); }
+
+  ScopedPreemptionOff(const ScopedPreemptionOff&) = delete;
+  ScopedPreemptionOff& operator=(const ScopedPreemptionOff&) = delete;
+
+ private:
+  TaskScheduler& scheduler_;
+  const bool was_enabled_;
+};
+
+// What TestSchedulerBlockWake() measured, for its diagnostic line.
+struct BlockWakeReport {
+  int64_t cross_cpu_wakes = 0;
+  int64_t spurious_returns = 0;
+  uint64_t pingpong_cpus = 0;
+  int64_t ipi_wakes = 0;
+  uint64_t ipi_cpus = 0;
+  int64_t max_ipi_wake_ticks = 0;
+  int64_t blocked_ticks = -1;
+  int64_t live_task_ticks = -1;
+  int64_t live_cpu_ticks = -1;
+  int64_t timed_wait_late_ticks = -1;
+  int64_t timed_wait_own_ticks = -1;
+};
+
+struct BlockWakePingPongShared {
+  TaskScheduler* scheduler = nullptr;
+  std::atomic<bool> abort{false};
+  std::atomic<bool> start{false};
+  std::atomic<Task*> tasks[2] = {};
+  // The side (0 or 1) whose turn it is, and the CPU of the task that handed
+  // the turn over.
+  std::atomic<int> turn{0};
+  std::atomic<int> last_cpu{-1};
+  std::atomic<int> rounds_done[2] = {};
+  std::atomic<int64_t> cross_cpu_wakes{0};
+  std::atomic<int64_t> spurious_returns{0};
+  AtomicCpuMask128 cpus;
+  std::atomic<bool> done[2] = {};
+};
+
+struct BlockWakePingPongArg {
+  BlockWakePingPongShared* shared = nullptr;
+  int side = 0;
+};
+
+// Waits, blocked, for its turn, then hands the turn to the other task and
+// wakes it, kBlockWakePingPongRounds times.
+static void BlockWakePingPongWorker(void* const raw_arg) {
+  const BlockWakePingPongArg* const arg =
+      static_cast<const BlockWakePingPongArg*>(raw_arg);
+  BlockWakePingPongShared* const shared = arg->shared;
+  const int side = arg->side;
+  while (!shared->start.load(std::memory_order_acquire)) {
+    if (shared->abort.load(std::memory_order_acquire)) {
+      shared->done[side].store(true, std::memory_order_release);
+      return;
+    }
+    shared->scheduler->Yield();
+  }
+  for (int round = 0; round < kBlockWakePingPongRounds; ++round) {
+    while (shared->turn.load(std::memory_order_acquire) != side) {
+      if (shared->abort.load(std::memory_order_acquire)) {
+        shared->done[side].store(true, std::memory_order_release);
+        return;
+      }
+      shared->scheduler->Block();
+      if (shared->turn.load(std::memory_order_acquire) != side) {
+        shared->spurious_returns.fetch_add(1, std::memory_order_relaxed);
+      }
+    }
+    const int cpu = CurrentCpuId();
+    shared->cpus.Add(cpu);
+    const int last_cpu = shared->last_cpu.load(std::memory_order_relaxed);
+    if (last_cpu >= 0 && last_cpu != cpu) {
+      shared->cross_cpu_wakes.fetch_add(1, std::memory_order_relaxed);
+    }
+    shared->rounds_done[side].fetch_add(1, std::memory_order_relaxed);
+    shared->last_cpu.store(cpu, std::memory_order_relaxed);
+    shared->turn.store(1 - side, std::memory_order_release);
+    shared->scheduler->Wake(shared->tasks[1 - side].load());
+  }
+  shared->done[side].store(true, std::memory_order_release);
+}
+
+// Phase A: two tasks hand a turn back and forth with Block() and Wake(), so
+// wakeups race with blocking on other CPUs all the time. A lost wakeup stops
+// them (the phase fails at its deadline), and a Block() that did not block
+// would return far more often than once per turn.
+static bool TestBlockWakePingPongPhase(TaskScheduler& scheduler,
+                                       const int cpu_count,
+                                       BlockWakeReport* const report) {
+  BlockWakePingPongShared shared;
+  shared.scheduler = &scheduler;
+  BlockWakePingPongArg args[2] = {{&shared, 0}, {&shared, 1}};
+  BlockingTaskGroup group(scheduler, &shared.abort);
+  for (int side = 0; side < 2; ++side) {
+    Task* const task = scheduler.CreateTaskOnCpu(BlockWakePingPongWorker,  //
+                                                 &args[side],              //
+                                                 kDefaultTaskWeight,       //
+                                                 (side + 1) % cpu_count);
+    SELFTEST_EXPECT(group.Add(task, &shared.done[side]));
+    shared.tasks[side].store(task, std::memory_order_release);
+  }
+  shared.start.store(true, std::memory_order_release);
+  const TscDeadline deadline(kSelfTestWaitTimeoutTscCycles);
+  while (!shared.done[0].load(std::memory_order_acquire) ||
+         !shared.done[1].load(std::memory_order_acquire)) {
+    SELFTEST_EXPECT(!deadline.Expired());
+    scheduler.Yield();
+  }
+  group.JoinAll();
+
+  report->cross_cpu_wakes = shared.cross_cpu_wakes.load();
+  report->spurious_returns = shared.spurious_returns.load();
+  report->pingpong_cpus = shared.cpus.Load().low;
+  SELFTEST_EXPECT(shared.rounds_done[0].load() == kBlockWakePingPongRounds);
+  SELFTEST_EXPECT(shared.rounds_done[1].load() == kBlockWakePingPongRounds);
+  SELFTEST_EXPECT(report->spurious_returns <= kBlockWakePingPongRounds);
+  if (cpu_count > 1) {
+    SELFTEST_EXPECT(report->cross_cpu_wakes >= 1);
+  }
+  return true;
+}
+
+// The task that SelfTestWakeIpiHandler() wakes, and what the handler saw.
+std::atomic<Task*> g_block_wake_ipi_target{nullptr};
+std::atomic<int64_t> g_block_wake_ipi_count{0};
+AtomicCpuMask128 g_block_wake_ipi_cpus;
+
+// Handler of kVectorSelfTestWakeIpi: wakes the sleeper of phase B from
+// interrupt context, as a device interrupt handler wakes its driver.
+static void SelfTestWakeIpiHandler(InterruptFrame* const /*frame*/) {
+  g_block_wake_ipi_cpus.Add(CurrentCpuId());
+  Task* const target = g_block_wake_ipi_target.load(std::memory_order_acquire);
+  if (target != nullptr) {
+    GetTaskScheduler()->Wake(target);
+  }
+  g_block_wake_ipi_count.fetch_add(1, std::memory_order_acq_rel);
+}
+
+struct BlockWakeIpiShared {
+  TaskScheduler* scheduler = nullptr;
+  std::atomic<bool> abort{false};
+  // The events posted by CPU 0 and consumed by the sleeper so far.
+  std::atomic<int64_t> posted{0};
+  std::atomic<int64_t> consumed{0};
+  std::atomic<bool> done{false};
+};
+
+// The wait loop of a driver: consumes the posted events, and blocks while
+// there is none.
+static void BlockWakeIpiSleeperWorker(void* const raw_shared) {
+  BlockWakeIpiShared* const shared =
+      static_cast<BlockWakeIpiShared*>(raw_shared);
+  int64_t seen = 0;
+  while (seen < kBlockWakeIpiRounds) {
+    const int64_t posted = shared->posted.load(std::memory_order_acquire);
+    if (posted == seen) {
+      if (shared->abort.load(std::memory_order_acquire)) {
+        break;
+      }
+      shared->scheduler->Block();
+      continue;
+    }
+    seen = posted;
+    shared->consumed.store(seen, std::memory_order_release);
+  }
+  shared->done.store(true, std::memory_order_release);
+}
+
+// Body of phase B, between the registration and the unregistration of the
+// IPI handler: posts one event at a time, sends a wake IPI to the next CPU,
+// and waits until the sleeper has consumed the event and the IPI has been
+// handled. (Two IPIs on one vector that are pending at the same CPU make one
+// interrupt, so the next IPI goes out only after the handler has run.)
+static bool RunBlockWakeIpiRounds(TaskScheduler& scheduler,          //
+                                  const int cpu_count,               //
+                                  BlockWakeIpiShared* const shared,  //
+                                  BlockWakeReport* const report) {
+  BlockingTaskGroup group(scheduler, &shared->abort);
+  Task* const sleeper = scheduler.CreateTaskOnCpu(BlockWakeIpiSleeperWorker,  //
+                                                  shared,                     //
+                                                  kDefaultTaskWeight,         //
+                                                  1 % cpu_count);
+  SELFTEST_EXPECT(group.Add(sleeper, &shared->done));
+  g_block_wake_ipi_target.store(sleeper, std::memory_order_release);
+  bool ok = true;
+  int64_t sent = 0;
+  for (int64_t i = 1; i <= kBlockWakeIpiRounds && ok; ++i) {
+    const int64_t posted_tick = Cpu0TimerTicks();
+    shared->posted.store(i, std::memory_order_release);
+    SmpSendIpi(static_cast<int>(i % cpu_count), kVectorSelfTestWakeIpi);
+    sent = i;
+    const TscDeadline deadline(kSelfTestWaitTimeoutTscCycles);
+    while (shared->consumed.load(std::memory_order_acquire) < i ||
+           g_block_wake_ipi_count.load(std::memory_order_acquire) < i) {
+      if (deadline.Expired()) {
+        ok = false;
+        break;
+      }
+      scheduler.Yield();
+    }
+    const int64_t latency = Cpu0TimerTicks() - posted_tick;
+    if (latency > report->max_ipi_wake_ticks) {
+      report->max_ipi_wake_ticks = latency;
+    }
+  }
+  // No handler may still wake the sleeper when it is reclaimed: wait until
+  // every IPI that was sent has been handled (only a failed round leaves one
+  // outstanding).
+  const TscDeadline deadline(kSelfTestWaitTimeoutTscCycles);
+  while (g_block_wake_ipi_count.load(std::memory_order_acquire) < sent &&
+         !deadline.Expired()) {
+    scheduler.Yield();
+  }
+  g_block_wake_ipi_target.store(nullptr, std::memory_order_release);
+  group.JoinAll();
+  SELFTEST_EXPECT(ok);
+  SELFTEST_EXPECT(shared->consumed.load() == kBlockWakeIpiRounds);
+  return true;
+}
+
+// Phase B: a task blocked in a driver-style wait loop is woken from the
+// handler of an IPI that goes to every CPU in turn: also to the sleeper's own
+// CPU (often while it is about to block) and to CPU 0, which is busy.
+static bool TestBlockWakeIpiPhase(TaskScheduler& scheduler,  //
+                                  const int cpu_count,       //
+                                  BlockWakeReport* const report) {
+  SELFTEST_EXPECT(IdtGetHandler(kVectorSelfTestWakeIpi) == nullptr);
+  BlockWakeIpiShared shared;
+  shared.scheduler = &scheduler;
+  g_block_wake_ipi_count.store(0, std::memory_order_release);
+  g_block_wake_ipi_cpus.Clear();
+  IdtRegisterHandler(kVectorSelfTestWakeIpi, SelfTestWakeIpiHandler);
+  const bool rounds_ok =
+      RunBlockWakeIpiRounds(scheduler, cpu_count, &shared, report);
+  IdtUnregisterHandler(kVectorSelfTestWakeIpi);
+
+  report->ipi_wakes = g_block_wake_ipi_count.load();
+  report->ipi_cpus = g_block_wake_ipi_cpus.Load().low;
+  SELFTEST_EXPECT(rounds_ok);
+  SELFTEST_EXPECT(report->ipi_wakes == kBlockWakeIpiRounds);
+  SELFTEST_EXPECT(g_block_wake_ipi_cpus.Load().ContainsAll(
+      CpuMask128::FirstCpus(cpu_count)));
+  SELFTEST_EXPECT(IdtGetHandler(kVectorSelfTestWakeIpi) == nullptr);
+  return true;
+}
+
+struct BlockWakeTicksShared {
+  TaskScheduler* scheduler = nullptr;
+  std::atomic<bool> abort{false};
+  std::atomic<bool> blocker_waiting{false};
+  std::atomic<bool> release_blocker{false};
+  std::atomic<bool> blocker_done{false};
+  std::atomic<bool> spinner_running{false};
+  std::atomic<bool> stop_spinner{false};
+  std::atomic<bool> spinner_done{false};
+};
+
+// Blocks until released.
+static void BlockWakeBlockerWorker(void* const raw_shared) {
+  BlockWakeTicksShared* const shared =
+      static_cast<BlockWakeTicksShared*>(raw_shared);
+  shared->blocker_waiting.store(true, std::memory_order_release);
+  while (!shared->release_blocker.load(std::memory_order_acquire) &&
+         !shared->abort.load(std::memory_order_acquire)) {
+    shared->scheduler->Block();
+  }
+  shared->blocker_done.store(true, std::memory_order_release);
+}
+
+// Spins, without ever giving up its CPU, until told to stop.
+static void BlockWakeSpinnerWorker(void* const raw_shared) {
+  BlockWakeTicksShared* const shared =
+      static_cast<BlockWakeTicksShared*>(raw_shared);
+  shared->spinner_running.store(true, std::memory_order_release);
+  while (!shared->stop_spinner.load(std::memory_order_acquire) &&
+         !shared->abort.load(std::memory_order_acquire)) {
+    asm volatile("pause" : : : "memory");
+  }
+  shared->spinner_done.store(true, std::memory_order_release);
+}
+
+// Yields until CPU 0 has taken `ticks` more timer ticks (false if that takes
+// longer than kSelfTestWaitTimeoutTscCycles), checking `still_ok()` on the
+// way (false as soon as it fails).
+template <typename StillOkFn>
+static bool YieldForCpu0Ticks(TaskScheduler& scheduler,  //
+                              const int64_t ticks,       //
+                              const StillOkFn& still_ok) {
+  const int64_t start = Cpu0TimerTicks();
+  const TscDeadline deadline(kSelfTestWaitTimeoutTscCycles);
+  while (Cpu0TimerTicks() - start < ticks) {
+    if (deadline.Expired() || !still_ok()) {
+      return false;
+    }
+    scheduler.Yield();
+    asm volatile("pause" : : : "memory");
+  }
+  return still_ok();
+}
+
+// TaskTimerTicks() of a running task and the tick count of the CPU that runs
+// it, read at one instant.
+struct LiveTicksSample {
+  int64_t task_ticks = 0;
+  int64_t cpu_ticks = 0;
+};
+
+// Reads TaskTimerTicks(task) between two reads of `local`'s tick count, again
+// while that CPU took a tick in between (as when this vCPU stalls there), so
+// that both counts are read at one instant. The timer interrupt advances the
+// CPU's count first and the task's second, so a sample may show the task one
+// tick behind. Returns false if no try was clean.
+static bool SampleLiveTicks(const Task* const task,       //
+                            const CpuLocal* const local,  //
+                            LiveTicksSample* const sample) {
+  for (int i = 0; i < kBlockWakeLiveSampleAttempts; ++i) {
+    const ScopedIrqDisable irq_guard;
+    const int64_t cpu_before = local->timer_ticks.load();
+    const int64_t task_ticks = TaskTimerTicks(task);
+    const int64_t cpu_after = local->timer_ticks.load();
+    if (cpu_before == cpu_after) {
+      sample->task_ticks = task_ticks;
+      sample->cpu_ticks = cpu_after;
+      return true;
+    }
+  }
+  return false;
+}
+
+// One window of the live tick count check of phase C.
+struct BlockWakeLiveWindow {
+  // The CPU that ran the spinner when the window began (-1: none).
+  int cpu = -1;
+  // Whether both samples were clean, and whether the spinner ran on another
+  // CPU (or none) when the window ended.
+  bool sampled = false;
+  bool moved = false;
+  // Context switches of `cpu`, and how much the spinner's TaskTimerTicks()
+  // and the tick count of `cpu` grew, over the window.
+  int64_t switches = 0;
+  int64_t task_ticks = 0;
+  int64_t cpu_ticks = 0;
+};
+
+// Measures how the TaskTimerTicks() of `spinner`, which never gives up its
+// CPU, and the tick count of its CPU grow over kBlockWakeLiveWindowTicks CPU 0
+// ticks.
+static void MeasureBlockWakeLiveWindow(TaskScheduler& scheduler,
+                                       const Task* const spinner,
+                                       BlockWakeLiveWindow* const window) {
+  const int cpu = TaskRunningCpu(spinner);
+  window->cpu = cpu;
+  if (cpu < 0) {
+    return;
+  }
+  const CpuLocal* const local = SmpGetCpuLocal(cpu);
+  const int64_t switches_before = local->context_switches.load();
+  LiveTicksSample before;
+  LiveTicksSample after;
+  const bool before_ok = SampleLiveTicks(spinner, local, &before);
+  (void)YieldForCpu0Ticks(scheduler,                  //
+                          kBlockWakeLiveWindowTicks,  //
+                          []() { return true; });
+  const bool after_ok = SampleLiveTicks(spinner, local, &after);
+  window->sampled = before_ok && after_ok;
+  window->moved = TaskRunningCpu(spinner) != cpu;
+  window->switches = local->context_switches.load() - switches_before;
+  window->task_ticks = after.task_ticks - before.task_ticks;
+  window->cpu_ticks = after.cpu_ticks - before.cpu_ticks;
+}
+
+static void UartWriteSignedDec(const int64_t value) {
+  if (value < 0) {
+    UartWrite("-");
+    UartWriteDec(static_cast<uint64_t>(-(value + 1)) + 1);
+  } else {
+    UartWriteDec(static_cast<uint64_t>(value));
+  }
+}
+
+// Prints window `index` of a live tick count check that failed.
+static void PrintBlockWakeLiveWindow(const int index,
+                                     const BlockWakeLiveWindow& window) {
+  UartWrite("[SCHED] block_wake: live window ");
+  UartWriteDec(static_cast<uint64_t>(index));
+  UartWrite(": cpu=");
+  UartWriteSignedDec(window.cpu);
+  UartWrite(" sampled=");
+  UartWriteDec(window.sampled ? 1 : 0);
+  UartWrite(" moved=");
+  UartWriteDec(window.moved ? 1 : 0);
+  UartWrite(" switches=");
+  UartWriteSignedDec(window.switches);
+  UartWrite(" task_ticks=");
+  UartWriteSignedDec(window.task_ticks);
+  UartWrite(" cpu_ticks=");
+  UartWriteSignedDec(window.cpu_ticks);
+  UartWrite("\n");
+}
+
+// Phase C: a blocked task takes no timer tick at all (it uses no CPU time),
+// while TaskTimerTicks() of a running task follows its CPU's ticks live.
+static bool TestBlockWakeTicksPhase(TaskScheduler& scheduler,
+                                    const int cpu_count,
+                                    BlockWakeReport* const report) {
+  BlockWakeTicksShared shared;
+  shared.scheduler = &scheduler;
+  BlockingTaskGroup group(scheduler, &shared.abort);
+
+  // Without preemption a running task leaves its CPU only when it blocks, so
+  // once the blocker has said that it is about to block and runs on no CPU,
+  // it is blocked (nothing wakes it).
+  Task* blocker = nullptr;
+  {
+    const ScopedPreemptionOff no_preemption(scheduler);
+    blocker = scheduler.CreateTaskOnCpu(BlockWakeBlockerWorker,  //
+                                        &shared,                 //
+                                        kDefaultTaskWeight,      //
+                                        1 % cpu_count);
+    SELFTEST_EXPECT(group.Add(blocker, &shared.blocker_done));
+    const TscDeadline deadline(kSelfTestWaitTimeoutTscCycles);
+    while (!shared.blocker_waiting.load(std::memory_order_acquire) ||
+           TaskRunningCpu(blocker) != -1) {
+      SELFTEST_EXPECT(!deadline.Expired());
+      scheduler.Yield();
+    }
+  }
+  const int64_t blocked_before = TaskTimerTicks(blocker);
+  const auto still_blocked = [blocker]() {
+    return TaskRunningCpu(blocker) == -1;
+  };
+  SELFTEST_EXPECT(YieldForCpu0Ticks(scheduler,                  //
+                                    kBlockWakeIdleWindowTicks,  //
+                                    still_blocked));
+  report->blocked_ticks = TaskTimerTicks(blocker) - blocked_before;
+  SELFTEST_EXPECT(report->blocked_ticks == 0);
+
+  // The calling task's count is the one that its CPU counts for it.
+  {
+    const ScopedIrqDisable irq_guard;
+    SELFTEST_EXPECT(TaskTimerTicks(scheduler.CurrentTask()) ==
+                    CurrentCpu()->task_timer_ticks.load());
+  }
+
+  if (cpu_count > 1) {
+    Task* const spinner = scheduler.CreateTaskOnCpu(BlockWakeSpinnerWorker,  //
+                                                    &shared,                 //
+                                                    kDefaultTaskWeight,      //
+                                                    cpu_count - 1);
+    SELFTEST_EXPECT(group.Add(spinner, &shared.spinner_done));
+    // Waits without yielding: a yield on CPU 0 would take the spinner over
+    // while it is queued (the work stealing layer steals for a yielding CPU
+    // that has nothing queued), and the spinner must run alone on its CPU.
+    const TscDeadline deadline(kSelfTestWaitTimeoutTscCycles);
+    while (!shared.spinner_running.load(std::memory_order_acquire)) {
+      SELFTEST_EXPECT(!deadline.Expired());
+      asm volatile("pause" : : : "memory");
+    }
+    // Over a window in which the spinner ran on one CPU without a switch
+    // there, its count grows as that CPU's tick count does (within the tick
+    // by which a sample may show the task behind). A count updated only when
+    // the task is switched out would not grow at all.
+    BlockWakeLiveWindow windows[kBlockWakeLiveWindowAttempts];
+    int measured = 0;
+    bool live_ok = false;
+    while (measured < kBlockWakeLiveWindowAttempts && !live_ok) {
+      BlockWakeLiveWindow& window = windows[measured];
+      ++measured;
+      MeasureBlockWakeLiveWindow(scheduler, spinner, &window);
+      if (window.cpu < 0 || !window.sampled || window.moved ||
+          window.switches != 0 || window.cpu_ticks < 3) {
+        continue;
+      }
+      report->live_task_ticks = window.task_ticks;
+      report->live_cpu_ticks = window.cpu_ticks;
+      live_ok = window.task_ticks >= window.cpu_ticks - 1 &&
+                window.task_ticks <= window.cpu_ticks + 1;
+    }
+    if (!live_ok) {
+      for (int i = 0; i < measured; ++i) {
+        PrintBlockWakeLiveWindow(i, windows[i]);
+      }
+    }
+    SELFTEST_EXPECT(live_ok);
+    shared.stop_spinner.store(true, std::memory_order_release);
+  }
+
+  shared.release_blocker.store(true, std::memory_order_release);
+  scheduler.Wake(blocker);
+  group.JoinAll();
+  return true;
+}
+
+struct BlockWakeTimedShared {
+  TaskScheduler* scheduler = nullptr;
+  int64_t timeout_ticks = 0;
+  std::atomic<bool> abort{false};
+  std::atomic<bool> release{false};
+  std::atomic<bool> waiting{false};
+  std::atomic<int64_t> deadline{-1};
+  std::atomic<int64_t> end_tick{-1};
+  std::atomic<int> returns{0};
+  std::atomic<int64_t> own_ticks{-1};
+  std::atomic<bool> done{false};
+};
+
+// Waits, blocked, until CPU 0's tick count reaches now + `timeout_ticks` or
+// until released, as a driver's interrupt wait with a timeout does.
+static void BlockWakeTimedWaitWorker(void* const raw_shared) {
+  BlockWakeTimedShared* const shared =
+      static_cast<BlockWakeTimedShared*>(raw_shared);
+  Task* const self = shared->scheduler->CurrentTask();
+  const int64_t own_before = TaskTimerTicks(self);
+  const int64_t deadline = Cpu0TimerTicks() + shared->timeout_ticks;
+  shared->deadline.store(deadline, std::memory_order_release);
+  shared->waiting.store(true, std::memory_order_release);
+  while (!shared->release.load(std::memory_order_acquire) &&
+         !shared->abort.load(std::memory_order_acquire) &&
+         Cpu0TimerTicks() < deadline) {
+    shared->scheduler->BlockUntil(deadline);
+    shared->returns.fetch_add(1, std::memory_order_relaxed);
+  }
+  shared->end_tick.store(Cpu0TimerTicks(), std::memory_order_release);
+  shared->own_ticks.store(TaskTimerTicks(self) - own_before,
+                          std::memory_order_release);
+  shared->done.store(true, std::memory_order_release);
+}
+
+// Phase D: a timed wait ends at its deadline, without using CPU time while it
+// waits, and a Wake() ends one long before its deadline.
+static bool TestBlockWakeTimedPhase(TaskScheduler& scheduler,
+                                    const int cpu_count,
+                                    BlockWakeReport* const report) {
+  {
+    BlockWakeTimedShared shared;
+    shared.scheduler = &scheduler;
+    shared.timeout_ticks = kBlockWakeTimedWaitTicks;
+    BlockingTaskGroup group(scheduler, &shared.abort);
+    Task* const waiter = scheduler.CreateTaskOnCpu(BlockWakeTimedWaitWorker,  //
+                                                   &shared,                   //
+                                                   kDefaultTaskWeight,        //
+                                                   1 % cpu_count);
+    SELFTEST_EXPECT(group.Add(waiter, &shared.done));
+    const TscDeadline deadline(kSelfTestWaitTimeoutTscCycles);
+    while (!shared.done.load(std::memory_order_acquire)) {
+      SELFTEST_EXPECT(!deadline.Expired());
+      scheduler.Yield();
+    }
+    group.JoinAll();
+    report->timed_wait_late_ticks =
+        shared.end_tick.load() - shared.deadline.load();
+    report->timed_wait_own_ticks = shared.own_ticks.load();
+    SELFTEST_EXPECT(report->timed_wait_late_ticks >= 0);
+    SELFTEST_EXPECT(report->timed_wait_late_ticks <=
+                    kBlockWakeTimedWaitSlackTicks);
+    // It blocked: a few returns at most, and (almost) no CPU time.
+    SELFTEST_EXPECT(shared.returns.load() >= 1);
+    SELFTEST_EXPECT(shared.returns.load() <= 3);
+    SELFTEST_EXPECT(report->timed_wait_own_ticks <= 2);
+  }
+  {
+    BlockWakeTimedShared shared;
+    shared.scheduler = &scheduler;
+    shared.timeout_ticks = kBlockWakeLongTimedWaitTicks;
+    BlockingTaskGroup group(scheduler, &shared.abort);
+    Task* const waiter = scheduler.CreateTaskOnCpu(BlockWakeTimedWaitWorker,  //
+                                                   &shared,                   //
+                                                   kDefaultTaskWeight,        //
+                                                   1 % cpu_count);
+    SELFTEST_EXPECT(group.Add(waiter, &shared.done));
+    const TscDeadline deadline(kSelfTestWaitTimeoutTscCycles);
+    while (!shared.waiting.load(std::memory_order_acquire) ||
+           TaskRunningCpu(waiter) != -1) {
+      SELFTEST_EXPECT(!deadline.Expired());
+      scheduler.Yield();
+    }
+    shared.release.store(true, std::memory_order_release);
+    scheduler.Wake(waiter);
+    while (!shared.done.load(std::memory_order_acquire)) {
+      SELFTEST_EXPECT(!deadline.Expired());
+      scheduler.Yield();
+    }
+    group.JoinAll();
+    SELFTEST_EXPECT(shared.end_tick.load() < shared.deadline.load());
+  }
+  return true;
+}
+
+// Block(), Wake(), BlockUntil() and TaskTimerTicks() on the real CPUs, with
+// real interrupts. Runs on the bootstrap task, which never blocks itself.
+static bool TestSchedulerBlockWake() {
+  TaskScheduler* const scheduler = GetTaskScheduler();
+  SELFTEST_EXPECT(scheduler != nullptr);
+  const int cpu_count = SmpCpuCount();
+  SELFTEST_EXPECT(cpu_count >= 1 && cpu_count <= kMaxSupportedCpus);
+  SELFTEST_EXPECT(CurrentCpuId() == 0);
+  SELFTEST_EXPECT(scheduler->IsPreemptEnabled());
+  const int64_t pmm_free_before = PmmFreeFrameCount();
+  const int64_t heap_free_before = HeapTotalFreeBytes();
+
+  BlockWakeReport report;
+  TaskScheduler& sched = *scheduler;
+  SELFTEST_EXPECT(TestBlockWakePingPongPhase(sched, cpu_count, &report));
+  SELFTEST_EXPECT(TestBlockWakeIpiPhase(sched, cpu_count, &report));
+  SELFTEST_EXPECT(TestBlockWakeTicksPhase(sched, cpu_count, &report));
+  SELFTEST_EXPECT(TestBlockWakeTimedPhase(sched, cpu_count, &report));
+
+  UartWrite("[SCHED] block_wake: cross_cpu_wakes=");
+  UartWriteDec(static_cast<uint64_t>(report.cross_cpu_wakes));
+  UartWrite(" spurious_returns=");
+  UartWriteDec(static_cast<uint64_t>(report.spurious_returns));
+  UartWrite(" pingpong_cpus=");
+  UartWriteHex(report.pingpong_cpus);
+  UartWrite(" ipi_wakes=");
+  UartWriteDec(static_cast<uint64_t>(report.ipi_wakes));
+  UartWrite(" ipi_cpus=");
+  UartWriteHex(report.ipi_cpus);
+  UartWrite(" max_ipi_wake_ticks=");
+  UartWriteDec(static_cast<uint64_t>(report.max_ipi_wake_ticks));
+  UartWrite(" blocked_ticks=");
+  UartWriteDec(static_cast<uint64_t>(report.blocked_ticks));
+  UartWrite("/");
+  UartWriteDec(static_cast<uint64_t>(kBlockWakeIdleWindowTicks));
+  if (report.live_cpu_ticks >= 0) {
+    UartWrite(" live_ticks=");
+    UartWriteDec(static_cast<uint64_t>(report.live_task_ticks));
+    UartWrite("/");
+    UartWriteDec(static_cast<uint64_t>(report.live_cpu_ticks));
+  }
+  UartWrite(" timed_wait_late_ticks=");
+  UartWriteDec(static_cast<uint64_t>(report.timed_wait_late_ticks));
+  UartWrite(" timed_wait_own_ticks=");
+  UartWriteDec(static_cast<uint64_t>(report.timed_wait_own_ticks));
+  UartWrite("\n");
+
+  SELFTEST_EXPECT(PmmFreeFrameCount() == pmm_free_before);
+  SELFTEST_EXPECT(HeapTotalFreeBytes() == heap_free_before);
   return true;
 }
 
@@ -6714,6 +7458,1165 @@ static bool TestUserModeMixedWorkload() {
   return true;
 }
 
+static bool RunUserTestWithCaps(const uint64_t arg,   //
+                                const uint64_t caps,  //
+                                UserProgramResult* const result) {
+  const std::unique_ptr<UserProcess> process =
+      UserProcess::Start(UserTestProgram(), arg, caps);
+  if (process == nullptr) {
+    return false;
+  }
+  SELFTEST_EXPECT(WaitForProcesses(&process, 1, HasEnded, WaitMode::kYield));
+  *result = process->Wait();
+  return true;
+}
+
+static bool IsInIrqWait(const UserProcessStats& stats) {
+  return stats.in_irq_wait;
+}
+
+static bool IsBlockedInIrqWait(const UserProcessStats& stats) {
+  return stats.blocked_in_irq_wait;
+}
+
+static bool FindClaimablePciDeviceWithBar(int* const out_dev_index,  //
+                                          int* const out_bar_index,  //
+                                          const bool prefer_msix) {
+  int best_dev = -1;
+  int best_bar = -1;
+  const int count = PciDeviceCount();
+  for (int i = 0; i < count; ++i) {
+    const PciDevice* const dev = PciGetDevice(i);
+    if (dev == nullptr || !dev->claimable) {
+      continue;
+    }
+    int mem_bar = -1;
+    for (int b = 0; b < kPciMaxBars; ++b) {
+      const PciBar& bar = dev->bars[b];
+      if ((bar.type == PciBarType::kMem32 || bar.type == PciBarType::kMem64) &&
+          bar.base != 0 && bar.size >= kPageSize &&
+          !DriverPageHoldsMsixStructure(dev->msix, bar.base)) {
+        mem_bar = b;
+        break;
+      }
+    }
+    if (mem_bar < 0) {
+      continue;
+    }
+    if (best_dev < 0) {
+      best_dev = i;
+      best_bar = mem_bar;
+    }
+    if (prefer_msix && dev->msix.offset != 0 && dev->msix.valid &&
+        dev->msix.table_bar == mem_bar) {
+      *out_dev_index = i;
+      *out_bar_index = mem_bar;
+      return true;
+    }
+  }
+  if (best_dev < 0) {
+    return false;
+  }
+  *out_dev_index = best_dev;
+  *out_bar_index = best_bar;
+  return true;
+}
+
+// For a boot test whose device checks need a claimable PCI function with a
+// usable memory BAR, which a machine may lack (a Hyper-V Generation 2 VM has no
+// PCI functions at all): logs that the test skipped them, and returns true so
+// that the test passes on the checks that it could run.
+static bool SkipDeviceChecks(const char* const test_name) {
+  UartWrite("[TEST] ");
+  UartWrite(test_name);
+  UartWrite(": skipped (no claimable PCI function with a memory BAR)\n");
+  return true;
+}
+
+// Verifies capability separation and EPERM gating:
+// - An unprivileged process (`kUserCapNone`) receives `kSyscallErrorPermission`
+//   on every privileged syscall (`7..15`), succeeds on `kSyscallGetTicks`
+//   (`16`), and receives `kSyscallErrorNoSys` on `17`/`-1`.
+// - A `kUserCapSpawnDrivers` process receives `kSyscallErrorPermission` on
+//   driver syscalls `8..15`, succeeds on `kSyscallSpawnDriver`, and its
+//   spawned driver child runs with `kUserCapDriver` (succeeds on `pci_info`
+//   and `get_ticks`, and gets `kSyscallErrorPermission` on `spawn_driver`).
+// - A child spawned via `kSyscallSpawn` from either a `kUserCapSpawnDrivers`
+//   or a `kUserCapDriver` process receives `kUserCapNone`.
+// - A `kUserCapDriver` process validates `kSyscallConsolePush` error cases and
+//   pushes input bytes into the console ring that a reader process consumes.
+static bool TestDriverPrivilege() {
+  using usertest::DriverCapProbeSubmode;
+  using usertest::Mode;
+  SELFTEST_EXPECT(GetTaskScheduler() != nullptr);
+  const int64_t pmm_free_at_start = PmmFreeFrameCount();
+  const int64_t heap_free_at_start = HeapTotalFreeBytes();
+
+  UserProgramResult result{};
+  // Warm up the multi-level spawn_driver -> spawn chain before recording the
+  // exact PMM and heap baseline.
+  SELFTEST_EXPECT(RunUserTestWithCaps(
+      usertest::DriverArg(
+          Mode::kDriverCapProbe,
+          static_cast<uint8_t>(DriverCapProbeSubmode::kProbeSpawnerRole)),
+      kUserCapSpawnDrivers, &result));
+  SELFTEST_EXPECT(ExitedWith(result, 0));
+
+  const int64_t pmm_free_before = PmmFreeFrameCount();
+  const int64_t heap_free_before = HeapTotalFreeBytes();
+  const bool heap_grew = pmm_free_before < pmm_free_at_start &&
+                         heap_free_before > heap_free_at_start;
+  if (!heap_grew) {
+    SELFTEST_EXPECT(pmm_free_before == pmm_free_at_start);
+    SELFTEST_EXPECT(heap_free_before == heap_free_at_start);
+  }
+
+  // (a) Default unprivileged process (`kUserCapNone`).
+  SELFTEST_EXPECT(RunUserTest(Mode::kDriverDenied, &result));
+  SELFTEST_EXPECT(ExitedWith(result, 0));
+
+  // (b) `kUserCapSpawnDrivers` process and its `spawn_driver` / `spawn`
+  // children.
+  SELFTEST_EXPECT(RunUserTestWithCaps(
+      usertest::DriverArg(
+          Mode::kDriverCapProbe,
+          static_cast<uint8_t>(DriverCapProbeSubmode::kProbeSpawnerRole)),
+      kUserCapSpawnDrivers, &result));
+  SELFTEST_EXPECT(ExitedWith(result, 0));
+
+  // (c) Direct `kUserCapDriver` process probing its own capability boundary and
+  // its `spawn()` child's `kUserCapNone`.
+  SELFTEST_EXPECT(RunUserTestWithCaps(
+      usertest::DriverArg(
+          Mode::kDriverCapProbe,
+          static_cast<uint8_t>(DriverCapProbeSubmode::kProbeDriverRole)),
+      kUserCapDriver, &result));
+  SELFTEST_EXPECT(ExitedWith(result, 0));
+
+  // (d) `kSyscallConsolePush` from `kUserCapDriver` feeds the console input
+  // ring.
+  ConsoleClearInput();
+  SELFTEST_EXPECT(RunUserTestWithCaps(
+      usertest::DriverArg(Mode::kDriverConsolePush), kUserCapDriver, &result));
+  SELFTEST_EXPECT(ExitedWith(result, 0));
+  {
+    constexpr const char kExpectedInput[] = "drv_in!\n";
+    constexpr int64_t kExpectedLen = 8;
+    const std::unique_ptr<UserProcess> reader = UserProcess::Start(
+        UserTestProgram(),
+        usertest::Arg(Mode::kConsoleRead, static_cast<uint64_t>(kExpectedLen)));
+    SELFTEST_EXPECT(reader != nullptr);
+    SELFTEST_EXPECT(WaitForProcesses(&reader, 1, HasEnded, WaitMode::kYield));
+    const int64_t expected_checksum = SyscallSpinChecksum(
+        reinterpret_cast<const uint8_t*>(kExpectedInput), kExpectedLen);
+    SELFTEST_EXPECT(ExitedWith(reader->Wait(), expected_checksum));
+  }
+  ConsoleClearInput();
+
+  SELFTEST_EXPECT(PagingActiveRoot() == PagingKernelRoot());
+  SELFTEST_EXPECT(PagingUserSpaceIsEmpty());
+  SELFTEST_EXPECT(PmmFreeFrameCount() == pmm_free_before);
+  SELFTEST_EXPECT(HeapTotalFreeBytes() == heap_free_before);
+  return true;
+}
+
+// Verifies PCI device discovery (`kSyscallPciInfo`), exclusive device claiming
+// (`kSyscallPciClaim`), `kSyscallPciBusMaster`, and rejection of operations on
+// unclaimed or foreign-owned PCI devices.
+static bool TestDriverDeviceOwnership() {
+  using usertest::DriverForeignSubmode;
+  using usertest::DriverHoldSubmode;
+  using usertest::Mode;
+  SELFTEST_EXPECT(GetTaskScheduler() != nullptr);
+  int dev_idx = -1;
+  int bar_idx = -1;
+  if (!FindClaimablePciDeviceWithBar(&dev_idx, &bar_idx,
+                                     /*prefer_msix=*/true)) {
+    return SkipDeviceChecks("driver_device_ownership");
+  }
+  const PciDevice* const dev = PciGetDevice(dev_idx);
+  SELFTEST_EXPECT(dev != nullptr);
+
+  // Verify `DriverContext::PciInfo` populates `PciDeviceInfo` matching
+  // `PciGetDevice(dev_idx)`.
+  {
+    DriverContext ctx;
+    PciDeviceInfo info{};
+    SELFTEST_EXPECT(ctx.PciInfo(0, nullptr) == PciDeviceCount());
+    SELFTEST_EXPECT(ctx.PciInfo(dev_idx, &info) == PciDeviceCount());
+    SELFTEST_EXPECT(info.bus == dev->address.bus);
+    SELFTEST_EXPECT(info.device == dev->address.device);
+    SELFTEST_EXPECT(info.function == dev->address.function);
+    SELFTEST_EXPECT(info.vendor_id == dev->vendor_id);
+    SELFTEST_EXPECT(info.device_id == dev->device_id);
+    SELFTEST_EXPECT(info.class_code == dev->class_code);
+    SELFTEST_EXPECT(info.subclass == dev->subclass);
+    SELFTEST_EXPECT(info.prog_if == dev->prog_if);
+    SELFTEST_EXPECT(info.revision == dev->revision);
+    SELFTEST_EXPECT(info.claimable == (dev->claimable ? 1 : 0));
+    SELFTEST_EXPECT(info.msi_vectors ==
+                    (dev->msi.offset != 0
+                         ? static_cast<uint8_t>(1U << dev->msi.vectors_log2)
+                         : 0));
+    SELFTEST_EXPECT(info.msix_vectors ==
+                    (dev->msix.offset != 0 && dev->msix.valid
+                         ? static_cast<uint16_t>(dev->msix.table_size)
+                         : 0));
+    for (int b = 0; b < kPciMaxBars; ++b) {
+      SELFTEST_EXPECT(info.bars[b].phys_base == dev->bars[b].base);
+      SELFTEST_EXPECT(info.bars[b].size == dev->bars[b].size);
+      SELFTEST_EXPECT(info.bars[b].prefetchable ==
+                      (dev->bars[b].prefetchable ? 1 : 0));
+    }
+  }
+
+  const int64_t pmm_free_before = PmmFreeFrameCount();
+  const int64_t heap_free_before = HeapTotalFreeBytes();
+  UserProgramResult result{};
+
+  // (a) Operations on an unclaimed device fail with `kSyscallErrorAccess`.
+  SELFTEST_EXPECT(RunUserTestWithCaps(
+      usertest::DriverArg(
+          Mode::kDriverForeign,
+          static_cast<uint8_t>(DriverForeignSubmode::kUnclaimedDevice), dev_idx,
+          bar_idx),
+      kUserCapDriver, &result));
+  SELFTEST_EXPECT(ExitedWith(result, 0));
+
+  // (b) Validation errors, non-claimable device rejection, idempotent re-claim
+  // by the same owner, and Bus Master toggling.
+  SELFTEST_EXPECT(RunUserTestWithCaps(
+      usertest::DriverArg(
+          Mode::kDriverForeign,
+          static_cast<uint8_t>(DriverForeignSubmode::kValidationAndClaimToggle),
+          dev_idx, bar_idx),
+      kUserCapDriver, &result));
+  SELFTEST_EXPECT(ExitedWith(result, 0));
+  SELFTEST_EXPECT(PciOwner(dev_idx) == kPciNoOwner);
+  SELFTEST_EXPECT((PciConfigRead16(dev_idx, kPciCommandOffset) &
+                   kPciCommandBusMaster) == 0);
+
+  // (c) Process A claims `dev_idx` and enables Bus Master; process B attempts
+  // to claim (`kSyscallErrorBusy`) and operate on `dev_idx`
+  // (`kSyscallErrorAccess`); after A is killed, `dev_idx` is unclaimed and
+  // Bus Master is cleared.
+  {
+    const std::unique_ptr<UserProcess> proc_a = UserProcess::Start(
+        UserTestProgram(),
+        usertest::DriverArg(
+            Mode::kDriverHold,
+            static_cast<uint8_t>(DriverHoldSubmode::kHoldClaimOnly), dev_idx,
+            bar_idx),
+        kUserCapDriver);
+    SELFTEST_EXPECT(proc_a != nullptr);
+    SELFTEST_EXPECT(
+        WaitForProcesses(&proc_a, 1, IsInIrqWait, WaitMode::kYield));
+    SELFTEST_EXPECT(PciOwner(dev_idx) == proc_a->OwnerToken());
+    SELFTEST_EXPECT((PciConfigRead16(dev_idx, kPciCommandOffset) &
+                     kPciCommandBusMaster) != 0);
+
+    SELFTEST_EXPECT(RunUserTestWithCaps(
+        usertest::DriverArg(
+            Mode::kDriverForeign,
+            static_cast<uint8_t>(DriverForeignSubmode::kOwnedByOtherProcess),
+            dev_idx, bar_idx),
+        kUserCapDriver, &result));
+    SELFTEST_EXPECT(ExitedWith(result, 0));
+
+    proc_a->Kill();
+    UserProcessStats stats_a{};
+    SELFTEST_EXPECT(EndedKilled(proc_a, &stats_a));
+    SELFTEST_EXPECT(PciOwner(dev_idx) == kPciNoOwner);
+    SELFTEST_EXPECT((PciConfigRead16(dev_idx, kPciCommandOffset) &
+                     kPciCommandBusMaster) == 0);
+  }
+
+  // (d) Another process can claim `dev_idx` cleanly after A's release.
+  SELFTEST_EXPECT(RunUserTestWithCaps(
+      usertest::DriverArg(
+          Mode::kDriverForeign,
+          static_cast<uint8_t>(DriverForeignSubmode::kValidationAndClaimToggle),
+          dev_idx, bar_idx),
+      kUserCapDriver, &result));
+  SELFTEST_EXPECT(ExitedWith(result, 0));
+
+  SELFTEST_EXPECT(PagingActiveRoot() == PagingKernelRoot());
+  SELFTEST_EXPECT(PagingUserSpaceIsEmpty());
+  SELFTEST_EXPECT(PmmFreeFrameCount() == pmm_free_before);
+  SELFTEST_EXPECT(HeapTotalFreeBytes() == heap_free_before);
+  return true;
+}
+
+// Verifies `kSyscallMmioMap`: PAT entry 3 is UC (0x00), mapped BAR pages sit in
+// `[kDriverMmioWindowBase, kDriverMmioWindowBase + kDriverMmioWindowSize)` with
+// `kPtePresent | kPteWritable | kPteUser | kPtePcd | kPteNoExecute |
+// kPteNotOwned` (and `kPtePwt == 0`), MSI-X table/PBA pages are rejected with
+// `kSyscallErrorAccess`, each mapping is followed by an unmapped 4 KiB guard
+// page, instruction fetch from an MMIO page faults (#PF NX), reading the
+// unmapped guard page faults (#PF non-present), and destroying the address
+// space frees page-table frames without freeing BAR physical pages into the
+// PMM.
+static bool TestDriverMmioMapping() {
+  using usertest::DriverMmioFaultSubmode;
+  using usertest::Mode;
+  SELFTEST_EXPECT(GetTaskScheduler() != nullptr);
+
+  // PAT entry 3 (bits 24..31 of IA32_PAT, selected by PAT=0, PCD=1, PWT=0) must
+  // be 0x00 (Uncacheable).
+  const uint64_t pat_msr = PagingReadPatMsr();
+  SELFTEST_EXPECT(((pat_msr >> 24) & 0xFFULL) == 0x00ULL);
+
+  int dev_idx = -1;
+  int bar_idx = -1;
+  if (!FindClaimablePciDeviceWithBar(&dev_idx, &bar_idx,
+                                     /*prefer_msix=*/true)) {
+    return SkipDeviceChecks("driver_mmio_mapping");
+  }
+  const PciDevice* const dev = PciGetDevice(dev_idx);
+  SELFTEST_EXPECT(dev != nullptr);
+  const PciBar& bar = dev->bars[bar_idx];
+
+  const int64_t pmm_free_at_start = PmmFreeFrameCount();
+  const int64_t heap_free_at_start = HeapTotalFreeBytes();
+  UserProgramResult result{};
+  // Warm up once before recording the exact baseline.
+  SELFTEST_EXPECT(RunUserTestWithCaps(
+      usertest::DriverArg(Mode::kDriverMmioChecks, 0, dev_idx, bar_idx),
+      kUserCapDriver, &result));
+  SELFTEST_EXPECT(ExitedWith(result, 0));
+
+  const int64_t pmm_free_before = PmmFreeFrameCount();
+  const int64_t heap_free_before = HeapTotalFreeBytes();
+  const bool heap_grew = pmm_free_before < pmm_free_at_start &&
+                         heap_free_before > heap_free_at_start;
+  if (!heap_grew) {
+    SELFTEST_EXPECT(pmm_free_before == pmm_free_at_start);
+    SELFTEST_EXPECT(heap_free_before == heap_free_at_start);
+  }
+
+  // (a) Inspect live PTE flags and guard pages while mapped.
+  {
+    const std::unique_ptr<UserProcess> proc = UserProcess::Start(
+        UserTestProgram(),
+        usertest::DriverArg(Mode::kDriverMmioChecks, 1, dev_idx, bar_idx),
+        kUserCapDriver);
+    SELFTEST_EXPECT(proc != nullptr);
+    SELFTEST_EXPECT(WaitForProcesses(&proc, 1, IsInIrqWait, WaitMode::kYield));
+
+    // `RunDriverMmioChecks` mapped `bar.base` (1 page) twice: at
+    // `kDriverMmioWindowBase` (followed by guard page `+ kPageSize`) and at
+    // `kDriverMmioWindowBase + 2 * kPageSize` (followed by guard page
+    // `+ 3 * kPageSize`).
+    for (int m = 0; m < 2; ++m) {
+      const uintptr_t mapped_va =
+          kDriverMmioWindowBase +
+          static_cast<uintptr_t>(2 * m) * static_cast<uintptr_t>(kPageSize);
+      const uintptr_t guard_va = mapped_va + static_cast<uintptr_t>(kPageSize);
+      UserPageInfo page_info{};
+      SELFTEST_EXPECT(proc->QueryUserPage(mapped_va, &page_info));
+      SELFTEST_EXPECT(page_info.writable);
+      SELFTEST_EXPECT(page_info.executable == !PagingNoExecuteEnabled());
+      SELFTEST_EXPECT(page_info.write_through);
+      SELFTEST_EXPECT(page_info.cache_disable);
+      SELFTEST_EXPECT(!page_info.pat);
+      SELFTEST_EXPECT(!page_info.owned);
+      SELFTEST_EXPECT(page_info.phys_addr == bar.base);
+
+      UserPageInfo guard_info{};
+      SELFTEST_EXPECT(!proc->QueryUserPage(guard_va, &guard_info));
+      SELFTEST_EXPECT(proc->LookupUserPage(guard_va) == 0);
+    }
+
+    proc->Kill();
+    UserProcessStats stats{};
+    SELFTEST_EXPECT(EndedKilled(proc, &stats));
+  }
+
+  // (b) Executing code from the mapped MMIO BAR faults with an
+  // instruction-fetch #PF when NX is enabled.
+  if (PagingNoExecuteEnabled()) {
+    SELFTEST_EXPECT(RunUserTestWithCaps(
+        usertest::DriverArg(
+            Mode::kDriverMmioFault,
+            static_cast<uint8_t>(DriverMmioFaultSubmode::kFaultExecuteMmio),
+            dev_idx, bar_idx),
+        kUserCapDriver, &result));
+    SELFTEST_EXPECT(FaultedWith(result,               //
+                                kVectorPageFault,     //
+                                kPageFaultUserFetch,  //
+                                kPageFaultUserFetch));
+    SELFTEST_EXPECT(result.fault_address == kDriverMmioWindowBase);
+  }
+
+  // (c) Reading the unmapped guard page right after the 1-page mapping faults
+  // with a non-present user #PF.
+  {
+    SELFTEST_EXPECT(RunUserTestWithCaps(
+        usertest::DriverArg(Mode::kDriverMmioFault,
+                            static_cast<uint8_t>(
+                                DriverMmioFaultSubmode::kFaultReadWithheldMsix),
+                            dev_idx, bar_idx),
+        kUserCapDriver, &result));
+    SELFTEST_EXPECT(FaultedWith(result,                              //
+                                kVectorPageFault,                    //
+                                kPageFaultPresent | kPageFaultUser,  //
+                                kPageFaultUser));
+    SELFTEST_EXPECT(result.fault_address ==
+                    kDriverMmioWindowBase + static_cast<uintptr_t>(kPageSize));
+  }
+
+  SELFTEST_EXPECT(PagingActiveRoot() == PagingKernelRoot());
+  SELFTEST_EXPECT(PagingUserSpaceIsEmpty());
+  SELFTEST_EXPECT(PmmFreeFrameCount() == pmm_free_before);
+  SELFTEST_EXPECT(HeapTotalFreeBytes() == heap_free_before);
+  return true;
+}
+
+// Verifies `kSyscallDmaAlloc`: argument/pointer validation, zero-initialized
+// physically contiguous multi-page allocation in `[kDriverDmaWindowBase,
+// kDriverDmaWindowBase + kDriverDmaWindowSize)`, Write-Back + NX + owned PTE
+// flags (`PCD == 0`, `PWT == 0`, `NX == 1`, `kPteNotOwned == 0`),
+// instruction-fetch #PF on DMA pages, and complete PMM frame reclamation on
+// process teardown.
+static bool TestDriverDmaMemory() {
+  using usertest::Mode;
+  TaskScheduler* const scheduler = GetTaskScheduler();
+  SELFTEST_EXPECT(scheduler != nullptr);
+  const int64_t pmm_free_before = PmmFreeFrameCount();
+  const int64_t heap_free_before = HeapTotalFreeBytes();
+
+  // (a) Allocate 4-page (16 KiB) + 1-page (4 KiB) DMA regions and inspect live
+  // PTEs and physical contiguity.
+  {
+    const std::unique_ptr<UserProcess> proc = UserProcess::Start(
+        UserTestProgram(), usertest::DriverArg(Mode::kDriverDmaChecks, 0),
+        kUserCapDriver);
+    SELFTEST_EXPECT(proc != nullptr);
+    SELFTEST_EXPECT(WaitForProcesses(&proc, 1, IsInIrqWait, WaitMode::kYield));
+
+    // At least the 5 DMA frames (plus the process's own frames) are allocated
+    // from the PMM while the process is alive.
+    SELFTEST_EXPECT(PmmFreeFrameCount() <= pmm_free_before - 5);
+
+    uint64_t phys1 = 0;
+    uint64_t phys2 = 0;
+    for (int p = 0; p < 4; ++p) {
+      const uintptr_t va =
+          kDriverDmaWindowBase +
+          static_cast<uintptr_t>(p) * static_cast<uintptr_t>(kPageSize);
+      UserPageInfo page_info{};
+      SELFTEST_EXPECT(proc->QueryUserPage(va, &page_info));
+      SELFTEST_EXPECT(page_info.writable);
+      SELFTEST_EXPECT(page_info.executable == !PagingNoExecuteEnabled());
+      SELFTEST_EXPECT(!page_info.write_through);
+      SELFTEST_EXPECT(!page_info.cache_disable);
+      SELFTEST_EXPECT(!page_info.pat);
+      SELFTEST_EXPECT(page_info.owned);
+      if (p == 0) {
+        phys1 = page_info.phys_addr;
+        SELFTEST_EXPECT(phys1 != 0);
+        SELFTEST_EXPECT((phys1 & (static_cast<uint64_t>(kPageSize) - 1)) == 0);
+        // Word 0 of page 0 holds `phys1` written by user mode after
+        // `dma_alloc`.
+        const uint64_t reported_phys1 =
+            *reinterpret_cast<const volatile uint64_t*>(
+                static_cast<uintptr_t>(phys1));
+        SELFTEST_EXPECT(reported_phys1 == phys1);
+      } else {
+        // Multi-page DMA buffer must be physically contiguous.
+        SELFTEST_EXPECT(page_info.phys_addr ==
+                        phys1 + static_cast<uint64_t>(p) * kPageSize);
+        const uint64_t word = *reinterpret_cast<const volatile uint64_t*>(
+            static_cast<uintptr_t>(page_info.phys_addr));
+        SELFTEST_EXPECT(word ==
+                        0xD0A0000000000000ULL + static_cast<uint64_t>(p));
+      }
+    }
+
+    // One unmapped 4 KiB guard page sits between the 4-page allocation and the
+    // second 1-page allocation.
+    {
+      const uintptr_t guard_va =
+          kDriverDmaWindowBase + 4 * static_cast<uintptr_t>(kPageSize);
+      UserPageInfo guard_info{};
+      SELFTEST_EXPECT(!proc->QueryUserPage(guard_va, &guard_info));
+      SELFTEST_EXPECT(proc->LookupUserPage(guard_va) == 0);
+
+      const uintptr_t va2 =
+          kDriverDmaWindowBase + 5 * static_cast<uintptr_t>(kPageSize);
+      UserPageInfo page_info2{};
+      SELFTEST_EXPECT(proc->QueryUserPage(va2, &page_info2));
+      SELFTEST_EXPECT(page_info2.writable);
+      SELFTEST_EXPECT(page_info2.executable == !PagingNoExecuteEnabled());
+      SELFTEST_EXPECT(!page_info2.write_through);
+      SELFTEST_EXPECT(!page_info2.cache_disable);
+      SELFTEST_EXPECT(!page_info2.pat);
+      SELFTEST_EXPECT(page_info2.owned);
+      phys2 = page_info2.phys_addr;
+      SELFTEST_EXPECT(phys2 != 0 && phys2 != phys1);
+      const uint64_t reported_phys2 =
+          *reinterpret_cast<const volatile uint64_t*>(
+              static_cast<uintptr_t>(phys2));
+      SELFTEST_EXPECT(reported_phys2 == phys2);
+    }
+
+    proc->Kill();
+    UserProcessStats stats{};
+    SELFTEST_EXPECT(EndedKilled(proc, &stats));
+  }
+
+  // (b) Executing from a DMA page faults with an instruction-fetch #PF when NX
+  // is enabled.
+  if (PagingNoExecuteEnabled()) {
+    UserProgramResult result{};
+    SELFTEST_EXPECT(
+        RunUserTestWithCaps(usertest::DriverArg(Mode::kDriverDmaChecks, 1),
+                            kUserCapDriver, &result));
+    SELFTEST_EXPECT(FaultedWith(result,               //
+                                kVectorPageFault,     //
+                                kPageFaultUserFetch,  //
+                                kPageFaultUserFetch));
+    SELFTEST_EXPECT(result.fault_address == kDriverDmaWindowBase);
+  }
+
+  SELFTEST_EXPECT(PagingActiveRoot() == PagingKernelRoot());
+  SELFTEST_EXPECT(PagingUserSpaceIsEmpty());
+  SELFTEST_EXPECT(PmmFreeFrameCount() == pmm_free_before);
+  SELFTEST_EXPECT(HeapTotalFreeBytes() == heap_free_before);
+  return true;
+}
+
+// Verifies `kSyscallIrqAlloc` and `kSyscallIrqWait` across every claimable PCI
+// device with MSI or MSI-X:
+// - Validation of invalid counts/modes and duplicate `irq_alloc` rejection.
+// - Non-blocking poll (`timeout_ticks == 0`) and timeout expiration.
+// - Hardware MSI / MSI-X capability and table programming (`0xFEE00000 |
+//   (apic_id << 12)`, vector in `[0x50, 0x7F]`, `Command.Interrupt Disable`).
+// - Pre-pending bit delivery and selective mask consumption.
+// - True scheduler blocking (`BlockUntil`, 0 task timer ticks across 20 global
+//   timer ticks while blocked) and wakeup within `<= 2` task timer ticks upon
+//   `SmpSendIpi(0, vector_k)` for each allocated vector `k`.
+// - `Kill()` while blocked in `irq_wait` terminating within
+//   `kKillDeadlineTicks`.
+static bool TestDriverIrqWait() {
+  using usertest::DriverIrqSubmode;
+  using usertest::Mode;
+  TaskScheduler* const scheduler = GetTaskScheduler();
+  SELFTEST_EXPECT(scheduler != nullptr);
+  const int64_t pmm_free_before = PmmFreeFrameCount();
+  const int64_t heap_free_before = HeapTotalFreeBytes();
+
+  int target_devices[kPciMaxDevices] = {};
+  int target_count = 0;
+  int tested_msi = 0;
+  int tested_msix = 0;
+  const int total_pci = PciDeviceCount();
+  for (int dev_idx = 0; dev_idx < total_pci; ++dev_idx) {
+    const PciDevice* const dev = PciGetDevice(dev_idx);
+    if (dev == nullptr || !dev->claimable ||
+        (dev->msi.offset == 0 && (dev->msix.offset == 0 || !dev->msix.valid))) {
+      continue;
+    }
+    target_devices[target_count++] = dev_idx;
+    if (dev->msix.offset != 0 && dev->msix.valid) {
+      ++tested_msix;
+    } else {
+      ++tested_msi;
+    }
+  }
+  if (target_count == 0) {
+    int fallback_dev = -1;
+    int fallback_bar = -1;
+    if (!FindClaimablePciDeviceWithBar(&fallback_dev, &fallback_bar,
+                                       /*prefer_msix=*/false)) {
+      return SkipDeviceChecks("driver_irq_wait");
+    }
+    target_devices[target_count++] = fallback_dev;
+  }
+
+  for (int t = 0; t < target_count; ++t) {
+    const int dev_idx = target_devices[t];
+    const PciDevice* const dev = PciGetDevice(dev_idx);
+    SELFTEST_EXPECT(dev != nullptr);
+    const bool has_hw_irq =
+        dev->msi.offset != 0 || (dev->msix.offset != 0 && dev->msix.valid);
+    const int expected_count =
+        (!has_hw_irq || (dev->msix.offset != 0 && dev->msix.valid &&
+                         dev->msix.table_size >= 2))
+            ? 2
+            : 1;
+
+    // (a) Argument validation, duplicate `irq_alloc` rejection, non-blocking
+    // poll, and timeout expiration.
+    {
+      UserProgramResult result{};
+      const int64_t start_tick = Cpu0TimerTicks();
+      SELFTEST_EXPECT(RunUserTestWithCaps(
+          usertest::DriverArg(
+              Mode::kDriverIrqWait,
+              static_cast<uint8_t>(DriverIrqSubmode::kIrqValidationAndTimeout),
+              dev_idx),
+          kUserCapDriver, &result));
+      const int64_t elapsed_ticks = Cpu0TimerTicks() - start_tick;
+      SELFTEST_EXPECT(ExitedWith(result, 0));
+      SELFTEST_EXPECT(elapsed_ticks >= 7);
+    }
+
+    // (b) Hardware MSI/MSI-X programming, pre-pending interrupt delivery, and
+    // selective mask consumption.
+    ConsoleClearInput();
+    {
+      const std::unique_ptr<UserProcess> proc = UserProcess::Start(
+          UserTestProgram(),
+          usertest::DriverArg(
+              Mode::kDriverIrqWait,
+              static_cast<uint8_t>(
+                  DriverIrqSubmode::kIrqPrePendingAndSelectiveMask),
+              dev_idx),
+          kUserCapDriver);
+      SELFTEST_EXPECT(proc != nullptr);
+      const int64_t expected_read_syscall = has_hw_irq ? 4 : 3;
+      SELFTEST_EXPECT(WaitForProcesses(
+          &proc, 1,
+          [expected_read_syscall](const UserProcessStats& s) {
+            return (s.syscalls >= expected_read_syscall && s.in_syscall &&
+                    !s.in_irq_wait) ||
+                   HasEnded(s);
+          },
+          WaitMode::kYield));
+      SELFTEST_EXPECT(!HasEnded(proc->stats()));
+      if (!has_hw_irq) {
+        SELFTEST_EXPECT(proc->BindVectorsForSelftest(dev_idx, expected_count));
+      }
+
+      const uintptr_t owner = proc->OwnerToken();
+      const int vec0 = DeviceIrqVectorForBit(owner, 0);
+      SELFTEST_EXPECT(vec0 >= kDeviceIrqVectorFirst &&
+                      vec0 <= kDeviceIrqVectorLast);
+      SELFTEST_EXPECT(IdtGetHandler(vec0) != nullptr);
+      int vec1 = -1;
+      if (expected_count == 2) {
+        vec1 = DeviceIrqVectorForBit(owner, 1);
+        SELFTEST_EXPECT(vec1 >= kDeviceIrqVectorFirst &&
+                        vec1 <= kDeviceIrqVectorLast && vec1 != vec0);
+        SELFTEST_EXPECT(IdtGetHandler(vec1) != nullptr);
+      }
+
+      // Verify hardware MSI or MSI-X capability registers / table entries.
+      SELFTEST_EXPECT((PciConfigRead16(dev_idx, kPciCommandOffset) &
+                       kPciCommandInterruptDisable) != 0);
+      if (has_hw_irq) {
+        const uint32_t expected_addr_lo = DeviceIrqMsiAddressLow(
+            static_cast<uint8_t>(SmpGetCpuInfo(0)->apic_id & 0xFFU));
+        if (dev->msix.offset != 0 && dev->msix.valid) {
+          const uint16_t ctrl =
+              PciConfigRead16(dev_idx, dev->msix.offset + kPciMsiControlOffset);
+          SELFTEST_EXPECT((ctrl & kPciMsixControlEnable) != 0);
+          SELFTEST_EXPECT((ctrl & kPciMsixControlFunctionMask) == 0);
+          for (int k = 0; k < expected_count; ++k) {
+            const int vec_k = (k == 0) ? vec0 : vec1;
+            SELFTEST_EXPECT(DeviceIrqReadMsixTableWord(dev_idx, k * 4 + 0) ==
+                            expected_addr_lo);
+            SELFTEST_EXPECT(DeviceIrqReadMsixTableWord(dev_idx, k * 4 + 1) ==
+                            0);
+            SELFTEST_EXPECT(DeviceIrqReadMsixTableWord(dev_idx, k * 4 + 2) ==
+                            DeviceIrqMsiData(vec_k));
+            SELFTEST_EXPECT(
+                (DeviceIrqReadMsixTableWord(dev_idx, k * 4 + 3) & 1U) == 0);
+          }
+        } else {
+          const uint16_t ctrl =
+              PciConfigRead16(dev_idx, dev->msi.offset + kPciMsiControlOffset);
+          SELFTEST_EXPECT((ctrl & kPciMsiControlEnable) != 0);
+          SELFTEST_EXPECT(PciConfigRead32(dev_idx, dev->msi.offset + 4) ==
+                          expected_addr_lo);
+          SELFTEST_EXPECT(PciConfigRead16(dev_idx, dev->msi.data_offset) ==
+                          DeviceIrqMsiData(vec0));
+        }
+      }
+
+      // Inject the device interrupt(s) BEFORE the process calls `irq_wait`.
+      SmpSendIpi(0, static_cast<uint8_t>(vec0));
+      if (expected_count == 2) {
+        SmpSendIpi(0, static_cast<uint8_t>(vec1));
+      }
+      ConsolePushInput("G", 1);
+      SELFTEST_EXPECT(WaitForProcesses(&proc, 1, HasEnded, WaitMode::kYield));
+      SELFTEST_EXPECT(ExitedWith(proc->Wait(), 0));
+    }
+    ConsoleClearInput();
+
+    // (c) Blocking wakeup: verify `BlockUntil` parks the task off the runqueue
+    // (0 task timer ticks across 20 global timer ticks) and wakes within `<= 2`
+    // task timer ticks when `SmpSendIpi(0, vec_k)` fires.
+    ConsoleClearInput();
+    {
+      const std::unique_ptr<UserProcess> proc = UserProcess::Start(
+          UserTestProgram(),
+          usertest::DriverArg(
+              Mode::kDriverIrqWait,
+              static_cast<uint8_t>(DriverIrqSubmode::kIrqBlockingWakeup),
+              dev_idx),
+          kUserCapDriver);
+      SELFTEST_EXPECT(proc != nullptr);
+      const int64_t base_syscalls = has_hw_irq ? 3 : 2;
+
+      for (int k = 0; k < expected_count; ++k) {
+        SELFTEST_EXPECT(
+            WaitForProcesses(&proc, 1, IsBlockedInIrqWait, WaitMode::kYield));
+        if (k == 0 && !has_hw_irq) {
+          SELFTEST_EXPECT(
+              proc->BindVectorsForSelftest(dev_idx, expected_count));
+        }
+        scheduler->Yield();
+        SELFTEST_EXPECT(proc->stats().blocked_in_irq_wait);
+
+        const int64_t task_ticks_before = proc->stats().task_timer_ticks;
+        const int64_t wait_start_tick = Cpu0TimerTicks();
+        const TscDeadline block_deadline(kSelfTestWaitTimeoutTscCycles);
+        while (Cpu0TimerTicks() - wait_start_tick < 20) {
+          SELFTEST_EXPECT(!block_deadline.Expired());
+          scheduler->Yield();
+        }
+        const UserProcessStats mid_stats = proc->stats();
+        SELFTEST_EXPECT(mid_stats.blocked_in_irq_wait);
+        SELFTEST_EXPECT(mid_stats.task_timer_ticks == task_ticks_before);
+
+        const int vec_k = DeviceIrqVectorForBit(proc->OwnerToken(), k);
+        SELFTEST_EXPECT(vec_k >= kDeviceIrqVectorFirst &&
+                        vec_k <= kDeviceIrqVectorLast);
+        SmpSendIpi(0, static_cast<uint8_t>(vec_k));
+
+        if (k + 1 < expected_count) {
+          const int64_t target_read_syscall = base_syscalls + (k + 1) * 3;
+          SELFTEST_EXPECT(WaitForProcesses(
+              &proc, 1,
+              [target_read_syscall](const UserProcessStats& s) {
+                return (s.syscalls >= target_read_syscall && s.in_syscall &&
+                        !s.in_irq_wait) ||
+                       HasEnded(s);
+              },
+              WaitMode::kYield));
+          SELFTEST_EXPECT(proc->stats().task_timer_ticks - task_ticks_before <=
+                          2);
+          ConsolePushInput("G", 1);
+        } else {
+          SELFTEST_EXPECT(
+              WaitForProcesses(&proc, 1, HasEnded, WaitMode::kYield));
+          SELFTEST_EXPECT(proc->stats().task_timer_ticks - task_ticks_before <=
+                          2);
+        }
+      }
+      SELFTEST_EXPECT(WaitForProcesses(&proc, 1, HasEnded, WaitMode::kYield));
+      SELFTEST_EXPECT(ExitedWith(proc->Wait(), 0));
+    }
+    ConsoleClearInput();
+
+    // (d) `Kill()` while blocked in `irq_wait` terminates within
+    // `kKillDeadlineTicks`.
+    {
+      const std::unique_ptr<UserProcess> proc = UserProcess::Start(
+          UserTestProgram(),
+          usertest::DriverArg(
+              Mode::kDriverIrqWait,
+              static_cast<uint8_t>(DriverIrqSubmode::kIrqKillWhileBlocked),
+              dev_idx),
+          kUserCapDriver);
+      SELFTEST_EXPECT(proc != nullptr);
+      SELFTEST_EXPECT(
+          WaitForProcesses(&proc, 1, IsBlockedInIrqWait, WaitMode::kYield));
+      scheduler->Yield();
+      proc->Kill();
+      UserProcessStats stats{};
+      SELFTEST_EXPECT(EndedKilled(proc, &stats));
+      SELFTEST_EXPECT(stats.kill_in_syscall);
+      SELFTEST_EXPECT(stats.end_vector == kVectorSyscall);
+      LogLateKill("driver_irq_wait", stats);
+      SELFTEST_EXPECT(KillTicks(stats) <= kKillDeadlineTicks);
+    }
+  }
+
+  LineBuffer summary;
+  summary.Append("[TEST] driver_irq_wait: devices=")
+      .AppendDec(static_cast<uint64_t>(target_count))
+      .Append(" msix=")
+      .AppendDec(static_cast<uint64_t>(tested_msix))
+      .Append(" msi=")
+      .AppendDec(static_cast<uint64_t>(tested_msi))
+      .Append("\n");
+  UartWrite(summary.c_str());
+
+  SELFTEST_EXPECT(PagingActiveRoot() == PagingKernelRoot());
+  SELFTEST_EXPECT(PagingUserSpaceIsEmpty());
+  SELFTEST_EXPECT(PmmFreeFrameCount() == pmm_free_before);
+  SELFTEST_EXPECT(HeapTotalFreeBytes() == heap_free_before);
+  return true;
+}
+
+// Verifies complete, ordered driver resource reclamation across all 3 process
+// termination paths (`exit(0)`, user fault `#UD`, and `Kill()`) on a driver
+// process that claimed a PCI device, enabled Bus Master, mapped an MMIO BAR,
+// allocated 4 pages of DMA memory, allocated/enabled MSI or MSI-X interrupts,
+// and spawned a child process.
+static bool TestDriverTeardown() {
+  using usertest::DriverHoldSubmode;
+  using usertest::Mode;
+  SELFTEST_EXPECT(GetTaskScheduler() != nullptr);
+  int dev_idx = -1;
+  int bar_idx = -1;
+  if (!FindClaimablePciDeviceWithBar(&dev_idx, &bar_idx,
+                                     /*prefer_msix=*/true)) {
+    return SkipDeviceChecks("driver_teardown");
+  }
+  const PciDevice* const dev = PciGetDevice(dev_idx);
+  SELFTEST_EXPECT(dev != nullptr);
+  const bool has_irq =
+      dev->msi.offset != 0 || (dev->msix.offset != 0 && dev->msix.valid);
+
+  const int64_t pmm_free_before = PmmFreeFrameCount();
+  const int64_t heap_free_before = HeapTotalFreeBytes();
+
+  constexpr DriverHoldSubmode kSubmodes[3] = {
+      DriverHoldSubmode::kHoldExit,
+      DriverHoldSubmode::kHoldFault,
+      DriverHoldSubmode::kHoldSpin,
+  };
+  for (int path = 0; path < 3; ++path) {
+    const DriverHoldSubmode submode = kSubmodes[path];
+    const std::unique_ptr<UserProcess> proc = UserProcess::Start(
+        UserTestProgram(),
+        usertest::DriverArg(Mode::kDriverHold, static_cast<uint8_t>(submode),
+                            dev_idx, bar_idx),
+        kUserCapDriver);
+    SELFTEST_EXPECT(proc != nullptr);
+    const uintptr_t expected_owner = proc->OwnerToken();
+
+    if (submode == DriverHoldSubmode::kHoldSpin) {
+      SELFTEST_EXPECT(
+          WaitForProcesses(&proc, 1, IsInIrqWait, WaitMode::kYield));
+      SELFTEST_EXPECT(PciOwner(dev_idx) == expected_owner);
+      SELFTEST_EXPECT((PciConfigRead16(dev_idx, kPciCommandOffset) &
+                       kPciCommandBusMaster) != 0);
+      if (has_irq) {
+        SELFTEST_EXPECT(DeviceIrqUsedVectorCount() == 1);
+        const int vec0 = DeviceIrqVectorForBit(expected_owner, 0);
+        SELFTEST_EXPECT(vec0 >= kDeviceIrqVectorFirst &&
+                        vec0 <= kDeviceIrqVectorLast);
+        SELFTEST_EXPECT(IdtGetHandler(vec0) != nullptr);
+      }
+      proc->Kill();
+      UserProcessStats stats{};
+      SELFTEST_EXPECT(EndedKilled(proc, &stats));
+      SELFTEST_EXPECT(KillTicks(stats) <= 5 * kKillDeadlineTicks);
+    } else {
+      SELFTEST_EXPECT(WaitForProcesses(&proc, 1, HasEnded, WaitMode::kYield));
+      const UserProgramResult result = proc->Wait();
+      if (submode == DriverHoldSubmode::kHoldExit) {
+        SELFTEST_EXPECT(ExitedWith(result, 0));
+      } else {
+        SELFTEST_EXPECT(FaultedWith(result, kVectorInvalidOpcode, 0, 0));
+      }
+    }
+
+    const DriverReleaseRecord rec = DriverLastReleaseRecord();
+    SELFTEST_EXPECT(rec.quiesced_count == 1);
+    SELFTEST_EXPECT(rec.freed_vectors == (has_irq ? 1 : 0));
+    SELFTEST_EXPECT(rec.released_claims == 1);
+    SELFTEST_EXPECT(rec.quiesced_before_vectors_freed);
+    SELFTEST_EXPECT(rec.quiesced_before_address_space_destroyed);
+
+    SELFTEST_EXPECT(PciOwner(dev_idx) == kPciNoOwner);
+    const uint16_t cmd = PciConfigRead16(dev_idx, kPciCommandOffset);
+    SELFTEST_EXPECT((cmd & kPciCommandBusMaster) == 0);
+    SELFTEST_EXPECT((cmd & kPciCommandInterruptDisable) != 0);
+    if (dev->msi.offset != 0) {
+      const uint16_t msi_ctrl =
+          PciConfigRead16(dev_idx, dev->msi.offset + kPciMsiControlOffset);
+      SELFTEST_EXPECT((msi_ctrl & kPciMsiControlEnable) == 0);
+    }
+    if (dev->msix.offset != 0) {
+      const uint16_t msix_ctrl =
+          PciConfigRead16(dev_idx, dev->msix.offset + kPciMsiControlOffset);
+      SELFTEST_EXPECT((msix_ctrl & kPciMsixControlEnable) == 0);
+    }
+    SELFTEST_EXPECT(DeviceIrqUsedVectorCount() == 0);
+    for (int v = kDeviceIrqVectorFirst; v <= kDeviceIrqVectorLast; ++v) {
+      SELFTEST_EXPECT(IdtGetHandler(v) == nullptr);
+    }
+  }
+
+  SELFTEST_EXPECT(PagingActiveRoot() == PagingKernelRoot());
+  SELFTEST_EXPECT(PagingUserSpaceIsEmpty());
+  SELFTEST_EXPECT(PmmFreeFrameCount() == pmm_free_before);
+  SELFTEST_EXPECT(HeapTotalFreeBytes() == heap_free_before);
+  return true;
+}
+
+constexpr int kMaxSelfTestXhciControllers = 4;
+constexpr uint8_t kPciClassSerialBus = 0x0C;
+constexpr uint8_t kPciSubclassUsb = 0x03;
+constexpr uint8_t kPciProgIfXhci = 0x30;
+// 100 ticks at 250 Hz = 400 ms: covers two-phase controller bring-up (reset +
+// port power settle) plus the 100 ms port debounce, 50 ms USB2 reset recovery,
+// 10 ms address settle, and descriptor/endpoint setup so all cold-plugged
+// keyboards reach steady-state indefinite `irq_wait(mask, -1)`.
+constexpr int64_t kDriverEnumSettleTicks = 100;
+// 550 ticks at 250 Hz = 2.20 s; the measured window must be at least
+// kDriverMinIdleWindowTicks (500 ticks = 2.0 s).
+constexpr int64_t kDriverIdleWindowTicks = 550;
+constexpr int64_t kDriverMinIdleWindowTicks = 500;
+
+static int FindClaimableXhciDevices(
+    int (&out_indices)[kMaxSelfTestXhciControllers]) {
+  int found = 0;
+  const int count = PciDeviceCount();
+  for (int i = 0; i < count && found < kMaxSelfTestXhciControllers; ++i) {
+    const PciDevice* const dev = PciGetDevice(i);
+    if (dev == nullptr || !dev->claimable ||
+        dev->class_code != kPciClassSerialBus ||
+        dev->subclass != kPciSubclassUsb || dev->prog_if != kPciProgIfXhci) {
+      continue;
+    }
+    const PciBar& bar0 = dev->bars[0];
+    const bool has_mem_bar0 =
+        (bar0.type == PciBarType::kMem32 || bar0.type == PciBarType::kMem64) &&
+        bar0.base != 0 && bar0.size >= kPageSize;
+    if (!has_mem_bar0) {
+      continue;
+    }
+    out_indices[found++] = i;
+  }
+  return found;
+}
+
+static bool VerifyXhciDevicesQuiescedAndReleased(
+    const int* const dev_indices,  //
+    const int dev_count,           //
+    const int64_t expected_pmm,    //
+    const int64_t expected_heap) {
+  const DriverReleaseRecord rec = DriverLastReleaseRecord();
+  SELFTEST_EXPECT(rec.quiesced_count == dev_count);
+  SELFTEST_EXPECT(rec.freed_vectors == dev_count);
+  SELFTEST_EXPECT(rec.released_claims == dev_count);
+  SELFTEST_EXPECT(rec.quiesced_before_vectors_freed);
+  SELFTEST_EXPECT(rec.quiesced_before_address_space_destroyed);
+
+  for (int i = 0; i < dev_count; ++i) {
+    const int dev_idx = dev_indices[i];
+    const PciDevice* const dev = PciGetDevice(dev_idx);
+    SELFTEST_EXPECT(dev != nullptr);
+    SELFTEST_EXPECT(PciOwner(dev_idx) == kPciNoOwner);
+
+    const uint16_t cmd = PciConfigRead16(dev_idx, kPciCommandOffset);
+    SELFTEST_EXPECT((cmd & kPciCommandBusMaster) == 0);
+    SELFTEST_EXPECT((cmd & kPciCommandInterruptDisable) != 0);
+    SELFTEST_EXPECT((cmd & kPciCommandMemorySpace) != 0);
+
+    if (dev->msi.offset != 0) {
+      const uint16_t msi_ctrl =
+          PciConfigRead16(dev_idx, dev->msi.offset + kPciMsiControlOffset);
+      SELFTEST_EXPECT((msi_ctrl & kPciMsiControlEnable) == 0);
+    }
+    if (dev->msix.offset != 0) {
+      const uint16_t msix_ctrl =
+          PciConfigRead16(dev_idx, dev->msix.offset + kPciMsiControlOffset);
+      SELFTEST_EXPECT((msix_ctrl & kPciMsixControlEnable) == 0);
+    }
+  }
+
+  SELFTEST_EXPECT(PciClaimedCount() == 0);
+  SELFTEST_EXPECT(DeviceIrqUsedVectorCount() == 0);
+  for (int v = kDeviceIrqVectorFirst; v <= kDeviceIrqVectorLast; ++v) {
+    SELFTEST_EXPECT(IdtGetHandler(v) == nullptr);
+  }
+  SELFTEST_EXPECT(PagingActiveRoot() == PagingKernelRoot());
+  SELFTEST_EXPECT(PagingUserSpaceIsEmpty());
+  SELFTEST_EXPECT(PmmFreeFrameCount() == expected_pmm);
+  SELFTEST_EXPECT(HeapTotalFreeBytes() == expected_heap);
+  return true;
+}
+
+// Verifies the real `usbkbd` ring-3 driver binary across:
+// 0. Every pass: started without `kUserCapDriver` (as `sh`'s `run usbkbd`
+//    starts it), it exits with `kDriverExitNotDriver`, claiming nothing.
+// 1. Passes without xHCI (`mb1`, `max`, `smep`, `kvm24`, or `BOOT_TEST_USB=0`):
+//    clean `exit(0)` and full PMM/heap/PCI/IRQ baseline preservation.
+// 2. Passes with xHCI (`bios` single MSI-X controller, `uefi` root MSI-X +
+//    bridged MSI controller):
+//    (a) Clean `exit(0)` after full controller bring-up
+//    (`kDriverArgExitAfterReady`). (b) Ring-3 `#UD` fault after full controller
+//    bring-up (`kDriverArgFaultAfterReady`). (c) Normal daemon mode
+//    (`kDriverArgNormal`): verifies active ownership,
+//        Bus Master, and IRQ vector allocation; waits for initial port
+//        enumeration to settle; measures `TaskTimerTicks` over `>= 2.0 s`
+//        (`550` ticks = `2.2 s`) while blocked in `irq_wait` and asserts
+//        `driver_ticks * 100 <= total_ticks * 2` (`<= 2%` CPU usage); then
+//        terminates `usbkbd` via `Kill()` while the controller is running.
+//    (d) Re-claim after `Kill()` by spawning a fresh `usbkbd` instance that
+//        resets and restarts all controllers cleanly
+//        (`kDriverArgExitAfterReady`).
+static bool TestUsbKbdDriverLifecycle() {
+  TaskScheduler* const scheduler = GetTaskScheduler();
+  SELFTEST_EXPECT(scheduler != nullptr);
+  SELFTEST_EXPECT(PciClaimedCount() == 0);
+  SELFTEST_EXPECT(DeviceIrqUsedVectorCount() == 0);
+
+  int xhci_indices[kMaxSelfTestXhciControllers] = {};
+  const int xhci_count = FindClaimableXhciDevices(xhci_indices);
+
+  const int64_t pmm_free_before = PmmFreeFrameCount();
+  const int64_t heap_free_before = HeapTotalFreeBytes();
+
+  // 0. Not started as a driver: its first driver system call fails with
+  // `kSyscallErrorPermission`, so it exits before claiming any device.
+  {
+    const std::unique_ptr<UserProcess> proc =
+        UserProcess::Start(UsbkbdProgram(), kDriverArgNormal, kUserCapNone);
+    SELFTEST_EXPECT(proc != nullptr);
+    SELFTEST_EXPECT(WaitForProcesses(&proc, 1, HasEnded, WaitMode::kYield));
+    SELFTEST_EXPECT(ExitedWith(proc->Wait(), kDriverExitNotDriver));
+  }
+  SELFTEST_EXPECT(PciClaimedCount() == 0);
+  SELFTEST_EXPECT(DeviceIrqUsedVectorCount() == 0);
+
+  if (xhci_count == 0) {
+    {
+      const std::unique_ptr<UserProcess> proc =
+          UserProcess::Start(UsbkbdProgram(), kDriverArgNormal, kUserCapDriver);
+      SELFTEST_EXPECT(proc != nullptr);
+      SELFTEST_EXPECT(WaitForProcesses(&proc, 1, HasEnded, WaitMode::kYield));
+      SELFTEST_EXPECT(ExitedWith(proc->Wait(), 0));
+    }
+    ConsoleClearInput();
+
+    SELFTEST_EXPECT(PciClaimedCount() == 0);
+    SELFTEST_EXPECT(DeviceIrqUsedVectorCount() == 0);
+    SELFTEST_EXPECT(PagingActiveRoot() == PagingKernelRoot());
+    SELFTEST_EXPECT(PagingUserSpaceIsEmpty());
+    SELFTEST_EXPECT(PmmFreeFrameCount() == pmm_free_before);
+    SELFTEST_EXPECT(HeapTotalFreeBytes() == heap_free_before);
+
+    UartWrite("[TEST] usbkbd_driver_lifecycle: controllers=0 status=no_xhci\n");
+    return true;
+  }
+
+  // (a) Clean exit(0) after full two-phase bring-up on all controllers.
+  {
+    const std::unique_ptr<UserProcess> proc = UserProcess::Start(
+        UsbkbdProgram(), kDriverArgExitAfterReady, kUserCapDriver);
+    SELFTEST_EXPECT(proc != nullptr);
+    SELFTEST_EXPECT(WaitForProcesses(&proc, 1, HasEnded, WaitMode::kYield));
+    SELFTEST_EXPECT(ExitedWith(proc->Wait(), 0));
+  }
+  SELFTEST_EXPECT(VerifyXhciDevicesQuiescedAndReleased(
+      xhci_indices, xhci_count, pmm_free_before, heap_free_before));
+
+  // (b) Ring-3 fault (#UD) after re-claiming and starting all controllers.
+  {
+    const std::unique_ptr<UserProcess> proc = UserProcess::Start(
+        UsbkbdProgram(), kDriverArgFaultAfterReady, kUserCapDriver);
+    SELFTEST_EXPECT(proc != nullptr);
+    SELFTEST_EXPECT(WaitForProcesses(&proc, 1, HasEnded, WaitMode::kYield));
+    SELFTEST_EXPECT(FaultedWith(proc->Wait(), kVectorInvalidOpcode, 0, 0));
+  }
+  SELFTEST_EXPECT(VerifyXhciDevicesQuiescedAndReleased(
+      xhci_indices, xhci_count, pmm_free_before, heap_free_before));
+
+  // (c) Normal daemon mode: re-claim after fault, settle initial port
+  // enumeration, measure idle CPU ticks over >= 2.0 s (550 ticks = 2.2 s)
+  // while blocked in irq_wait, and Kill() while running.
+  int64_t measured_driver_ticks = 0;
+  int64_t measured_total_ticks = 0;
+  {
+    const std::unique_ptr<UserProcess> proc =
+        UserProcess::Start(UsbkbdProgram(), kDriverArgNormal, kUserCapDriver);
+    SELFTEST_EXPECT(proc != nullptr);
+    const uintptr_t expected_owner = proc->OwnerToken();
+
+    // Allow Phase 1 reset delay, Phase 2 port power settle, and cold-plugged
+    // root-hub ports (100 ms debounce + 50 ms reset recovery + 10 ms address
+    // settle + control transfers) to finish enumerating and enter indefinite
+    // `irq_wait(mask, -1)`.
+    const int64_t settle_start = Cpu0TimerTicks();
+    const TscDeadline settle_deadline(kSelfTestWaitTimeoutTscCycles);
+    while (Cpu0TimerTicks() - settle_start < kDriverEnumSettleTicks) {
+      SELFTEST_EXPECT(!settle_deadline.Expired());
+      scheduler->Yield();
+    }
+    SELFTEST_EXPECT(
+        WaitForProcesses(&proc, 1, IsBlockedInIrqWait, WaitMode::kYield));
+    scheduler->Yield();
+    SELFTEST_EXPECT(proc->stats().blocked_in_irq_wait);
+
+    for (int i = 0; i < xhci_count; ++i) {
+      const int dev_idx = xhci_indices[i];
+      SELFTEST_EXPECT(PciOwner(dev_idx) == expected_owner);
+      const uint16_t cmd = PciConfigRead16(dev_idx, kPciCommandOffset);
+      SELFTEST_EXPECT((cmd & kPciCommandBusMaster) != 0);
+    }
+    SELFTEST_EXPECT(DeviceIrqUsedVectorCount() == xhci_count);
+
+    const int64_t driver_ticks_before = proc->stats().task_timer_ticks;
+    const int64_t total_ticks_before = Cpu0TimerTicks();
+    const TscDeadline idle_deadline(kSelfTestWaitTimeoutTscCycles);
+    bool checked_midpoint = false;
+    for (;;) {
+      const int64_t elapsed = Cpu0TimerTicks() - total_ticks_before;
+      if (!checked_midpoint && elapsed >= kDriverIdleWindowTicks / 2) {
+        SELFTEST_EXPECT(proc->stats().blocked_in_irq_wait);
+        checked_midpoint = true;
+      }
+      if (elapsed >= kDriverIdleWindowTicks) {
+        break;
+      }
+      SELFTEST_EXPECT(!idle_deadline.Expired());
+      scheduler->Yield();
+    }
+
+    const UserProcessStats end_stats = proc->stats();
+    const int64_t total_ticks_after = Cpu0TimerTicks();
+    measured_driver_ticks = end_stats.task_timer_ticks - driver_ticks_before;
+    measured_total_ticks = total_ticks_after - total_ticks_before;
+
+    SELFTEST_EXPECT(end_stats.blocked_in_irq_wait);
+    SELFTEST_EXPECT(measured_total_ticks >= kDriverMinIdleWindowTicks);
+    SELFTEST_EXPECT(measured_driver_ticks >= 0);
+    SELFTEST_EXPECT(measured_driver_ticks * 100 <= measured_total_ticks * 2);
+
+    proc->Kill();
+    UserProcessStats kill_stats{};
+    SELFTEST_EXPECT(EndedKilled(proc, &kill_stats));
+    SELFTEST_EXPECT(kill_stats.kill_in_syscall);
+    SELFTEST_EXPECT(KillTicks(kill_stats) <= 5 * kKillDeadlineTicks);
+  }
+  SELFTEST_EXPECT(VerifyXhciDevicesQuiescedAndReleased(
+      xhci_indices, xhci_count, pmm_free_before, heap_free_before));
+
+  // (d) Re-claim verification after Kill(): a freshly spawned `usbkbd` can
+  // immediately re-claim all xHCI controllers, reset them, and reach ready.
+  {
+    const std::unique_ptr<UserProcess> proc = UserProcess::Start(
+        UsbkbdProgram(), kDriverArgExitAfterReady, kUserCapDriver);
+    SELFTEST_EXPECT(proc != nullptr);
+    SELFTEST_EXPECT(WaitForProcesses(&proc, 1, HasEnded, WaitMode::kYield));
+    SELFTEST_EXPECT(ExitedWith(proc->Wait(), 0));
+  }
+  SELFTEST_EXPECT(VerifyXhciDevicesQuiescedAndReleased(
+      xhci_indices, xhci_count, pmm_free_before, heap_free_before));
+  ConsoleClearInput();
+
+  LineBuffer summary;
+  summary.Append("[TEST] usbkbd_driver_lifecycle: controllers=")
+      .AppendDec(static_cast<uint64_t>(xhci_count))
+      .Append(" driver_ticks=")
+      .AppendDec(static_cast<uint64_t>(measured_driver_ticks))
+      .Append(" total_ticks=")
+      .AppendDec(static_cast<uint64_t>(measured_total_ticks))
+      .Append("\n");
+  UartWrite(summary.c_str());
+  return true;
+}
+
 struct BootTest {
   const char* name;
   bool (*run)();
@@ -6738,6 +8641,7 @@ constexpr BootTest kBootTests[] = {
     {"smp_multicpu_sync_stress", TestSmpMultiCpuSyncStress},
     {"idt_percpu_and_lapic_timer", TestIdtPerCpuAndLapicTimer},
     {"task_scheduler_smp", TestTaskSchedulerSmp},
+    {"scheduler_block_wake", TestSchedulerBlockWake},
     {"tlb_shootdown", TestTlbShootdown},
     {"task_stack_guard_pages", TestTaskStackGuardPages},
     {"address_spaces", TestAddressSpaces},
@@ -6750,6 +8654,13 @@ constexpr BootTest kBootTests[] = {
     {"user_mode_fpu_initial_state", TestUserModeFpuInitialState},
     {"cpu_protection_features", TestCpuProtectionFeatures},
     {"smap_smep_protection", TestSmapSmepProtection},
+    {"driver_privilege", TestDriverPrivilege},
+    {"driver_device_ownership", TestDriverDeviceOwnership},
+    {"driver_mmio_mapping", TestDriverMmioMapping},
+    {"driver_dma_memory", TestDriverDmaMemory},
+    {"driver_irq_wait", TestDriverIrqWait},
+    {"driver_teardown", TestDriverTeardown},
+    {"usbkbd_driver_lifecycle", TestUsbKbdDriverLifecycle},
     // End-to-end tests.
     {"user_mode_kill_edge_cases", TestUserModeKillEdgeCases},
     {"user_mode_syscall_buffer_checks", TestUserModeSyscallBufferChecks},

@@ -12,19 +12,22 @@ namespace protos {
 // `IsCpuBusy()` and `StealTask()` semantics (see core_runqueue_scheduler.h),
 // so in practice this layer wraps `CreateCoreRunqueueScheduler()` directly,
 // inside the preemptive and join-lifecycle layers (see `TaskInit()`). It
-// overrides `CreateTask()`, `CreateTaskOnCpu()`, `Yield()`, `PollIdleCpu()`,
-// `OnTimerInterrupt()` and `OnWakeupIpi()` to add:
+// overrides `CreateTask()`, `CreateTaskOnCpu()`, `Yield()`, `Wake()`,
+// `PollIdleCpu()`, `OnTimerInterrupt()`, `OnWakeupIpi()` and `WakeOnCpu()` to
+// add:
 //
 // - Load: CPUs are compared by their load, the number of their queued tasks
 //   that may be stolen (`RunqueueLoad()`) plus 1 if they are running a task
 //   other than their idle task (`IsCpuBusy()`). A busy CPU with nothing queued
-//   thus has load 1, and an idle one load 0.
-// - Placement: `CreateTask()` picks the online CPU with the smallest load
-//   (the calling CPU's load includes the caller). Ties go to the calling CPU,
-//   which needs no wakeup IPI, and then to the lowest CPU index.
+//   thus has load 1, and an idle one load 0. A blocked task adds no load.
+// - Placement: `CreateTask()` and `Wake()` pick the online CPU with the
+//   smallest load (the calling CPU's load includes the caller). Ties go to the
+//   calling CPU, which needs no wakeup IPI, and then to the lowest CPU index.
 // - Wakeups: `CreateTask()` and `CreateTaskOnCpu()` send `kVectorWakeupIpi` to
 //   the target CPU unless it is the calling CPU, so a halted AP notices the new
-//   task at once instead of at its next timer tick.
+//   task at once instead of at its next timer tick. `Wake()` and `WakeOnCpu()`
+//   do the same, but only if they queued a blocked task: a wakeup that only
+//   leaves the task's pending-wakeup flag sends none.
 // - Stealing: when the calling CPU has nothing queued, `PollIdleCpu()` and
 //   `Yield()` first move one task to it from the CPU with the largest load
 //   that has a queued task: an idle CPU, and a CPU whose running task yields

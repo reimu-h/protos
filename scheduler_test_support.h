@@ -45,6 +45,7 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
+#include <functional>
 #include <memory>
 #include <mutex>
 #include <ostream>
@@ -123,6 +124,12 @@ struct FakeSchedulerEnv {
   // Every call of the fake FpuSave() and FpuRestore(), in order, guarded by
   // `log_mutex`.
   std::vector<FakeFpuCall> fpu_calls;
+  // If set, the fake FpuSave() calls it with its argument after it recorded
+  // the call: on the switching CPU, with interrupts disabled and no
+  // `IrqSpinLock` held, after `Schedule()` released the runqueue lock and
+  // before it switches stacks (the handoff window). It must not switch tasks.
+  // SetupEnv() clears it.
+  std::function<void(const FpuState*)> fpu_save_hook;
 
   // Output of the fake UART and VGA functions, guarded by `log_mutex`.
   std::mutex log_mutex;
@@ -154,6 +161,7 @@ inline void SetupEnv(const int num_cpus = 1) {
   g_env.eoi_count.store(0, std::memory_order_relaxed);
   g_env.address_space_switches.store(0, std::memory_order_relaxed);
   g_env.fpu_save_mismatches.store(0, std::memory_order_relaxed);
+  g_env.fpu_save_hook = nullptr;
   {
     const std::lock_guard<std::mutex> lock(g_env.log_mutex);
     g_env.fpu_calls.clear();
@@ -215,6 +223,9 @@ class MockTaskScheduler : public TaskScheduler {
               (TaskFn, void*, int64_t, int),  //
               (override));
   MOCK_METHOD(void, Yield, (), (override));
+  MOCK_METHOD(void, Block, (), (override));
+  MOCK_METHOD(void, BlockUntil, (int64_t), (override));
+  MOCK_METHOD(void, Wake, (Task*), (override));
   MOCK_METHOD(void, Join, (Task*), (override));
   MOCK_METHOD(void, Detach, (Task*), (override));
   MOCK_METHOD(int, ReapZombies, (), (override));
@@ -222,6 +233,7 @@ class MockTaskScheduler : public TaskScheduler {
   MOCK_METHOD(int, RunqueueLoad, (int), (const, override));
   MOCK_METHOD(bool, IsCpuBusy, (int), (const, override));
   MOCK_METHOD(bool, StealTask, (int, int), (override));
+  MOCK_METHOD(bool, WakeOnCpu, (Task*, int), (override));
   MOCK_METHOD(void, SetPreemptEnabled, (bool), (override));
   MOCK_METHOD(bool, IsPreemptEnabled, (), (const, override));
   MOCK_METHOD(void, OnTimerInterrupt, (InterruptFrame*), (override));

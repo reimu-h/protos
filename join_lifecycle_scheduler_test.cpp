@@ -966,5 +966,46 @@ TEST(JoinLifecycleSchedulerTest,
   EXPECT_FALSE(TaskSchedulerInternals::StealTask(*sched, 1, 3));
 }
 
+// 13. Block(), BlockUntil(), Wake() and WakeOnCpu() are forwarded to inner
+//     once each, unchanged, and blocking leaves the join record alone: a task
+//     that blocked and was woken is joined as usual once its entry function
+//     returns.
+TEST(JoinLifecycleSchedulerTest,
+     ForwardsBlockingCallsAndJoinsAWokenTaskAsUsual) {
+  ResetTestEnv();
+  const int64_t heap_before = HeapTotalFreeBytes();
+  const auto mock_inner = std::make_shared<t::StrictMock<MockTaskScheduler>>();
+  const std::shared_ptr<TaskScheduler> sched =
+      CreateJoinLifecycleScheduler(mock_inner);
+  Task* const self_task = FakeTaskPtr(90);
+  Task* const sleeper = FakeTaskPtr(91);
+  CapturedTaskLaunch sleeper_launch;
+  CreateFakeTask(*mock_inner, *sched, sleeper, &sleeper_launch);
+
+  {
+    const t::InSequence in_sequence;
+    EXPECT_CALL(*mock_inner, Block);
+    EXPECT_CALL(*mock_inner, BlockUntil(4321));
+    EXPECT_CALL(*mock_inner, Wake(sleeper));
+    EXPECT_CALL(*mock_inner, WakeOnCpu(sleeper, 2)).WillOnce(t::Return(true));
+    EXPECT_CALL(*mock_inner, WakeOnCpu(sleeper, 1)).WillOnce(t::Return(false));
+  }
+  sched->Block();
+  sched->BlockUntil(4321);
+  sched->Wake(sleeper);
+  EXPECT_TRUE(TaskSchedulerInternals::WakeOnCpu(*sched, sleeper, 2));
+  EXPECT_FALSE(TaskSchedulerInternals::WakeOnCpu(*sched, sleeper, 1));
+
+  // The woken task finishes while its joiner yields.
+  EXPECT_CALL(*mock_inner, CurrentTask).WillRepeatedly(t::Return(self_task));
+  EXPECT_CALL(*mock_inner, Yield).WillOnce([&sleeper_launch]() {
+    sleeper_launch.RunToCompletion();
+  });
+  EXPECT_CALL(*mock_inner, Join(sleeper));
+  sched->Join(sleeper);
+  EXPECT_THAT(sched->ReapZombies(), t::Eq(0));
+  EXPECT_THAT(HeapTotalFreeBytes(), t::Eq(heap_before));
+}
+
 }  // namespace
 }  // namespace protos

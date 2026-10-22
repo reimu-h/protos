@@ -100,6 +100,82 @@ inline int64_t Wait(const int64_t pid, UserProgramResult* const result) {
                  reinterpret_cast<uintptr_t>(result));
 }
 
+constexpr bool IsError(const int64_t result) { return SyscallIsError(result); }
+
+// Starts the embedded user program whose name is the `name_len` bytes at
+// `name` in a new child driver process (`kUserCapDriver`) with `arg` in its
+// rdi, and returns the child's process ID, or an error
+// (`kSyscallErrorPermission` unless the caller has `kUserCapSpawnDrivers`).
+inline int64_t SpawnDriver(const char* const name,  //
+                           const int64_t name_len,  //
+                           const uint64_t arg) {
+  return Syscall(kSyscallSpawnDriver,                //
+                 reinterpret_cast<uintptr_t>(name),  //
+                 static_cast<uint64_t>(name_len),    //
+                 arg);
+}
+
+inline int64_t SpawnDriver(const char* const name, const uint64_t arg = 0) {
+  if (name == nullptr) {
+    return SpawnDriver(nullptr, 1, arg);
+  }
+  int64_t length = 0;
+  while (name[length] != '\0') {
+    ++length;
+  }
+  return SpawnDriver(name, length, arg);
+}
+
+inline int64_t GetPciInfo(const int64_t index, PciDeviceInfo* const out) {
+  return Syscall(kSyscallPciInfo,               //
+                 static_cast<uint64_t>(index),  //
+                 reinterpret_cast<uintptr_t>(out));
+}
+
+inline int64_t PciClaim(const int64_t index) {
+  return Syscall(kSyscallPciClaim, static_cast<uint64_t>(index));
+}
+
+inline int64_t PciBusMaster(const int64_t index, const int64_t enable) {
+  return Syscall(kSyscallPciBusMaster,          //
+                 static_cast<uint64_t>(index),  //
+                 static_cast<uint64_t>(enable));
+}
+
+inline int64_t MmioMap(const uint64_t phys_addr, const int64_t size) {
+  return Syscall(kSyscallMmioMap, phys_addr, static_cast<uint64_t>(size));
+}
+
+inline int64_t DmaAlloc(const int64_t size,        //
+                        uint64_t* const out_phys,  //
+                        const uint64_t flags = 0) {
+  return Syscall(kSyscallDmaAlloc,                       //
+                 static_cast<uint64_t>(size),            //
+                 reinterpret_cast<uintptr_t>(out_phys),  //
+                 flags);
+}
+
+inline int64_t IrqAlloc(const int64_t index,  //
+                        const int64_t count,  //
+                        const int64_t mode = kSyscallIrqModeAuto) {
+  return Syscall(kSyscallIrqAlloc,              //
+                 static_cast<uint64_t>(index),  //
+                 static_cast<uint64_t>(count),  //
+                 static_cast<uint64_t>(mode));
+}
+
+inline int64_t IrqWait(const uint64_t mask, const int64_t timeout_ticks) {
+  return Syscall(kSyscallIrqWait, mask, static_cast<uint64_t>(timeout_ticks));
+}
+
+inline int64_t ConsolePush(const void* const buffer, const int64_t size) {
+  return Syscall(kSyscallConsolePush,                  //
+                 reinterpret_cast<uintptr_t>(buffer),  //
+                 static_cast<uint64_t>(size));
+}
+
+inline int64_t GetTicks() { return Syscall(kSyscallGetTicks); }
+
 // Each user program defines its main function, which the entry point
 // (user/crt.cpp) calls with the argument that the kernel passed in rdi. The
 // program exits with the status that it returns.

@@ -68,7 +68,7 @@ TEST_COMMON_LDFLAGS := -lgmock_main -lgmock -lgtest -pthread
 # inline assembly, which the kernel keeps for each process (user_mode.h), so
 # GCC may use SSE in them. GCC must not turn their loops into calls of the
 # memory functions that user/crt.cpp defines with such loops.
-USER_PROGRAMS := init sh usertest
+USER_PROGRAMS := init sh usertest usbkbd
 USER_CXXFLAGS := -m64 -masm=intel -std=c++20 -O2 -Wall -Wextra $(WERROR_FLAG) \
                  -ffreestanding -nostdlib -fno-builtin \
                  -fno-exceptions -fno-rtti -mno-red-zone \
@@ -78,7 +78,10 @@ USER_CXXFLAGS := -m64 -masm=intel -std=c++20 -O2 -Wall -Wextra $(WERROR_FLAG) \
                  $(PROJECT_INCLUDE_FLAGS) -I$(BUILD_DIR)/include
 USER_LDFLAGS := -m elf_x86_64 -z max-page-size=0x1000 -z noexecstack \
                 -static -nostdlib -T user/user.ld
-USER_HDRS := syscall_abi.h user/syscall.h user/sh_lib.h user/usertest.h
+USER_HDRS := syscall_abi.h user/syscall.h user/sh_lib.h user/usertest.h \
+             user/usb_descriptors.h user/usb_hid.h user/xhci_context.h \
+             user/xhci_controller.h user/xhci_platform.h user/xhci_regs.h \
+             user/xhci_ring.h
 USER_ELFS := $(patsubst %,$(BUILD_DIR)/user/%.elf,$(USER_PROGRAMS))
 
 TEST_BUILD_MODES := debug opt
@@ -138,6 +141,7 @@ TEST_EXTRA_SRCS_heap_test := heap.cpp
 TEST_EXTRA_SRCS_idt_test := $(IDT_TEST_SRCS)
 TEST_EXTRA_SRCS_multiboot_test := multiboot.cpp console.cpp
 TEST_EXTRA_SRCS_pmm_test := pmm.cpp console.cpp
+TEST_EXTRA_SRCS_pci_test := pci.cpp pci_config_fake.cpp
 TEST_EXTRA_SRCS_random_test := random.cpp
 TEST_EXTRA_SRCS_selftest_test := selftest/selftest.cpp
 # ApKernelEntry() (smp.cpp) calls CpuInitAp(), whose host build counts calls.
@@ -158,6 +162,8 @@ TEST_EXTRA_SRCS_join_lifecycle_scheduler_test := join_lifecycle_scheduler.cpp $(
 TEST_EXTRA_SRCS_preemptive_scheduler_test := preemptive_scheduler.cpp $(SCHED_TEST_FAKES) $(SCHED_TEST_IDT_TASK_FAKES)
 TEST_EXTRA_SRCS_task_test := $(TASK_LAYER_SRCS) context_switch.S task.cpp $(IDT_TEST_SRCS) $(SCHED_TEST_FAKES)
 TEST_EXTRA_SRCS_stress_test := selftest/stress.cpp random.cpp $(TASK_LAYER_SRCS) context_switch.S task.cpp $(IDT_TEST_SRCS) $(SCHED_TEST_FAKES)
+TEST_EXTRA_SRCS_device_irq_test := device_irq.cpp pci.cpp pci_config_fake.cpp $(TASK_LAYER_SRCS) context_switch.S task.cpp $(IDT_TEST_SRCS) $(SCHED_TEST_FAKES)
+TEST_EXTRA_SRCS_driver_test := driver.cpp device_irq.cpp pci.cpp pci_config_fake.cpp $(TASK_LAYER_SRCS) context_switch.S task.cpp $(IDT_TEST_SRCS) $(SCHED_TEST_FAKES)
 
 SELFTEST_SRCS := selftest/selftest.cpp selftest/boot_selftest.cpp selftest/stress.cpp
 
@@ -183,6 +189,9 @@ CXX_SRCS := \
     elf.cpp \
     user_mode.cpp \
     user_access.cpp \
+    pci.cpp \
+    device_irq.cpp \
+    driver.cpp \
     random.cpp \
     $(if $(filter 1,$(SELFTEST)),$(SELFTEST_SRCS)) \
     kernel.cpp
@@ -206,6 +215,10 @@ CXX_HDRS := \
     cxx_runtime.h \
     smp.h \
     smp_hardware.h \
+    port_io.h \
+    pci.h \
+    device_irq.h \
+    driver.h \
     steal_time.h \
     kill_delay_injection.h \
     cpu_clock.h \
@@ -223,6 +236,13 @@ CXX_HDRS := \
     user/syscall.h \
     user/sh_lib.h \
     user/usertest.h \
+    user/usb_descriptors.h \
+    user/usb_hid.h \
+    user/xhci_context.h \
+    user/xhci_controller.h \
+    user/xhci_platform.h \
+    user/xhci_regs.h \
+    user/xhci_ring.h \
     selftest/selftest.h \
     selftest/boot_selftest.h \
     selftest/fpu_lifecycle_layout.h \
@@ -317,7 +337,7 @@ ifneq ($(strip $(INJECT_KILL_DELAY)),)
 INNER_MAKE += INJECT_KILL_DELAY=$(strip $(INJECT_KILL_DELAY))
 endif
 # Boot-test settings forwarded into the container (see test_boot.sh).
-BOOT_TEST_ENV_VARS := BIOS_TIMEOUT_SECS UEFI_TIMEOUT_SECS MIN_STRESS_PASSES OVMF OVMF_VARS REQUIRE_UEFI BOOT_TEST_JOBS
+BOOT_TEST_ENV_VARS := BIOS_TIMEOUT_SECS UEFI_TIMEOUT_SECS MIN_STRESS_PASSES OVMF OVMF_VARS REQUIRE_UEFI BOOT_TEST_JOBS BOOT_TEST_USB QEMU_USB_FLAGS USB_SESSION_TIMEOUT_SECS
 
 ifeq ($(USE_DOCKER),1)
 # With KVM=1 the container gets the host's /dev/kvm, membership in the group
@@ -355,6 +375,7 @@ INNER_MAKE += INJECT_FLAKY_TEST=$(INJECT_FLAKY_TEST)
 endif
 
 QEMU_RUN_FLAGS ?= -smp 4 -m 256M -serial mon:stdio
+QEMU_USB_FLAGS ?= -device qemu-xhci,id=xhci0 -device usb-kbd,bus=xhci0.0,port=1,id=kbd0
 QEMU_KVM_FLAGS := $(if $(filter 1,$(KVM)),-enable-kvm -cpu host)
 
 .PHONY: all clean test unit-test test-host docker-build docker-test run run-boot-test FORCE test-rbtree test-spinlock test-heap test-idt test-gdt test-pmm test-smp test-core-runqueue-scheduler test-work-stealing-scheduler test-join-lifecycle-scheduler test-preemptive-scheduler test-task test-task-stack test-stress
@@ -531,7 +552,7 @@ run-boot-test: $(KERNEL_ISO) $(KERNEL_MB1_ISO) $(DOCKER_DEPS)
 # Boots the kernel interactively; the serial console is attached to the
 # terminal (press Ctrl-A X to quit QEMU). KVM=1 enables KVM acceleration.
 run: $(KERNEL_ISO) $(DOCKER_DEPS)
-	$(DOCKER_RUN_INTERACTIVE) qemu-system-x86_64 $(QEMU_RUN_FLAGS) $(QEMU_KVM_FLAGS) \
+	$(DOCKER_RUN_INTERACTIVE) qemu-system-x86_64 $(QEMU_RUN_FLAGS) $(QEMU_USB_FLAGS) $(QEMU_KVM_FLAGS) \
 		$(if $(filter 1,$(USE_DOCKER)),-display none) -cdrom $(KERNEL_ISO)
 
 # The QEMU boot test is timing-sensitive, so it runs only after the unit tests

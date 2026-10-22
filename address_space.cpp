@@ -59,6 +59,22 @@ uintptr_t AddressSpace::PageFrame(const uintptr_t user_addr) const {
   return PagingUserPageFrame(root_, user_addr);
 }
 
+bool AddressSpace::MapDevicePage(const uintptr_t user_addr,
+                                 const uintptr_t phys_addr) {
+  return PagingMapUserDevicePage(root_, user_addr, phys_addr);
+}
+
+bool AddressSpace::MapOwnedFrame(const uintptr_t user_addr,   //
+                                 const uintptr_t frame_phys,  //
+                                 const UserPageAccess access) {
+  return PagingMapUserPage(root_, user_addr, frame_phys, access);
+}
+
+bool AddressSpace::QueryPage(const uintptr_t user_addr,
+                             UserPageInfo* const info) const {
+  return PagingQueryUserPage(root_, user_addr, info);
+}
+
 void ActivateAddressSpace(const AddressSpace* const address_space) {
   PagingActivateRoot(address_space != nullptr ? address_space->root()
                                               : PagingKernelRoot());

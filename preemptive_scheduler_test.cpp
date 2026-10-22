@@ -4,9 +4,11 @@
 #include <gtest/gtest.h>
 
 #include <atomic>
+#include <chrono>
 #include <cstdint>
 #include <cstdio>
 #include <memory>
+#include <mutex>
 #include <string>
 #include <thread>
 #include <vector>
@@ -462,6 +464,19 @@ TEST(ForwardingTaskSchedulerTest,
   EXPECT_CALL(*mock_inner, Yield);
   layer.Yield();
 
+  EXPECT_CALL(*mock_inner, Block);
+  layer.Block();
+
+  EXPECT_CALL(*mock_inner, BlockUntil).WillOnce([](const int64_t deadline) {
+    EXPECT_THAT(deadline, t::Eq(77));
+  });
+  layer.BlockUntil(77);
+
+  EXPECT_CALL(*mock_inner, Wake).WillOnce([&](Task* const task) {
+    EXPECT_THAT(task, t::Eq(fake_task_a));
+  });
+  layer.Wake(fake_task_a);
+
   EXPECT_CALL(*mock_inner, Join).WillOnce([&](Task* const task) {
     EXPECT_THAT(task, t::Eq(fake_task_a));
   });
@@ -572,6 +587,20 @@ TEST(ForwardingTaskSchedulerTest,
       });
   EXPECT_TRUE(TaskSchedulerInternals::StealTask(layer, 0, 2));
   EXPECT_FALSE(TaskSchedulerInternals::StealTask(layer, 1, 3));
+
+  EXPECT_CALL(*mock_inner, WakeOnCpu)
+      .WillOnce([&](Task* const task, const int target_cpu) {
+        EXPECT_THAT(task, t::Eq(fake_task_b));
+        EXPECT_THAT(target_cpu, t::Eq(2));
+        return true;
+      })
+      .WillOnce([&](Task* const task, const int target_cpu) {
+        EXPECT_THAT(task, t::Eq(fake_task_a));
+        EXPECT_THAT(target_cpu, t::Eq(0));
+        return false;
+      });
+  EXPECT_TRUE(TaskSchedulerInternals::WakeOnCpu(layer, fake_task_b, 2));
+  EXPECT_FALSE(TaskSchedulerInternals::WakeOnCpu(layer, fake_task_a, 0));
 }
 
 // The scheduler internals are private in `TaskScheduler` and protected in
@@ -588,12 +617,244 @@ template <typename Scheduler>
 concept CanCallRunqueueLoadDirectly =
     requires(const Scheduler& scheduler) { scheduler.RunqueueLoad(0); };
 
+template <typename Scheduler>
+concept CanCallWakeOnCpuDirectly = requires(Scheduler& scheduler, Task* task) {
+  scheduler.WakeOnCpu(task, 0);
+};
+
 static_assert(!CanCallInitDirectly<TaskScheduler>);
 static_assert(!CanCallRunqueueLoadDirectly<TaskScheduler>);
+static_assert(!CanCallWakeOnCpuDirectly<TaskScheduler>);
 static_assert(!CanCallInitDirectly<ForwardingTaskScheduler>);
 static_assert(!CanCallRunqueueLoadDirectly<ForwardingTaskScheduler>);
+static_assert(!CanCallWakeOnCpuDirectly<ForwardingTaskScheduler>);
 static_assert(CanCallInitDirectly<MockTaskScheduler>);
 static_assert(CanCallRunqueueLoadDirectly<MockTaskScheduler>);
+static_assert(CanCallWakeOnCpuDirectly<MockTaskScheduler>);
+
+// ============================================================================
+// Blocking: Block() and Wake() pass through, BlockUntil() (timed waits)
+// ============================================================================
+
+TEST(PreemptiveSchedulerTest,
+     ForwardsBlockAndWakeWhateverThePreemptionAndInterruptState) {
+  SetupEnv(1);
+  const auto mock_inner = std::make_shared<t::StrictMock<MockTaskScheduler>>();
+  const std::shared_ptr<TaskScheduler> sched =
+      CreatePreemptiveScheduler(mock_inner);
+  Task* const fake_task = reinterpret_cast<Task*>(0x4001);
+  EXPECT_CALL(*mock_inner, Wake(fake_task)).Times(3);
+  EXPECT_CALL(*mock_inner, Block).Times(2);
+
+  sched->Wake(fake_task);
+  sched->Block();
+  sched->SetPreemptEnabled(false);
+  sched->Wake(fake_task);
+  sched->Block();
+  sched->SetPreemptEnabled(true);
+  // As from an interrupt handler that holds a lock of its own.
+  SetInterruptsEnabledForTest(false);
+  {
+    IrqSpinLock lock;
+    const IrqSpinLockGuard guard(lock);
+    sched->Wake(fake_task);
+  }
+  SetInterruptsEnabledForTest(true);
+}
+
+// Calls OnTimerInterrupt() as CPU `cpu`'s timer interrupt does, with CPU 0's
+// tick count set to `cpu0_ticks` (idt.cpp counts the tick before the handler
+// runs). The frame says that the interrupted code had interrupts disabled, so
+// the tick may not preempt anything.
+static void DeliverUnpreemptibleTick(TaskScheduler& sched,  //
+                                     const int cpu,         //
+                                     const int64_t cpu0_ticks) {
+  SmpGetCpuLocal(0)->timer_ticks.store(cpu0_ticks, std::memory_order_relaxed);
+  InterruptFrame frame = MakeInterruptFrame(kVectorApicTimer);
+  frame.rflags = 0x2ULL;
+  BindCpuLocal(SmpGetCpuLocal(cpu));
+  TaskSchedulerInternals::OnTimerInterrupt(sched, &frame);
+  BindCpuLocal(SmpGetCpuLocal(0));
+}
+
+TEST(PreemptiveSchedulerTest,
+     BlockUntilEndsWithAWakeOnTheCpu0TickThatReachesTheDeadline) {
+  SetupEnv(2);
+  const auto mock_inner = std::make_shared<t::StrictMock<MockTaskScheduler>>();
+  const std::shared_ptr<TaskScheduler> sched =
+      CreatePreemptiveScheduler(mock_inner);
+  Task* const fake_task = reinterpret_cast<Task*>(0x4002);
+  // Ticks end timed waits even while they may not preempt.
+  sched->SetPreemptEnabled(false);
+  SmpGetCpuLocal(0)->timer_ticks.store(100, std::memory_order_relaxed);
+  int wakes = 0;
+  int64_t woken_at_tick = -1;
+  EXPECT_CALL(*mock_inner, CurrentTask).WillRepeatedly(t::Return(fake_task));
+  EXPECT_CALL(*mock_inner, Wake).WillRepeatedly([&](Task* const task) {
+    EXPECT_THAT(task, t::Eq(fake_task));
+    ++wakes;
+    woken_at_tick = SmpGetCpuLocal(0)->timer_ticks.load();
+  });
+  // Stands in for the inner Block(): the ticks arrive while the task is
+  // blocked.
+  EXPECT_CALL(*mock_inner, Block).WillOnce([&]() {
+    for (int64_t tick = 101; tick <= 104; ++tick) {
+      DeliverUnpreemptibleTick(*sched, 0, tick);
+    }
+    EXPECT_THAT(wakes, t::Eq(0));
+    // Only CPU 0's ticks end timed waits.
+    DeliverUnpreemptibleTick(*sched, 1, 105);
+    EXPECT_THAT(wakes, t::Eq(0));
+    DeliverUnpreemptibleTick(*sched, 0, 105);
+    EXPECT_THAT(wakes, t::Eq(1));
+  });
+
+  sched->BlockUntil(105);
+  EXPECT_THAT(wakes, t::Eq(1));
+  EXPECT_THAT(woken_at_tick, t::Eq(105));
+
+  // The waiter is gone: later ticks wake nobody.
+  for (int64_t tick = 106; tick <= 108; ++tick) {
+    DeliverUnpreemptibleTick(*sched, 0, tick);
+  }
+  EXPECT_THAT(wakes, t::Eq(1));
+}
+
+TEST(PreemptiveSchedulerTest,
+     BlockUntilReturnsAtOnceAndBlocksNotIfTheDeadlineHasPassed) {
+  SetupEnv(1);
+  const auto mock_inner = std::make_shared<t::StrictMock<MockTaskScheduler>>();
+  const std::shared_ptr<TaskScheduler> sched =
+      CreatePreemptiveScheduler(mock_inner);
+  Task* const fake_task = reinterpret_cast<Task*>(0x4003);
+  SmpGetCpuLocal(0)->timer_ticks.store(50, std::memory_order_relaxed);
+  // No Block() and no Wake() expected.
+  EXPECT_CALL(*mock_inner, CurrentTask).WillRepeatedly(t::Return(fake_task));
+  sched->BlockUntil(50);
+  sched->BlockUntil(10);
+  DeliverUnpreemptibleTick(*sched, 0, 51);
+}
+
+TEST(PreemptiveSchedulerTest,
+     BlockUntilEndedByAnotherWakeLeavesNoWaiterForTheTimer) {
+  SetupEnv(1);
+  const auto mock_inner = std::make_shared<t::StrictMock<MockTaskScheduler>>();
+  const std::shared_ptr<TaskScheduler> sched =
+      CreatePreemptiveScheduler(mock_inner);
+  Task* const fake_task = reinterpret_cast<Task*>(0x4004);
+  SmpGetCpuLocal(0)->timer_ticks.store(200, std::memory_order_relaxed);
+  EXPECT_CALL(*mock_inner, CurrentTask).WillRepeatedly(t::Return(fake_task));
+  // Another Wake() ends the Block() before the deadline (the inner Block()
+  // returns at once), so the timer must not wake the task later: its waiter,
+  // on the stack of the returned BlockUntil() call, is gone. The StrictMock
+  // fails on any Wake().
+  EXPECT_CALL(*mock_inner, Block).Times(2);
+  sched->BlockUntil(210);
+  sched->BlockUntil(205);
+  for (int64_t tick = 201; tick <= 215; ++tick) {
+    DeliverUnpreemptibleTick(*sched, 0, tick);
+  }
+}
+
+// Host threads bound to CPUs 1-3 stand in for three tasks in BlockUntil() with
+// different deadlines; the inner Block() waits until the inner Wake() of the
+// thread's task. CPU 0's ticks wake each task once, in deadline order, at its
+// deadline.
+TEST(PreemptiveSchedulerTest,
+     ConcurrentTimedWaitersAreWokenOnceEachInDeadlineOrder) {
+  constexpr int kNumCpus = 4;
+  SetupEnv(kNumCpus);
+  const auto mock_inner = std::make_shared<t::StrictMock<MockTaskScheduler>>();
+  const std::shared_ptr<TaskScheduler> sched =
+      CreatePreemptiveScheduler(mock_inner);
+  SmpGetCpuLocal(0)->timer_ticks.store(100, std::memory_order_relaxed);
+  // The task of CPU `cpu`, and its deadline.
+  const auto fake_task = [](const int cpu) {
+    return reinterpret_cast<Task*>(0x5000 + cpu * 0x100);
+  };
+  const int64_t deadlines[kNumCpus] = {0, 110, 105, 120};
+  std::atomic<int> blocked{0};
+  std::atomic<bool> woken[kNumCpus] = {};
+  std::atomic<int64_t> woken_at[kNumCpus] = {};
+  std::atomic<int> wake_count{0};
+  std::mutex order_mutex;
+  std::vector<int> wake_order;
+
+  EXPECT_CALL(*mock_inner, CurrentTask).WillRepeatedly([&fake_task]() {
+    return fake_task(CurrentCpuId());
+  });
+  EXPECT_CALL(*mock_inner, Wake).WillRepeatedly([&](Task* const task) {
+    for (int cpu = 1; cpu < kNumCpus; ++cpu) {
+      if (task == fake_task(cpu)) {
+        woken_at[cpu].store(SmpGetCpuLocal(0)->timer_ticks.load());
+        {
+          const std::lock_guard<std::mutex> lock(order_mutex);
+          wake_order.push_back(cpu);
+        }
+        wake_count.fetch_add(1);
+        woken[cpu].store(true);
+      }
+    }
+  });
+  EXPECT_CALL(*mock_inner, Block).Times(kNumCpus - 1).WillRepeatedly([&]() {
+    const int cpu = CurrentCpuId();
+    blocked.fetch_add(1);
+    const auto deadline =
+        std::chrono::steady_clock::now() + std::chrono::seconds(30);
+    while (!woken[cpu].load() && std::chrono::steady_clock::now() < deadline) {
+      std::this_thread::yield();
+    }
+  });
+
+  std::vector<std::thread> waiters;
+  for (int cpu = 1; cpu < kNumCpus; ++cpu) {
+    waiters.emplace_back([cpu, &sched, &deadlines]() {
+      BindCpuLocal(SmpGetCpuLocal(cpu));
+      SetInterruptsEnabledForTest(true);
+      sched->BlockUntil(deadlines[cpu]);
+      ResetCpuLocalForTest();
+    });
+  }
+  const auto deadline =
+      std::chrono::steady_clock::now() + std::chrono::seconds(30);
+  while (blocked.load() < kNumCpus - 1 &&
+         std::chrono::steady_clock::now() < deadline) {
+    std::this_thread::yield();
+  }
+  EXPECT_THAT(blocked.load(), t::Eq(kNumCpus - 1));
+  for (int64_t tick = 101; tick <= 125; ++tick) {
+    DeliverUnpreemptibleTick(*sched, 0, tick);
+  }
+  for (std::thread& waiter : waiters) {
+    waiter.join();
+  }
+
+  EXPECT_THAT(wake_count.load(), t::Eq(kNumCpus - 1));
+  EXPECT_THAT(wake_order, t::ElementsAre(2, 1, 3));
+  for (int cpu = 1; cpu < kNumCpus; ++cpu) {
+    EXPECT_THAT(woken_at[cpu].load(), t::Eq(deadlines[cpu])) << "cpu " << cpu;
+  }
+}
+
+TEST(PreemptiveSchedulerDeathTest, BlockUntilMisuseFailsChecks) {
+  SetupEnv(1);
+  const auto mock_inner = std::make_shared<t::NiceMock<MockTaskScheduler>>();
+  const std::shared_ptr<TaskScheduler> sched =
+      CreatePreemptiveScheduler(mock_inner);
+  EXPECT_DEATH(
+      {
+        IrqSpinLock lock;
+        const IrqSpinLockGuard guard(lock);
+        sched->BlockUntil(1);
+      },
+      "Check failed: !HoldsAnyIrqSpinLock\\(\\)");
+  EXPECT_DEATH(
+      {
+        SetInterruptsEnabledForTest(false);
+        sched->BlockUntil(1);
+      },
+      "Check failed: AreInterruptsEnabled\\(\\)");
+}
 
 }  // namespace
 }  // namespace protos

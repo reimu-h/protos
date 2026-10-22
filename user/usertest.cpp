@@ -1789,6 +1789,583 @@ static int64_t RunSpawnAndWait(const usertest::SpawnTestSubmode submode) {
   return 0;
 }
 
+static int64_t RunDriverDenied() {
+  uint64_t phys = 0;
+  if (SpawnDriver("usertest", 8, 0) != kSyscallErrorPermission) {
+    return 1;
+  }
+  if (GetPciInfo(0, nullptr) != kSyscallErrorPermission) {
+    return 2;
+  }
+  if (PciClaim(0) != kSyscallErrorPermission) {
+    return 3;
+  }
+  if (PciBusMaster(0, 1) != kSyscallErrorPermission) {
+    return 4;
+  }
+  if (MmioMap(0x1000, 4096) != kSyscallErrorPermission) {
+    return 5;
+  }
+  if (DmaAlloc(4096, &phys, 0) != kSyscallErrorPermission) {
+    return 6;
+  }
+  if (IrqAlloc(0, 1, kSyscallIrqModeAuto) != kSyscallErrorPermission) {
+    return 7;
+  }
+  if (IrqWait(1, 0) != kSyscallErrorPermission) {
+    return 8;
+  }
+  if (ConsolePush("a", 1) != kSyscallErrorPermission) {
+    return 9;
+  }
+  // GetTicks() (syscall 16) is available to all processes.
+  if (GetTicks() < 0) {
+    return 10;
+  }
+  if (Syscall(kSyscallGetTicks + 1, 0, 0, 0) != kSyscallErrorNoSys) {
+    return 11;
+  }
+  if (Syscall(-1, 0, 0, 0) != kSyscallErrorNoSys) {
+    return 12;
+  }
+  return 0;
+}
+
+static int64_t RunDriverCapProbe(const uint64_t arg) {
+  using usertest::DriverCapProbeSubmode;
+  const DriverCapProbeSubmode submode =
+      static_cast<DriverCapProbeSubmode>(usertest::DriverSubmode(arg));
+  if (submode == DriverCapProbeSubmode::kProbeDriverRole) {
+    // Allowed for a driver: returns the number of PCI functions, which is 0 on
+    // a machine without PCI (such as a Hyper-V Generation 2 VM).
+    if (GetPciInfo(0, nullptr) < 0) {
+      return 1;
+    }
+    if (SpawnDriver("usertest", 8, 0) != kSyscallErrorPermission) {
+      return 2;
+    }
+    if (GetTicks() < 0) {
+      return 3;
+    }
+    const int64_t child_pid =
+        Spawn("usertest", usertest::Arg(Mode::kDriverDenied));
+    if (child_pid < 1) {
+      return 4;
+    }
+    UserProgramResult child_result{};
+    if (Wait(child_pid, &child_result) != 0 ||
+        child_result.outcome != UserProgramOutcome::kExited ||
+        child_result.exit_status != 0) {
+      return 5;
+    }
+    return 0;
+  }
+
+  // kProbeSpawnerRole: process has kUserCapSpawnDrivers only.
+  uint64_t phys = 0;
+  if (GetPciInfo(0, nullptr) != kSyscallErrorPermission ||
+      PciClaim(0) != kSyscallErrorPermission ||
+      PciBusMaster(0, 1) != kSyscallErrorPermission ||
+      MmioMap(0x1000, 4096) != kSyscallErrorPermission ||
+      DmaAlloc(4096, &phys, 0) != kSyscallErrorPermission ||
+      IrqAlloc(0, 1, kSyscallIrqModeAuto) != kSyscallErrorPermission ||
+      IrqWait(1, 0) != kSyscallErrorPermission ||
+      ConsolePush("a", 1) != kSyscallErrorPermission || GetTicks() < 0) {
+    return 10;
+  }
+  if (SpawnDriver(nullptr, 0, 0) != kSyscallErrorInvalid ||
+      SpawnDriver("usertest", -1, 0) != kSyscallErrorInvalid ||
+      SpawnDriver("usertest", kSyscallSpawnMaxNameLength + 1, 0) !=
+          kSyscallErrorInvalid ||
+      SpawnDriver("nonexistent_drv", 15, 0) != kSyscallErrorInvalid ||
+      SpawnDriver(nullptr, 4, 0) != kSyscallErrorFault ||
+      SpawnDriver(reinterpret_cast<const char*>(usertest::kKernelAddress), 4,
+                  0) != kSyscallErrorFault) {
+    return 11;
+  }
+  // A regular spawn() from kUserCapSpawnDrivers still creates an unprivileged
+  // child (kUserCapNone).
+  const int64_t unpriv_pid =
+      Spawn("usertest", usertest::Arg(Mode::kDriverDenied));
+  if (unpriv_pid < 1) {
+    return 12;
+  }
+  UserProgramResult unpriv_result{};
+  if (Wait(unpriv_pid, &unpriv_result) != 0 ||
+      unpriv_result.outcome != UserProgramOutcome::kExited ||
+      unpriv_result.exit_status != 0) {
+    return 13;
+  }
+  const int64_t drv_pid = SpawnDriver(
+      "usertest",
+      usertest::DriverArg(
+          Mode::kDriverCapProbe,
+          static_cast<uint8_t>(DriverCapProbeSubmode::kProbeDriverRole)));
+  if (drv_pid < 1) {
+    return 14;
+  }
+  UserProgramResult drv_result{};
+  if (Wait(drv_pid, &drv_result) != 0 ||
+      drv_result.outcome != UserProgramOutcome::kExited ||
+      drv_result.exit_status != 0) {
+    return 15;
+  }
+  return 0;
+}
+
+static bool IsMemoryBar(const PciBarInfo& bar) {
+  return (bar.type == PciBarInfoType::kMemory32 ||
+          bar.type == PciBarInfoType::kMemory64) &&
+         bar.phys_base != 0 && bar.size >= 4096;
+}
+
+static int64_t RunDriverHold(const uint64_t arg) {
+  using usertest::DriverHoldSubmode;
+  const DriverHoldSubmode submode =
+      static_cast<DriverHoldSubmode>(usertest::DriverSubmode(arg));
+  const int dev_idx = usertest::DriverDeviceIndex(arg);
+  const int bar_idx = usertest::DriverBarIndex(arg);
+
+  if (PciClaim(dev_idx) != 0) {
+    return 1;
+  }
+  if (PciBusMaster(dev_idx, 1) != 0) {
+    return 2;
+  }
+  PciDeviceInfo info{};
+  if (GetPciInfo(dev_idx, &info) < 1) {
+    return 3;
+  }
+  if (bar_idx >= 0 && bar_idx < 6 && IsMemoryBar(info.bars[bar_idx])) {
+    const int64_t mmio_va = MmioMap(info.bars[bar_idx].phys_base, 4096);
+    if (SyscallIsError(mmio_va)) {
+      return 4;
+    }
+  }
+  if (submode == DriverHoldSubmode::kHoldClaimOnly) {
+    (void)IrqWait(0, kSyscallIrqWaitMaxTicks);
+    return 0;
+  }
+
+  uint64_t dma_phys = 0;
+  const int64_t dma_va = DmaAlloc(4 * 4096, &dma_phys, 0);
+  if (SyscallIsError(dma_va) || dma_phys == 0) {
+    return 5;
+  }
+  if (info.msi_vectors != 0 || info.msix_vectors > 0) {
+    if (IrqAlloc(dev_idx, 1, kSyscallIrqModeAuto) != 0) {
+      return 6;
+    }
+  }
+  const int64_t child_pid =
+      Spawn("usertest", usertest::Arg(Mode::kSpinWithoutSyscalls, 0x444));
+  if (child_pid < 1) {
+    return 7;
+  }
+  if (submode == DriverHoldSubmode::kHoldExit) {
+    return 0;
+  }
+  if (submode == DriverHoldSubmode::kHoldFault) {
+    asm volatile("ud2");
+    return 8;
+  }
+  (void)IrqWait(0, kSyscallIrqWaitMaxTicks);
+  return 0;
+}
+
+static int64_t RunDriverForeign(const uint64_t arg) {
+  using usertest::DriverForeignSubmode;
+  const DriverForeignSubmode submode =
+      static_cast<DriverForeignSubmode>(usertest::DriverSubmode(arg));
+  const int dev_idx = usertest::DriverDeviceIndex(arg);
+  const int bar_idx = usertest::DriverBarIndex(arg);
+
+  PciDeviceInfo info{};
+  if (GetPciInfo(dev_idx, &info) < 1) {
+    return 1;
+  }
+  const uint64_t bar_phys = info.bars[bar_idx].phys_base;
+
+  if (submode == DriverForeignSubmode::kUnclaimedDevice) {
+    if (PciBusMaster(dev_idx, 1) != kSyscallErrorAccess ||
+        PciBusMaster(dev_idx, 0) != kSyscallErrorAccess ||
+        MmioMap(bar_phys, 4096) != kSyscallErrorAccess ||
+        IrqAlloc(dev_idx, 1, kSyscallIrqModeAuto) != kSyscallErrorAccess) {
+      return 2;
+    }
+    return 0;
+  }
+
+  if (submode == DriverForeignSubmode::kOwnedByOtherProcess) {
+    if (PciClaim(dev_idx) != kSyscallErrorBusy ||
+        PciBusMaster(dev_idx, 0) != kSyscallErrorAccess ||
+        PciBusMaster(dev_idx, 1) != kSyscallErrorAccess ||
+        MmioMap(bar_phys, 4096) != kSyscallErrorAccess ||
+        IrqAlloc(dev_idx, 1, kSyscallIrqModeAuto) != kSyscallErrorAccess) {
+      return 3;
+    }
+    return 0;
+  }
+
+  // kValidationAndClaimToggle:
+  const int64_t count = GetPciInfo(0, nullptr);
+  if (count < 1) {
+    return 10;
+  }
+  if (GetPciInfo(-1, &info) != kSyscallErrorNoDevice ||
+      GetPciInfo(count, &info) != kSyscallErrorNoDevice ||
+      GetPciInfo(1, nullptr) != kSyscallErrorFault) {
+    return 11;
+  }
+  if (GetPciInfo(dev_idx,
+                 reinterpret_cast<PciDeviceInfo*>(usertest::kKernelAddress)) !=
+          kSyscallErrorFault ||
+      GetPciInfo(dev_idx, reinterpret_cast<PciDeviceInfo*>(
+                              kNonCanonicalAddress)) != kSyscallErrorFault ||
+      GetPciInfo(dev_idx, reinterpret_cast<PciDeviceInfo*>(
+                              kUnmappedUserAddress)) != kSyscallErrorFault ||
+      GetPciInfo(dev_idx, reinterpret_cast<PciDeviceInfo*>(
+                              const_cast<uint64_t*>(&kReadOnlyWord))) !=
+          kSyscallErrorFault) {
+    return 12;
+  }
+  if (PciClaim(-1) != kSyscallErrorNoDevice ||
+      PciClaim(count) != kSyscallErrorNoDevice ||
+      PciClaim(0) != kSyscallErrorInvalid) {
+    return 13;
+  }
+  // Claiming the same device a second time from the same owner is idempotent.
+  if (PciClaim(dev_idx) != 0 || PciClaim(dev_idx) != 0) {
+    return 14;
+  }
+  if (PciBusMaster(-1, 1) != kSyscallErrorNoDevice ||
+      PciBusMaster(count, 1) != kSyscallErrorNoDevice ||
+      PciBusMaster(dev_idx, -1) != kSyscallErrorInvalid ||
+      PciBusMaster(dev_idx, 2) != kSyscallErrorInvalid) {
+    return 15;
+  }
+  if (PciBusMaster(dev_idx, 1) != 0 || PciBusMaster(dev_idx, 0) != 0 ||
+      PciBusMaster(dev_idx, 1) != 0) {
+    return 16;
+  }
+  return 0;
+}
+
+static int64_t RunDriverMmioChecks(const uint64_t arg) {
+  const uint8_t submode = usertest::DriverSubmode(arg);
+  const int dev_idx = usertest::DriverDeviceIndex(arg);
+  const int bar_idx = usertest::DriverBarIndex(arg);
+
+  if (PciClaim(dev_idx) != 0) {
+    return 1;
+  }
+  PciDeviceInfo info{};
+  if (GetPciInfo(dev_idx, &info) < 1) {
+    return 2;
+  }
+  const uint64_t bar_phys = info.bars[bar_idx].phys_base;
+  const int64_t bar_size = info.bars[bar_idx].size;
+  if (bar_phys == 0 || bar_size < 4096) {
+    return 3;
+  }
+  // Invalid alignment, size, or overflow -> kSyscallErrorInvalid.
+  if (MmioMap(0, 4096) != kSyscallErrorInvalid ||
+      MmioMap(bar_phys + 1, 4096) != kSyscallErrorInvalid ||
+      MmioMap(bar_phys, 0) != kSyscallErrorInvalid ||
+      MmioMap(bar_phys, -4096) != kSyscallErrorInvalid ||
+      MmioMap(bar_phys, 100) != kSyscallErrorInvalid ||
+      MmioMap(bar_phys, kSyscallMmioMaxSize + 4096) != kSyscallErrorInvalid) {
+    return 4;
+  }
+  // Physical address outside any claimed BAR -> kSyscallErrorAccess.
+  if (MmioMap(bar_phys + static_cast<uint64_t>(bar_size), 4096) !=
+          kSyscallErrorAccess ||
+      MmioMap(0x100000ULL, 4096) != kSyscallErrorAccess) {
+    return 5;
+  }
+  // If the device has MSI-X in this BAR, attempting to map the entire BAR
+  // (including the MSI-X table/PBA page) must be rejected with
+  // kSyscallErrorAccess.
+  if (info.msix_vectors > 0 && bar_size > 4096) {
+    if (MmioMap(bar_phys, bar_size) != kSyscallErrorAccess) {
+      return 6;
+    }
+  }
+  // Map the first 4 KiB page of the BAR (non-MSI-X register page).
+  const int64_t va1 = MmioMap(bar_phys, 4096);
+  if (SyscallIsError(va1) ||
+      static_cast<uint64_t>(va1) != 0xFFFF900000000000ULL) {
+    return 7;
+  }
+  // Mapping the same page a second time places it after the first mapping's
+  // 4 KiB guard page (`va1 + 2 * 4096`).
+  const int64_t va2 = MmioMap(bar_phys, 4096);
+  if (SyscallIsError(va2) || va2 != va1 + 2 * 4096) {
+    return 8;
+  }
+  const uint32_t reg0 = *Launder(
+      reinterpret_cast<const volatile uint32_t*>(static_cast<uintptr_t>(va1)));
+  (void)reg0;
+  // Device MMIO pages carry kPteNotOwned, so kernel user-copy helpers
+  // (MayRead/MayWrite -> PagingUserRangeAccessible) reject them with EFAULT.
+  if (Write(reinterpret_cast<const char*>(static_cast<uintptr_t>(va1)), 4) !=
+          kSyscallErrorFault ||
+      ConsolePush(reinterpret_cast<const char*>(static_cast<uintptr_t>(va1)),
+                  4) != kSyscallErrorFault ||
+      Read(reinterpret_cast<char*>(static_cast<uintptr_t>(va1)), 4) !=
+          kSyscallErrorFault) {
+    return 9;
+  }
+  if (submode == 1) {
+    (void)IrqWait(0, kSyscallIrqWaitMaxTicks);
+  }
+  return 0;
+}
+
+static int64_t RunDriverMmioFault(const uint64_t arg) {
+  using usertest::DriverMmioFaultSubmode;
+  const DriverMmioFaultSubmode submode =
+      static_cast<DriverMmioFaultSubmode>(usertest::DriverSubmode(arg));
+  const int dev_idx = usertest::DriverDeviceIndex(arg);
+  const int bar_idx = usertest::DriverBarIndex(arg);
+
+  if (PciClaim(dev_idx) != 0) {
+    return 1;
+  }
+  PciDeviceInfo info{};
+  if (GetPciInfo(dev_idx, &info) < 1) {
+    return 2;
+  }
+  const int64_t va = MmioMap(info.bars[bar_idx].phys_base, 4096);
+  if (SyscallIsError(va)) {
+    return 3;
+  }
+  if (submode == DriverMmioFaultSubmode::kFaultExecuteMmio) {
+    Launder(reinterpret_cast<void (*)()>(static_cast<uintptr_t>(va)))();
+    return 4;
+  }
+  // Read the unmapped guard page right after the 1-page mapping (`va + 4096`).
+  const uintptr_t guard_page = static_cast<uintptr_t>(va) + 4096;
+  const uint32_t word =
+      *Launder(reinterpret_cast<const volatile uint32_t*>(guard_page));
+  (void)word;
+  return 5;
+}
+
+static int64_t RunDriverDmaChecks(const uint64_t arg) {
+  const uint8_t submode = usertest::DriverSubmode(arg);
+  uint64_t phys = 0;
+  if (DmaAlloc(0, &phys, 0) != kSyscallErrorInvalid ||
+      DmaAlloc(-4096, &phys, 0) != kSyscallErrorInvalid ||
+      DmaAlloc(100, &phys, 0) != kSyscallErrorInvalid ||
+      DmaAlloc(kSyscallDmaMaxSize + 4096, &phys, 0) != kSyscallErrorInvalid ||
+      DmaAlloc(4096, &phys, 2) != kSyscallErrorInvalid) {
+    return 1;
+  }
+  if (DmaAlloc(4096, nullptr, 0) != kSyscallErrorFault ||
+      DmaAlloc(4096, reinterpret_cast<uint64_t*>(usertest::kKernelAddress),
+               0) != kSyscallErrorFault ||
+      DmaAlloc(4096, reinterpret_cast<uint64_t*>(kNonCanonicalAddress), 0) !=
+          kSyscallErrorFault ||
+      DmaAlloc(4096, reinterpret_cast<uint64_t*>(kUnmappedUserAddress), 0) !=
+          kSyscallErrorFault ||
+      DmaAlloc(4096, const_cast<uint64_t*>(&kReadOnlyWord), 0) !=
+          kSyscallErrorFault) {
+    return 2;
+  }
+  uint64_t phys1 = 0;
+  const int64_t va1 = DmaAlloc(4 * 4096, &phys1, kSyscallDmaBelow4GiB);
+  if (SyscallIsError(va1) ||
+      static_cast<uint64_t>(va1) != 0xFFFFA00000000000ULL || phys1 == 0 ||
+      (phys1 & 0xFFFULL) != 0 || phys1 + 4 * 4096 > 0x100000000ULL) {
+    return 3;
+  }
+  // Second allocation sits after the 4 pages of `va1` plus its 1 guard page
+  // (`va1 + 5 * 4096`).
+  uint64_t phys2 = 0;
+  const int64_t va2 = DmaAlloc(4096, &phys2, 0);
+  if (SyscallIsError(va2) || va2 != va1 + 5 * 4096 || phys2 == 0 ||
+      (phys2 & 0xFFFULL) != 0 || phys2 == phys1) {
+    return 4;
+  }
+  const volatile uint64_t* const words1 =
+      reinterpret_cast<const volatile uint64_t*>(static_cast<uintptr_t>(va1));
+  for (int i = 0; i < (4 * 4096) / 8; ++i) {
+    if (words1[i] != 0) {
+      return 5;
+    }
+  }
+  const volatile uint64_t* const words2 =
+      reinterpret_cast<const volatile uint64_t*>(static_cast<uintptr_t>(va2));
+  for (int i = 0; i < 4096 / 8; ++i) {
+    if (words2[i] != 0) {
+      return 6;
+    }
+  }
+  volatile uint64_t* const mut1 =
+      reinterpret_cast<volatile uint64_t*>(static_cast<uintptr_t>(va1));
+  mut1[0] = phys1;
+  for (int p = 1; p < 4; ++p) {
+    mut1[p * (4096 / 8)] = 0xD0A0000000000000ULL + static_cast<uint64_t>(p);
+  }
+  volatile uint64_t* const mut2 =
+      reinterpret_cast<volatile uint64_t*>(static_cast<uintptr_t>(va2));
+  mut2[0] = phys2;
+
+  if (submode == 1) {
+    // Write a RET instruction (0xC3) at va1 and jump to it to trigger an NX
+    // instruction-fetch #PF on the DMA page.
+    *reinterpret_cast<volatile uint8_t*>(static_cast<uintptr_t>(va1)) = 0xC3;
+    Launder(reinterpret_cast<void (*)()>(static_cast<uintptr_t>(va1)))();
+    return 7;
+  }
+  (void)IrqWait(0, kSyscallIrqWaitMaxTicks);
+  return 0;
+}
+
+static int64_t RunDriverConsolePush() {
+  if (ConsolePush("a", -1) != kSyscallErrorInvalid ||
+      ConsolePush("a", kSyscallConsolePushMaxSize + 1) !=
+          kSyscallErrorInvalid) {
+    return 1;
+  }
+  if (ConsolePush(nullptr, 0) != 0) {
+    return 2;
+  }
+  if (ConsolePush(nullptr, 4) != kSyscallErrorFault ||
+      ConsolePush(reinterpret_cast<const char*>(usertest::kKernelAddress), 4) !=
+          kSyscallErrorFault ||
+      ConsolePush(reinterpret_cast<const char*>(kNonCanonicalAddress), 4) !=
+          kSyscallErrorFault ||
+      ConsolePush(reinterpret_cast<const char*>(kUnmappedUserAddress), 4) !=
+          kSyscallErrorFault) {
+    return 3;
+  }
+  if (ConsolePush("drv_in!\n", 8) != 8) {
+    return 4;
+  }
+  return 0;
+}
+
+static int64_t RunDriverIrqWait(const uint64_t arg) {
+  using usertest::DriverIrqSubmode;
+  const DriverIrqSubmode submode =
+      static_cast<DriverIrqSubmode>(usertest::DriverSubmode(arg));
+  const int dev_idx = usertest::DriverDeviceIndex(arg);
+
+  if (PciClaim(dev_idx) != 0) {
+    return 1;
+  }
+  PciDeviceInfo info{};
+  if (GetPciInfo(dev_idx, &info) < 1) {
+    return 2;
+  }
+  const bool has_hw_irq = info.msi_vectors != 0 || info.msix_vectors != 0;
+  const int64_t count = (!has_hw_irq || info.msix_vectors >= 2) ? 2 : 1;
+
+  if (submode == DriverIrqSubmode::kIrqValidationAndTimeout) {
+    if (IrqAlloc(-1, 1, kSyscallIrqModeAuto) != kSyscallErrorNoDevice ||
+        IrqAlloc(0, 1, kSyscallIrqModeAuto) != kSyscallErrorAccess ||
+        IrqAlloc(dev_idx, 0, kSyscallIrqModeAuto) != kSyscallErrorInvalid ||
+        IrqAlloc(dev_idx, -1, kSyscallIrqModeAuto) != kSyscallErrorInvalid ||
+        IrqAlloc(dev_idx, kSyscallIrqMaxCount + 1, kSyscallIrqModeAuto) !=
+            kSyscallErrorInvalid ||
+        IrqAlloc(dev_idx, 1, 3) != kSyscallErrorInvalid ||
+        IrqAlloc(dev_idx, 1, -1) != kSyscallErrorInvalid) {
+      return 10;
+    }
+    if (info.msi_vectors == 0) {
+      if (IrqAlloc(dev_idx, 1, kSyscallIrqModeMsi) != kSyscallErrorInvalid) {
+        return 11;
+      }
+    } else if (IrqAlloc(dev_idx, 2, kSyscallIrqModeMsi) !=
+               kSyscallErrorInvalid) {
+      return 12;
+    }
+    if (info.msix_vectors == 0) {
+      if (IrqAlloc(dev_idx, 1, kSyscallIrqModeMsix) != kSyscallErrorInvalid) {
+        return 13;
+      }
+    } else if (IrqAlloc(dev_idx, static_cast<int64_t>(info.msix_vectors) + 1,
+                        kSyscallIrqModeMsix) != kSyscallErrorInvalid) {
+      return 14;
+    }
+    if (has_hw_irq) {
+      if (IrqAlloc(dev_idx, count, kSyscallIrqModeAuto) != 0) {
+        return 15;
+      }
+      if (IrqAlloc(dev_idx, 1, kSyscallIrqModeAuto) != kSyscallErrorBusy) {
+        return 16;
+      }
+    } else if (IrqAlloc(dev_idx, 1, kSyscallIrqModeAuto) !=
+               kSyscallErrorInvalid) {
+      return 15;
+    }
+    if (IrqWait(uint64_t{1} << 32, 0) != kSyscallErrorInvalid ||
+        IrqWait(~uint64_t{0}, 0) != kSyscallErrorInvalid ||
+        IrqWait(1, kSyscallIrqWaitMaxTicks + 1) != kSyscallErrorInvalid) {
+      return 17;
+    }
+    if (IrqWait((uint64_t{1} << count) - 1, 0) != 0) {
+      return 18;
+    }
+    if (IrqWait(1, 5) != 0) {
+      return 19;
+    }
+    if (IrqWait(0, 2) != 0) {
+      return 20;
+    }
+    return 0;
+  }
+
+  if (submode == DriverIrqSubmode::kIrqPrePendingAndSelectiveMask) {
+    if (has_hw_irq && IrqAlloc(dev_idx, count, kSyscallIrqModeAuto) != 0) {
+      return 30;
+    }
+    char sync = 0;
+    if (Read(&sync, 1) != 1 || sync != 'G') {
+      return 31;
+    }
+    if (IrqWait(uint64_t{1} << 0, 100) != 1 ||
+        IrqWait(uint64_t{1} << 0, 0) != 0) {
+      return 32;
+    }
+    if (count == 2) {
+      if (IrqWait(uint64_t{1} << 1, 0) != 2 || IrqWait(3, 0) != 0) {
+        return 33;
+      }
+    }
+    return 0;
+  }
+
+  if (submode == DriverIrqSubmode::kIrqBlockingWakeup) {
+    if (has_hw_irq && IrqAlloc(dev_idx, count, kSyscallIrqModeAuto) != 0) {
+      return 40;
+    }
+    for (int64_t k = 0; k < count; ++k) {
+      const uint64_t bit = uint64_t{1} << k;
+      if (IrqWait(bit, 5000) != static_cast<int64_t>(bit) ||
+          IrqWait(bit, 0) != 0) {
+        return 41 + k;
+      }
+      if (k + 1 < count) {
+        char sync = 0;
+        if (Read(&sync, 1) != 1 || sync != 'G') {
+          return 45;
+        }
+      }
+    }
+    return 0;
+  }
+
+  // kIrqKillWhileBlocked:
+  if (has_hw_irq && IrqAlloc(dev_idx, 1, kSyscallIrqModeAuto) != 0) {
+    return 50;
+  }
+  (void)IrqWait(1, 5000);
+  return 51;
+}
+
 }  // namespace
 
 int64_t Main(const uint64_t arg) {
@@ -1851,6 +2428,24 @@ int64_t Main(const uint64_t arg) {
     case Mode::kSpawnAndWait:
       return RunSpawnAndWait(
           static_cast<usertest::SpawnTestSubmode>((arg >> 8) & 0xFF));
+    case Mode::kDriverDenied:
+      return RunDriverDenied();
+    case Mode::kDriverCapProbe:
+      return RunDriverCapProbe(arg);
+    case Mode::kDriverHold:
+      return RunDriverHold(arg);
+    case Mode::kDriverForeign:
+      return RunDriverForeign(arg);
+    case Mode::kDriverMmioChecks:
+      return RunDriverMmioChecks(arg);
+    case Mode::kDriverMmioFault:
+      return RunDriverMmioFault(arg);
+    case Mode::kDriverDmaChecks:
+      return RunDriverDmaChecks(arg);
+    case Mode::kDriverConsolePush:
+      return RunDriverConsolePush();
+    case Mode::kDriverIrqWait:
+      return RunDriverIrqWait(arg);
   }
   // The mode should have faulted, or it is unknown.
   return -1;

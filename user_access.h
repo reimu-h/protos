@@ -27,13 +27,13 @@ namespace protos {
 // every task switch DCHECK.
 //
 // The helpers check only that the range lies in user space. The caller first
-// checks that the running program may access every page of it
-// (PagingUserRangeAccessible() in its address space, as UserProcess::MayRead()
-// does) and fails with kSyscallErrorFault otherwise. A program's mappings
-// don't change while one of its system calls runs (only its own task maps and
-// unmaps them, before it enters user mode and after it has left), so a copy
-// of a checked range can't fault; if it does, the kernel panics as for any
-// other fault of kernel code.
+// checks that the running program may access every page of it as owned user
+// RAM (PagingUserRangeAccessible() in its address space, which also rejects
+// device MMIO pages, as UserProcess::MayRead() does) and fails with
+// kSyscallErrorFault otherwise. A program's mappings don't change while one of
+// its system calls runs (only its own task maps and unmaps them, before it
+// enters user mode and after it has left), so a copy of a checked range can't
+// fault; if it does, the kernel panics as for any other fault of kernel code.
 
 // Copies the `size` bytes at `user_src` in the active address space to `dst`.
 // Returns false, copying nothing, unless `[user_src, user_src + size)` lies in

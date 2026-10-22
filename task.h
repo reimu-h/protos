@@ -48,14 +48,17 @@ using TaskFn = void (*)(void* arg);
 //   A task that is never joined or detached leaks its TCB and join record.
 // - The handle is invalid once Join() returns or Detach() is called. Its TCB
 //   may be reused for a new task with the same `Task*` value.
+// - While it runs, a task may block (Block(), BlockUntil()): it is then
+//   neither runnable nor exited, and uses no CPU time, until a Wake() (or its
+//   BlockUntil() deadline) makes it runnable again.
 
 // Kernel task scheduler. `TaskInit()` creates the scheduler and
 // `GetTaskScheduler()` returns it.
 //
 // Each online CPU runs its queued tasks in order of weighted virtual runtime
 // (proportional-share scheduling; see `kDefaultTaskWeight`). A CPU switches
-// tasks when the running task yields or exits and, while preemption is
-// enabled, on timer interrupts and wakeup IPIs. CPUs that run out of queued
+// tasks when the running task yields, blocks or exits and, while preemption
+// is enabled, on timer interrupts and wakeup IPIs. CPUs that run out of queued
 // tasks take tasks queued on busier CPUs.
 //
 // The methods form two sections: the public task API, which task code calls,
@@ -113,6 +116,55 @@ class TaskScheduler {
   // weight. Must not be called while holding an `IrqSpinLock`.
   virtual void Yield() = 0;
 
+  // Blocks the calling task until Wake() is called on it: the task leaves its
+  // CPU and is not runnable, so it uses no CPU time, until then. Each task has
+  // one pending-wakeup flag. A Wake() that finds the task not blocked sets it,
+  // and Block() returns at once, clearing it, if it is set. So a Wake() that
+  // arrives before Block(), however early, is not lost, several Wake() calls
+  // before one Block() count as one, and a Wake() that ends a Block() leaves
+  // no flag behind. Block() may also return without a Wake() (rarely), so
+  // callers wait for their condition in a loop:
+  //
+  //   while (!condition()) {  // The waker makes it true, then calls Wake().
+  //     scheduler->Block();
+  //   }
+  //
+  // What the waker wrote before it called Wake() is visible to the task once
+  // Block() returns. Like Yield(), the task may resume on another CPU.
+  // CHECK-fails if called from the bootstrap task (CPU 0's boot context,
+  // which must stay runnable) or an idle task, with interrupts disabled (so
+  // also from an interrupt handler), or while holding an `IrqSpinLock`.
+  virtual void Block() = 0;
+
+  // Like Block(), but also returns once CPU 0's timer tick count (the
+  // `CpuLocal::timer_ticks` of CPU 0, `kApicTimerTargetHz` ticks per second)
+  // has reached `deadline_tick`, at once if it already has. CPU 0's timer
+  // interrupt ends the wait with a Wake(), also while preemption is disabled
+  // (SetPreemptEnabled()). If that Wake() comes after another Wake() has ended
+  // the wait but before BlockUntil() returns, it sets the pending-wakeup flag.
+  // BlockUntil() may also return before either happened, so callers loop:
+  //
+  //   while (!condition() && cpu0_ticks() < deadline_tick) {
+  //     scheduler->BlockUntil(deadline_tick);
+  //   }
+  //
+  // Same calling rules as Block().
+  virtual void BlockUntil(int64_t deadline_tick) = 0;
+
+  // Ends the Block() or BlockUntil() of `task` if the task is blocked: queues
+  // it on a CPU chosen by the scheduler (the least-loaded online CPU, as for
+  // CreateTask()) and wakes that CPU with an IPI if it is not the calling CPU.
+  // Otherwise sets the task's pending-wakeup flag (see Block()). Never
+  // switches tasks and never waits for another CPU, so it may be called on any
+  // CPU, also from interrupt handlers (but not NMI handlers), with interrupts
+  // disabled, and while preemption is disabled. A caller may hold
+  // `IrqSpinLock`s that the scheduler never takes: Wake() takes exactly one
+  // runqueue lock, so the lock order is the caller's locks, then the runqueue
+  // lock. `task` is a handle from CreateTask*() that must not be reclaimed
+  // (joined or reaped) before Wake() returns. Waking a task that has exited
+  // does nothing.
+  virtual void Wake(Task* task) = 0;
+
   // Waits until `task` has exited, then frees its TCB and join record.
   //
   // The wait is a busy-wait: the caller stays runnable and loops on Yield(),
@@ -120,7 +172,8 @@ class TaskScheduler {
   // the entry function returns, then the task's CPU switches away from it and
   // frees its stack. Join() returns without yielding only if both steps are
   // done; a task whose entry function has just returned may still need a few
-  // yields to finish switching away.
+  // yields to finish switching away. A blocked task exits only after it has
+  // been woken, so Join() waits for that as well.
   //
   // `task` must be a handle from CreateTask*() that has been neither joined
   // nor detached, and only one task may join it. Must not be called on
@@ -150,7 +203,8 @@ class TaskScheduler {
   // wakeup IPIs entirely: besides not preempting, ticks charge no virtual
   // runtime and idle CPUs don't steal work on ticks or IPIs, so a CPU-bound
   // task that runs in that window is favored afterwards. This differs from
-  // Linux's per-CPU, nesting `preempt_disable()`.
+  // Linux's per-CPU, nesting `preempt_disable()`. Block(), BlockUntil() (with
+  // its deadline) and Wake() work regardless.
   virtual void SetPreemptEnabled(bool enabled) = 0;
 
   // Returns `true` if interrupt-driven scheduling is currently enabled.
@@ -200,11 +254,13 @@ class TaskScheduler {
   virtual void Init() = 0;
 
   // Handles a Local APIC timer interrupt (`kVectorApicTimer = 0x20`) on the
-  // calling CPU. `frame` is the interrupted context. Acts only if preemption
-  // is enabled, the interrupted context had interrupts enabled (`frame` is
-  // non-null and has RFLAGS.IF set) and holds no `IrqSpinLock`: then charges a
-  // tick of virtual runtime to the interrupted task and switches to a runnable
-  // task with lower `vruntime`, if any.
+  // calling CPU. `frame` is the interrupted context. On CPU 0 it first ends
+  // every BlockUntil() whose deadline has passed, whatever the conditions
+  // below. Otherwise acts only if preemption is enabled, the interrupted
+  // context had interrupts enabled (`frame` is non-null and has RFLAGS.IF
+  // set) and holds no `IrqSpinLock`: then charges a tick of virtual runtime to
+  // the interrupted task and switches to a runnable task with lower
+  // `vruntime`, if any.
   virtual void OnTimerInterrupt(InterruptFrame* frame) = 0;
 
   // Handles a cross-CPU wakeup/reschedule IPI (`kVectorWakeupIpi = 0x21`) on
@@ -239,6 +295,16 @@ class TaskScheduler {
   // starts at `dst_cpu`'s min_vruntime. Returns `true` if `dst_cpu` already
   // had runnable work or a task was moved.
   virtual bool StealTask(int dst_cpu, int src_cpu) = 0;
+
+  // Wake() with the CPU chosen by the caller: if this call ends the Block() of
+  // `task`, queues the task on online CPU `target_cpu`
+  // (`0 <= target_cpu < SmpCpuCount()`), waking that CPU with an IPI if it is
+  // not the calling CPU, and returns true. Otherwise sets the task's
+  // pending-wakeup flag and returns false. The woken task keeps the lead over
+  // `min_vruntime` that it had on the CPU where it blocked, rebased on
+  // `target_cpu`'s, as StealTask() rebases a stolen task. Same calling rules
+  // as Wake(); once it returns true, `task` may already have run and exited.
+  virtual bool WakeOnCpu(Task* task, int target_cpu) = 0;
 };
 
 // Composes the scheduler layers (join lifecycle -> preemptive -> work stealing
@@ -261,14 +327,28 @@ bool TaskPollIdleCpu(int cpu_index);
 TaskScheduler* GetTaskScheduler();
 
 // Returns the CPU that is running `task` (a handle from CreateTask*() that has
-// not been reclaimed yet), or -1 if no CPU is: the task is queued, has not
-// started or has exited. A task counts as running from the moment a CPU picks
-// it until that CPU has completely switched away from it, so -1 means that the
-// task executes on no CPU at that moment. The answer may be out of date as soon
-// as it is returned. Safe on any CPU, with interrupts enabled or disabled. The
-// core layer (core_runqueue_scheduler.h), which owns the task control blocks,
-// implements it.
+// not been reclaimed yet), or -1 if no CPU is: the task is queued or blocked,
+// has not started or has exited. A task counts as running from the moment a
+// CPU picks it until that CPU has completely switched away from it, so -1
+// means that the task executes on no CPU at that moment. The answer may be out
+// of date as soon as it is returned. Safe on any CPU, with interrupts enabled
+// or disabled. The core layer (core_runqueue_scheduler.h), which owns the task
+// control blocks, implements it.
 int TaskRunningCpu(const Task* task);
+
+// Returns how many timer interrupts (`kVectorApicTimer`, `kApicTimerTargetHz`
+// per CPU) have interrupted `task` so far, on whichever CPUs it ran: the CPU
+// time it has used, in ticks, including its current run if a CPU is running
+// it now (the count that ReadCpuClock() in cpu_clock.h reports to the task
+// itself). The count doesn't change while the task is queued, blocked or
+// exited, and it never decreases. `task` is a handle from CreateTask*() that
+// has not been reclaimed yet, or `CurrentTask()` (also the bootstrap or an
+// idle task). The answer may be out of date as soon as it is returned. Safe on
+// any CPU, also from interrupt handlers (but not NMI handlers). It takes the
+// runqueue lock of the CPU that runs the task, so a caller that holds an
+// `IrqSpinLock` follows Wake()'s lock order. The core layer
+// (core_runqueue_scheduler.h) implements it.
+int64_t TaskTimerTicks(const Task* task);
 
 #if __STDC_HOSTED__
 // Host unit-test hook: unregisters the interrupt handlers and destroys the

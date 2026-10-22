@@ -162,12 +162,13 @@ void WriteUserProgramResult(const UserProgramResult& result,
   }
 }
 
-std::unique_ptr<UserProcess> UserProcess::Start(const UserProgram& program,
-                                                const uint64_t arg) {
+std::unique_ptr<UserProcess> UserProcess::Start(const UserProgram& program,  //
+                                                const uint64_t arg,          //
+                                                const uint64_t capabilities) {
   TaskScheduler* const scheduler = GetTaskScheduler();
   DCHECK(scheduler != nullptr);
-  std::unique_ptr<UserProcess> process(new (std::nothrow)
-                                           UserProcess(program, arg));
+  std::unique_ptr<UserProcess> process(
+      new (std::nothrow) UserProcess(program, arg, capabilities));
   if (process == nullptr) {
     return nullptr;
   }
@@ -180,8 +181,10 @@ std::unique_ptr<UserProcess> UserProcess::Start(const UserProgram& program,
   return process;
 }
 
-UserProcess::UserProcess(const UserProgram& program, const uint64_t arg)
-    : program_(program), arg_(arg) {}
+UserProcess::UserProcess(const UserProgram& program,  //
+                         const uint64_t arg,          //
+                         const uint64_t capabilities)
+    : program_(program), arg_(arg), capabilities_(capabilities) {}
 
 UserProcess::~UserProcess() {
   if (!waited_) {
@@ -230,6 +233,10 @@ void UserProcess::Kill() {
     kill_requested_.store(true, std::memory_order_seq_cst);
     if (!task_reclaimed_) {
       running_cpu = TaskRunningCpu(task_);
+      TaskScheduler* const scheduler = GetTaskScheduler();
+      if (scheduler != nullptr) {
+        scheduler->Wake(task_);
+      }
     }
   }
   // The program ends on its way back to user mode from whichever interrupt or
@@ -239,6 +246,20 @@ void UserProcess::Kill() {
   if (running_cpu >= 0 && running_cpu != CurrentCpuIdIrqsOff()) {
     SmpSendIpi(running_cpu, kVectorKickIpi);
   }
+}
+
+uintptr_t UserProcess::LookupUserPage(const uintptr_t user_addr) const {
+  return (space_ != nullptr) ? space_->PageFrame(user_addr) : 0;
+}
+
+bool UserProcess::QueryUserPage(const uintptr_t user_addr,
+                                UserPageInfo* const info) const {
+  return space_ != nullptr && space_->QueryPage(user_addr, info);
+}
+
+bool UserProcess::BindVectorsForSelftest(const int device_index,
+                                         const int count) {
+  return driver_.BindVectorsForSelftest(device_index, count, task_);
 }
 
 UserProcessStats UserProcess::stats() const {
@@ -285,6 +306,15 @@ UserProcessStats UserProcess::stats() const {
     const int64_t excluded_ns = KillExcludedStealNs(rec);
     snapshot.kill_steal_ticks =
         StealNsToTicks(excluded_ns, SmpTimerTickNsUpperBound());
+  }
+  snapshot.in_irq_wait = in_irq_wait_.load(std::memory_order_acquire);
+  {
+    const IrqSpinLockGuard guard(kill_lock_);
+    if (!task_reclaimed_ && task_ != nullptr) {
+      snapshot.task_timer_ticks = TaskTimerTicks(task_);
+      snapshot.blocked_in_irq_wait =
+          snapshot.in_irq_wait && TaskRunningCpu(task_) < 0;
+    }
   }
   return snapshot;
 }
@@ -334,6 +364,10 @@ void UserProcess::Run() {
     // End().
     UserModeEnter(executable.entry, kUserStackTop - 8, arg_, this);
   }
+  // Quiesce any claimed PCI devices, disable MSI/MSI-X, and release vectors
+  // and PCI claims while `space_` is still alive, before DMA frames are
+  // unmapped and returned to the PMM.
+  driver_.Release(/*address_space_alive=*/space_ != nullptr);
 #if PROTOS_INJECT_KILL_DELAY != 0
   if (result_.outcome == UserProgramOutcome::kKilled) {
     if (kActiveKillDelayInjection == KillDelayInjection::kTeardown) {
@@ -418,6 +452,10 @@ UserProcess* UserProcess::FromFrame(const InterruptFrame* const frame) {
   return process;
 }
 
+bool UserProcess::ShouldStopIrqWait(void* const ctx) {
+  return static_cast<const UserProcess*>(ctx)->IsKillRequested();
+}
+
 void UserProcess::OnSyscall(InterruptFrame* const frame) {
   // The interrupt gate disabled interrupts: the task still runs on the CPU
   // that took the call, whose TSS.rsp0 is right above `frame` (FromFrame()).
@@ -442,32 +480,79 @@ void UserProcess::OnSyscall(InterruptFrame* const frame) {
   process->in_syscall_.store(true, std::memory_order_release);
   RestoreInterrupts((frame->rflags & kRflagsInterruptEnableBit) != 0);
   int64_t ret = kSyscallErrorNoSys;
-  switch (number) {
-    case kSyscallWrite:
-      ret = process->Write(frame->rdi, static_cast<int64_t>(frame->rsi));
-      break;
-    case kSyscallGetCpu:
-      ret = meter.start_cpu();
-      break;
-    case kSyscallSpin:
-      ret = process->Spin(frame->rdi,                        //
-                          static_cast<int64_t>(frame->rsi),  //
-                          static_cast<int64_t>(frame->rdx),  //
-                          &meter);
-      break;
-    case kSyscallRead:
-      ret = process->Read(frame->rdi, static_cast<int64_t>(frame->rsi));
-      break;
-    case kSyscallSpawn:
-      ret = process->Spawn(frame->rdi,                        //
-                           static_cast<int64_t>(frame->rsi),  //
-                           frame->rdx);
-      break;
-    case kSyscallWait:
-      ret = process->WaitChild(static_cast<int64_t>(frame->rdi), frame->rsi);
-      break;
-    default:
-      break;
+  if (!MayMakeSyscall(process->capabilities_, number)) {
+    ret = kSyscallErrorPermission;
+  } else {
+    switch (number) {
+      case kSyscallWrite:
+        ret = process->Write(frame->rdi, static_cast<int64_t>(frame->rsi));
+        break;
+      case kSyscallGetCpu:
+        ret = meter.start_cpu();
+        break;
+      case kSyscallSpin:
+        ret = process->Spin(frame->rdi,                        //
+                            static_cast<int64_t>(frame->rsi),  //
+                            static_cast<int64_t>(frame->rdx),  //
+                            &meter);
+        break;
+      case kSyscallRead:
+        ret = process->Read(frame->rdi, static_cast<int64_t>(frame->rsi));
+        break;
+      case kSyscallSpawn:
+        ret = process->Spawn(frame->rdi,                        //
+                             static_cast<int64_t>(frame->rsi),  //
+                             frame->rdx,                        //
+                             kUserCapNone);
+        break;
+      case kSyscallWait:
+        ret = process->WaitChild(static_cast<int64_t>(frame->rdi), frame->rsi);
+        break;
+      case kSyscallSpawnDriver:
+        ret = process->Spawn(frame->rdi,                        //
+                             static_cast<int64_t>(frame->rsi),  //
+                             frame->rdx,                        //
+                             kUserCapDriver);
+        break;
+      case kSyscallPciInfo:
+        ret = process->PciInfo(static_cast<int64_t>(frame->rdi), frame->rsi);
+        break;
+      case kSyscallPciClaim:
+        ret = process->driver_.Claim(static_cast<int64_t>(frame->rdi));
+        break;
+      case kSyscallPciBusMaster:
+        ret = process->driver_.SetBusMaster(static_cast<int64_t>(frame->rdi),
+                                            static_cast<int64_t>(frame->rsi));
+        break;
+      case kSyscallMmioMap:
+        ret = process->driver_.MmioMap(process->space_,  //
+                                       frame->rdi,       //
+                                       static_cast<int64_t>(frame->rsi));
+        break;
+      case kSyscallDmaAlloc:
+        ret = process->DmaAlloc(static_cast<int64_t>(frame->rdi),  //
+                                frame->rsi,                        //
+                                frame->rdx);
+        break;
+      case kSyscallIrqAlloc:
+        ret = process->driver_.IrqAlloc(static_cast<int64_t>(frame->rdi),  //
+                                        static_cast<int64_t>(frame->rsi),  //
+                                        static_cast<int64_t>(frame->rdx),  //
+                                        process->task_);
+        break;
+      case kSyscallIrqWait:
+        ret = process->IrqWait(frame->rdi, static_cast<int64_t>(frame->rsi));
+        break;
+      case kSyscallConsolePush:
+        ret =
+            process->ConsolePush(frame->rdi, static_cast<int64_t>(frame->rsi));
+        break;
+      case kSyscallGetTicks:
+        ret = GlobalTimerTicks();
+        break;
+      default:
+        break;
+    }
   }
   // Interrupts stay disabled until the program runs again (IdtDispatch()),
   // which ends it instead if it was killed meanwhile (OnReturnToUser()).
@@ -633,7 +718,8 @@ int64_t UserProcess::Read(const uintptr_t buffer, const int64_t size) {
 
 int64_t UserProcess::Spawn(const uintptr_t name_ptr,  //
                            const int64_t name_len,    //
-                           const uint64_t arg) {
+                           const uint64_t arg,        //
+                           const uint64_t child_caps) {
   if (name_len <= 0 || name_len > kSyscallSpawnMaxNameLength) {
     return kSyscallErrorInvalid;
   }
@@ -661,7 +747,8 @@ int64_t UserProcess::Spawn(const uintptr_t name_ptr,  //
     RecordKillNoticeIrqsOff();
     return kSyscallErrorInvalid;
   }
-  std::unique_ptr<UserProcess> child = UserProcess::Start(program, arg);
+  std::unique_ptr<UserProcess> child =
+      UserProcess::Start(program, arg, child_caps);
   if (child == nullptr) {
     return kSyscallErrorInvalid;
   }
@@ -712,6 +799,71 @@ int64_t UserProcess::WaitChild(const int64_t pid, const uintptr_t result_ptr) {
     RecordKillNoticeIrqsOff();
   }
   return 0;
+}
+
+int64_t UserProcess::PciInfo(const int64_t index,
+                             const uintptr_t info_ptr) const {
+  if (info_ptr == 0) {
+    return driver_.PciInfo(index, nullptr);
+  }
+  if (!MayWrite(info_ptr, sizeof(PciDeviceInfo))) {
+    return kSyscallErrorFault;
+  }
+  PciDeviceInfo info{};
+  const int64_t ret = driver_.PciInfo(index, &info);
+  if (ret < 0) {
+    return ret;
+  }
+  WriteUserMemory(info_ptr, &info, sizeof(info));
+  return ret;
+}
+
+int64_t UserProcess::DmaAlloc(const int64_t size,            //
+                              const uintptr_t phys_out_ptr,  //
+                              const uint64_t flags) {
+  if (size <= 0 || (static_cast<uint64_t>(size) & kPageMask) != 0 ||
+      size > kSyscallDmaMaxSize || (flags & ~kSyscallDmaFlagsMask) != 0) {
+    return kSyscallErrorInvalid;
+  }
+  if (phys_out_ptr == 0 || !MayWrite(phys_out_ptr, sizeof(uint64_t))) {
+    return kSyscallErrorFault;
+  }
+  uint64_t phys = 0;
+  const int64_t ret = driver_.DmaAlloc(space_, size, flags, &phys);
+  if (SyscallIsError(ret)) {
+    return ret;
+  }
+  WriteUserMemory(phys_out_ptr, &phys, sizeof(phys));
+  return ret;
+}
+
+int64_t UserProcess::IrqWait(const uint64_t mask, const int64_t timeout_ticks) {
+  in_irq_wait_.store(true, std::memory_order_release);
+  const int64_t ret = driver_.IrqWait(mask, timeout_ticks,
+                                      &UserProcess::ShouldStopIrqWait, this);
+  in_irq_wait_.store(false, std::memory_order_release);
+  if (IsKillRequested()) {
+    const ScopedIrqDisable irq_disable;
+    RecordKillNoticeIrqsOff();
+  }
+  return ret;
+}
+
+int64_t UserProcess::ConsolePush(const uintptr_t buffer,
+                                 const int64_t size) const {
+  if (size < 0 || size > kSyscallConsolePushMaxSize) {
+    return kSyscallErrorInvalid;
+  }
+  if (size == 0) {
+    return 0;
+  }
+  if (!MayRead(buffer, size)) {
+    return kSyscallErrorFault;
+  }
+  char local[kSyscallConsolePushMaxSize];
+  ReadUserMemory(local, buffer, size);
+  ConsolePushInput(local, size);
+  return size;
 }
 
 void UserProcess::CleanupChildren() {

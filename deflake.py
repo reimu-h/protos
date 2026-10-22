@@ -8,7 +8,7 @@ budget (`--duration DUR`), strictly one VM at a time under a per-boot flock
 (`--lock FILE`).
 
 For every run it parses the kernel's serial output, attributes results across
-the 32 boot self-tests (`kBootTests` in `selftest/boot_selftest.cpp`) plus
+the boot self-tests (`kBootTests` in `selftest/boot_selftest.cpp`) plus
 pseudo-tests (`random_multicpu_stress`, `@panic`, `@boot`, `@harness`), and
 reports per-configuration and per-test pass/fail counts with Wilson 95%
 confidence intervals and flaky/broken test classifications. For every failed
@@ -73,7 +73,19 @@ BOOT_TEST_ENV_VARS: tuple[str, ...] = (
     "OVMF_VARS",
     "REQUIRE_UEFI",
     "BOOT_TEST_JOBS",
+    "BOOT_TEST_USB",
+    "QEMU_USB_FLAGS",
+    "USB_SESSION_TIMEOUT_SECS",
 )
+# The test_boot.sh passes that also run the USB keyboard scenarios (unless
+# BOOT_TEST_USB=0), which add up to USB_SESSION_TIMEOUT_SECS (default 60) to
+# the pass timeout.
+USB_PASS_NAMES: tuple[str, ...] = ("bios", "uefi")
+DEFAULT_USB_SESSION_TIMEOUT_S = 60.0
+# How much longer than test_boot.sh's own bound for a pass (its timeout plus
+# the USB scenarios) a test_boot run may take before deflake stops it (the
+# post-boot checks, draining after a failure, and a loaded host).
+TEST_BOOT_WATCHDOG_MARGIN_S = 120.0
 
 FLAG_OPTIONS: frozenset[str] = frozenset({
     "-enable-kvm",
@@ -1008,6 +1020,36 @@ def _make_builtin_config(name: str) -> Config:
     raise ConfigError(f"Unknown configuration '{name}'")
 
 
+def _env_seconds(env: Mapping[str, str], name: str, default: float) -> float:
+    """Returns env[name] as seconds if it is a positive whole number, else default."""
+    raw = env.get(name, "")
+    if raw.isdigit() and int(raw) > 0:
+        return float(raw)
+    return default
+
+
+def harness_watchdog_s(config: Config, env: Mapping[str, str]) -> float:
+    """Returns how long one test_boot.sh run of `config` may take.
+
+    test_boot.sh bounds a pass itself: by its timeout (BIOS_TIMEOUT_SECS or
+    UEFI_TIMEOUT_SECS, which the environment may raise above the configuration's
+    acceptance timeout) plus, in the bios and uefi passes, USB_SESSION_TIMEOUT_SECS
+    for the USB keyboard scenarios (unless BOOT_TEST_USB=0). The watchdog adds
+    TEST_BOOT_WATCHDOG_MARGIN_S, so that test_boot.sh, not the watchdog, reports
+    a pass that hangs.
+    """
+    pass_timeout = config.timeout_s
+    if config.pass_name:
+        var = "UEFI_TIMEOUT_SECS" if config.pass_name == "uefi" else "BIOS_TIMEOUT_SECS"
+        pass_timeout = max(pass_timeout, _env_seconds(env, var, config.timeout_s))
+    usb_s = 0.0
+    if config.pass_name in USB_PASS_NAMES and env.get("BOOT_TEST_USB", "1") != "0":
+        usb_s = _env_seconds(
+            env, "USB_SESSION_TIMEOUT_SECS", DEFAULT_USB_SESSION_TIMEOUT_S
+        )
+    return pass_timeout + usb_s + TEST_BOOT_WATCHDOG_MARGIN_S
+
+
 def expand_configs(
     config_specs: Sequence[str] = (),
     qemu_args_list: Sequence[str] = (),
@@ -1787,7 +1829,7 @@ def run_test_boot_pass(
         )
 
     test_boot_log_path = run_dir / "test_boot.log"
-    watchdog_s = config.timeout_s + 120.0
+    watchdog_s = harness_watchdog_s(config, env)
     t0 = time.monotonic()
     watchdog_fired = False
     exit_code: int | None = None

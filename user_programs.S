@@ -26,5 +26,12 @@ g_usertest_elf_start:
     .incbin "user/usertest.elf"
 g_usertest_elf_end:
 
+.balign 16
+.global g_usbkbd_elf_start
+.global g_usbkbd_elf_end
+g_usbkbd_elf_start:
+    .incbin "user/usbkbd.elf"
+g_usbkbd_elf_end:
+
 .section .note.GNU-stack,"",@progbits
 

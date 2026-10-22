@@ -4,6 +4,7 @@
 #include <gtest/gtest.h>
 
 #include <atomic>
+#include <chrono>
 #include <cstddef>
 #include <cstdint>
 #include <cstdio>
@@ -972,6 +973,558 @@ TEST(TaskTest,
   g_preempted_syscall = nullptr;
   EXPECT_THAT(PmmFreeFrameCount(), t::Eq(pmm_before));
   EXPECT_THAT(HeapTotalFreeBytes(), t::Eq(heap_before));
+  TaskResetForTest();
+}
+
+// ============================================================================
+// Blocking through the composed scheduler (`Block`, `Wake`, `BlockUntil`,
+// `TaskTimerTicks`), with interrupts dispatched by the real idt.cpp
+// ============================================================================
+
+// A vector that no kernel code uses, for the interrupts whose handler wakes a
+// task in these tests.
+constexpr uint8_t kTestWakeVector = 0x2F;
+
+// Bound on each wait of the blocking tests: a lost wakeup must fail a test
+// instead of hanging it.
+constexpr std::chrono::seconds kBlockWaitTimeout(30);
+
+// Calls `step()` until `done()` holds or kBlockWaitTimeout has passed, and
+// returns whether `done()` holds.
+template <typename DoneFn, typename StepFn>
+static bool WaitUntil(const DoneFn& done, const StepFn& step) {
+  const auto deadline = std::chrono::steady_clock::now() + kBlockWaitTimeout;
+  while (!done()) {
+    if (std::chrono::steady_clock::now() >= deadline) {
+      return done();
+    }
+    step();
+  }
+  return true;
+}
+
+// WaitUntil() that yields the calling task, and the host thread, in between.
+template <typename DoneFn>
+static bool YieldUntil(const DoneFn& done) {
+  return WaitUntil(done, []() {
+    GetTaskScheduler()->Yield();
+    std::this_thread::yield();
+  });
+}
+
+// Dispatches an interrupt on `vector` as the CPU delivers it: with interrupts
+// disabled, from code that had them enabled.
+static void DispatchInterrupt(const uint8_t vector) {
+  InterruptFrame frame = MakeInterruptFrame(vector);
+  SetInterruptsEnabledForTest(false);
+  IdtDispatch(&frame);
+  SetInterruptsEnabledForTest(true);
+}
+
+static int64_t Cpu0TimerTicks() {
+  return SmpGetCpuLocal(0)->timer_ticks.load(std::memory_order_acquire);
+}
+
+// The task that TestWakeHandler() wakes, and what the handler saw.
+std::atomic<Task*> g_wake_target{nullptr};
+std::atomic<int64_t> g_wake_handler_calls{0};
+std::atomic<int> g_wake_handler_cpu{-1};
+std::atomic<bool> g_wake_handler_saw_interrupts_enabled{true};
+
+// Interrupt handler on kTestWakeVector that wakes `g_wake_target`, as a device
+// interrupt handler wakes its driver.
+static void TestWakeHandler(InterruptFrame* const /*frame*/) {
+  g_wake_handler_cpu.store(CurrentCpuId());
+  g_wake_handler_saw_interrupts_enabled.store(AreInterruptsEnabled());
+  Task* const target = g_wake_target.load(std::memory_order_acquire);
+  if (target != nullptr) {
+    GetTaskScheduler()->Wake(target);
+  }
+  g_wake_handler_calls.fetch_add(1, std::memory_order_acq_rel);
+}
+
+// Registers TestWakeHandler() for kTestWakeVector for its lifetime.
+class ScopedTestWakeHandler {
+ public:
+  ScopedTestWakeHandler() {
+    g_wake_target.store(nullptr);
+    g_wake_handler_calls.store(0);
+    g_wake_handler_cpu.store(-1);
+    g_wake_handler_saw_interrupts_enabled.store(true);
+    EXPECT_THAT(IdtGetHandler(kTestWakeVector), t::IsNull());
+    IdtRegisterHandler(kTestWakeVector, TestWakeHandler);
+  }
+  ~ScopedTestWakeHandler() {
+    IdtUnregisterHandler(kTestWakeVector);
+    g_wake_target.store(nullptr);
+  }
+
+  ScopedTestWakeHandler(const ScopedTestWakeHandler&) = delete;
+  ScopedTestWakeHandler& operator=(const ScopedTestWakeHandler&) = delete;
+};
+
+struct BlockerCtx {
+  std::atomic<int> phase{0};
+  std::atomic<int> resumed_cpu{-1};
+};
+
+// Blocks once, then records the CPU that resumed it.
+static void BlockerWorker(void* const raw_ctx) {
+  BlockerCtx* const ctx = static_cast<BlockerCtx*>(raw_ctx);
+  ctx->phase.store(1, std::memory_order_release);
+  GetTaskScheduler()->Block();
+  ctx->resumed_cpu.store(CurrentCpuId(), std::memory_order_release);
+  ctx->phase.store(2, std::memory_order_release);
+}
+
+struct DelayedWakerCtx {
+  Task* target = nullptr;
+};
+
+// Yields a few times, then wakes `target`.
+static void DelayedWakerWorker(void* const raw_ctx) {
+  DelayedWakerCtx* const ctx = static_cast<DelayedWakerCtx*>(raw_ctx);
+  for (int i = 0; i < 3; ++i) {
+    GetTaskScheduler()->Yield();
+  }
+  GetTaskScheduler()->Wake(ctx->target);
+}
+
+TEST(TaskTest, JoinDetachAndReapWaitForABlockedTaskUntilItIsWoken) {
+  SetupEnv(1);
+  TaskInit();
+  TaskScheduler* const sched = GetTaskScheduler();
+  const int64_t pmm_before = PmmFreeFrameCount();
+  const int64_t heap_before = HeapTotalFreeBytes();
+
+  // Join() keeps waiting for a blocked task until another task wakes it.
+  BlockerCtx joined_ctx;
+  Task* const joined = sched->CreateTask(BlockerWorker,  //
+                                         &joined_ctx,    //
+                                         kDefaultTaskWeight);
+  ASSERT_THAT(joined, t::NotNull());
+  sched->Yield();
+  ASSERT_THAT(joined_ctx.phase.load(), t::Eq(1));
+  EXPECT_THAT(TaskRunningCpu(joined), t::Eq(-1));
+  DelayedWakerCtx waker_ctx;
+  waker_ctx.target = joined;
+  Task* const waker =
+      sched->CreateTask(DelayedWakerWorker, &waker_ctx, kDefaultTaskWeight);
+  ASSERT_THAT(waker, t::NotNull());
+  sched->Join(joined);
+  EXPECT_THAT(joined_ctx.phase.load(), t::Eq(2));
+  sched->Join(waker);
+
+  // A detached task that blocks is no zombie until it is woken and exits.
+  BlockerCtx detached_ctx;
+  Task* const detached = sched->CreateTask(BlockerWorker,  //
+                                           &detached_ctx,  //
+                                           kDefaultTaskWeight);
+  ASSERT_THAT(detached, t::NotNull());
+  sched->Yield();
+  ASSERT_THAT(detached_ctx.phase.load(), t::Eq(1));
+  sched->Detach(detached);
+  for (int i = 0; i < 3; ++i) {
+    sched->Yield();
+    EXPECT_THAT(sched->ReapZombies(), t::Eq(0));
+  }
+  sched->Wake(detached);
+  int reaped = 0;
+  EXPECT_TRUE(YieldUntil([&reaped, sched]() {
+    reaped += sched->ReapZombies();
+    return reaped == 1;
+  }));
+  EXPECT_THAT(detached_ctx.phase.load(), t::Eq(2));
+  EXPECT_THAT(PmmFreeFrameCount(), t::Eq(pmm_before));
+  EXPECT_THAT(HeapTotalFreeBytes(), t::Eq(heap_before));
+  TaskResetForTest();
+}
+
+TEST(TaskTest, WakeFromAnInterruptHandlerQueuesTheTaskOnAnIdleCpuWithAnIpi) {
+  SetupEnv(3);
+  TaskInit();
+  TaskScheduler* const sched = GetTaskScheduler();
+  Task* const bootstrap = sched->CurrentTask();
+  const int64_t pmm_before = PmmFreeFrameCount();
+  const int64_t heap_before = HeapTotalFreeBytes();
+  const ScopedTestWakeHandler wake_handler;
+
+  // 1. The interrupt arrives on CPU 0, which is busy: the handler's Wake()
+  //    queues the task on the lowest idle CPU, 1, and sends it a wakeup IPI,
+  //    without switching tasks on CPU 0.
+  BlockerCtx ctx;
+  Task* const task =
+      sched->CreateTaskOnCpu(BlockerWorker, &ctx, kDefaultTaskWeight, 0);
+  ASSERT_THAT(task, t::NotNull());
+  sched->Yield();
+  ASSERT_THAT(ctx.phase.load(), t::Eq(1));
+  g_wake_target.store(task);
+  const int64_t eoi_before = g_env.eoi_count.load();
+  const int64_t cpu1_ipis_before = g_env.ipi_sent_count[1].load();
+  DispatchInterrupt(kTestWakeVector);
+  EXPECT_THAT(g_wake_handler_calls.load(), t::Eq(1));
+  EXPECT_THAT(g_wake_handler_cpu.load(), t::Eq(0));
+  EXPECT_FALSE(g_wake_handler_saw_interrupts_enabled.load());
+  EXPECT_THAT(g_env.eoi_count.load(), t::Eq(eoi_before + 1));
+  EXPECT_THAT(sched->CurrentTask(), t::Eq(bootstrap));
+  EXPECT_THAT(TaskSchedulerInternals::RunqueueLoad(*sched, 1), t::Eq(1));
+  EXPECT_THAT(g_env.ipi_sent_count[1].load(), t::Eq(cpu1_ipis_before + 1));
+  EXPECT_THAT(g_env.last_ipi_vector[1].load(), t::Eq(kVectorWakeupIpi));
+  // CPU 1 (the calling thread stands in for it) takes the IPI, and its idle
+  // loop runs the task.
+  BindCpuLocal(SmpGetCpuLocal(1));
+  DispatchInterrupt(kVectorWakeupIpi);
+  EXPECT_TRUE(TaskPollIdleCpu(1));
+  BindCpuLocal(SmpGetCpuLocal(0));
+  EXPECT_THAT(ctx.phase.load(), t::Eq(2));
+  EXPECT_THAT(ctx.resumed_cpu.load(), t::Eq(1));
+  sched->Join(task);
+
+  // 2. The interrupt arrives on idle CPU 2: the task goes to CPU 2 itself
+  //    (ties go to the calling CPU), which needs no IPI.
+  BlockerCtx idle_ctx;
+  Task* const idle_task_target =
+      sched->CreateTaskOnCpu(BlockerWorker, &idle_ctx, kDefaultTaskWeight, 0);
+  ASSERT_THAT(idle_task_target, t::NotNull());
+  sched->Yield();
+  ASSERT_THAT(idle_ctx.phase.load(), t::Eq(1));
+  g_wake_target.store(idle_task_target);
+  const int64_t ipis_before = g_env.ipi_sent_count[0].load() +
+                              g_env.ipi_sent_count[1].load() +
+                              g_env.ipi_sent_count[2].load();
+  BindCpuLocal(SmpGetCpuLocal(2));
+  DispatchInterrupt(kTestWakeVector);
+  EXPECT_THAT(g_wake_handler_cpu.load(), t::Eq(2));
+  EXPECT_THAT(TaskSchedulerInternals::RunqueueLoad(*sched, 2), t::Eq(1));
+  EXPECT_TRUE(TaskPollIdleCpu(2));
+  BindCpuLocal(SmpGetCpuLocal(0));
+  EXPECT_THAT(g_env.ipi_sent_count[0].load() + g_env.ipi_sent_count[1].load() +
+                  g_env.ipi_sent_count[2].load(),
+              t::Eq(ipis_before));
+  EXPECT_THAT(idle_ctx.resumed_cpu.load(), t::Eq(2));
+  sched->Join(idle_task_target);
+  EXPECT_THAT(PmmFreeFrameCount(), t::Eq(pmm_before));
+  EXPECT_THAT(HeapTotalFreeBytes(), t::Eq(heap_before));
+  TaskResetForTest();
+}
+
+struct SelfInterruptCtx {
+  std::atomic<int> runqueue_load_after_interrupt{-1};
+  std::atomic<int64_t> switches_in_block{-1};
+  std::atomic<bool> done{false};
+};
+
+// Takes an interrupt whose handler wakes this very task (the interrupt beats
+// the Block() that waits for it), then blocks.
+static void SelfInterruptWorker(void* const raw_ctx) {
+  SelfInterruptCtx* const ctx = static_cast<SelfInterruptCtx*>(raw_ctx);
+  g_wake_target.store(GetTaskScheduler()->CurrentTask());
+  DispatchInterrupt(kTestWakeVector);
+  ctx->runqueue_load_after_interrupt.store(
+      TaskSchedulerInternals::RunqueueLoad(*GetTaskScheduler(), 0));
+  const int64_t before = CurrentCpu()->context_switches.load();
+  GetTaskScheduler()->Block();
+  ctx->switches_in_block.store(CurrentCpu()->context_switches.load() - before);
+  ctx->done.store(true, std::memory_order_release);
+}
+
+TEST(TaskTest, InterruptThatWakesTheRunningTaskMakesItsNextBlockReturnAtOnce) {
+  SetupEnv(1);
+  TaskInit();
+  TaskScheduler* const sched = GetTaskScheduler();
+  const ScopedTestWakeHandler wake_handler;
+
+  SelfInterruptCtx ctx;
+  Task* const task =
+      sched->CreateTask(SelfInterruptWorker, &ctx, kDefaultTaskWeight);
+  ASSERT_THAT(task, t::NotNull());
+  sched->Join(task);
+  EXPECT_TRUE(ctx.done.load());
+  EXPECT_THAT(g_wake_handler_calls.load(), t::Eq(1));
+  // The running task was not queued a second time, and its Block() consumed
+  // the pending wakeup without switching.
+  EXPECT_THAT(ctx.runqueue_load_after_interrupt.load(), t::Eq(0));
+  EXPECT_THAT(ctx.switches_in_block.load(), t::Eq(0));
+  TaskResetForTest();
+}
+
+struct IrqWaitCtx {
+  int64_t interrupts_to_send = 0;
+  std::atomic<int64_t> pending{0};
+  std::atomic<int64_t> consumed{0};
+  std::atomic<int64_t> sent{0};
+  std::atomic<bool> abort{false};
+  std::atomic<bool> done{false};
+};
+
+// The wait loop of a driver: takes every pending interrupt, and blocks while
+// there is none.
+static void IrqWaitConsumerWorker(void* const raw_ctx) {
+  IrqWaitCtx* const ctx = static_cast<IrqWaitCtx*>(raw_ctx);
+  while (ctx->consumed.load() < ctx->interrupts_to_send) {
+    const int64_t got = ctx->pending.exchange(0, std::memory_order_acq_rel);
+    if (got == 0) {
+      if (ctx->abort.load(std::memory_order_acquire)) {
+        break;
+      }
+      GetTaskScheduler()->Block();
+      continue;
+    }
+    ctx->consumed.fetch_add(got, std::memory_order_acq_rel);
+  }
+  ctx->done.store(true, std::memory_order_release);
+}
+
+// A device on CPU 3 raises interrupts as fast as it can, each after posting
+// its event; the handler wakes the waiting task, which runs wherever the
+// work-stealing layer puts it. Wakeups may coalesce, but no event is lost.
+TEST(TaskTest, InterruptDrivenWaitLoopLosesNoInterrupts) {
+  constexpr int kNumCpus = 4;
+  SetupEnv(kNumCpus);
+  TaskInit();
+  TaskScheduler* const sched = GetTaskScheduler();
+  const int64_t pmm_before = PmmFreeFrameCount();
+  const int64_t heap_before = HeapTotalFreeBytes();
+  const ScopedTestWakeHandler wake_handler;
+
+  IrqWaitCtx ctx;
+  ctx.interrupts_to_send = 2000;
+  Task* const consumer = sched->CreateTaskOnCpu(IrqWaitConsumerWorker,  //
+                                                &ctx,                   //
+                                                kDefaultTaskWeight,     //
+                                                0);
+  ASSERT_THAT(consumer, t::NotNull());
+  g_wake_target.store(consumer);
+
+  std::atomic<bool> stop_aps{false};
+  std::vector<std::thread> ap_threads;
+  for (int cpu = 1; cpu < kNumCpus; ++cpu) {
+    ap_threads.emplace_back([cpu, &ctx, &stop_aps]() {
+      BindCpuLocal(SmpGetCpuLocal(cpu));
+      SetInterruptsEnabledForTest(true);
+      while (!stop_aps.load(std::memory_order_acquire)) {
+        // CPU 3 also hosts the device.
+        if (cpu == kNumCpus - 1 && ctx.sent.load() < ctx.interrupts_to_send) {
+          ctx.pending.fetch_add(1, std::memory_order_acq_rel);
+          ctx.sent.fetch_add(1, std::memory_order_acq_rel);
+          DispatchInterrupt(kTestWakeVector);
+        }
+        if (!TaskPollIdleCpu(cpu)) {
+          std::this_thread::yield();
+        }
+      }
+      ResetCpuLocalForTest();
+    });
+  }
+
+  const bool finished = YieldUntil([&ctx]() {
+    return ctx.done.load() &&
+           g_wake_handler_calls.load() == ctx.interrupts_to_send;
+  });
+  EXPECT_TRUE(finished);
+  if (!finished) {
+    ctx.abort.store(true, std::memory_order_release);
+    EXPECT_TRUE(YieldUntil([&ctx, sched, consumer]() {
+      sched->Wake(consumer);
+      return ctx.done.load();
+    }));
+  }
+  // No handler can wake the consumer anymore once the device has stopped.
+  stop_aps.store(true, std::memory_order_release);
+  for (std::thread& th : ap_threads) {
+    th.join();
+  }
+  g_wake_target.store(nullptr);
+  sched->Join(consumer);
+
+  EXPECT_THAT(ctx.consumed.load(), t::Eq(ctx.interrupts_to_send));
+  EXPECT_THAT(g_wake_handler_calls.load(), t::Eq(ctx.interrupts_to_send));
+  EXPECT_THAT(PmmFreeFrameCount(), t::Eq(pmm_before));
+  EXPECT_THAT(HeapTotalFreeBytes(), t::Eq(heap_before));
+  TaskResetForTest();
+}
+
+struct TickedBlockerCtx {
+  std::atomic<int64_t> own_ticks_before_block{-1};
+  std::atomic<bool> done{false};
+};
+
+// Takes three real timer interrupts, then blocks.
+static void TickedBlockerWorker(void* const raw_ctx) {
+  TickedBlockerCtx* const ctx = static_cast<TickedBlockerCtx*>(raw_ctx);
+  for (int i = 0; i < 3; ++i) {
+    DispatchInterrupt(kVectorApicTimer);
+  }
+  ctx->own_ticks_before_block.store(
+      TaskTimerTicks(GetTaskScheduler()->CurrentTask()));
+  GetTaskScheduler()->Block();
+  ctx->done.store(true, std::memory_order_release);
+}
+
+TEST(TaskTest, TaskTimerTicksCountsTheTimerInterruptsThatHitEachTask) {
+  SetupEnv(1);
+  TaskInit();
+  TaskScheduler* const sched = GetTaskScheduler();
+  Task* const bootstrap = sched->CurrentTask();
+  // Ticks count even while they may not preempt.
+  sched->SetPreemptEnabled(false);
+
+  TickedBlockerCtx ctx;
+  Task* const task =
+      sched->CreateTask(TickedBlockerWorker, &ctx, kDefaultTaskWeight);
+  ASSERT_THAT(task, t::NotNull());
+  const int64_t bootstrap_ticks = TaskTimerTicks(bootstrap);
+  sched->Yield();
+  EXPECT_THAT(ctx.own_ticks_before_block.load(), t::Eq(3));
+  EXPECT_THAT(TaskTimerTicks(task), t::Eq(3));
+  EXPECT_THAT(TaskTimerTicks(bootstrap), t::Eq(bootstrap_ticks));
+
+  // While the task is blocked, CPU 0's ticks are all the bootstrap task's.
+  for (int i = 0; i < 5; ++i) {
+    DispatchInterrupt(kVectorApicTimer);
+  }
+  EXPECT_THAT(TaskTimerTicks(task), t::Eq(3));
+  EXPECT_THAT(TaskTimerTicks(bootstrap), t::Eq(bootstrap_ticks + 5));
+
+  sched->SetPreemptEnabled(true);
+  sched->Wake(task);
+  sched->Join(task);
+  EXPECT_TRUE(ctx.done.load());
+  TaskResetForTest();
+}
+
+struct TimedWaitCtx {
+  int64_t timeout_ticks = 0;
+  std::atomic<int64_t> deadline{-1};
+  std::atomic<int> returns{0};
+  std::atomic<int64_t> end_tick{-1};
+  std::atomic<bool> release{false};
+  std::atomic<bool> done{false};
+};
+
+// Waits, blocked, until CPU 0's tick count reaches now + `timeout_ticks` or
+// until released, as a driver's interrupt wait with a timeout does.
+static void TimedWaitWorker(void* const raw_ctx) {
+  TimedWaitCtx* const ctx = static_cast<TimedWaitCtx*>(raw_ctx);
+  const int64_t deadline = Cpu0TimerTicks() + ctx->timeout_ticks;
+  ctx->deadline.store(deadline);
+  while (!ctx->release.load() && Cpu0TimerTicks() < deadline) {
+    GetTaskScheduler()->BlockUntil(deadline);
+    ctx->returns.fetch_add(1);
+  }
+  ctx->end_tick.store(Cpu0TimerTicks());
+  ctx->done.store(true, std::memory_order_release);
+}
+
+TEST(TaskTest, BlockUntilEndsOnTheCpu0TimerTickThatReachesTheDeadline) {
+  SetupEnv(2);
+  TaskInit();
+  TaskScheduler* const sched = GetTaskScheduler();
+  const int64_t pmm_before = PmmFreeFrameCount();
+  const int64_t heap_before = HeapTotalFreeBytes();
+
+  TimedWaitCtx ctx;
+  ctx.timeout_ticks = 3;
+  Task* const task =
+      sched->CreateTaskOnCpu(TimedWaitWorker, &ctx, kDefaultTaskWeight, 0);
+  ASSERT_THAT(task, t::NotNull());
+  sched->Yield();
+  ASSERT_THAT(ctx.deadline.load(), t::Ge(0));
+  EXPECT_THAT(TaskRunningCpu(task), t::Eq(-1));
+  EXPECT_THAT(ctx.returns.load(), t::Eq(0));
+
+  // CPU 0's ticks end the wait at the deadline, also with preemption
+  // disabled.
+  sched->SetPreemptEnabled(false);
+  while (Cpu0TimerTicks() + 1 < ctx.deadline.load()) {
+    DispatchInterrupt(kVectorApicTimer);
+    EXPECT_THAT(TaskSchedulerInternals::RunqueueLoad(*sched, 0) +
+                    TaskSchedulerInternals::RunqueueLoad(*sched, 1),
+                t::Eq(0));
+  }
+  DispatchInterrupt(kVectorApicTimer);
+  EXPECT_THAT(Cpu0TimerTicks(), t::Eq(ctx.deadline.load()));
+  // Woken from busy CPU 0, the task went to idle CPU 1.
+  EXPECT_THAT(TaskSchedulerInternals::RunqueueLoad(*sched, 1), t::Eq(1));
+  sched->SetPreemptEnabled(true);
+  BindCpuLocal(SmpGetCpuLocal(1));
+  EXPECT_TRUE(TaskPollIdleCpu(1));
+  BindCpuLocal(SmpGetCpuLocal(0));
+  sched->Join(task);
+
+  EXPECT_TRUE(ctx.done.load());
+  EXPECT_THAT(ctx.returns.load(), t::Eq(1));
+  EXPECT_THAT(ctx.end_tick.load(), t::Eq(ctx.deadline.load()));
+  EXPECT_THAT(PmmFreeFrameCount(), t::Eq(pmm_before));
+  EXPECT_THAT(HeapTotalFreeBytes(), t::Eq(heap_before));
+  TaskResetForTest();
+}
+
+struct EarlyWakeCtx {
+  std::atomic<int64_t> deadline{-1};
+  std::atomic<int64_t> returned_at{-1};
+  std::atomic<bool> second_block_returned{false};
+};
+
+// BlockUntil() with a deadline 5 ticks away, then a plain Block().
+static void EarlyWakeWorker(void* const raw_ctx) {
+  EarlyWakeCtx* const ctx = static_cast<EarlyWakeCtx*>(raw_ctx);
+  const int64_t deadline = Cpu0TimerTicks() + 5;
+  ctx->deadline.store(deadline);
+  GetTaskScheduler()->BlockUntil(deadline);
+  ctx->returned_at.store(Cpu0TimerTicks());
+  GetTaskScheduler()->Block();
+  ctx->second_block_returned.store(true, std::memory_order_release);
+}
+
+// A Wake() before the deadline ends BlockUntil(), which then leaves nothing
+// behind for the timer: the deadline passing later must not end the task's
+// next Block().
+TEST(TaskTest, BlockUntilEndedEarlyByWakeIsNotWokenAgainByItsDeadline) {
+  SetupEnv(1);
+  TaskInit();
+  TaskScheduler* const sched = GetTaskScheduler();
+  const int64_t pmm_before = PmmFreeFrameCount();
+  const int64_t heap_before = HeapTotalFreeBytes();
+
+  EarlyWakeCtx ctx;
+  Task* const task =
+      sched->CreateTask(EarlyWakeWorker, &ctx, kDefaultTaskWeight);
+  ASSERT_THAT(task, t::NotNull());
+  sched->Yield();
+  ASSERT_THAT(ctx.deadline.load(), t::Ge(0));
+  sched->Wake(task);
+  EXPECT_TRUE(YieldUntil([&ctx, task]() {
+    return ctx.returned_at.load() >= 0 && TaskRunningCpu(task) == -1;
+  }));
+  EXPECT_THAT(ctx.returned_at.load(), t::Lt(ctx.deadline.load()));
+
+  for (int i = 0; i < 10; ++i) {
+    DispatchInterrupt(kVectorApicTimer);
+  }
+  EXPECT_THAT(Cpu0TimerTicks(), t::Gt(ctx.deadline.load()));
+  for (int i = 0; i < 3; ++i) {
+    sched->Yield();
+  }
+  EXPECT_FALSE(ctx.second_block_returned.load());
+  EXPECT_THAT(TaskSchedulerInternals::RunqueueLoad(*sched, 0), t::Eq(0));
+
+  sched->Wake(task);
+  sched->Join(task);
+  EXPECT_TRUE(ctx.second_block_returned.load());
+  EXPECT_THAT(PmmFreeFrameCount(), t::Eq(pmm_before));
+  EXPECT_THAT(HeapTotalFreeBytes(), t::Eq(heap_before));
+  TaskResetForTest();
+}
+
+TEST(TaskDeathTest, BlockingMisuseThroughTheComposedSchedulerFailsChecks) {
+  SetupEnv(2);
+  TaskInit();
+  TaskScheduler* const sched = GetTaskScheduler();
+  // The bootstrap task (CPU 0's boot context) never blocks.
+  EXPECT_DEATH(sched->Block(), "Check failed: !self->is_bootstrap");
+  EXPECT_DEATH(sched->BlockUntil(1 << 20), "Check failed: !self->is_bootstrap");
+  EXPECT_DEATH(sched->Wake(nullptr), "Check failed: task != nullptr");
   TaskResetForTest();
 }
 

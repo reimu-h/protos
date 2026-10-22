@@ -79,6 +79,14 @@ constexpr uint8_t kVectorSyscall = 0x80;
 constexpr uint8_t kVectorTlbShootdown = 0xF0;
 constexpr uint8_t kVectorSpurious = 0xFF;
 
+// Device MSI / MSI-X interrupt vectors (device_irq.h): 48 vectors in priority
+// classes 5, 6 and 7, leaving out 0x20-0x22, 0x2F (boot_selftest), 0x40
+// (idt_test), 0x80 (system calls), 0xE0-0xEF (PIC) and 0xF0/0xFF (APIC).
+constexpr int kDeviceIrqVectorFirst = 0x50;
+constexpr int kDeviceIrqVectorLast = 0x7F;
+constexpr int kDeviceIrqVectorCount =
+    kDeviceIrqVectorLast - kDeviceIrqVectorFirst + 1;
+
 // 16-byte 64-bit IDT Gate Descriptor per Intel SDM Vol. 3A §6.14.1.
 struct [[gnu::packed]] IdtGateDescriptor {
   uint16_t offset_low;

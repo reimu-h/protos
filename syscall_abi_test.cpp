@@ -101,15 +101,93 @@ TEST(SyscallAbiTest, NumbersAndLimitsStayTheSame) {
   EXPECT_THAT(kSyscallRead, t::Eq(4));
   EXPECT_THAT(kSyscallSpawn, t::Eq(5));
   EXPECT_THAT(kSyscallWait, t::Eq(6));
+  EXPECT_THAT(kSyscallSpawnDriver, t::Eq(7));
+  EXPECT_THAT(kSyscallPciInfo, t::Eq(8));
+  EXPECT_THAT(kSyscallPciClaim, t::Eq(9));
+  EXPECT_THAT(kSyscallPciBusMaster, t::Eq(10));
+  EXPECT_THAT(kSyscallMmioMap, t::Eq(11));
+  EXPECT_THAT(kSyscallDmaAlloc, t::Eq(12));
+  EXPECT_THAT(kSyscallIrqAlloc, t::Eq(13));
+  EXPECT_THAT(kSyscallIrqWait, t::Eq(14));
+  EXPECT_THAT(kSyscallConsolePush, t::Eq(15));
+  EXPECT_THAT(kSyscallGetTicks, t::Eq(16));
   EXPECT_THAT(kSyscallWriteMaxSize, t::Eq(4096));
   EXPECT_THAT(kSyscallSpinMaxSize, t::Eq(4096));
   EXPECT_THAT(kSyscallSpinMaxTicks, t::Eq(1000000));
   EXPECT_THAT(kSyscallReadMaxSize, t::Eq(4096));
   EXPECT_THAT(kSyscallSpawnMaxNameLength, t::Eq(64));
   EXPECT_THAT(kMaxUserChildProcesses, t::Eq(8));
+  EXPECT_THAT(kSyscallConsolePushMaxSize, t::Eq(256));
+  EXPECT_THAT(kSyscallMmioMaxSize, t::Eq(16LL << 20));
+  EXPECT_THAT(kSyscallDmaMaxSize, t::Eq(1LL << 20));
+  EXPECT_THAT(kSyscallDmaMaxTotalSize, t::Eq(16LL << 20));
+  EXPECT_THAT(kSyscallMaxClaims, t::Eq(16));
+  EXPECT_THAT(kSyscallDmaBelow4GiB, t::Eq(1ULL));
+  EXPECT_THAT(kSyscallDmaFlagsMask, t::Eq(kSyscallDmaBelow4GiB));
+  EXPECT_THAT(kSyscallIrqModeAuto, t::Eq(0));
+  EXPECT_THAT(kSyscallIrqModeMsi, t::Eq(1));
+  EXPECT_THAT(kSyscallIrqModeMsix, t::Eq(2));
+  EXPECT_THAT(kSyscallIrqMaxCount, t::Eq(32));
+  EXPECT_THAT(kSyscallIrqWaitMaxTicks, t::Eq(1000000));
+  EXPECT_THAT(kSyscallTicksPerSecond, t::Eq(250));
+  EXPECT_THAT(kSyscallErrorPermission, t::Eq(-1));
+  EXPECT_THAT(kSyscallErrorNoMemory, t::Eq(-12));
+  EXPECT_THAT(kSyscallErrorAccess, t::Eq(-13));
   EXPECT_THAT(kSyscallErrorFault, t::Eq(-14));
+  EXPECT_THAT(kSyscallErrorBusy, t::Eq(-16));
+  EXPECT_THAT(kSyscallErrorNoDevice, t::Eq(-19));
   EXPECT_THAT(kSyscallErrorInvalid, t::Eq(-22));
   EXPECT_THAT(kSyscallErrorNoSys, t::Eq(-38));
+  EXPECT_THAT(kUserCapNone, t::Eq(0ULL));
+  EXPECT_THAT(kUserCapDriver, t::Eq(1ULL << 0));
+  EXPECT_THAT(kUserCapSpawnDrivers, t::Eq(1ULL << 1));
+  EXPECT_THAT(kInitArgStartDrivers, t::Eq(1ULL << 0));
+  EXPECT_THAT(kDriverArgNormal, t::Eq(0ULL));
+  EXPECT_THAT(kDriverArgExitAfterReady, t::Eq(1ULL));
+  EXPECT_THAT(kDriverArgFaultAfterReady, t::Eq(2ULL));
+}
+
+TEST(SyscallAbiTest, DriverAbiLayoutsAndHelpers) {
+  EXPECT_TRUE(SyscallIsError(-1));
+  EXPECT_TRUE(SyscallIsError(-4095));
+  EXPECT_TRUE(SyscallIsError(kSyscallErrorPermission));
+  EXPECT_TRUE(SyscallIsError(kSyscallErrorNoSys));
+  EXPECT_FALSE(SyscallIsError(0));
+  EXPECT_FALSE(SyscallIsError(1));
+  EXPECT_FALSE(SyscallIsError(-4096));
+  // Higher-half user virtual addresses (MMIO / DMA windows) cast to negative
+  // int64_t values outside [-4095, -1] and are not errors.
+  EXPECT_FALSE(SyscallIsError(static_cast<int64_t>(0xFFFF900000000000ULL)));
+  EXPECT_FALSE(SyscallIsError(static_cast<int64_t>(0xFFFFA00000000000ULL)));
+
+  for (int64_t num = -1; num <= 20; ++num) {
+    const bool expected = (num >= 8 && num <= 15);
+    EXPECT_THAT(SyscallIsDriverOnly(num), t::Eq(expected)) << "syscall " << num;
+  }
+
+  for (int64_t num = -1; num <= 20; ++num) {
+    const bool is_unpriv = (num >= 0 && num <= 6) || num == kSyscallGetTicks;
+    const bool is_spawn_drv = (num == kSyscallSpawnDriver);
+    const bool is_drv_only =
+        (num >= kSyscallPciInfo && num <= kSyscallConsolePush);
+    EXPECT_THAT(MayMakeSyscall(kUserCapNone, num),
+                t::Eq(is_unpriv || (!is_spawn_drv && !is_drv_only)))
+        << "syscall " << num;
+    EXPECT_THAT(MayMakeSyscall(kUserCapDriver, num), t::Eq(!is_spawn_drv))
+        << "syscall " << num;
+    EXPECT_THAT(MayMakeSyscall(kUserCapSpawnDrivers, num), t::Eq(!is_drv_only))
+        << "syscall " << num;
+    EXPECT_TRUE(MayMakeSyscall(kUserCapDriver | kUserCapSpawnDrivers, num))
+        << "syscall " << num;
+  }
+
+  const PciDeviceInfo info{};
+  EXPECT_THAT(sizeof(info), t::Eq(176U));
+  EXPECT_THAT(alignof(PciDeviceInfo), t::Eq(8U));
+  EXPECT_THAT(sizeof(PciBarInfo), t::Eq(24U));
+  EXPECT_THAT(alignof(PciBarInfo), t::Eq(8U));
+  EXPECT_THAT(info.parent_index, t::Eq(-1));
+  EXPECT_THAT(info.bars[0].type, t::Eq(PciBarInfoType::kNone));
 }
 
 TEST(SyscallAbiTest, UserProgramResultDefaultsAndOutcomes) {

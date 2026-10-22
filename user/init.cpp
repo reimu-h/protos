@@ -1,9 +1,11 @@
 // init: the first user process, which the kernel starts once it has booted
-// (kernel.cpp). It greets from user mode, spawns the interactive shell (sh),
-// waits for the shell to finish, and exits.
+// (kernel.cpp). It greets from user mode, optionally starts user-space hardware
+// drivers when `kInitArgStartDrivers` is set in `arg`, spawns the interactive
+// shell (sh), waits for the shell to finish, and exits.
 
 #include <cstdint>
 
+#include "syscall_abi.h"
 #include "user/syscall.h"
 
 namespace protos::user {
@@ -21,7 +23,12 @@ int64_t Main(const uint64_t arg) {
   if (Print("[INIT] hello from ring 3\n") < 0) {
     return 2;
   }
-  const int64_t sh_pid = Spawn("sh", arg);
+  if ((arg & kInitArgStartDrivers) != 0) {
+    if (SpawnDriver("usbkbd", kDriverArgNormal) < 0) {
+      return 7;
+    }
+  }
+  const int64_t sh_pid = Spawn("sh", arg & ~kInitArgStartDrivers);
   if (sh_pid < 0) {
     return 3;
   }

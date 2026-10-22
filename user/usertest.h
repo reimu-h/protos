@@ -140,6 +140,61 @@ enum class Mode : uint8_t {
   //   3 (`kOrphanOnFault`): spawns a spinning child and faults (#UD) without
   //     waiting for it.
   kSpawnAndWait,
+  // Calls every privileged system call (`7..16`) from an unprivileged process
+  // (`kUserCapNone`), checks that each returns `kSyscallErrorPermission`, that
+  // out-of-range system calls (`17`, `-1`) return `kSyscallErrorNoSys`, and
+  // that a child spawned via `spawn()` also gets `kSyscallErrorPermission`.
+  kDriverDenied,
+  // Probes capability separation (`DriverSubmode(arg)`):
+  //   0 (`kProbeDriverRole`): run as `kUserCapDriver`; checks `pci_info` works,
+  //     `spawn_driver` returns `kSyscallErrorPermission`, reserved syscall `16`
+  //     returns `kSyscallErrorNoSys`, and a child spawned via `spawn()` runs
+  //     `kDriverDenied` with `kUserCapNone` and exits with 0.
+  //   1 (`kProbeSpawnerRole`): run as `kUserCapSpawnDrivers`; checks driver
+  //     syscalls `8..16` return `kSyscallErrorPermission`, then calls
+  //     `spawn_driver("usertest", ...)` with `kProbeDriverRole` and waits for
+  //     the driver child to exit with 0.
+  kDriverCapProbe,
+  // Claims PCI device `DriverDeviceIndex(arg)`, enables Bus Master, maps BAR
+  // `DriverBarIndex(arg)`, and according to `DriverSubmode(arg)`
+  // (`DriverHoldSubmode`):
+  //   0 (`kHoldSpin`): also allocates 4 pages of DMA memory, allocates device
+  //     IRQs (if supported), spawns a spinning child, and blocks in
+  //     `irq_wait(0, kSyscallIrqWaitMaxTicks)` until killed.
+  //   1 (`kHoldExit`): sets up the same 6 resources and exits with 0.
+  //   2 (`kHoldFault`): sets up the same 6 resources and raises #UD.
+  //   3 (`kHoldClaimOnly`): claims the device, enables Bus Master, maps the BAR
+  //     (if valid), and blocks in `irq_wait(0, kSyscallIrqWaitMaxTicks)` until
+  //     killed.
+  kDriverHold,
+  // Exercises PCI info, claim, and foreign/unowned device rejection on
+  // `DriverDeviceIndex(arg)` / `DriverBarIndex(arg)` according to
+  // `DriverSubmode(arg)` (`DriverForeignSubmode`).
+  kDriverForeign,
+  // Claims `DriverDeviceIndex(arg)`, maps BAR `DriverBarIndex(arg)`, verifies
+  // virtual address range, page offset, idempotency, 32-bit MMIO read, and
+  // invalid BAR arguments, and (when `DriverSubmode(arg) == 1`) blocks in
+  // `irq_wait` so the boot self-test can inspect live PTEs before killing it.
+  kDriverMmioChecks,
+  // Claims `DriverDeviceIndex(arg)`, maps BAR `DriverBarIndex(arg)`, and faults
+  // on purpose (`DriverMmioFaultSubmode`):
+  //   0 (`kFaultExecuteMmio`): jumps to the mapped MMIO address (#PF NX fetch).
+  //   1 (`kFaultReadWithheldMsix`): reads from the withheld MSI-X table page
+  //     offset inside the BAR (#PF non-present).
+  kDriverMmioFault,
+  // Validates `dma_alloc` error cases, allocates 4-page and 1-page DMA buffers,
+  // verifies zero-initialization, virtual/physical alignment, and distinct
+  // addresses, writes test patterns, and either blocks in `irq_wait` (`submode
+  // == 0`) so the boot self-test can inspect PTEs and physical contiguity or
+  // jumps to the DMA buffer (`submode == 1`) to trigger an NX instruction-fetch
+  // #PF.
+  kDriverDmaChecks,
+  // Validates `console_push` error cases and pushes `"drv_in!\n"` into the
+  // console input ring.
+  kDriverConsolePush,
+  // Exercises `irq_alloc` and `irq_wait` on `DriverDeviceIndex(arg)` according
+  // to `DriverSubmode(arg)` (`DriverIrqSubmode`).
+  kDriverIrqWait,
 };
 
 enum class SpawnTestSubmode : uint8_t {
@@ -147,6 +202,36 @@ enum class SpawnTestSubmode : uint8_t {
   kBlockInWait = 1,
   kOrphanOnExit = 2,
   kOrphanOnFault = 3,
+};
+
+enum class DriverCapProbeSubmode : uint8_t {
+  kProbeDriverRole = 0,
+  kProbeSpawnerRole = 1,
+};
+
+enum class DriverHoldSubmode : uint8_t {
+  kHoldSpin = 0,
+  kHoldExit = 1,
+  kHoldFault = 2,
+  kHoldClaimOnly = 3,
+};
+
+enum class DriverForeignSubmode : uint8_t {
+  kUnclaimedDevice = 0,
+  kOwnedByOtherProcess = 1,
+  kValidationAndClaimToggle = 2,
+};
+
+enum class DriverMmioFaultSubmode : uint8_t {
+  kFaultExecuteMmio = 0,
+  kFaultReadWithheldMsix = 1,
+};
+
+enum class DriverIrqSubmode : uint8_t {
+  kIrqValidationAndTimeout = 0,
+  kIrqPrePendingAndSelectiveMask = 1,
+  kIrqBlockingWakeup = 2,
+  kIrqKillWhileBlocked = 3,
 };
 
 constexpr int64_t kExitStatus = -0x123456789AB;
@@ -318,6 +403,36 @@ static_assert((FpuLongSyscallArg(8, 4, 9) & 0xFF) ==
 static_assert(KernelSpinTicks(FpuLongSyscallArg(8, 4, 9)) == 8);
 static_assert(KernelSpinCalls(FpuLongSyscallArg(8, 4, 9)) == 4);
 static_assert(KernelSpinSeed(FpuLongSyscallArg(8, 4, 9)) == 9);
+
+// Encodes a driver mode argument:
+//   bits  0.. 7: `mode`
+//   bits  8..15: `submode`
+//   bits 16..31: `device_index`
+//   bits 32..39: `bar_index`
+constexpr uint64_t DriverArg(const Mode mode,             //
+                             const uint8_t submode = 0,   //
+                             const int device_index = 0,  //
+                             const int bar_index = 0) {
+  return Arg(mode) | (static_cast<uint64_t>(submode) << 8) |
+         (static_cast<uint64_t>(device_index & 0xFFFF) << 16) |
+         (static_cast<uint64_t>(bar_index & 0xFF) << 32);
+}
+
+constexpr uint8_t DriverSubmode(const uint64_t arg) {
+  return static_cast<uint8_t>((arg >> 8) & 0xFF);
+}
+
+constexpr int DriverDeviceIndex(const uint64_t arg) {
+  return static_cast<int>(static_cast<int16_t>((arg >> 16) & 0xFFFF));
+}
+
+constexpr int DriverBarIndex(const uint64_t arg) {
+  return static_cast<int>((arg >> 32) & 0xFF);
+}
+
+static_assert(DriverSubmode(DriverArg(Mode::kDriverHold, 2, 5, 3)) == 2);
+static_assert(DriverDeviceIndex(DriverArg(Mode::kDriverHold, 2, 5, 3)) == 5);
+static_assert(DriverBarIndex(DriverArg(Mode::kDriverHold, 2, 5, 3)) == 3);
 
 }  // namespace protos::usertest
 

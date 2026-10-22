@@ -41,9 +41,26 @@ class AddressSpace {
   // (paging.h) or is mapped already, or if memory runs out.
   uintptr_t MapNewPage(uintptr_t user_addr, UserPageAccess access);
 
+  // Maps the non-owned device MMIO page at non-zero page-aligned `phys_addr`
+  // at page-aligned `user_addr` as uncacheable, writable and non-executable
+  // (`PagingMapUserDevicePage()`). `~AddressSpace()` does not free `phys_addr`
+  // to the PMM.
+  bool MapDevicePage(uintptr_t user_addr, uintptr_t phys_addr);
+
+  // Maps the PMM-owned frame at `frame_phys` at page-aligned `user_addr` with
+  // `access`; on success, the address space takes over `frame_phys` and frees
+  // it in `~AddressSpace()`.
+  bool MapOwnedFrame(uintptr_t user_addr,   //
+                     uintptr_t frame_phys,  //
+                     UserPageAccess access);
+
   // Returns the physical address of the frame that the page at page-aligned
   // `user_addr` maps to, or 0 if it is not mapped.
   uintptr_t PageFrame(uintptr_t user_addr) const;
+
+  // Fills `*info` with the attributes of the mapped user page at `user_addr`
+  // and returns true, or returns false if it is not mapped.
+  bool QueryPage(uintptr_t user_addr, UserPageInfo* info) const;
 
   // The root of the page tables: the physical address of the PML4.
   uintptr_t root() const { return root_; }

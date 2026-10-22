@@ -8,12 +8,14 @@ import json
 import os
 from pathlib import Path
 import random
+import re
 import shlex
 import shutil
 import stat
 import subprocess
 import tempfile
 import textwrap
+import time
 import unittest
 
 import deflake
@@ -94,15 +96,372 @@ def make_serial_log(
   return (crlf.join(lines) + crlf).encode("latin-1")
 
 
+# A fake qemu-system-x86_64 for test_boot.sh's USB keyboard scenarios. Its
+# guest boots like the kernel in the interactive boot session (the boot
+# self-tests, then an init session that waits for 'exit 0'), has a driver that
+# turns the key events of each USB keyboard into boot-protocol reports (like
+# QEMU's usb-kbd) and those into US-layout characters, and the shell's line
+# editor; the serial console socket drops unread input when the client hangs
+# up (like QEMU). FAKE_BOOT_LINES names a file of lines to print before the
+# self-tests end; FAKE_BUG injects one bug: "noninteractive" (the kernel
+# ignores the fw_cfg opt-in) or "symbols_unshifted" (Shift does not change
+# digits and symbols).
+FAKE_GUEST_QEMU = r'''#!/usr/bin/env python3
+import json, os, queue, select, socket, sys, threading, time
+
+argv = sys.argv[1:]
+if "--version" in argv:
+    print("QEMU emulator version 11.1.0")
+    sys.exit(0)
+BUG = os.environ.get("FAKE_BUG", "")
+
+
+def values(name):
+    return [argv[i + 1] for i, a in enumerate(argv[:-1]) if a == name]
+
+
+def opts(spec):
+    parts = spec.split(",")
+    return parts[0], dict(p.split("=", 1) for p in parts[1:] if "=" in p)
+
+
+serial_sock_path = None
+serial = values("-serial")[0]
+if serial.startswith("file:"):
+    log_path = serial[len("file:"):]
+else:
+    for spec in values("-chardev"):
+        _, o = opts(spec)
+        if o.get("id") == serial[len("chardev:"):]:
+            log_path, serial_sock_path = o["logfile"], o["path"]
+qmp_path = values("-qmp")[0][len("unix:"):].split(",")[0]
+monitor_path = values("-monitor")[0][len("unix:"):].split(",")[0]
+interactive = ("name=opt/protos/boot_session,string=interactive" in
+               values("-fw_cfg") and BUG != "noninteractive")
+uefi = "-bios" in argv
+controllers, cold, slot = {}, [], 4
+for spec in values("-device"):
+    driver, o = opts(spec)
+    if driver in ("qemu-xhci", "nec-usb-xhci"):
+        if o.get("bus") == "br1":
+            bdf = "01:%02x.0" % int(o["addr"])
+        else:
+            bdf, slot = "00:%02x.0" % slot, slot + 1
+        controllers[o["id"]] = (bdf, "msi" if o.get("msix") == "off" else "msix")
+    elif driver == "pci-bridge":
+        controllers[o["id"]], slot = ("00:%02x.0" % slot, None), slot + 1
+    elif driver == "usb-kbd":
+        cold.append({"id": o["id"], "ctrl": o["bus"].split(".")[0],
+                     "port": int(o["port"]),
+                     "speed": "fs" if o.get("usb_version") == "1" else "hs"})
+
+log_lock = threading.Lock()
+log_file = open(log_path, "ab", buffering=0)
+
+
+def log(text):
+    with log_lock:
+        log_file.write(text.replace("\n", "\r\n").encode("latin-1"))
+
+
+SHIFTED = dict(zip("0123456789", ")!@#$%^&*("))
+KEYS = {"grave_accent": "`~", "minus": "-_", "equal": "=+", "bracket_left": "[{",
+        "bracket_right": "]}", "backslash": "\\|", "semicolon": ";:",
+        "apostrophe": "'\"", "comma": ",<", "dot": ".>", "slash": "/?",
+        "spc": "  ", "tab": "\t\t", "ret": "\r\r", "backspace": "\b\b"}
+KEYS.update({d: d + SHIFTED[d] for d in SHIFTED})
+shell_input = queue.Queue()
+keyboards = []  # newest last
+caps_lock = [False]
+lock = threading.Lock()
+
+
+def new_keyboard(spec):
+    return dict(spec, events=[], mods=set(), keys=[], previous=[],
+                armed=False)
+
+
+def driver():
+    """Turns queued key events into reports (one per poll) and new keys of a
+    report into characters for the shell."""
+    while True:
+        with lock:
+            ready = [k for k in keyboards if k["armed"] and k["events"]]
+        for kb in ready:
+            qcode, down = kb["events"].pop(0)
+            if qcode in ("shift", "shift_r"):
+                (kb["mods"].add if down else kb["mods"].discard)(qcode)
+            elif down and qcode not in kb["keys"]:
+                kb["keys"].append(qcode)
+            elif not down and qcode in kb["keys"]:
+                kb["keys"].remove(qcode)
+            new = [k for k in kb["keys"] if k not in kb["previous"]]
+            kb["previous"] = list(kb["keys"])
+            shift = bool(kb["mods"])
+            for key in new:
+                if key == "caps_lock":
+                    caps_lock[0] = not caps_lock[0]
+                elif len(key) == 1 and key.isalpha():
+                    shell_input.put(key.upper() if shift != caps_lock[0] else key)
+                else:
+                    use_shift = shift and BUG != "symbols_unshifted"
+                    shell_input.put(KEYS[key][1 if use_shift else 0])
+        time.sleep(0.002)
+
+
+def attach(kb):
+    time.sleep(0.05)
+    kb["armed"] = True
+    log("[USBKBD] keyboard attached: %s port %d (%s)\n" % (
+        controllers[kb["ctrl"]][0], kb["port"] + 4, kb["speed"]))
+
+
+def detach(kb):
+    time.sleep(0.02)
+    log("[USBKBD] keyboard detached: %s port %d\n" % (
+        controllers[kb["ctrl"]][0], kb["port"] + 4))
+
+
+def shell():
+    line = []
+    last_cr = False
+    log("sh> ")
+    while True:
+        ch = shell_input.get()
+        if ch == "\n" and last_cr:
+            last_cr = False
+            continue
+        last_cr = ch == "\r"
+        if ch in "\r\n":
+            log("\n")
+            words = "".join(line).split()
+            line = []
+            if words[:1] == ["echo"]:
+                log(" ".join(words[1:16]) + "\n")
+            elif words == ["help"]:
+                log("built-in commands: help echo cpu programs run exit\n"
+                    "user programs: init sh usertest\n")
+            elif words == ["usertest", "0"]:
+                log("sh: usertest exited with status -1250999896491\n")
+            elif words[:1] == ["exit"]:
+                return
+            elif words:
+                log("sh: unknown command: %s\n" % words[0])
+            log("sh> ")
+        elif ch == "\b":
+            if line:
+                line.pop()
+                log("\b \b")
+        elif " " <= ch.replace("\t", " ") <= "~" and len(line) < 128:
+            line.append(ch.replace("\t", " "))
+            log(line[-1])
+
+
+def serial_server():
+    server = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    server.bind(serial_sock_path)
+    server.listen(1)
+    while True:
+        conn, _ = server.accept()
+        poller = select.poll()
+        poller.register(conn, select.POLLIN | select.POLLHUP)
+        while True:
+            events = poller.poll(1000)
+            if events and events[0][1] & select.POLLHUP:
+                break  # Like QEMU: unread input is lost.
+            if events:
+                data = conn.recv(14)  # One UART FIFO at a time.
+                if not data:
+                    break
+                for ch in data.decode("latin-1"):
+                    shell_input.put(ch)
+                time.sleep(0.004)
+        conn.close()
+
+
+def boot():
+    with open(os.environ["FAKE_BOOT_LINES"]) as f:
+        log(f.read())
+    if uefi:
+        log("[PMM] mmap entry: base=0x100000000 len=0x40000000 type=1\n"
+            "[PMM] Framebuffer: addr=0x80000000 pitch=5120 width=1280 "
+            "height=800 bpp=32\n")
+    script = "help\necho boot_sh_ok\nusertest 0\n"
+    stress = "[STRESS] random_multicpu_stress: PASS\n" * 3
+    if not interactive:
+        log("[INIT] hello from ring 3\n")
+        for ch in script + "exit 0\n":
+            shell_input.put(ch)
+        shell()
+        log("[INIT] exited with status 0\n[TEST] ALL BOOT SELF-TESTS PASSED\n")
+        log(stress)
+        return
+    log("[TEST] ALL BOOT SELF-TESTS PASSED\n[INIT] hello from ring 3\n")
+    for ch in script:
+        shell_input.put(ch)
+    for bdf, mode in controllers.values():
+        if mode:
+            log("[USBKBD] controller %s ready (%s)\n" % (bdf, mode))
+    with lock:
+        for spec in cold:
+            kb = new_keyboard(spec)
+            keyboards.append(kb)
+            threading.Thread(target=attach, args=(kb,), daemon=True).start()
+    shell()
+    log("[INIT] exited with status 0\n[TEST] driver_session_cleanup: PASS\n")
+    log(stress)
+
+
+def pci_devices():
+    devices, bridge = [], None
+    for qid, (bdf, mode) in controllers.items():
+        bus, rest = bdf.split(":")
+        device = {"bus": int(bus, 16), "slot": int(rest[:2], 16),
+                  "function": 0, "qdev_id": qid,
+                  "class_info": {"class": 3075 if mode else 1540}}
+        if mode is None:
+            bridge = device
+            device["pci_bridge"] = {"bus": {"number": 1}, "devices": []}
+        if bus == "00":
+            devices.append(device)
+        else:
+            bridge["pci_bridge"]["devices"].append(device)
+    return [{"bus": 0, "devices": devices}]
+
+
+def qmp_server():
+    server = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    server.bind(qmp_path)
+    server.listen(1)
+    while True:
+        conn, _ = server.accept()
+        send = lambda obj: conn.sendall(json.dumps(obj).encode() + b"\r\n")
+        send({"QMP": {"version": {}, "capabilities": []}})
+        for raw in conn.makefile("rb"):
+            request = json.loads(raw)
+            command, args = request["execute"], request.get("arguments", {})
+            reply, events = {"return": {}}, []
+            if command == "query-pci":
+                reply = {"return": pci_devices()}
+            elif command == "query-cpus-fast":
+                reply = {"return": [{"qom-path": "/cpu%d" % i} for i in range(4)]}
+            elif command == "qom-get":
+                reply = {"return": (False if args["property"] == "xsaveerptr"
+                                    else "AuthenticAMD")}
+            elif command == "input-send-event":
+                with lock:
+                    target = keyboards[-1] if keyboards else None  # else PS/2
+                for e in args["events"]:
+                    if target is not None and len(target["events"]) < 16:
+                        target["events"].append((e["data"]["key"]["data"],
+                                                 e["data"]["down"]))
+            elif command == "device_add":
+                kb = new_keyboard({"id": args["id"], "port": int(args["port"]),
+                                   "ctrl": args["bus"].split(".")[0],
+                                   "speed": "fs" if args.get("usb_version") == 1
+                                   else "hs"})
+                with lock:
+                    keyboards.append(kb)
+                threading.Thread(target=attach, args=(kb,), daemon=True).start()
+            elif command == "device_del":
+                with lock:
+                    kb = [k for k in keyboards if k["id"] == args["id"]][0]
+                    keyboards.remove(kb)
+                events.append({"event": "DEVICE_DELETED",
+                               "data": {"device": kb["id"]}})
+                threading.Thread(target=detach, args=(kb,), daemon=True).start()
+            reply["id"] = request.get("id")
+            send(reply)
+            for event in events:
+                send(event)
+        conn.close()
+
+
+def monitor_server():
+    server = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    server.bind(monitor_path)
+    server.listen(1)
+    while True:
+        conn, _ = server.accept()
+        words = conn.makefile("rb").readline().decode().split()
+        if words[:1] == ["pmemsave"]:
+            size = int(words[2])
+            if int(words[1], 0) == 0xB8000:
+                data = b"".join(bytes([ord(c), 0x0F])
+                                for c in "Hello, x86-64 Kernel World!")
+            else:
+                data = b"\xff" * size
+            with open(words[3], "wb") as f:
+                f.write(data[:size])
+        conn.close()
+
+
+for target in (qmp_server, monitor_server, driver, boot):
+    threading.Thread(target=target, daemon=True).start()
+if serial_sock_path:
+    threading.Thread(target=serial_server, daemon=True).start()
+time.sleep(600)
+'''
+
+
+def qemu64_boot_lines(script: str) -> list[str]:
+  """Lines with every marker that test_boot.sh requires in a qemu64 pass
+  (REQUIRED_MARKERS and the non-KVM QEMU64_MARKERS), except those that a
+  boot prints at fixed points of its flow (init, self-test end, stress)."""
+  values = dict(re.findall(r'^\s*([A-Z0-9_]+)="([^"$]*)"$', script, re.M))
+  lines = ["Hello, x86-64 Kernel World!", "[CPU] x87 pointer reset: enabled"]
+  for array in ("REQUIRED_MARKERS", "QEMU64_MARKERS"):
+    body = re.search(
+        r"^\s*%s=\(\n(.*?)^\s*\)$" % array, script, re.M | re.S
+    ).group(1)
+    for item in re.findall(r'"([^"]*)"', body):
+      ref = re.fullmatch(r"\$\{(\w+)\}", item)
+      line = values[ref.group(1)] if ref else item
+      if not line.startswith(("[INIT]", "[STRESS]", "[TEST] ALL BOOT")):
+        lines.append(line)
+  return lines
+
+
 class RegistryTest(unittest.TestCase):
+
+  # The kBootTests table before the USB driver work added tests.
+  ORIGINAL_BOOT_TESTS = (
+      "pmm_memory_map_init", "pmm_alloc_and_bounds", "pmm_free_and_reuse",
+      "heap_varied_sizes_and_alignment", "heap_pattern_isolation",
+      "cpp_new_delete_lifecycle", "heap_stress_reuse", "edge_cases_and_oom",
+      "pmm_heap_exhaustion", "paging_edge_cases", "rbtree_edge_cases",
+      "multiboot_mmap_edge_cases", "smp_discovery_and_ap_bringup",
+      "smp_multicpu_sync_stress", "idt_percpu_and_lapic_timer",
+      "task_scheduler_smp", "tlb_shootdown", "task_stack_guard_pages",
+      "address_spaces", "address_space_switching", "user_mode_programs",
+      "user_mode_preemption", "user_mode_preemptible_syscalls",
+      "user_mode_kill", "user_mode_fpu_isolation",
+      "user_mode_fpu_initial_state", "cpu_protection_features",
+      "smap_smep_protection", "user_mode_kill_edge_cases",
+      "user_mode_syscall_buffer_checks", "user_mode_fpu_lifecycle",
+      "user_mode_mixed_workload",
+  )
 
   def test_load_real_boot_test_names(self) -> None:
     names = deflake.load_boot_test_names(REPO_ROOT)
-    self.assertEqual(len(names), 32)
+    # Every entry of the table parses (counted here independently of the
+    # parser's regex). The table only grows (it has at least 33 tests), and the
+    # original tests keep their order.
+    source = (REPO_ROOT / "selftest" / "boot_selftest.cpp").read_text(
+        encoding="utf-8"
+    )
+    table = source.split("constexpr BootTest kBootTests[] = {", 1)[1]
+    entries = [
+        line for line in table.split("};", 1)[0].splitlines()
+        if line.strip().startswith('{"')
+    ]
+    self.assertEqual(len(names), len(entries))
+    self.assertGreaterEqual(len(names), 33)
     self.assertEqual(names[0], "pmm_memory_map_init")
-    self.assertEqual(names[-1], "user_mode_mixed_workload")
-    self.assertIn("rbtree_edge_cases", names)
-    self.assertIn("user_mode_kill", names)
+    for name in self.ORIGINAL_BOOT_TESTS:
+      self.assertIn(name, names)
+    positions = [names.index(name) for name in self.ORIGINAL_BOOT_TESTS]
+    self.assertEqual(positions, sorted(positions))
     self.assertEqual(len(names), len(set(names)))
 
   def test_load_boot_test_names_errors_on_corrupt_source(self) -> None:
@@ -713,6 +1072,67 @@ class ConfigsAndCliTest(unittest.TestCase):
     with self.assertRaises(ValueError):
       deflake.parse_duration("abc")
 
+  def test_harness_watchdog_covers_test_boot_bounds(self) -> None:
+    bios = deflake._make_builtin_config("host:bios")
+    uefi = deflake._make_builtin_config("docker:uefi")
+    smep = deflake._make_builtin_config("host:smep")
+    # The USB keyboard scenarios of bios and uefi add their budget (60 s by
+    # default) to the pass timeout; the other passes have none.
+    self.assertEqual(deflake.harness_watchdog_s(bios, {}), 60 + 60 + 120)
+    self.assertEqual(deflake.harness_watchdog_s(uefi, {}), 90 + 60 + 120)
+    self.assertEqual(deflake.harness_watchdog_s(smep, {}), 60 + 120)
+    self.assertEqual(
+        deflake.harness_watchdog_s(bios, {"BOOT_TEST_USB": "0"}), 60 + 120
+    )
+    self.assertEqual(
+        deflake.harness_watchdog_s(uefi, {"BOOT_TEST_USB": ""}), 90 + 60 + 120
+    )
+    self.assertEqual(
+        deflake.harness_watchdog_s(
+            uefi, {"USB_SESSION_TIMEOUT_SECS": "200", "UEFI_TIMEOUT_SECS": "300"}
+        ),
+        300 + 200 + 120,
+    )
+    # A lower or invalid timeout in the environment never shortens the
+    # watchdog below the acceptance timeouts.
+    self.assertEqual(
+        deflake.harness_watchdog_s(
+            bios, {"BIOS_TIMEOUT_SECS": "5", "USB_SESSION_TIMEOUT_SECS": "x"}
+        ),
+        60 + 60 + 120,
+    )
+    self.assertEqual(
+        deflake.harness_watchdog_s(smep, {"BIOS_TIMEOUT_SECS": "100"}), 100 + 120
+    )
+
+  def test_duplicated_lists_match_makefile_and_test_boot_sh(self) -> None:
+    makefile = (REPO_ROOT / "Makefile").read_text(encoding="utf-8")
+    script = (REPO_ROOT / "test_boot.sh").read_text(encoding="utf-8")
+    # Docker forwards exactly the variables of the Makefile's list; deflake.py
+    # forwards (docker:<pass>) and records the same ones.
+    env_vars = re.search(
+        r"^BOOT_TEST_ENV_VARS := (.*)$", makefile, re.M
+    ).group(1).split()
+    self.assertEqual(env_vars, list(deflake.BOOT_TEST_ENV_VARS))
+    for var in env_vars:
+      self.assertIn("${%s" % var, script)
+    # deflake's host:<pass>/docker:<pass> configurations name test_boot.sh's
+    # passes.
+    pass_names = re.search(r"^PASS_NAMES=\((.*)\)$", script, re.M).group(1)
+    self.assertEqual(tuple(pass_names.split()), deflake.PASS_NAMES)
+    # The bios pass verifies the USB devices of `make run`: test_boot.sh's
+    # default must equal the Makefile's (checked once the Makefile has one).
+    default = re.search(
+        r'^QEMU_USB_FLAGS_DEFAULT="([^"]*)"$', script, re.M
+    ).group(1)
+    self.assertEqual(
+        default,
+        "-device qemu-xhci,id=xhci0 -device usb-kbd,bus=xhci0.0,port=1,id=kbd0",
+    )
+    in_makefile = re.search(r"^QEMU_USB_FLAGS \?= (.*)$", makefile, re.M)
+    if in_makefile:
+      self.assertEqual(in_makefile.group(1).split(), default.split())
+
 
 class LockAndRunnersTest(unittest.TestCase):
 
@@ -877,10 +1297,13 @@ class LockAndRunnersTest(unittest.TestCase):
       script_copy.chmod(0o755)
       (tmp_path / "kernel.iso").write_bytes(b"fake-iso")
       (tmp_path / "kernel-mb1.iso").write_bytes(b"fake-mb1-iso")
+      (tmp_path / "OVMF.fd").write_bytes(b"fake-ovmf")
 
       fakebin = tmp_path / "fakebin"
       fakebin.mkdir()
       fake_qemu = fakebin / "qemu-system-x86_64"
+      # The serial log is the -serial file: or, in the USB passes, the
+      # logfile= of the -chardev that -serial chardev:<id> names.
       fake_qemu.write_text(
           textwrap.dedent("""\
           #!/usr/bin/env python3
@@ -891,6 +1314,12 @@ class LockAndRunnersTest(unittest.TestCase):
               sys.exit(0)
           serial_arg = argv[argv.index("-serial") + 1]
           serial_path = serial_arg[len("file:"):]
+          if serial_arg.startswith("chardev:"):
+              for i, arg in enumerate(argv[:-1]):
+                  if arg == "-chardev":
+                      opts = dict(o.split("=", 1) for o in argv[i + 1].split(",")[1:])
+                      if opts["id"] == serial_arg[len("chardev:"):]:
+                          serial_path = opts["logfile"]
           with open(serial_path, "wb") as f:
               f.write(b"Hello, x86-64 Kernel World!\\r\\n")
               f.write(b"[TEST] rbtree_edge_cases: FAIL\\r\\n")
@@ -907,21 +1336,36 @@ class LockAndRunnersTest(unittest.TestCase):
 
       env = os.environ.copy()
       env["PATH"] = f"{fakebin}:{env.get('PATH', '')}"
-      env.pop("USE_DOCKER", None)
-      env.pop("KVM", None)
+      for var in ("USE_DOCKER", "KVM", "BOOT_TEST_USB", "QEMU_USB_FLAGS",
+                  "USB_SESSION_TIMEOUT_SECS"):
+        env.pop(var, None)
 
-      # 1. Invalid --passes values fail closed before running QEMU.
-      for bad_arg in ("--passes=bogus", "--passes=,", "--passes=*", "--unknown-opt"):
+      # 1. Invalid --passes values and USB settings fail closed before running
+      # QEMU.
+      bad_runs = [
+          ([bad_arg], {})
+          for bad_arg in ("--passes=bogus", "--passes=,", "--passes=*",
+                          "--unknown-opt")
+      ] + [
+          (["--passes=bios"], {"BOOT_TEST_USB": "yes"}),
+          (["--passes=bios"], {"USB_SESSION_TIMEOUT_SECS": "0"}),
+          (["--passes=bios"], {"USB_SESSION_TIMEOUT_SECS": "1e3"}),
+          (["--passes=bios"], {"QEMU_USB_FLAGS": "-device qemu-xhci,id=xhci0"}),
+          (["--passes=bios"],
+           {"QEMU_USB_FLAGS": "-device usb-kbd,bus=xhci0.0,port=1,id=kbd0"}),
+      ]
+      for args, extra_env in bad_runs:
         proc = subprocess.run(
-            [str(script_copy), bad_arg, "kernel.iso", "kernel-mb1.iso"],
+            [str(script_copy), *args, "kernel.iso", "kernel-mb1.iso"],
             cwd=tmp_path,
-            env=env,
+            env={**env, **extra_env},
             capture_output=True,
             text=True,
             check=False,
         )
-        self.assertEqual(proc.returncode, 1)
+        self.assertEqual(proc.returncode, 1, (args, extra_env))
         self.assertIn("FAIL:", proc.stderr + proc.stdout)
+        self.assertNotIn("Running ", proc.stdout, (args, extra_env))
 
       # 2. --passes=max,bios --artifact-dir=... --drain-on-fail runs only bios and max in canonical order.
       art_dir = tmp_path / "artifacts"
@@ -947,6 +1391,7 @@ class LockAndRunnersTest(unittest.TestCase):
           combined_out,
       )
       self.assertNotIn("uefi:", combined_out)
+      argvs = {}
       for p in ("bios", "max"):
         self.assertEqual(
             (art_dir / p / "result").read_text(encoding="utf-8").strip(),
@@ -959,6 +1404,7 @@ class LockAndRunnersTest(unittest.TestCase):
             .rstrip("\0")
             .split("\0")
         )
+        argvs[p] = argv_items
         self.assertEqual(argv_items[0], "qemu-system-x86_64")
         self.assertIn("-qmp", argv_items)
         if p == "max":
@@ -966,6 +1412,80 @@ class LockAndRunnersTest(unittest.TestCase):
         serial_txt = (art_dir / p / "serial.log").read_text(encoding="utf-8")
         self.assertIn("[TEST] multiboot_mmap_edge_cases: PASS", serial_txt)
         self.assertIn("[TEST] BOOT SELF-TESTS FAILED", serial_txt)
+        # A failure line in the serial log ends the USB session at once and is
+        # reported like any failed boot (the first FAIL: line of the output).
+        output_txt = (art_dir / p / "output.log").read_text(encoding="utf-8")
+        self.assertIn(
+            "did not complete within its timeout",
+            deflake.first_harness_failure(output_txt) or "",
+        )
+      # The bios pass (USB scenarios by default) has the USB devices of
+      # `make run`, the fw_cfg opt-in and a serial console socket that logs to
+      # the usual file; the max pass keeps its file serial and no USB device.
+      bios_argv = argvs["bios"]
+      chardev = bios_argv[bios_argv.index("-chardev") + 1]
+      self.assertEqual(
+          chardev,
+          "socket,id=ser0,path=build/qemu_bios_serial.sock,server=on,"
+          "wait=off,logfile=build/serial_bios_output.log",
+      )
+      self.assertEqual(
+          bios_argv[bios_argv.index("-serial") + 1], "chardev:ser0"
+      )
+      usb_args = [
+          "-device", "qemu-xhci,id=xhci0",
+          "-device", "usb-kbd,bus=xhci0.0,port=1,id=kbd0",
+          "-fw_cfg", "name=opt/protos/boot_session,string=interactive",
+      ]
+      start = bios_argv.index("-device")
+      self.assertEqual(bios_argv[start:start + len(usb_args)], usb_args)
+      self.assertEqual(
+          argvs["max"][argvs["max"].index("-serial") + 1],
+          "file:build/serial_max_output.log",
+      )
+      for absent in ("-chardev", "-device", "-fw_cfg"):
+        self.assertNotIn(absent, argvs["max"])
+      self.assertEqual(sorted(os.listdir(tmp_path / "build")), [])
+
+      # 3. BOOT_TEST_USB=0 runs bios and uefi exactly as without the USB
+      # scenarios (the USB settings are then ignored).
+      art_off = tmp_path / "artifacts_off"
+      proc_off = subprocess.run(
+          [
+              str(script_copy),
+              "--passes=bios,uefi",
+              f"--artifact-dir={art_off}",
+              "kernel.iso",
+              "kernel-mb1.iso",
+          ],
+          cwd=tmp_path,
+          env={**env, "BOOT_TEST_USB": "0", "OVMF": str(tmp_path / "OVMF.fd"),
+               "USB_SESSION_TIMEOUT_SECS": "bogus", "QEMU_USB_FLAGS": "bogus"},
+          capture_output=True,
+          text=True,
+          check=False,
+      )
+      self.assertIn(
+          "FAILURE: boot verification failed (bios: FAIL uefi: FAIL).",
+          proc_off.stdout + proc_off.stderr,
+      )
+      common = ["qemu-system-x86_64", "-smp", "4", "-display", "none"]
+      for p, rest in (
+          ("bios", ["-cpu", "qemu64"]),
+          ("uefi", ["-bios", str(tmp_path / "OVMF.fd"), "-cpu",
+                    "qemu64,+x2apic", "-m", "4G"]),
+      ):
+        self.assertEqual(
+            (art_off / p / "qemu_argv").read_bytes().decode().split("\0"),
+            common + [
+                "-serial", f"file:build/serial_{p}_output.log",
+                "-monitor", f"unix:build/qemu_{p}_monitor.sock,server,nowait",
+                "-qmp", f"unix:build/qemu_{p}_qmp.sock,server,nowait",
+                "-no-reboot",
+            ] + rest + ["-cdrom", str(tmp_path / "kernel.iso"), ""],
+        )
+        output_txt = (art_off / p / "output.log").read_text(encoding="utf-8")
+        self.assertNotIn("USB", output_txt)
 
   def test_end_to_end_session_writes_artifacts_and_rerun_script(self) -> None:
     with tempfile.TemporaryDirectory() as tmp:
@@ -1120,6 +1640,106 @@ class LockAndRunnersTest(unittest.TestCase):
       self.assertIn(str(tmp_path / "build" / "deflake" / "isos"), docker_rerun)
       self.assertIn(f"-v {tmp_path}:{tmp_path}:ro", docker_rerun)
       self.assertIn("cp -p", docker_rerun)
+
+
+class UsbHarnessTest(unittest.TestCase):
+  """test_boot.sh's USB keyboard scenarios against FAKE_GUEST_QEMU."""
+
+  def run_test_boot(
+      self, tmp_path: Path, passes: str, bug: str = ""
+  ) -> tuple[subprocess.CompletedProcess[str], Path, float]:
+    art_dir = tmp_path / f"artifacts_{passes.replace(',', '_')}_{bug}"
+    env = os.environ.copy()
+    for var in ("USE_DOCKER", "KVM", "BOOT_TEST_USB", "QEMU_USB_FLAGS",
+                "USB_SESSION_TIMEOUT_SECS"):
+      env.pop(var, None)
+    env.update({
+        "PATH": f"{tmp_path / 'fakebin'}:{env.get('PATH', '')}",
+        "OVMF": str(tmp_path / "OVMF.fd"),
+        "BOOT_TEST_JOBS": "2",
+        "FAKE_BOOT_LINES": str(tmp_path / "boot_lines.txt"),
+        "FAKE_BUG": bug,
+    })
+    started = time.monotonic()
+    proc = subprocess.run(
+        [str(tmp_path / "test_boot.sh"), f"--passes={passes}",
+         f"--artifact-dir={art_dir}", "kernel.iso", "kernel-mb1.iso"],
+        cwd=tmp_path,
+        env=env,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    return proc, art_dir, time.monotonic() - started
+
+  def test_test_boot_sh_usb_scenarios_with_fake_guest(self) -> None:
+    with tempfile.TemporaryDirectory() as tmp:
+      tmp_path = Path(tmp)
+      script = (REPO_ROOT / "test_boot.sh").read_text(encoding="utf-8")
+      (tmp_path / "test_boot.sh").write_text(script, encoding="utf-8")
+      (tmp_path / "test_boot.sh").chmod(0o755)
+      for name in ("kernel.iso", "kernel-mb1.iso", "OVMF.fd"):
+        (tmp_path / name).write_bytes(b"fake")
+      (tmp_path / "boot_lines.txt").write_text(
+          "".join(line + "\n" for line in qemu64_boot_lines(script)),
+          encoding="utf-8",
+      )
+      (tmp_path / "fakebin").mkdir()
+      fake_qemu = tmp_path / "fakebin" / "qemu-system-x86_64"
+      fake_qemu.write_text(FAKE_GUEST_QEMU, encoding="utf-8")
+      fake_qemu.chmod(0o755)
+
+      # 1. With an ideal driver every scenario of both passes passes, and so
+      # do the usual checks after the session.
+      proc, art_dir, _ = self.run_test_boot(tmp_path, "bios,uefi")
+      out = proc.stdout + proc.stderr
+      self.assertEqual(proc.returncode, 0, out[-3000:])
+      self.assertIn("USB keyboard scenarios passed in: bios uefi.", proc.stdout)
+      scenarios = {
+          "bios": ("usb_serial_sync", "usb_token", "usb_shift_backspace",
+                   "usb_editing_edges", "usb_serial_mixed", "usb_unplug",
+                   "usb_no_keyboard", "usb_hotplug_add", "usb_replug",
+                   "usb_second_keyboard", "usb_long_line", "usb_commands"),
+          "uefi": ("usb_serial_sync", "usb_token", "usb_shift_backspace",
+                   "usb_unplug", "usb_root_controller", "usb_editing_edges",
+                   "usb_serial_after_usb", "usb_replug",
+                   "usb_bridged_controller", "usb_hotplug_add",
+                   "usb_commands"),
+      }
+      for p, names in scenarios.items():
+        output = (art_dir / p / "output.log").read_text(encoding="utf-8")
+        for name in names:
+          self.assertIn("USB %s: " % name, output)
+        self.assertIn("USB session: all scenarios passed", output)
+        serial = (art_dir / p / "serial.log").read_text(encoding="latin-1")
+        self.assertIn("[TEST] driver_session_cleanup: PASS", serial)
+      self.assertEqual(sorted(os.listdir(tmp_path / "build")), [])
+
+      # 2. A driver that ignores Shift on digits and symbols fails the
+      # Shift/Backspace scenario (and only the bios pass runs).
+      proc, art_dir, _ = self.run_test_boot(tmp_path, "bios",
+                                            "symbols_unshifted")
+      self.assertEqual(proc.returncode, 1)
+      output = (art_dir / "bios" / "output.log").read_text(encoding="utf-8")
+      self.assertTrue(
+          (deflake.first_harness_failure(output) or "").startswith(
+              "FAIL: usb_shift_backspace: "),
+          output[:2000],
+      )
+
+      # 3. A kernel that ignores the interactive boot session (as before the
+      # driver exists) fails at once instead of timing out.
+      proc, art_dir, elapsed = self.run_test_boot(tmp_path, "uefi",
+                                                  "noninteractive")
+      self.assertEqual(proc.returncode, 1)
+      output = (art_dir / "uefi" / "output.log").read_text(encoding="utf-8")
+      self.assertTrue(
+          (deflake.first_harness_failure(output) or "").startswith(
+              "FAIL: usb_session: the init session ended before the boot "
+              "self-tests passed"),
+          output[:2000],
+      )
+      self.assertLess(elapsed, 30)
 
 
 if __name__ == "__main__":

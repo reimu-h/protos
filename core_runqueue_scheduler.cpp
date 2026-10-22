@@ -49,6 +49,25 @@ enum class TaskState : uint8_t {
   kReady = 0,
   kRunning = 1,
   kExited = 2,
+  // Switched out by Block(): in no runqueue, and running on no CPU, until a
+  // Wake() queues it again. Only FinishContextSwitch() sets it, once the CPU
+  // has left the task's stack.
+  kBlocked = 3,
+};
+
+// The Block()/Wake() handshake of a task (`Task::wake`). Every Block() and
+// Wake() makes its decision with one atomic read-modify-write of this one
+// word, so they are totally ordered: no wakeup is lost, and exactly one party
+// queues a task that blocks (FinishContextSwitch() or one Wake()). See
+// Block(), FinishBlockLocked() and WakeOnCpu().
+enum class TaskWake : uint8_t {
+  // No wakeup is pending, and the task is not parked.
+  kNone = 0,
+  // A Wake() arrived that no Block() has consumed yet (the task's
+  // pending-wakeup flag).
+  kPending = 1,
+  // Blocked, and switched out completely: the next Wake() queues the task.
+  kParked = 2,
 };
 
 struct TaskRunqueueKey {
@@ -91,13 +110,20 @@ struct Task {
 
   int64_t weight = kDefaultTaskWeight;
   int64_t vruntime = 0;
+  // While the task is blocked: how far its `vruntime` was ahead of the
+  // `min_vruntime` of the CPU that it blocked on (0 if it was behind). The CPU
+  // that queues the task again puts it that far ahead of its own
+  // `min_vruntime` (EnqueueBlockedTaskLocked()).
+  int64_t block_lag = 0;
   // The task's `CpuLocal::task_timer_ticks` while it doesn't run, saved and
-  // loaded by `Schedule()` under the lock of the CPU that switches it.
-  int64_t timer_ticks = 0;
+  // loaded by `Schedule()` under the lock of the CPU that switches it. Atomic
+  // because TaskTimerTicks() reads it without that lock.
+  std::atomic<int64_t> timer_ticks{0};
   int64_t enqueue_seq = 0;
   RbNode runqueue_node;
 
   std::atomic<TaskState> state{TaskState::kReady};
+  std::atomic<TaskWake> wake{TaskWake::kNone};
   std::atomic<int> running_cpu{-1};
   bool is_idle = false;
   bool is_bootstrap = false;
@@ -162,6 +188,11 @@ static_assert(offsetof(InitialSwitchFrame, rip) == 6 * sizeof(uint64_t));
 constexpr uint64_t kTaskStackCanary = 0x57ACCA9A57ACCA9AULL;
 
 struct alignas(64) CpuRunqueue {
+  // Innermost lock: while holding it, the core takes no other lock except the
+  // second runqueue lock in StealTask(), always in CPU index order. Callers of
+  // Wake(), WakeOnCpu() and TaskTimerTicks(), which take exactly one runqueue
+  // lock, may hold `IrqSpinLock`s of their own (order: the caller's locks,
+  // then this lock).
   IrqSpinLock lock;
   TaskRunqueueTree tree;
   int cpu_id = 0;
@@ -324,6 +355,11 @@ static void EnqueueTaskLocked(CpuRunqueue* const rq,  //
   DCHECK(rq != nullptr);
   DCHECK(task != nullptr);
   DCHECK(!task->is_idle);
+  // A task is in at most one runqueue: `RbTree::Insert()` would overwrite the
+  // links of a task queued elsewhere and corrupt both trees.
+  DCHECK(task->runqueue_node.left == nullptr &&
+         task->runqueue_node.right == nullptr &&
+         task->runqueue_node.parent_color == 0);
 
   if (clamp_to_min_vruntime && task->vruntime < rq->min_vruntime) {
     task->vruntime = rq->min_vruntime;
@@ -338,6 +374,53 @@ static void EnqueueTaskLocked(CpuRunqueue* const rq,  //
     rq->runnable_count.fetch_add(1, std::memory_order_release);
   }
   UpdateRunqueueMinVruntime(rq);
+}
+
+// Queues `task`, which has blocked, on `rq`: `block_lag` ahead of `rq`'s
+// `min_vruntime`, as StealTask() rebases a stolen task. Each CPU's
+// `min_vruntime` grows at its own pace (a CPU whose tasks busy-wait in Yield()
+// loops gains 1024 per call), so a task woken on another CPU than the one it
+// blocked on would otherwise wait behind every task there, for as long as it
+// takes them to catch up with its old CPU, or be favored over them for as
+// long.
+static void EnqueueBlockedTaskLocked(CpuRunqueue* const rq, Task* const task) {
+  DCHECK(task->state.load(std::memory_order_seq_cst) == TaskState::kBlocked);
+  DCHECK(task->block_lag >= 0);
+  task->vruntime = rq->min_vruntime + task->block_lag;
+  task->block_lag = 0;
+  EnqueueTaskLocked(rq, task, false);
+}
+
+// The kBlocked part of FinishContextSwitch(), under the lock of `rq`, the
+// runqueue of the CPU that has just switched away from `prev` in Block(),
+// and off `prev`'s stack. Parks `prev`, or, if a Wake() came in since Block()
+// looked for one, queues it on `rq` again.
+static void FinishBlockLocked(CpuRunqueue* const rq, Task* const prev) {
+  DCHECK(!prev->is_idle);
+  DCHECK(!prev->is_bootstrap);
+  DCHECK(prev->state.load(std::memory_order_seq_cst) == TaskState::kRunning);
+  CheckTaskStackCanary(prev);
+  // All of this happens before the compare-exchange below publishes the task
+  // to WakeOnCpu(): once parked, another CPU may queue and resume it at once,
+  // so nothing here may touch `prev` after a successful exchange.
+  prev->running_cpu.store(-1, std::memory_order_release);
+  prev->block_lag = (prev->vruntime > rq->min_vruntime)
+                        ? prev->vruntime - rq->min_vruntime
+                        : 0;
+  prev->state.store(TaskState::kBlocked, std::memory_order_seq_cst);
+  TaskWake expected = TaskWake::kNone;
+  if (prev->wake.compare_exchange_strong(expected,           //
+                                         TaskWake::kParked,  //
+                                         std::memory_order_seq_cst)) {
+    return;
+  }
+  // A Wake() found the task not parked yet and left a pending wakeup, which
+  // ends this Block(). Consume it with a read-modify-write rather than a
+  // store, which would drop (without synchronizing with) a Wake() that sets
+  // it again in between. The next Block() then blocks again.
+  DCHECK(expected == TaskWake::kPending);
+  (void)prev->wake.exchange(TaskWake::kNone, std::memory_order_seq_cst);
+  EnqueueBlockedTaskLocked(rq, prev);
 }
 
 // Switches the CPU of `rq`, which must be the calling CPU, to the page tables
@@ -446,6 +529,48 @@ class CoreRunqueueTaskScheduler final : public TaskScheduler {
     (void)Schedule(TaskState::kReady);
   }
 
+  [[gnu::noinline]] void Block() override {
+    DCHECK(initialized_.load(std::memory_order_acquire));
+    // A task must not switch out while holding a lock, and an interrupt
+    // handler (which runs with interrupts disabled) must not block.
+    CHECK(!HoldsAnyIrqSpinLock());
+    CHECK(AreInterruptsEnabled());
+    Task* const self = CurrentTask();
+    // CPU 0's runqueue must not run empty while another task runs there (see
+    // Init()), and an idle loop must stay runnable, so neither may block.
+    CHECK(!self->is_bootstrap);
+    CHECK(!self->is_idle);
+    DCHECK(self->state.load(std::memory_order_relaxed) == TaskState::kRunning);
+    // Consume a wakeup that arrived since the previous Block() returned. The
+    // read-modify-write synchronizes with the Wake() that left it, so what the
+    // waker wrote before is visible once this returns.
+    TaskWake expected = TaskWake::kPending;
+    if (self->wake.compare_exchange_strong(expected,         //
+                                           TaskWake::kNone,  //
+                                           std::memory_order_seq_cst)) {
+      return;
+    }
+    DCHECK(expected == TaskWake::kNone);
+    // FinishContextSwitch() parks the task once this CPU has left its stack,
+    // or queues it again if a Wake() came in by then.
+    (void)Schedule(TaskState::kBlocked);
+  }
+
+  // Timed waits need CPU 0's timer interrupt before the preemption gate, so
+  // the preemptive layer implements them on top of Block() and Wake().
+  void BlockUntil(const int64_t /*deadline_tick*/) override {
+    PANIC(
+        "CoreRunqueueTaskScheduler::BlockUntil() is not supported: timed waits "
+        "are handled by the preemptive layer");
+  }
+
+  void Wake(Task* const task) override {
+    DCHECK(initialized_.load(std::memory_order_acquire));
+    DCHECK(task != nullptr);
+    const int cpu = CurrentCpuIdOrUnbound();
+    (void)WakeOnCpu(task, IsCpuOnline(cpu, cpu_count_) ? cpu : 0);
+  }
+
   void Join(Task* const task) override {
     DCHECK(initialized_.load(std::memory_order_acquire));
     DCHECK(task != nullptr);
@@ -541,6 +666,7 @@ class CoreRunqueueTaskScheduler final : public TaskScheduler {
 
  private:
   friend void protos::TaskStartupEntry(Task* curr);
+  friend int64_t protos::TaskTimerTicks(const Task* task);
 
   // Scheduler internals:
   void Init() override {
@@ -714,6 +840,70 @@ class CoreRunqueueTaskScheduler final : public TaskScheduler {
     return true;
   }
 
+  bool WakeOnCpu(Task* const task, const int target_cpu) override {
+    DCHECK(initialized_.load(std::memory_order_acquire));
+    DCHECK(task != nullptr);
+    DCHECK(task->owner == this);
+    // Neither ever blocks (see Block()).
+    DCHECK(!task->is_idle);
+    DCHECK(!task->is_bootstrap);
+    DCHECK(target_cpu >= 0 && target_cpu < cpu_count_);
+    DCHECK(IsCpuOnline(target_cpu, cpu_count_));
+    // Always a read-modify-write, even if a wakeup is pending already: it
+    // orders what the caller wrote before this call before the task's next
+    // look at `wake`, so the task can't miss it and block anyway.
+    if (task->wake.exchange(TaskWake::kPending, std::memory_order_seq_cst) !=
+        TaskWake::kParked) {
+      // Running, about to block (FinishContextSwitch() then sees the pending
+      // wakeup and queues it), queued, or exited.
+      return false;
+    }
+    // This call ends the block. Consume the wakeup that it just left, and any
+    // that another Wake() left in between (synchronizing with it), so that
+    // the task's next Block() blocks again.
+    (void)task->wake.exchange(TaskWake::kNone, std::memory_order_seq_cst);
+    DCHECK(task->running_cpu.load(std::memory_order_relaxed) == -1);
+    DCHECK(!task->stack_reaped.load(std::memory_order_relaxed));
+    CpuRunqueue& rq = runqueues_[target_cpu];
+    {
+      const IrqSpinLockGuard guard(rq.lock);
+      EnqueueBlockedTaskLocked(&rq, task);
+    }
+    // The task may run, exit and be reclaimed from here on.
+    return true;
+  }
+
+  // Body of TaskTimerTicks().
+  int64_t TimerTicksOf(const Task& task) const {
+    DCHECK(initialized_.load(std::memory_order_acquire));
+    for (;;) {
+      const int cpu = task.running_cpu.load(std::memory_order_acquire);
+      if (cpu < 0) {
+        // On no CPU: the count that `Schedule()` saved when it last switched
+        // the task out (0 if it never ran), published by the release store of
+        // `running_cpu`.
+        return task.timer_ticks.load(std::memory_order_relaxed);
+      }
+      DCHECK(cpu < cpu_count_);
+      CpuRunqueue& rq = runqueues_[cpu];
+      const IrqSpinLockGuard guard(rq.lock);
+      if (rq.current_task == &task) {
+        // Running there: the CPU's live count, which `Schedule()` can't swap
+        // out while this lock is held, and which only that CPU's timer
+        // interrupt advances.
+        const CpuLocal* const local = SmpGetCpuLocal(cpu);
+        DCHECK(local != nullptr);
+        return local->task_timer_ticks.load(std::memory_order_relaxed);
+      }
+      if (task.running_cpu.load(std::memory_order_relaxed) == cpu) {
+        // Switched out there, and the CPU has not finished the switch yet:
+        // `Schedule()` saved the count under this lock.
+        return task.timer_ticks.load(std::memory_order_relaxed);
+      }
+      // It moved between the two looks; look again.
+    }
+  }
+
   void OnTimerInterrupt(InterruptFrame* const /*frame*/) override {
     PreemptFromInterrupt(/*charge_tick=*/true);
   }
@@ -785,9 +975,11 @@ class CoreRunqueueTaskScheduler final : public TaskScheduler {
   // has switched `%rsp` onto the incoming task's stack (`next`). Only once the
   // CPU is no longer executing on the outgoing task's stack (`prev`) is it
   // safe on SMP to either re-enqueue `prev` into `rq.tree` (where a remote CPU
-  // could immediately steal and resume it) or free `prev`'s stack on task exit
-  // (`TaskStackFree()`, which never waits for other CPUs, so it is safe with
-  // interrupts disabled). Both paths first check `prev`'s stack canary.
+  // could immediately steal and resume it), park it if it blocks (where a
+  // Wake() on another CPU could immediately queue and resume it), or free
+  // `prev`'s stack on task exit (`TaskStackFree()`, which never waits for
+  // other CPUs, so it is safe with interrupts disabled). All three paths first
+  // check `prev`'s stack canary.
   [[gnu::noinline]] void FinishContextSwitch() {
     DCHECK(!AreInterruptsEnabled());
     DCHECK(!HoldsAnyIrqSpinLock());
@@ -828,11 +1020,13 @@ class CoreRunqueueTaskScheduler final : public TaskScheduler {
           CheckTaskStackCanary(prev);
           EnqueueTaskLocked(&rq, prev, false);
         }
+      } else if (prev != nullptr && target_state == TaskState::kBlocked) {
+        FinishBlockLocked(&rq, prev);
       }
       rq.in_schedule.store(false, std::memory_order_release);
     }
 
-    if (prev == nullptr || target_state == TaskState::kReady) {
+    if (prev == nullptr || target_state != TaskState::kExited) {
       return;
     }
 
@@ -870,6 +1064,10 @@ class CoreRunqueueTaskScheduler final : public TaskScheduler {
   //     `rq.idle_task` when `rq.tree` is empty, which never happens on CPU 0
   //     because the bootstrap task is queued there whenever another task
   //     runs).
+  //   * `TaskState::kBlocked` when `prev` blocks (`Block()`): switched out
+  //     like a terminating task, but its registers are saved, and
+  //     `FinishContextSwitch()` parks it or, if a Wake() came in meanwhile,
+  //     queues it again.
   //
   // Returns `true` if a context switch occurred (after `prev` is eventually
   // scheduled back onto a CPU), or `false` if `prev` remained the active task
@@ -924,6 +1122,7 @@ class CoreRunqueueTaskScheduler final : public TaskScheduler {
         }
       } else {
         DCHECK(!prev->is_idle);
+        DCHECK(!prev->is_bootstrap);
         next = rq.tree.Empty() ? rq.idle_task : rq.tree.First();
       }
 
@@ -937,6 +1136,9 @@ class CoreRunqueueTaskScheduler final : public TaskScheduler {
       }
       // We need to do a context switch.
 
+      // Only queued tasks and switched-out idle tasks get here: never a
+      // blocked one.
+      DCHECK(next->state.load(std::memory_order_relaxed) == TaskState::kReady);
       next->state.store(TaskState::kRunning, std::memory_order_release);
       next->running_cpu.store(cpu_id, std::memory_order_release);
       rq.current_task = next;
@@ -953,10 +1155,12 @@ class CoreRunqueueTaskScheduler final : public TaskScheduler {
       CpuLocal* const cpu_local = CurrentCpuOrNullIrqsOff();
       DCHECK(cpu_local != nullptr);
       cpu_local->context_switches.fetch_add(1, std::memory_order_relaxed);
-      prev->timer_ticks =
-          cpu_local->task_timer_ticks.load(std::memory_order_relaxed);
-      cpu_local->task_timer_ticks.store(next->timer_ticks,
-                                        std::memory_order_relaxed);
+      prev->timer_ticks.store(
+          cpu_local->task_timer_ticks.load(std::memory_order_relaxed),
+          std::memory_order_relaxed);
+      cpu_local->task_timer_ticks.store(
+          next->timer_ticks.load(std::memory_order_relaxed),
+          std::memory_order_relaxed);
       UpdateRunqueueMinVruntime(&rq);
       // Switch to `next`'s page tables while still on `prev`'s stack: the
       // kernel, both stacks included, is mapped the same in every address
@@ -1092,6 +1296,12 @@ int TaskRunningCpu(const Task* const task) {
   // on x86, the kernel's only target. So either the caller sees the task
   // running, or the task sees what the caller stored before the call.
   return task->running_cpu.load(std::memory_order_seq_cst);
+}
+
+int64_t TaskTimerTicks(const Task* const task) {
+  DCHECK(task != nullptr);
+  DCHECK(task->owner != nullptr);
+  return task->owner->TimerTicksOf(*task);
 }
 
 #if __STDC_HOSTED__

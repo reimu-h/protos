@@ -42,6 +42,12 @@ class TaskSchedulerInternals {
                         const int src_cpu) {
     return scheduler.StealTask(dst_cpu, src_cpu);
   }
+
+  static bool WakeOnCpu(TaskScheduler& scheduler,  //
+                        Task* const task,          //
+                        const int target_cpu) {
+    return scheduler.WakeOnCpu(task, target_cpu);
+  }
 };
 
 }  // namespace protos

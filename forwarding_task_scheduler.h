@@ -41,6 +41,13 @@ class ForwardingTaskScheduler : public TaskScheduler {
   }
 
   void Yield() override { inner_->Yield(); }
+  void Block() override { inner_->Block(); }
+
+  void BlockUntil(const int64_t deadline_tick) override {
+    inner_->BlockUntil(deadline_tick);
+  }
+
+  void Wake(Task* const task) override { inner_->Wake(task); }
   void Join(Task* const task) override { inner_->Join(task); }
   void Detach(Task* const task) override { inner_->Detach(task); }
   int ReapZombies() override { return inner_->ReapZombies(); }
@@ -86,6 +93,10 @@ class ForwardingTaskScheduler : public TaskScheduler {
 
   bool StealTask(const int dst_cpu, const int src_cpu) override {
     return TaskSchedulerInternals::StealTask(*inner_, dst_cpu, src_cpu);
+  }
+
+  bool WakeOnCpu(Task* const task, const int target_cpu) override {
+    return TaskSchedulerInternals::WakeOnCpu(*inner_, task, target_cpu);
   }
 
   // Returns the wrapped layer.

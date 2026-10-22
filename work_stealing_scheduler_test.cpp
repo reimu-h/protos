@@ -4,6 +4,7 @@
 #include <gtest/gtest.h>
 
 #include <atomic>
+#include <chrono>
 #include <cstdint>
 #include <cstdio>
 #include <memory>
@@ -1238,6 +1239,352 @@ TEST(WorkStealingSchedulerTest,
   EXPECT_THAT(ctx.cpu_mask.load() & ~1u, t::Ne(0u));
   EXPECT_THAT(CurrentCpuId(), t::Eq(0));
   EXPECT_THAT(sched->CurrentTask(), t::Eq(bootstrap));
+  for (int c = 0; c < kNumCpus; ++c) {
+    EXPECT_THAT(TaskSchedulerInternals::RunqueueLoad(*sched, c), t::Eq(0));
+  }
+  EXPECT_THAT(PmmFreeFrameCount(), t::Eq(pmm_before));
+  EXPECT_THAT(HeapTotalFreeBytes(), t::Eq(heap_before));
+}
+
+// ============================================================================
+// Blocking: Wake() placement and wakeup IPIs
+// ============================================================================
+
+// Bound on each wait of the blocking tests: a lost wakeup must fail a test
+// instead of hanging it.
+constexpr std::chrono::seconds kBlockWaitTimeout(30);
+
+// Calls `step()` until `done()` holds or kBlockWaitTimeout has passed, and
+// returns whether `done()` holds.
+template <typename DoneFn, typename StepFn>
+static bool WaitUntil(const DoneFn& done, const StepFn& step) {
+  const auto deadline = std::chrono::steady_clock::now() + kBlockWaitTimeout;
+  while (!done()) {
+    if (std::chrono::steady_clock::now() >= deadline) {
+      return done();
+    }
+    step();
+  }
+  return true;
+}
+
+static int64_t TotalIpisSent(const int cpu_count) {
+  int64_t total = 0;
+  for (int cpu = 0; cpu < cpu_count; ++cpu) {
+    total += g_env.ipi_sent_count[cpu].load(std::memory_order_acquire);
+  }
+  return total;
+}
+
+TEST(WorkStealingSchedulerTest,
+     WakeQueuesOnTheLeastLoadedCpuAndSendsAnIpiOnlyIfItQueuedRemotely) {
+  SetupEnv(4);
+  const auto mock_inner = std::make_shared<t::StrictMock<MockTaskScheduler>>();
+  const std::shared_ptr<TaskScheduler> sched =
+      CreateWorkStealingScheduler(mock_inner);
+  int queued[4] = {2, 1, 0, 3};
+  bool busy[4] = {true, true, false, true};
+  Task* const fake_task = reinterpret_cast<Task*>(0x3001);
+  int captured_cpu = -1;
+  bool interrupts_enabled_in_inner = true;
+  EXPECT_CALL(*mock_inner, RunqueueLoad).WillRepeatedly([&](const int cpu) {
+    return queued[cpu];
+  });
+  EXPECT_CALL(*mock_inner, IsCpuBusy).WillRepeatedly([&](const int cpu) {
+    return busy[cpu];
+  });
+  // Stands in for the inner layer: whether it queued the task.
+  bool inner_queues = true;
+  EXPECT_CALL(*mock_inner, WakeOnCpu)
+      .WillRepeatedly([&](Task* const task, const int target_cpu) {
+        EXPECT_THAT(task, t::Eq(fake_task));
+        captured_cpu = target_cpu;
+        interrupts_enabled_in_inner = AreInterruptsEnabled();
+        return inner_queues;
+      });
+
+  // 1. Loads {3, 2, 0, 4}: the task goes to idle CPU 2, which gets a wakeup
+  //    IPI. The CPU is picked with interrupts disabled, and the caller's
+  //    interrupt flag is restored afterwards.
+  sched->Wake(fake_task);
+  EXPECT_THAT(captured_cpu, t::Eq(2));
+  EXPECT_FALSE(interrupts_enabled_in_inner);
+  EXPECT_TRUE(AreInterruptsEnabled());
+  EXPECT_THAT(g_env.ipi_sent_count[2].load(), t::Eq(1));
+  EXPECT_THAT(g_env.last_ipi_vector[2].load(), t::Eq(kVectorWakeupIpi));
+  EXPECT_THAT(TotalIpisSent(4), t::Eq(1));
+
+  // 2. The task was not blocked, so the inner layer only left a pending
+  //    wakeup: no IPI.
+  inner_queues = false;
+  sched->Wake(fake_task);
+  EXPECT_THAT(captured_cpu, t::Eq(2));
+  EXPECT_THAT(TotalIpisSent(4), t::Eq(1));
+  inner_queues = true;
+
+  // 3. Ties go to the calling CPU, which needs no IPI: loads {1, 1, 1, 1},
+  //    called from CPU 3, which runs the caller with nothing queued.
+  queued[0] = 0;
+  queued[1] = 1;
+  queued[2] = 1;
+  queued[3] = 0;
+  busy[1] = false;
+  busy[2] = false;
+  BindCpuLocal(SmpGetCpuLocal(3));
+  sched->Wake(fake_task);
+  BindCpuLocal(SmpGetCpuLocal(0));
+  EXPECT_THAT(captured_cpu, t::Eq(3));
+  EXPECT_THAT(TotalIpisSent(4), t::Eq(1));
+
+  // 4. From an interrupt handler (interrupts disabled): the same placement,
+  //    and interrupts stay disabled.
+  queued[1] = 0;
+  queued[2] = 0;
+  busy[1] = true;
+  SetInterruptsEnabledForTest(false);
+  sched->Wake(fake_task);
+  EXPECT_FALSE(AreInterruptsEnabled());
+  SetInterruptsEnabledForTest(true);
+  EXPECT_THAT(captured_cpu, t::Eq(2));
+  EXPECT_THAT(g_env.ipi_sent_count[2].load(), t::Eq(2));
+
+  // 5. A caller on no CPU (unbound): no target is local, so the IPI goes out
+  //    even to CPU 0.
+  busy[2] = true;
+  queued[1] = 1;
+  queued[2] = 1;
+  queued[3] = 1;
+  ResetCpuLocalForTest();
+  sched->Wake(fake_task);
+  BindCpuLocal(SmpGetCpuLocal(0));
+  EXPECT_THAT(captured_cpu, t::Eq(0));
+  EXPECT_THAT(g_env.ipi_sent_count[0].load(), t::Eq(1));
+  EXPECT_THAT(TotalIpisSent(4), t::Eq(3));
+}
+
+TEST(WorkStealingSchedulerTest,
+     WakeOnCpuForwardsTheTargetAndSendsAnIpiOnlyForARemoteQueuedTask) {
+  SetupEnv(3);
+  const auto mock_inner = std::make_shared<t::StrictMock<MockTaskScheduler>>();
+  const std::shared_ptr<TaskScheduler> sched =
+      CreateWorkStealingScheduler(mock_inner);
+  Task* const fake_task = reinterpret_cast<Task*>(0x3002);
+  const t::InSequence in_sequence;
+
+  EXPECT_CALL(*mock_inner, WakeOnCpu(fake_task, 1)).WillOnce(t::Return(true));
+  EXPECT_TRUE(TaskSchedulerInternals::WakeOnCpu(*sched, fake_task, 1));
+  EXPECT_THAT(g_env.ipi_sent_count[1].load(), t::Eq(1));
+
+  EXPECT_CALL(*mock_inner, WakeOnCpu(fake_task, 2)).WillOnce(t::Return(false));
+  EXPECT_FALSE(TaskSchedulerInternals::WakeOnCpu(*sched, fake_task, 2));
+  EXPECT_THAT(g_env.ipi_sent_count[2].load(), t::Eq(0));
+
+  // The calling CPU needs no IPI.
+  EXPECT_CALL(*mock_inner, WakeOnCpu(fake_task, 0)).WillOnce(t::Return(true));
+  EXPECT_TRUE(TaskSchedulerInternals::WakeOnCpu(*sched, fake_task, 0));
+  EXPECT_THAT(TotalIpisSent(3), t::Eq(1));
+}
+
+TEST(WorkStealingSchedulerTest, BlockAndBlockUntilAreForwardedUnchanged) {
+  SetupEnv(2);
+  const auto mock_inner = std::make_shared<t::StrictMock<MockTaskScheduler>>();
+  const std::shared_ptr<TaskScheduler> sched =
+      CreateWorkStealingScheduler(mock_inner);
+  const t::InSequence in_sequence;
+  EXPECT_CALL(*mock_inner, Block);
+  sched->Block();
+  EXPECT_CALL(*mock_inner, BlockUntil(1234));
+  sched->BlockUntil(1234);
+}
+
+struct WsBlockOnceCtx {
+  TaskScheduler* sched = nullptr;
+  std::atomic<int> phase{0};
+  std::atomic<int> resumed_cpu{-1};
+};
+
+static void WsBlockOnceWorker(void* const raw_ctx) {
+  WsBlockOnceCtx* const ctx = static_cast<WsBlockOnceCtx*>(raw_ctx);
+  ctx->phase.store(1, std::memory_order_release);
+  ctx->sched->Block();
+  ctx->resumed_cpu.store(CurrentCpuId(), std::memory_order_release);
+  ctx->phase.store(2, std::memory_order_release);
+}
+
+TEST(WorkStealingSchedulerTest,
+     BlockedTaskAddsNoLoadAndAWokenTaskGoesToAnIdleCpuWithOneIpi) {
+  SetupEnv(4);
+  const int64_t pmm_before = PmmFreeFrameCount();
+  const int64_t heap_before = HeapTotalFreeBytes();
+  const std::shared_ptr<TaskScheduler> sched =
+      CreateWorkStealingScheduler(CreateCoreRunqueueScheduler());
+  TaskSchedulerInternals::Init(*sched);
+
+  WsBlockOnceCtx ctx;
+  ctx.sched = sched.get();
+  Task* const task =
+      sched->CreateTaskOnCpu(WsBlockOnceWorker, &ctx, kDefaultTaskWeight, 1);
+  ASSERT_THAT(task, t::NotNull());
+  // CPU 1's idle loop (the calling thread stands in for it) runs the task
+  // until it blocks.
+  BindCpuLocal(SmpGetCpuLocal(1));
+  EXPECT_TRUE(TaskSchedulerInternals::PollIdleCpu(*sched, 1));
+  BindCpuLocal(SmpGetCpuLocal(0));
+  ASSERT_THAT(ctx.phase.load(), t::Eq(1));
+
+  // The blocked task leaves CPU 1 idle and adds no load anywhere, so no idle
+  // CPU finds anything to steal.
+  EXPECT_FALSE(TaskSchedulerInternals::IsCpuBusy(*sched, 1));
+  for (int cpu = 0; cpu < 4; ++cpu) {
+    EXPECT_THAT(TaskSchedulerInternals::RunqueueLoad(*sched, cpu), t::Eq(0));
+  }
+  BindCpuLocal(SmpGetCpuLocal(2));
+  EXPECT_FALSE(TaskSchedulerInternals::PollIdleCpu(*sched, 2));
+  BindCpuLocal(SmpGetCpuLocal(0));
+
+  // Woken from busy CPU 0, it goes to the lowest idle CPU, 1, with one IPI. A
+  // second Wake() only leaves a pending wakeup: no second IPI.
+  const int64_t ipis_before = TotalIpisSent(4);
+  sched->Wake(task);
+  EXPECT_THAT(TaskSchedulerInternals::RunqueueLoad(*sched, 1), t::Eq(1));
+  EXPECT_THAT(g_env.ipi_sent_count[1].load(), t::Eq(2));
+  EXPECT_THAT(g_env.last_ipi_vector[1].load(), t::Eq(kVectorWakeupIpi));
+  sched->Wake(task);
+  EXPECT_THAT(TotalIpisSent(4), t::Eq(ipis_before + 1));
+  EXPECT_THAT(TaskSchedulerInternals::RunqueueLoad(*sched, 1), t::Eq(1));
+
+  BindCpuLocal(SmpGetCpuLocal(1));
+  EXPECT_TRUE(TaskSchedulerInternals::PollIdleCpu(*sched, 1));
+  BindCpuLocal(SmpGetCpuLocal(0));
+  EXPECT_THAT(ctx.phase.load(), t::Eq(2));
+  EXPECT_THAT(ctx.resumed_cpu.load(), t::Eq(1));
+  sched->Join(task);
+  EXPECT_THAT(PmmFreeFrameCount(), t::Eq(pmm_before));
+  EXPECT_THAT(HeapTotalFreeBytes(), t::Eq(heap_before));
+}
+
+struct WsPingPongCtx {
+  TaskScheduler* sched = nullptr;
+  int rounds = 0;
+  std::atomic<bool> abort{false};
+  std::atomic<int> turn{0};
+  std::atomic<Task*> tasks[2] = {};
+  std::atomic<int64_t> rounds_done[2] = {};
+  std::atomic<uint32_t> cpu_mask{0};
+  std::atomic<int> done{0};
+};
+
+struct WsPingPongArg {
+  WsPingPongCtx* ctx = nullptr;
+  int side = 0;
+};
+
+static void WsPingPongWorker(void* const raw_arg) {
+  const WsPingPongArg* const arg = static_cast<const WsPingPongArg*>(raw_arg);
+  WsPingPongCtx* const ctx = arg->ctx;
+  for (int round = 0; round < ctx->rounds; ++round) {
+    while (ctx->turn.load(std::memory_order_acquire) != arg->side) {
+      if (ctx->abort.load(std::memory_order_acquire)) {
+        ctx->done.fetch_add(1, std::memory_order_acq_rel);
+        return;
+      }
+      ctx->sched->Block();
+    }
+    ctx->cpu_mask.fetch_or(1u << static_cast<uint32_t>(CurrentCpuId()));
+    ctx->rounds_done[arg->side].fetch_add(1);
+    ctx->turn.store(1 - arg->side, std::memory_order_release);
+    ctx->sched->Wake(ctx->tasks[1 - arg->side].load());
+  }
+  ctx->done.fetch_add(1, std::memory_order_acq_rel);
+}
+
+// Two tasks hand a turn back and forth through the work-stealing layer, whose
+// Wake() places each woken task on the least-loaded CPU and sends it a wakeup
+// IPI, while AP threads deliver those IPIs and poll as idle loops do.
+TEST(WorkStealingSchedulerTest,
+     ConcurrentBlockAndWakeThroughTheWorkStealingLayerLoseNoWakeups) {
+  constexpr int kNumCpus = 4;
+  SetupEnv(kNumCpus);
+  const int64_t pmm_before = PmmFreeFrameCount();
+  const int64_t heap_before = HeapTotalFreeBytes();
+  const std::shared_ptr<TaskScheduler> sched =
+      CreateWorkStealingScheduler(CreateCoreRunqueueScheduler());
+  TaskSchedulerInternals::Init(*sched);
+
+  WsPingPongCtx ctx;
+  ctx.sched = sched.get();
+  ctx.rounds = 1000;
+  WsPingPongArg args[2] = {{&ctx, 0}, {&ctx, 1}};
+  // Both on CPU 0, which runs them only once this task yields: after both
+  // handles are published.
+  for (int side = 0; side < 2; ++side) {
+    Task* const task = sched->CreateTaskOnCpu(WsPingPongWorker,    //
+                                              &args[side],         //
+                                              kDefaultTaskWeight,  //
+                                              0);
+    ASSERT_THAT(task, t::NotNull());
+    ctx.tasks[side].store(task);
+  }
+
+  std::atomic<bool> stop_aps{false};
+  std::vector<std::thread> ap_threads;
+  for (int cpu = 1; cpu < kNumCpus; ++cpu) {
+    ap_threads.emplace_back([cpu, &sched, &stop_aps]() {
+      BindCpuLocal(SmpGetCpuLocal(cpu));
+      SetInterruptsEnabledForTest(true);
+      int64_t handled_ipis = 0;
+      while (!stop_aps.load(std::memory_order_acquire)) {
+        const int64_t sent_ipis =
+            g_env.ipi_sent_count[cpu].load(std::memory_order_acquire);
+        if (sent_ipis > handled_ipis) {
+          handled_ipis = sent_ipis;
+          InterruptFrame ipi_frame = {};
+          ipi_frame.vector = kVectorWakeupIpi;
+          ipi_frame.rflags = kRflagsInterruptEnableBit;
+          SetInterruptsEnabledForTest(false);
+          TaskSchedulerInternals::OnWakeupIpi(*sched, &ipi_frame);
+          SetInterruptsEnabledForTest(true);
+        }
+        SetInterruptsEnabledForTest(false);
+        const bool dispatched =
+            TaskSchedulerInternals::PollIdleCpu(*sched, cpu);
+        SetInterruptsEnabledForTest(true);
+        if (!dispatched) {
+          std::this_thread::yield();
+        }
+      }
+      ResetCpuLocalForTest();
+    });
+  }
+
+  const bool finished = WaitUntil([&ctx]() { return ctx.done.load() == 2; },
+                                  [&sched]() {
+                                    sched->Yield();
+                                    std::this_thread::yield();
+                                  });
+  EXPECT_TRUE(finished);
+  if (!finished) {
+    ctx.abort.store(true, std::memory_order_release);
+    EXPECT_TRUE(WaitUntil([&ctx]() { return ctx.done.load() == 2; },
+                          [&sched, &ctx]() {
+                            sched->Wake(ctx.tasks[0].load());
+                            sched->Wake(ctx.tasks[1].load());
+                            sched->Yield();
+                            std::this_thread::yield();
+                          }));
+  }
+  sched->Join(ctx.tasks[0].load());
+  sched->Join(ctx.tasks[1].load());
+  stop_aps.store(true, std::memory_order_release);
+  for (std::thread& th : ap_threads) {
+    th.join();
+  }
+
+  EXPECT_THAT(ctx.rounds_done[0].load(), t::Eq(ctx.rounds));
+  EXPECT_THAT(ctx.rounds_done[1].load(), t::Eq(ctx.rounds));
+  // The woken tasks ran on APs, which the wakeup IPIs reached.
+  EXPECT_THAT(ctx.cpu_mask.load() & ~1u, t::Ne(0u));
+  EXPECT_THAT(TotalIpisSent(kNumCpus), t::Gt(0));
   for (int c = 0; c < kNumCpus; ++c) {
     EXPECT_THAT(TaskSchedulerInternals::RunqueueLoad(*sched, c), t::Eq(0));
   }

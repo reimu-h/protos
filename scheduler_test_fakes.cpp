@@ -116,7 +116,8 @@ void ActivateAddressSpace(const AddressSpace* const address_space) {
 
 // Records the save instead of executing XSAVE or FXSAVE, and counts it as a
 // mismatch if the calling CPU's registers hold another state than `state`.
-// The scheduler calls it with interrupts disabled, on the CPU that switches.
+// The scheduler calls it with interrupts disabled, on the CPU that switches,
+// in the handoff window, where it calls `g_env.fpu_save_hook` if set.
 void FpuSave(FpuState* const state) {
   DCHECK(state != nullptr);
   DCHECK(!AreInterruptsEnabled());
@@ -125,6 +126,9 @@ void FpuSave(FpuState* const state) {
     g_env.fpu_save_mismatches.fetch_add(1, std::memory_order_acq_rel);
   }
   RecordFpuCall(FakeFpuOp::kSave, cpu, state);
+  if (g_env.fpu_save_hook) {
+    g_env.fpu_save_hook(state);
+  }
 }
 
 // Records the load instead of executing XRSTOR or FXRSTOR: the calling CPU's

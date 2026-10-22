@@ -160,6 +160,10 @@ bool PagingReserveKernelRange(uintptr_t virt_addr, int64_t size);
 // translation, so it needs no TLB flush and is safe on any CPU.
 bool PagingMapKernelPage(uintptr_t virt_addr, uintptr_t phys_addr);
 
+// Like `PagingMapKernelPage`, but maps the page uncacheable and non-executable
+// (`P | W | PWT | PCD | NX`, PAT=0 -> PA3=UC) for kernel MMIO access.
+bool PagingMapKernelMmioPage(uintptr_t virt_addr, uintptr_t phys_addr);
+
 // Unmaps the 4 KiB page at page-aligned `virt_addr` that `PagingMapKernelPage`
 // mapped, invalidates it in the calling CPU's TLB, and returns the physical
 // address of its frame, or 0 if the page was not mapped. Other CPUs may keep
@@ -228,6 +232,18 @@ enum class UserPageAccess : uint8_t {
   kReadExecute,
 };
 
+// Attributes of a mapped 4 KiB user page in a user root, returned by
+// `PagingQueryUserPage()`.
+struct UserPageInfo {
+  uintptr_t phys_addr = 0;
+  bool writable = false;
+  bool executable = false;
+  bool write_through = false;
+  bool cache_disable = false;
+  bool pat = false;
+  bool owned = false;
+};
+
 // Maps the user page at page-aligned `user_addr`, in
 // `[kUserSpaceBase, kUserSpaceEnd)`, in `root` (from `PagingCreateUserRoot()`)
 // to the frame at non-zero page-aligned `phys_addr`, allocating missing page
@@ -242,15 +258,35 @@ bool PagingMapUserPage(uintptr_t root,       //
                        uintptr_t phys_addr,  //
                        UserPageAccess access);
 
+// Maps the user page at page-aligned `user_addr` in `root` to the device MMIO
+// page at non-zero page-aligned `phys_addr` as uncacheable, writable,
+// non-executable and non-owned (`P | U | W | PWT | PCD | kPteNotOwned | NX`,
+// PAT=0 -> PA3=UC). `PagingDestroyUserRoot()` does not free `phys_addr` to the
+// PMM, and `PagingUserRangeAccessible()` returns false for it so kernel user
+// copies (`CopyFromUser` / `CopyToUser`) refuse device MMIO pages.
+bool PagingMapUserDevicePage(uintptr_t root,       //
+                             uintptr_t user_addr,  //
+                             uintptr_t phys_addr);
+
 // Returns the frame that the user page at page-aligned `user_addr` maps to in
 // `root`, or 0 if it is not mapped.
 uintptr_t PagingUserPageFrame(uintptr_t root, uintptr_t user_addr);
 
+// Fills `*info` with the attributes of the mapped 4 KiB user page at
+// page-aligned `user_addr` in `root`, and returns true; returns false if the
+// page is not mapped or an argument is invalid.
+bool PagingQueryUserPage(uintptr_t root,       //
+                         uintptr_t user_addr,  //
+                         UserPageInfo* info);
+
+// Returns the value of the IA32_PAT MSR (0x277) on the calling CPU.
+uint64_t PagingReadPatMsr();
+
 // Returns true if user code may access every byte of `[addr, addr + size)`
 // (`IsUserRange(addr, size)`, `DCHECK`ed) in `root` (from
-// `PagingCreateUserRoot()`): every page that the range overlaps is a mapped
-// user page, and writable too if `write` is true. An empty range is
-// accessible.
+// `PagingCreateUserRoot()`) as normal RAM: every page that the range overlaps
+// is a mapped, PMM-owned user page (not a device MMIO page), and writable too
+// if `write` is true. An empty range is accessible.
 bool PagingUserRangeAccessible(uintptr_t root,  //
                                uintptr_t addr,  //
                                int64_t size,    //
@@ -261,7 +297,7 @@ bool PagingUserRangeAccessible(uintptr_t root,  //
 // Requires `PagingInitKernelHalf()` (`DCHECK`).
 bool PagingNoExecuteEnabled();
 
-// Frees `root` (from `PagingCreateUserRoot()`) together with every frame
+// Frees `root` (from `PagingCreateUserRoot()`) together with every owned frame
 // mapped in its user space and the page tables of its user space. No CPU may
 // use `root` anymore (`DCHECK`ed for the calling CPU), and no other call may
 // use it at the same time. CPUs that used `root` before keep no translation

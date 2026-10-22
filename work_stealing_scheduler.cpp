@@ -72,8 +72,32 @@ class WorkStealingTaskScheduler final : public ForwardingTaskScheduler {
     inner().Yield();
   }
 
+  void Wake(Task* const task) override {
+    DCHECK(task != nullptr);
+    // With interrupts disabled, so that the CPU that picks the target is the
+    // one that decides whether the target is remote.
+    const bool saved_irq = SaveAndDisableInterrupts();
+    (void)WakeOnCpu(task, SelectLeastLoadedCpu());
+    RestoreInterrupts(saved_irq);
+  }
+
  private:
   // Scheduler internals:
+  bool WakeOnCpu(Task* const task, const int target_cpu) override {
+    DCHECK(task != nullptr);
+    const int cpu_count = SmpCpuCount();
+    DCHECK(target_cpu >= 0 && target_cpu < cpu_count);
+    DCHECK(IsCpuOnline(target_cpu, cpu_count));
+    const bool queued =
+        TaskSchedulerInternals::WakeOnCpu(inner(), task, target_cpu);
+    // Only the call that queued the task wakes its CPU. `task` may have run
+    // and exited already, so this doesn't touch it.
+    if (queued) {
+      SendWakeupIpiIfRemote(target_cpu);
+    }
+    return queued;
+  }
+
   bool PollIdleCpu(const int cpu_index) override {
     const bool saved_irq = SaveAndDisableInterrupts();
     const bool dispatched = PollIdleCpuIrqsOff(cpu_index);

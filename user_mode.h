@@ -5,6 +5,8 @@
 #include <cstdint>
 #include <memory>
 
+#include "driver.h"
+#include "paging.h"
 #include "spinlock.h"
 #include "syscall_abi.h"
 
@@ -134,6 +136,12 @@ struct UserProcessStats {
   int64_t kill_notice_tick = -1;
   int kill_end_cpu = -1;
   bool kill_same_cpu_no_switch = false;
+  // Whether the program is currently in the middle of kSyscallIrqWait, whether
+  // its task is parked (not running on any CPU) inside kSyscallIrqWait, and
+  // the total timer interrupts its task has taken so far (`TaskTimerTicks()`).
+  bool in_irq_wait = false;
+  bool blocked_in_irq_wait = false;
+  int64_t task_timer_ticks = 0;
 };
 
 // A user process: a task that loads a user program into a new address space,
@@ -143,12 +151,15 @@ struct UserProcessStats {
 class UserProcess {
  public:
   // Starts a process that runs `program` (which must stay in memory until the
-  // process has ended) with `arg` in the program's rdi, on a CPU that the
-  // scheduler (task.h) chooses. Returns nullptr if the task can't be
-  // created; a program that can't be loaded ends with `kLoadFailed`. Must
-  // not be called while holding an `IrqSpinLock` (see `CreateTask()`).
-  static std::unique_ptr<UserProcess> Start(const UserProgram& program,
-                                            uint64_t arg);
+  // process has ended) with `arg` in the program's rdi and `capabilities`
+  // (`kUserCap*`, syscall_abi.h), on a CPU that the scheduler (task.h)
+  // chooses. Returns nullptr if the task can't be created; a program that
+  // can't be loaded ends with `kLoadFailed`. Must not be called while holding
+  // an `IrqSpinLock` (see `CreateTask()`).
+  static std::unique_ptr<UserProcess> Start(
+      const UserProgram& program,  //
+      uint64_t arg,                //
+      uint64_t capabilities = kUserCapNone);
 
   ~UserProcess();
 
@@ -163,12 +174,13 @@ class UserProcess {
   // then. It ends within a few timer ticks: if its task is running, `Kill()`
   // interrupts that CPU (`kVectorKickIpi`), a system call in progress returns
   // early, and the program ends on its way back to user mode; a task that is
-  // not running ends the program the same way once it runs again. A program
-  // killed before it entered user mode never does. May be called by any task,
-  // any number of times, also by several tasks at once and after the program
-  // has ended or `Wait()` has returned, which leaves the result alone. Once
-  // `Wait()` has started, it only sets the request. Must not be called by an
-  // interrupt handler: it takes a lock that the interrupted code may hold.
+  // not running (or is blocked in `irq_wait`) is woken and ends the program
+  // the same way once it runs again. A program killed before it entered user
+  // mode never does. May be called by any task, any number of times, also by
+  // several tasks at once and after the program has ended or `Wait()` has
+  // returned, which leaves the result alone. Once `Wait()` has started, it
+  // only sets the request. Must not be called by an interrupt handler: it
+  // takes a lock that the interrupted code may hold.
   void Kill();
 
   // Arms a synthetic post-kill delay of `ticks` non-stolen timer ticks for the
@@ -188,6 +200,20 @@ class UserProcess {
     return last_syscall_cpu_.load(std::memory_order_acquire);
   }
 
+  // Returns the process's capability mask (`kUserCap*`).
+  uint64_t capabilities() const { return capabilities_; }
+
+  // Returns the non-zero owner token used by this process when claiming PCI
+  // devices and device IRQs.
+  uintptr_t OwnerToken() const { return driver_.OwnerToken(); }
+
+  // Looks up or queries `user_addr` in the process's live address space.
+  // Intended for boot self-tests that inspect mapped pages while the process is
+  // alive (`space_ != nullptr`).
+  uintptr_t LookupUserPage(uintptr_t user_addr) const;
+  bool QueryUserPage(uintptr_t user_addr, UserPageInfo* info) const;
+  bool BindVectorsForSelftest(int device_index, int count);
+
   // Returns what the kernel has observed of the process so far. Each field is
   // read atomically, but not all of them at the same instant. May be called by
   // any task while the object exists.
@@ -196,7 +222,9 @@ class UserProcess {
  private:
   friend void UserModeInit();
 
-  UserProcess(const UserProgram& program, uint64_t arg);
+  UserProcess(const UserProgram& program,  //
+              uint64_t arg,                //
+              uint64_t capabilities);
 
   static void TaskEntry(void* raw_process);
   // Loads the program and runs it until it ends, leaving the result in
@@ -212,6 +240,7 @@ class UserProcess {
   static void OnUserFault(InterruptFrame* frame);
   static void OnReturnToUser(InterruptFrame* frame);
   static UserProcess* FromFrame(const InterruptFrame* frame);
+  static bool ShouldStopIrqWait(void* ctx);
   // Returns true once `Kill()` has been called. Long system calls poll it and
   // return early; the program then ends on its way back to user mode.
   bool IsKillRequested() const {
@@ -221,8 +250,8 @@ class UserProcess {
   // `buffer`.
   bool MayRead(uintptr_t buffer, int64_t size) const;
   bool MayWrite(uintptr_t buffer, int64_t size) const;
-  // Serve write(), spin(), read(), spawn() and wait() (syscall_abi.h): return
-  // the result for rax.
+  // Serve write(), spin(), read(), spawn(), wait() and driver system calls
+  // (syscall_abi.h): return the result for rax.
   // `meter` measures the system call from its start; spin() lasts until
   // `meter` has counted `ticks` timer interrupts that interrupted the task,
   // on whichever CPUs: other runnable tasks on its CPU make it last longer in
@@ -233,8 +262,15 @@ class UserProcess {
                int64_t ticks,     //
                TickMeter* meter) const;
   int64_t Read(uintptr_t buffer, int64_t size);
-  int64_t Spawn(uintptr_t name_ptr, int64_t name_len, uint64_t arg);
+  int64_t Spawn(uintptr_t name_ptr,  //
+                int64_t name_len,    //
+                uint64_t arg,        //
+                uint64_t child_caps);
   int64_t WaitChild(int64_t pid, uintptr_t result_ptr);
+  int64_t PciInfo(int64_t index, uintptr_t info_ptr) const;
+  int64_t DmaAlloc(int64_t size, uintptr_t phys_out_ptr, uint64_t flags);
+  int64_t IrqWait(uint64_t mask, int64_t timeout_ticks);
+  int64_t ConsolePush(uintptr_t buffer, int64_t size) const;
   void CleanupChildren();
   // Adds a finished system call, which `meter` measured, to the counters.
   void RecordSyscall(const TickMeter& meter);
@@ -250,19 +286,22 @@ class UserProcess {
 
   const UserProgram program_;
   const uint64_t arg_;
+  const uint64_t capabilities_;
   Task* task_ = nullptr;
   bool waited_ = false;
   // The address space while the program runs, else nullptr.
   AddressSpace* space_ = nullptr;
+  DriverContext driver_;
   // Written by the task (and its interrupt handlers); read after `Join()`.
   UserProgramResult result_;
   std::atomic<bool> kill_requested_{false};
   std::atomic<int64_t> syscall_count_{0};
   std::atomic<int> last_syscall_cpu_{-1};
-  // Kill() reads `task_` only under this lock and while `task_reclaimed_` is
-  // false. Wait() sets `task_reclaimed_` under it before `Join()` frees the
-  // task. A leaf lock: nothing else is taken while holding it.
-  IrqSpinLock kill_lock_;
+  // Kill() reads `task_` and wakes it only under this lock and while
+  // `task_reclaimed_` is false. Wait() sets `task_reclaimed_` under it before
+  // `Join()` frees the task. Only `TaskScheduler::Wake()` (which takes a
+  // single innermost runqueue lock) may be called while holding it.
+  mutable IrqSpinLock kill_lock_;
   bool task_reclaimed_ = false;
   // Written by the first Kill() before Wait() under `kill_lock_`, before it
   // publishes the request (`kill_requested_`); `kill_tick_` (stored last, with
@@ -277,6 +316,7 @@ class UserProcess {
   std::atomic<int64_t> syscall_timer_ticks_{0};
   std::atomic<int64_t> max_syscall_timer_ticks_{0};
   std::atomic<bool> in_syscall_{false};
+  std::atomic<bool> in_irq_wait_{false};
   std::atomic<int64_t> user_timer_ticks_{0};
   std::atomic<int> end_vector_{-1};
   std::atomic<int64_t> end_tick_{-1};

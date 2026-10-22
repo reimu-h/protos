@@ -39,7 +39,13 @@ constexpr uint64_t kHugePageAddressMask = 0x000FFFFFFFE00000ULL;
 // with this bit set, which keeps the page's physical address. The processor
 // ignores every bit of a not-present entry except Present.
 constexpr uint64_t kPteGuardPage = 1ULL << 9;
+// Software-available PTE bit (bit 10) on present user PTEs: the physical page
+// is a device MMIO page not owned by the PMM, so `PagingDestroyUserRoot` must
+// not free it and `PagingUserRangeAccessible` must reject it for kernel user
+// copies.
+constexpr uint64_t kPteNotOwned = 1ULL << 10;
 
+constexpr uint32_t kMsrIa32Pat = 0x00000277;
 constexpr uint32_t kMsrIa32Efer = 0xC0000080;
 constexpr uint64_t kEferNoExecuteEnable = 1ULL << 11;
 
@@ -427,7 +433,7 @@ static uint64_t* EnsureUserTableLocked(uint64_t* const entry) {
 
 // Appends the user page table at `table_phys` and everything below it to
 // `*frames`: the tables it points to and, if it is a PT (`level` 1; 2 for a
-// PD, 3 for a PDPT), the frames that it maps.
+// PD, 3 for a PDPT), the PMM-owned frames that it maps (`kPteNotOwned` clear).
 static void CollectUserTable(const uintptr_t table_phys,  //
                              const int level,             //
                              PmmFrameList* const frames) {
@@ -440,7 +446,9 @@ static void CollectUserTable(const uintptr_t table_phys,  //
       continue;
     }
     if (level == 1) {
-      frames->Add(entry & kPteAddressMask);
+      if ((entry & kPteNotOwned) == 0) {
+        frames->Add(entry & kPteAddressMask);
+      }
     } else {
       DCHECK((entry & kPteHugePage) == 0);
       CollectUserTable(entry & kPteAddressMask, level - 1, frames);
@@ -450,8 +458,10 @@ static void CollectUserTable(const uintptr_t table_phys,  //
 }
 
 // Returns true if user code may access the page at page-aligned `user_page` in
-// `root`, and write to it if `write` is true: the entries on every level are
-// present and allow user access (and writes). User space has no large pages.
+// `root` as normal RAM, and write to it if `write` is true: the entries on
+// every level are present and allow user access (and writes), and the leaf PT
+// entry is an owned RAM page (`kPteNotOwned` clear). User space has no large
+// pages.
 static bool IsUserPageAccessibleLocked(const uintptr_t root,
                                        const uintptr_t user_page,
                                        const bool write) {
@@ -464,13 +474,44 @@ static bool IsUserPageAccessibleLocked(const uintptr_t root,
       return false;
     }
     if (shift == 12) {
-      return true;
+      return (entry & kPteNotOwned) == 0;
     }
     if ((entry & kPteHugePage) != 0) {
       return false;
     }
     table = reinterpret_cast<const uint64_t*>(entry & kPteAddressMask);
   }
+}
+
+static bool MapUserPageWithFlags(const uintptr_t root,       //
+                                 const uintptr_t user_addr,  //
+                                 const uintptr_t phys_addr,  //
+                                 const uint64_t pte_flags) {
+  if (!IsUserRoot(root) || !IsUserPage(user_addr) || phys_addr == 0 ||
+      (phys_addr & ~kPteAddressMask) != 0) {
+    return false;
+  }
+  const IrqSpinLockGuard lock_guard(g_paging_lock);
+  uint64_t* const pml4 = reinterpret_cast<uint64_t*>(root);
+  uint64_t* const pdpt =
+      EnsureUserTableLocked(&pml4[(user_addr >> 39) & 0x1FF]);
+  if (pdpt == nullptr) {
+    return false;
+  }
+  uint64_t* const pd = EnsureUserTableLocked(&pdpt[(user_addr >> 30) & 0x1FF]);
+  if (pd == nullptr) {
+    return false;
+  }
+  uint64_t* const pt = EnsureUserTableLocked(&pd[(user_addr >> 21) & 0x1FF]);
+  if (pt == nullptr) {
+    return false;
+  }
+  uint64_t* const pte = &pt[(user_addr >> 12) & 0x1FF];
+  if ((*pte & kPtePresent) != 0) {
+    return false;
+  }
+  *pte = phys_addr | pte_flags;
+  return true;
 }
 
 }  // namespace
@@ -667,6 +708,26 @@ bool PagingMapKernelPage(const uintptr_t virt_addr, const uintptr_t phys_addr) {
   return true;
 }
 
+bool PagingMapKernelMmioPage(const uintptr_t virt_addr,
+                             const uintptr_t phys_addr) {
+  if (!IsKernelVirtualPage(virt_addr) || phys_addr == 0 ||
+      (phys_addr & ~kPteAddressMask) != 0) {
+    return false;
+  }
+  uint64_t pte_flags =
+      kPtePresent | kPteWritable | kPteWriteThrough | kPteCacheDisable;
+  if (g_no_execute_enabled) {
+    pte_flags |= kPteNoExecute;
+  }
+  const IrqSpinLockGuard lock_guard(g_paging_lock);
+  uint64_t* const pte = FindKernelPtEntryLocked(virt_addr);
+  if (pte == nullptr || (*pte & kPtePresent) != 0) {
+    return false;
+  }
+  *pte = phys_addr | pte_flags;
+  return true;
+}
+
 uintptr_t PagingUnmapKernelPage(const uintptr_t virt_addr) {
   if (!IsKernelVirtualPage(virt_addr)) {
     return 0;
@@ -763,10 +824,6 @@ bool PagingMapUserPage(const uintptr_t root,       //
                        const uintptr_t user_addr,  //
                        const uintptr_t phys_addr,  //
                        const UserPageAccess access) {
-  if (!IsUserRoot(root) || !IsUserPage(user_addr) || phys_addr == 0 ||
-      (phys_addr & ~kPteAddressMask) != 0) {
-    return false;
-  }
   uint64_t pte_flags = kPtePresent | kPteUser;
   if (access == UserPageAccess::kReadWrite) {
     pte_flags |= kPteWritable;
@@ -774,28 +831,18 @@ bool PagingMapUserPage(const uintptr_t root,       //
   if (access != UserPageAccess::kReadExecute && g_no_execute_enabled) {
     pte_flags |= kPteNoExecute;
   }
+  return MapUserPageWithFlags(root, user_addr, phys_addr, pte_flags);
+}
 
-  const IrqSpinLockGuard lock_guard(g_paging_lock);
-  uint64_t* const pml4 = reinterpret_cast<uint64_t*>(root);
-  uint64_t* const pdpt =
-      EnsureUserTableLocked(&pml4[(user_addr >> 39) & 0x1FF]);
-  if (pdpt == nullptr) {
-    return false;
+bool PagingMapUserDevicePage(const uintptr_t root,       //
+                             const uintptr_t user_addr,  //
+                             const uintptr_t phys_addr) {
+  uint64_t pte_flags = kPtePresent | kPteUser | kPteWritable |
+                       kPteWriteThrough | kPteCacheDisable | kPteNotOwned;
+  if (g_no_execute_enabled) {
+    pte_flags |= kPteNoExecute;
   }
-  uint64_t* const pd = EnsureUserTableLocked(&pdpt[(user_addr >> 30) & 0x1FF]);
-  if (pd == nullptr) {
-    return false;
-  }
-  uint64_t* const pt = EnsureUserTableLocked(&pd[(user_addr >> 21) & 0x1FF]);
-  if (pt == nullptr) {
-    return false;
-  }
-  uint64_t* const pte = &pt[(user_addr >> 12) & 0x1FF];
-  if ((*pte & kPtePresent) != 0) {
-    return false;
-  }
-  *pte = phys_addr | pte_flags;
-  return true;
+  return MapUserPageWithFlags(root, user_addr, phys_addr, pte_flags);
 }
 
 uintptr_t PagingUserPageFrame(const uintptr_t root, const uintptr_t user_addr) {
@@ -809,6 +856,30 @@ uintptr_t PagingUserPageFrame(const uintptr_t root, const uintptr_t user_addr) {
   }
   return *pte & kPteAddressMask;
 }
+
+bool PagingQueryUserPage(const uintptr_t root,       //
+                         const uintptr_t user_addr,  //
+                         UserPageInfo* const info) {
+  if (!IsUserRoot(root) || !IsUserPage(user_addr) || info == nullptr) {
+    return false;
+  }
+  const IrqSpinLockGuard lock_guard(g_paging_lock);
+  const uint64_t* const pte = FindPtEntryInRootLocked(root, user_addr);
+  if (pte == nullptr || (*pte & kPtePresent) == 0) {
+    return false;
+  }
+  const uint64_t entry = *pte;
+  info->phys_addr = entry & kPteAddressMask;
+  info->writable = (entry & kPteWritable) != 0;
+  info->executable = !g_no_execute_enabled || (entry & kPteNoExecute) == 0;
+  info->write_through = (entry & kPteWriteThrough) != 0;
+  info->cache_disable = (entry & kPteCacheDisable) != 0;
+  info->pat = (entry & kPtePat) != 0;
+  info->owned = (entry & kPteNotOwned) == 0;
+  return true;
+}
+
+uint64_t PagingReadPatMsr() { return ReadMsr(kMsrIa32Pat); }
 
 bool PagingUserRangeAccessible(const uintptr_t root,  //
                                const uintptr_t addr,  //

@@ -19,6 +19,13 @@ namespace protos {
 // - `CreateTask()` always places the task on CPU 0, and `CreateTaskOnCpu()`
 //   never sends a wakeup IPI. Placement and wakeups belong to the
 //   work-stealing layer.
+// - `Wake()` queues a blocked task on the calling CPU (CPU 0 if the caller
+//   runs on no online CPU), and `WakeOnCpu()` never sends a wakeup IPI, for
+//   the same reason.
+// - `BlockUntil()` is not supported: timed waits need CPU 0's timer interrupt
+//   before the preemptive layer filters it, so that layer implements them on
+//   top of `Block()` and `Wake()`, and the core crashes with a PANIC() message
+//   that names it.
 // - `SetPreemptEnabled()` does nothing and `IsPreemptEnabled()` always returns
 //   true. The preemptive layer decides whether an interrupt may preempt.
 // - `Join()` busy-waits, yielding until the task has exited, and then frees
@@ -47,16 +54,27 @@ namespace protos {
 // idle task. An idle task runs only while its CPU has nothing queued. It is
 // not preempted by interrupts: the idle loop switches to queued work by calling
 // `PollIdleCpu()` each time it wakes up, and is resumed only when a task exits
-// while nothing else is queued on that CPU. Work that the idle loop performs
-// itself, such as `SmpRunOnAllCpus()` callbacks, therefore waits while tasks
-// run on that AP.
+// or blocks while nothing else is queued on that CPU. Work that the idle loop
+// performs itself, such as `SmpRunOnAllCpus()` callbacks, therefore waits while
+// tasks run on that AP. Neither the bootstrap task nor an idle task may block.
+//
+// Blocking: `Block()` switches the task out like an exiting task, but saves
+// its registers and keeps its stack. Once the CPU has left the task's stack,
+// `FinishContextSwitch()` parks the task, or queues it again at once if a
+// `Wake()` came in meanwhile; one atomic word per task decides which `Wake()`
+// (or `FinishContextSwitch()`) queues it, so no wakeup is lost and no task is
+// queued twice. A blocked task is in no runqueue: `RunqueueLoad()` doesn't
+// count it, `StealTask()` never moves it, `TaskRunningCpu()` returns -1 for it
+// and its timer ticks don't advance. A woken task keeps the lead over
+// `min_vruntime` that it had on the CPU where it blocked, rebased on the
+// `min_vruntime` of the CPU that queues it, as `StealTask()` does.
 //
 // Interrupts and threading: methods may be called on any CPU and disable local
 // interrupts internally where they touch per-CPU state. `OnTimerInterrupt()`,
 // `OnWakeupIpi()` and `PollIdleCpu()` do nothing before `Init()` or on an
 // unbound or offline CPU, and `PollIdleCpu(cpu_index)` does nothing unless
-// called on CPU `cpu_index`. `CreateTask*()`, `Yield()`, `Join()` and
-// returning from a task must not happen while an `IrqSpinLock` is held.
+// called on CPU `cpu_index`. `CreateTask*()`, `Yield()`, `Block()`, `Join()`
+// and returning from a task must not happen while an `IrqSpinLock` is held.
 // `Init()` must run on the BSP after `SmpInit()` (which binds the BSP's
 // `CpuLocal`) and `IdtInit()`.
 //
@@ -64,7 +82,7 @@ namespace protos {
 // puts an unmapped guard page below each stack, and frees a stack with
 // `TaskStackFree()` when its task exits. Each stack also has a canary at its
 // lowest address. The core CHECK-fails if a task overwrote it (overflowed its
-// stack) when the task is switched out or exits.
+// stack) when the task is switched out (also when it blocks) or exits.
 //
 // Address spaces: the core records the address space of each task
 // (`SetAddressSpace()`) and calls `ActivateAddressSpace()` (address_space.h)
