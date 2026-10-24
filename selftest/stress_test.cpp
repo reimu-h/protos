@@ -240,6 +240,44 @@ TEST(TscDeadlineTest, ExpiresOnceTheTimeoutHasElapsed) {
   EXPECT_FALSE(long_deadline.Expired());
 }
 
+TEST(TickWaitTimeoutTscCyclesTest, CoversTheTicksAtTheMeasuredRate) {
+  // The usbkbd idle window: 550 ticks at 250 Hz, 2.2 s, on a 5 GHz TSC
+  // (20M cycles per tick) is longer than the fixed bound.
+  constexpr int64_t kWindowTicks = 550;
+  constexpr int64_t kCyclesPerTick = 5'000'000'000LL / kApicTimerTargetHz;
+  constexpr uint64_t kWindowCycles =
+      static_cast<uint64_t>(kWindowTicks * kCyclesPerTick);
+  ASSERT_THAT(kWindowCycles, t::Gt(kSelfTestWaitTimeoutTscCycles));
+  EXPECT_THAT(TickWaitTimeoutTscCycles(kWindowTicks, kCyclesPerTick),
+              t::Eq(2 * kWindowCycles + kSelfTestWaitTimeoutTscCycles));
+  // Other waits keep the fixed bound.
+  EXPECT_THAT(TickWaitTimeoutTscCycles(0, kCyclesPerTick),
+              t::Eq(kSelfTestWaitTimeoutTscCycles));
+  EXPECT_THAT(TickWaitTimeoutTscCycles(kWindowTicks, 0),
+              t::Eq(kSelfTestWaitTimeoutTscCycles));
+  EXPECT_THAT(TickWaitTimeoutTscCycles(-1, kCyclesPerTick),
+              t::Eq(kSelfTestWaitTimeoutTscCycles));
+  EXPECT_THAT(TickWaitTimeoutTscCycles(kWindowTicks, -1),
+              t::Eq(kSelfTestWaitTimeoutTscCycles));
+}
+
+TEST(TickWaitTimeoutTscCyclesTest, SaturatesInsteadOfOverflowing) {
+  constexpr uint64_t kMaxWindowCycles =
+      (UINT64_MAX - kSelfTestWaitTimeoutTscCycles) / 2;
+  constexpr int64_t kTicks = 1000;
+  constexpr int64_t kLargestCyclesPerTick =
+      static_cast<int64_t>(kMaxWindowCycles / kTicks);
+  EXPECT_THAT(TickWaitTimeoutTscCycles(kTicks, kLargestCyclesPerTick),
+              t::Eq(2 * static_cast<uint64_t>(kTicks * kLargestCyclesPerTick) +
+                    kSelfTestWaitTimeoutTscCycles));
+  EXPECT_THAT(TickWaitTimeoutTscCycles(kTicks, kLargestCyclesPerTick + 1),
+              t::Eq(UINT64_MAX));
+  EXPECT_THAT(TickWaitTimeoutTscCycles(INT64_MAX, INT64_MAX),
+              t::Eq(UINT64_MAX));
+  // Such a bound never expires.
+  EXPECT_FALSE(TscDeadline(TickWaitTimeoutTscCycles(INT64_MAX, 1)).Expired());
+}
+
 TEST_F(StressTest, ResolveStressTestSeedKeepsNonZeroSeedsAndHarvestsForZero) {
   SetupEnv(1);
   EXPECT_THAT(ResolveStressTestSeed(1), t::Eq(1u));

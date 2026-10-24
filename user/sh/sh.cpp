@@ -1,8 +1,9 @@
-// sh: the interactive ring-3 user-space shell spawned by init (user/init.cpp).
+// sh: the interactive ring-3 user-space shell spawned by init
+// (user/init/init.cpp).
 
 #include <cstdint>
 
-#include "user/sh_lib.h"
+#include "user/sh/sh_lib.h"
 #include "user/syscall.h"
 
 namespace protos::user {
@@ -34,10 +35,9 @@ static int64_t ShellSysSpawn(void* const /*ctx*/,     //
   return Spawn(name, name_len, arg);
 }
 
-static int64_t ShellSysWait(void* const /*ctx*/,  //
-                            const int64_t pid,    //
-                            UserProgramResult* const out) {
-  return Wait(pid, out);
+static StatusOr<UserProgramResult> ShellSysWait(void* const /*ctx*/,
+                                                const int64_t pid) {
+  return Wait(pid);
 }
 
 int64_t Main(const uint64_t /*arg*/) {

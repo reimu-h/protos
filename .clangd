@@ -1,9 +1,13 @@
+# Sources include project headers by their path from the repository root (the
+# Makefile's -iquote .), also from headers in subdirectories.
 CompileFlags:
   Add:
     - -std=c++20
     - -m64
     - -Wall
     - -Wextra
+    - -iquote
+    - .
 
 ---
 If:
@@ -42,3 +46,36 @@ CompileFlags:
     - ..
     - -isystem
     - ../build/include
+
+---
+# So do files in user/ and user/*/. Non-test files in user/ are compiled with
+# USER_CXXFLAGS: unlike the kernel, user programs may use the x87/MMX/SSE
+# registers, and they use the kernel code model.
+If:
+  PathMatch: user/[^/]+
+CompileFlags:
+  Add:
+    - -iquote
+    - ..
+    - -isystem
+    - ../build/include
+
+---
+If:
+  PathMatch: user/[^/]+/.*
+CompileFlags:
+  Add:
+    - -iquote
+    - ../..
+    - -isystem
+    - ../../build/include
+
+---
+If:
+  PathMatch: user/.*
+  PathExclude: .*_test\.cpp
+CompileFlags:
+  Add:
+    - -mcmodel=kernel
+  Remove:
+    - -mgeneral-regs-only

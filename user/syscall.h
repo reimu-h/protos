@@ -3,6 +3,7 @@
 
 #include <cstdint>
 
+#include "status_or.h"
 #include "syscall_abi.h"
 
 // System call wrappers for the user programs (see syscall_abi.h).
@@ -25,7 +26,7 @@ inline int64_t Syscall(const int64_t number,     //
 
 [[noreturn]] inline void Exit(const int64_t status) {
   Syscall(kSyscallExit, static_cast<uint64_t>(status));
-  // exit() does not return; trap (#UD) if it ever did.
+  // Exit() does not return; trap (#UD) if it ever did.
   __builtin_trap();
 }
 
@@ -46,7 +47,7 @@ inline int64_t Print(const char* const text) {
 
 inline int GetCpu() { return static_cast<int>(Syscall(kSyscallGetCpu)); }
 
-// Makes a spin() system call: the kernel reads the `size` bytes at `buffer`
+// Makes a Spin() system call: the kernel reads the `size` bytes at `buffer`
 // over and over until the CPUs running the call have taken `ticks` timer
 // interrupts while running it. Returns their checksum
 // (`SyscallSpinChecksum()`), or an error (syscall_abi.h).
@@ -92,12 +93,17 @@ inline int64_t Spawn(const char* const name, const uint64_t arg = 0) {
   return Spawn(name, length, arg);
 }
 
-// Waits until child process `pid` has ended, writes its `UserProgramResult` to
-// `*result`, and returns 0, or an error.
-inline int64_t Wait(const int64_t pid, UserProgramResult* const result) {
-  return Syscall(kSyscallWait,                //
-                 static_cast<uint64_t>(pid),  //
-                 reinterpret_cast<uintptr_t>(result));
+// Waits until child process `pid` has ended and returns its
+// `UserProgramResult`, or an error.
+inline StatusOr<UserProgramResult> Wait(const int64_t pid) {
+  UserProgramResult result{};
+  const int64_t rc = Syscall(kSyscallWait,                //
+                             static_cast<uint64_t>(pid),  //
+                             reinterpret_cast<uintptr_t>(&result));
+  if (SyscallIsError(rc)) {
+    return rc;
+  }
+  return result;
 }
 
 constexpr bool IsError(const int64_t result) { return SyscallIsError(result); }
@@ -126,10 +132,17 @@ inline int64_t SpawnDriver(const char* const name, const uint64_t arg = 0) {
   return SpawnDriver(name, length, arg);
 }
 
-inline int64_t GetPciInfo(const int64_t index, PciDeviceInfo* const out) {
-  return Syscall(kSyscallPciInfo,               //
-                 static_cast<uint64_t>(index),  //
-                 reinterpret_cast<uintptr_t>(out));
+inline int64_t GetPciDeviceCount() { return Syscall(kSyscallPciInfo, 0, 0); }
+
+inline StatusOr<PciDeviceInfo> GetPciInfo(const int64_t index) {
+  PciDeviceInfo info{};
+  const int64_t rc = Syscall(kSyscallPciInfo,               //
+                             static_cast<uint64_t>(index),  //
+                             reinterpret_cast<uintptr_t>(&info));
+  if (SyscallIsError(rc)) {
+    return rc;
+  }
+  return info;
 }
 
 inline int64_t PciClaim(const int64_t index) {
@@ -142,17 +155,35 @@ inline int64_t PciBusMaster(const int64_t index, const int64_t enable) {
                  static_cast<uint64_t>(enable));
 }
 
-inline int64_t MmioMap(const uint64_t phys_addr, const int64_t size) {
-  return Syscall(kSyscallMmioMap, phys_addr, static_cast<uint64_t>(size));
+inline StatusOr<uintptr_t> MmioMap(const uint64_t phys_addr,
+                                   const int64_t size) {
+  const int64_t rc =
+      Syscall(kSyscallMmioMap, phys_addr, static_cast<uint64_t>(size));
+  if (SyscallIsError(rc)) {
+    return Error(rc);
+  }
+  return static_cast<uintptr_t>(rc);
 }
 
-inline int64_t DmaAlloc(const int64_t size,        //
-                        uint64_t* const out_phys,  //
-                        const uint64_t flags = 0) {
-  return Syscall(kSyscallDmaAlloc,                       //
-                 static_cast<uint64_t>(size),            //
-                 reinterpret_cast<uintptr_t>(out_phys),  //
-                 flags);
+struct DmaAllocation {
+  uintptr_t va = 0;
+  uint64_t phys = 0;
+};
+
+inline StatusOr<DmaAllocation> DmaAlloc(const int64_t size,
+                                        const uint64_t flags = 0) {
+  uint64_t phys = 0;
+  const int64_t rc = Syscall(kSyscallDmaAlloc,                    //
+                             static_cast<uint64_t>(size),         //
+                             reinterpret_cast<uintptr_t>(&phys),  //
+                             flags);
+  if (SyscallIsError(rc)) {
+    return rc;
+  }
+  return DmaAllocation{
+      .va = static_cast<uintptr_t>(rc),
+      .phys = phys,
+  };
 }
 
 inline int64_t IrqAlloc(const int64_t index,  //

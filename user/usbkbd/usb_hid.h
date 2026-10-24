@@ -1,15 +1,15 @@
-#ifndef PROTOS_USER_USB_HID_H_
-#define PROTOS_USER_USB_HID_H_
+#ifndef PROTOS_USER_USBKBD_USB_HID_H_
+#define PROTOS_USER_USBKBD_USB_HID_H_
 
 #include <cstdint>
 #include <type_traits>
 
 // Translation of USB HID boot-protocol keyboard reports (HID 1.11 appendix B,
 // HID Usage Tables page 0x07) into console bytes for the shell, with a US
-// layout. Freestanding and header-only (see user/xhci_platform.h); pure
+// layout. Freestanding and header-only (see user/usbkbd/xhci_platform.h); pure
 // functions plus a small per-keyboard state.
 //
-// The bytes suit the shell's line editor (user/sh_lib.h): Enter is '\r',
+// The bytes suit the shell's line editor (user/sh/sh_lib.h): Enter is '\r',
 // Backspace is 0x08 and Tab is '\t'. Delete produces nothing (0x7F would
 // erase like Backspace), and no other control bytes are produced: a key
 // pressed while Ctrl, Alt or GUI is held produces nothing, because Ctrl+H,
@@ -257,4 +257,4 @@ inline int TranslateBootReport(HidKeyboardState* const state,  //
 
 }  // namespace protos::usb
 
-#endif  // PROTOS_USER_USB_HID_H_
+#endif  // PROTOS_USER_USBKBD_USB_HID_H_

@@ -70,14 +70,43 @@ enum class TaskWake : uint8_t {
   kParked = 2,
 };
 
+// Virtual runtime: a task's `vruntime` only grows, by
+// ComputeWeightedVruntimeDelta() per yield or tick, and so does each CPU's
+// `min_vruntime`. Like Linux CFS, the core keeps them modulo 2^64, where they
+// wrap around instead of overflowing, and compares and subtracts them only
+// through VruntimeBefore() and VruntimeLead(), which go by the signed
+// difference. That is exact while the values compared are less than 2^63
+// apart, which those of one CPU are by far: they stay within a few of the
+// largest charges (2^20, at weight 1) of its `min_vruntime`. Values of
+// different CPUs are never compared: a task that moves takes only its lead
+// over `min_vruntime` along (StealTask(), EnqueueBlockedTaskLocked()).
+
+// The `min_vruntime` of every CPU at Init(), and so the vruntime of the first
+// tasks: a few default-weight charges below the wrap, as Linux starts at
+// -(1 << 20) nanoseconds, so that every boot and every test wraps around early
+// instead of after weeks of uptime.
+constexpr uint64_t kInitialVruntime = 0 - uint64_t{4 * kBaseVruntimeDelta};
+
+// True if vruntime `a` is earlier than `b`.
+static constexpr bool VruntimeBefore(const uint64_t a, const uint64_t b) {
+  return static_cast<int64_t>(a - b) < 0;
+}
+
+// How far vruntime `vruntime` is ahead of `base`, or 0 if it is not.
+static constexpr int64_t VruntimeLead(const uint64_t vruntime,
+                                      const uint64_t base) {
+  const int64_t lead = static_cast<int64_t>(vruntime - base);
+  return (lead > 0) ? lead : 0;
+}
+
 struct TaskRunqueueKey {
-  int64_t vruntime = 0;
+  uint64_t vruntime = 0;
   int64_t enqueue_seq = 0;
   int64_t task_id = 0;
 
   constexpr bool operator<(const TaskRunqueueKey& other) const {
     if (vruntime != other.vruntime) {
-      return vruntime < other.vruntime;
+      return VruntimeBefore(vruntime, other.vruntime);
     }
     if (enqueue_seq != other.enqueue_seq) {
       return enqueue_seq < other.enqueue_seq;
@@ -109,7 +138,8 @@ struct Task {
   FpuState* fpu_state = nullptr;
 
   int64_t weight = kDefaultTaskWeight;
-  int64_t vruntime = 0;
+  // Modulo 2^64 (see VruntimeBefore()).
+  uint64_t vruntime = 0;
   // While the task is blocked: how far its `vruntime` was ahead of the
   // `min_vruntime` of the CPU that it blocked on (0 if it was behind). The CPU
   // that queues the task again puts it that far ahead of its own
@@ -196,7 +226,8 @@ struct alignas(64) CpuRunqueue {
   IrqSpinLock lock;
   TaskRunqueueTree tree;
   int cpu_id = 0;
-  int64_t min_vruntime = 0;
+  // Modulo 2^64, like `Task::vruntime`.
+  uint64_t min_vruntime = kInitialVruntime;
   int64_t next_enqueue_seq = 0;
   std::atomic<int> runnable_count{0};
 
@@ -334,17 +365,22 @@ static void CheckTaskStackCanary(const Task* const task) {
 
 static void UpdateRunqueueMinVruntime(CpuRunqueue* const rq) {
   DCHECK(rq != nullptr);
-  int64_t min_candidate = INT64_MAX;
+  bool has_candidate = false;
+  uint64_t min_candidate = 0;
   const Task* const curr = rq->current_task;
   if (curr != nullptr && !curr->is_idle &&
       curr->state.load(std::memory_order_relaxed) == TaskState::kRunning) {
     min_candidate = curr->vruntime;
+    has_candidate = true;
   }
   const Task* const first_ready = rq->tree.First();
-  if (first_ready != nullptr && first_ready->vruntime < min_candidate) {
+  if (first_ready != nullptr &&
+      (!has_candidate ||
+       VruntimeBefore(first_ready->vruntime, min_candidate))) {
     min_candidate = first_ready->vruntime;
+    has_candidate = true;
   }
-  if (min_candidate != INT64_MAX && min_candidate > rq->min_vruntime) {
+  if (has_candidate && VruntimeBefore(rq->min_vruntime, min_candidate)) {
     rq->min_vruntime = min_candidate;
   }
 }
@@ -361,7 +397,8 @@ static void EnqueueTaskLocked(CpuRunqueue* const rq,  //
          task->runqueue_node.right == nullptr &&
          task->runqueue_node.parent_color == 0);
 
-  if (clamp_to_min_vruntime && task->vruntime < rq->min_vruntime) {
+  if (clamp_to_min_vruntime &&
+      VruntimeBefore(task->vruntime, rq->min_vruntime)) {
     task->vruntime = rq->min_vruntime;
   }
   task->enqueue_seq = ++rq->next_enqueue_seq;
@@ -386,7 +423,7 @@ static void EnqueueTaskLocked(CpuRunqueue* const rq,  //
 static void EnqueueBlockedTaskLocked(CpuRunqueue* const rq, Task* const task) {
   DCHECK(task->state.load(std::memory_order_seq_cst) == TaskState::kBlocked);
   DCHECK(task->block_lag >= 0);
-  task->vruntime = rq->min_vruntime + task->block_lag;
+  task->vruntime = rq->min_vruntime + static_cast<uint64_t>(task->block_lag);
   task->block_lag = 0;
   EnqueueTaskLocked(rq, task, false);
 }
@@ -404,9 +441,7 @@ static void FinishBlockLocked(CpuRunqueue* const rq, Task* const prev) {
   // to WakeOnCpu(): once parked, another CPU may queue and resume it at once,
   // so nothing here may touch `prev` after a successful exchange.
   prev->running_cpu.store(-1, std::memory_order_release);
-  prev->block_lag = (prev->vruntime > rq->min_vruntime)
-                        ? prev->vruntime - rq->min_vruntime
-                        : 0;
+  prev->block_lag = VruntimeLead(prev->vruntime, rq->min_vruntime);
   prev->state.store(TaskState::kBlocked, std::memory_order_seq_cst);
   TaskWake expected = TaskWake::kNone;
   if (prev->wake.compare_exchange_strong(expected,           //
@@ -522,7 +557,8 @@ class CoreRunqueueTaskScheduler final : public TaskScheduler {
       Task* const curr = rq.current_task;
       DCHECK(curr != nullptr);
       if (!curr->is_idle) {
-        curr->vruntime += ComputeWeightedVruntimeDelta(1, curr->weight);
+        curr->vruntime += static_cast<uint64_t>(
+            ComputeWeightedVruntimeDelta(1, curr->weight));
         UpdateRunqueueMinVruntime(&rq);
       }
     }
@@ -704,7 +740,7 @@ class CoreRunqueueTaskScheduler final : public TaskScheduler {
     bootstrap_task_.stack_base = bsp_local->stack_base;
     bootstrap_task_.stack_top = bsp_local->stack_top;
     bootstrap_task_.weight = kDefaultTaskWeight;
-    bootstrap_task_.vruntime = 0;
+    bootstrap_task_.vruntime = kInitialVruntime;
     bootstrap_task_.enqueue_seq = 0;
     bootstrap_task_.state.store(TaskState::kRunning, std::memory_order_relaxed);
     bootstrap_task_.running_cpu.store(0, std::memory_order_relaxed);
@@ -729,7 +765,7 @@ class CoreRunqueueTaskScheduler final : public TaskScheduler {
       idle.stack_base = cpu_local->stack_base;
       idle.stack_top = cpu_local->stack_top;
       idle.weight = kDefaultTaskWeight;
-      idle.vruntime = 0;
+      idle.vruntime = kInitialVruntime;
       idle.enqueue_seq = 0;
       idle.state.store(TaskState::kRunning, std::memory_order_relaxed);
       idle.running_cpu.store(i, std::memory_order_relaxed);
@@ -826,16 +862,15 @@ class CoreRunqueueTaskScheduler final : public TaskScheduler {
     // the destination's, so that a task moving to a CPU with a much smaller
     // or larger `min_vruntime` neither starves nor is starved by the tasks
     // already there.
-    const int64_t src_min_vruntime = src_rq.min_vruntime;
-    const int64_t rel_vruntime = (stolen->vruntime > src_min_vruntime)
-                                     ? (stolen->vruntime - src_min_vruntime)
-                                     : 0;
+    const int64_t rel_vruntime =
+        VruntimeLead(stolen->vruntime, src_rq.min_vruntime);
 
     src_rq.tree.Erase(stolen);
     src_rq.runnable_count.fetch_sub(1, std::memory_order_release);
     UpdateRunqueueMinVruntime(&src_rq);
 
-    stolen->vruntime = dst_rq.min_vruntime + rel_vruntime;
+    stolen->vruntime =
+        dst_rq.min_vruntime + static_cast<uint64_t>(rel_vruntime);
     EnqueueTaskLocked(&dst_rq, stolen, false);
     return true;
   }
@@ -947,11 +982,13 @@ class CoreRunqueueTaskScheduler final : public TaskScheduler {
           !curr->is_idle &&
           curr->state.load(std::memory_order_relaxed) == TaskState::kRunning) {
         if (charge_tick) {
-          curr->vruntime += ComputeWeightedVruntimeDelta(1, curr->weight);
+          curr->vruntime += static_cast<uint64_t>(
+              ComputeWeightedVruntimeDelta(1, curr->weight));
           UpdateRunqueueMinVruntime(&rq);
         }
         const Task* const first = rq.tree.First();
-        should_preempt = first != nullptr && first->vruntime < curr->vruntime;
+        should_preempt =
+            first != nullptr && VruntimeBefore(first->vruntime, curr->vruntime);
       }
     }
     if (should_preempt) {
@@ -1116,7 +1153,8 @@ class CoreRunqueueTaskScheduler final : public TaskScheduler {
           next = rq.tree.Empty() ? prev : rq.tree.First();
         } else {
           Task* const candidate = rq.tree.First();
-          next = (candidate != nullptr && candidate->vruntime < prev->vruntime)
+          next = (candidate != nullptr &&
+                  VruntimeBefore(candidate->vruntime, prev->vruntime))
                      ? candidate
                      : prev;
         }

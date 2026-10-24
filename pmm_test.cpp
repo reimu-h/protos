@@ -70,6 +70,7 @@ struct FakeEnvState {
   int attached_fb_width = 0;
   int attached_fb_height = 0;
   int attached_fb_bpp = 0;
+  VgaPixelFormat attached_fb_format = {};
   std::string uart_log;
   std::string vga_log;
 };
@@ -220,13 +221,15 @@ bool VgaInitFramebuffer(const uintptr_t fb_phys_addr,  //
                         const int pitch,               //
                         const int width,               //
                         const int height,              //
-                        const int bpp) {
+                        const int bpp,                 //
+                        const VgaPixelFormat& format) {
   g_env.fb_attached = true;
   g_env.attached_fb_addr = fb_phys_addr;
   g_env.attached_fb_pitch = pitch;
   g_env.attached_fb_width = width;
   g_env.attached_fb_height = height;
   g_env.attached_fb_bpp = bpp;
+  g_env.attached_fb_format = format;
   return true;
 }
 
@@ -314,6 +317,12 @@ TEST(PmmTest, InitCarvesReservedKernelMultibootAndFramebuffer) {
   g_env.map.fb_width = 512;
   g_env.map.fb_height = 6;
   g_env.map.fb_bpp = 32;
+  g_env.map.fb_red_position = 24;
+  g_env.map.fb_red_size = 8;
+  g_env.map.fb_green_position = 16;
+  g_env.map.fb_green_size = 8;
+  g_env.map.fb_blue_position = 8;
+  g_env.map.fb_blue_size = 8;
 
   // Byte totals from the parser, which PmmInit only logs.
   g_env.map.total_ram_bytes = 600 * 1024;
@@ -329,6 +338,12 @@ TEST(PmmTest, InitCarvesReservedKernelMultibootAndFramebuffer) {
   EXPECT_THAT(g_env.attached_fb_width, t::Eq(512));
   EXPECT_THAT(g_env.attached_fb_height, t::Eq(6));
   EXPECT_THAT(g_env.attached_fb_bpp, t::Eq(32));
+  EXPECT_THAT(g_env.attached_fb_format.red_position, t::Eq(24));
+  EXPECT_THAT(g_env.attached_fb_format.red_size, t::Eq(8));
+  EXPECT_THAT(g_env.attached_fb_format.green_position, t::Eq(16));
+  EXPECT_THAT(g_env.attached_fb_format.green_size, t::Eq(8));
+  EXPECT_THAT(g_env.attached_fb_format.blue_position, t::Eq(8));
+  EXPECT_THAT(g_env.attached_fb_format.blue_size, t::Eq(8));
   EXPECT_THAT(g_env.uart_log, t::HasSubstr("[PMM] Framebuffer: addr="));
   EXPECT_THAT(g_env.uart_log, t::HasSubstr("[PMM] Kernel range: "));
   EXPECT_THAT(g_env.uart_log,

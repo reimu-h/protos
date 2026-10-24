@@ -6,6 +6,7 @@
 #include <cstdint>
 #include <cstring>
 #include <memory>
+#include <string>
 #include <utility>
 #include <vector>
 
@@ -93,6 +94,12 @@ class FakeDriverEnvironment final : public DriverEnvironment {
     return true;
   }
 
+  void SleepMicroseconds(const int64_t microseconds) override {
+    slept_us_.push_back(microseconds);
+  }
+
+  void Log(const char* const text) override { logs_.push_back(text); }
+
   uint64_t ram_range_base_ = 0;
   int64_t ram_range_size_ = 0;
   int fail_map_after_ = -1;
@@ -103,6 +110,8 @@ class FakeDriverEnvironment final : public DriverEnvironment {
   int64_t freed_frames_ = 0;
   std::vector<MappedPageRecord> mapped_pages_;
   std::vector<std::pair<uintptr_t, int64_t>> zeroed_ranges_;
+  std::vector<int64_t> slept_us_;
+  std::vector<std::string> logs_;
 };
 
 class FakeIrqEnv final : public DeviceIrqEnvironment {
@@ -116,7 +125,7 @@ class FakeIrqEnv final : public DeviceIrqEnvironment {
     handlers_[vector] = nullptr;
   }
 
-  uint8_t BspApicId() override { return 0; }
+  int MsiDestinationApicId() override { return msi_destination_; }
 
   volatile uint32_t* MapMsixTable(const int device_index,
                                   const PciMsix& msix) override {
@@ -139,6 +148,7 @@ class FakeIrqEnv final : public DeviceIrqEnvironment {
   std::vector<uint32_t> msix_words_[kPciMaxDevices];
   int unmapped_[kPciMaxDevices] = {};
   int64_t ticks_ = 50;
+  int msi_destination_ = 0;
 };
 
 class DriverTest : public t::Test {
@@ -184,21 +194,24 @@ TEST_F(DriverTest, MayMakeSyscallEnforcesCapabilityGates) {
 
 TEST_F(DriverTest, PciInfoQueriesCountAndPopulatesAbiStruct) {
   DriverContext ctx;
-  EXPECT_THAT(ctx.PciInfo(0, nullptr), t::Eq(9));
-  EXPECT_THAT(ctx.PciInfo(-1, nullptr), t::Eq(kSyscallErrorNoDevice));
-  EXPECT_THAT(ctx.PciInfo(9, nullptr), t::Eq(kSyscallErrorNoDevice));
+  EXPECT_THAT(PciDeviceCount(), t::Eq(9));
+  EXPECT_THAT(ctx.PciInfo(-1).status(), t::Eq(kSyscallErrorNoDevice));
+  EXPECT_THAT(ctx.PciInfo(9).status(), t::Eq(kSyscallErrorNoDevice));
 
   // Host bridge 00:00.0 is not claimable.
-  PciDeviceInfo host_bridge{};
-  ASSERT_THAT(ctx.PciInfo(0, &host_bridge), t::Eq(9));
-  EXPECT_THAT(host_bridge.vendor_id, t::Eq(0x8086));
-  EXPECT_THAT(host_bridge.class_code, t::Eq(kPciClassBridge));
-  EXPECT_THAT(host_bridge.claimable, t::Eq(0));
+  const StatusOr<DriverPciInfoResult> host_bridge = ctx.PciInfo(0);
+  ASSERT_TRUE(host_bridge.ok());
+  EXPECT_THAT(host_bridge->count, t::Eq(9));
+  EXPECT_THAT(host_bridge->info.vendor_id, t::Eq(0x8086));
+  EXPECT_THAT(host_bridge->info.class_code, t::Eq(kPciClassBridge));
+  EXPECT_THAT(host_bridge->info.claimable, t::Eq(0));
 
   // Root MSI-X controller at 00:04.0.
   const int msix_idx = PciFindDevice({0, 4, 0});
-  PciDeviceInfo msix_info{};
-  ASSERT_THAT(ctx.PciInfo(msix_idx, &msix_info), t::Eq(9));
+  const StatusOr<DriverPciInfoResult> msix_res = ctx.PciInfo(msix_idx);
+  ASSERT_TRUE(msix_res.ok());
+  EXPECT_THAT(msix_res->count, t::Eq(9));
+  const PciDeviceInfo& msix_info = msix_res->info;
   EXPECT_THAT(msix_info.bus, t::Eq(0));
   EXPECT_THAT(msix_info.device, t::Eq(4));
   EXPECT_THAT(msix_info.function, t::Eq(0));
@@ -217,8 +230,10 @@ TEST_F(DriverTest, PciInfoQueriesCountAndPopulatesAbiStruct) {
 
   // Bridged MSI controller at 01:01.0 behind bridge 00:05.0.
   const int msi_idx = PciFindDevice({1, 1, 0});
-  PciDeviceInfo msi_info{};
-  ASSERT_THAT(ctx.PciInfo(msi_idx, &msi_info), t::Eq(9));
+  const StatusOr<DriverPciInfoResult> msi_res = ctx.PciInfo(msi_idx);
+  ASSERT_TRUE(msi_res.ok());
+  EXPECT_THAT(msi_res->count, t::Eq(9));
+  const PciDeviceInfo& msi_info = msi_res->info;
   EXPECT_THAT(msi_info.claimable, t::Eq(1));
   EXPECT_THAT(msi_info.msi_vectors, t::Eq(16));
   EXPECT_THAT(msi_info.msix_vectors, t::Eq(0));
@@ -263,6 +278,55 @@ TEST_F(DriverTest, ClaimOwnershipAndBusMasterSemantics) {
   // Upstream bridge Bus Master stays enabled because bridges are shared.
   EXPECT_THAT(pci_->Peek16({0, 5, 0}, kPciCommandOffset) & kPciCommandBusMaster,
               t::Ne(0U));
+  // No QEMU function has a Power Management capability: nothing to wake.
+  EXPECT_THAT(driver_env_->slept_us_, t::IsEmpty());
+  EXPECT_THAT(driver_env_->logs_, t::IsEmpty());
+}
+
+TEST_F(DriverTest, ClaimWakesADeviceThatFirmwareLeftInD3hot) {
+  // Two Ethernet controllers with a Power Management capability at 0x40: one
+  // in D3hot that resets itself on the way to D0, one already in D0.
+  constexpr PciAddress kAsleep = {0, 6, 0};
+  constexpr PciAddress kAwake = {0, 7, 0};
+  constexpr int kPmcsr = 0x40 + kPciPmControlStatusOffset;
+  for (const PciAddress address : {kAsleep, kAwake}) {
+    pci_->AddFunction(
+        address,
+        {.vendor_id = 0x8086, .device_id = 0x10D3, .class_code = 0x02});
+    pci_->SetBar(address,  //
+                 0,        //
+                 {.kind = FakePciConfigSpace::BarKind::kMem64,
+                  .base = (address == kAsleep) ? 0xFC000000u : 0xFC100000u,
+                  .size = 0x20000});
+  }
+  pci_->AddPowerManagement(kAsleep, 0x40, {.power_state = 3});
+  pci_->AddPowerManagement(kAwake, 0x40, {.power_state = 0});
+  PciResetForTest();
+  PciInit(pci_);
+  const int asleep = PciFindDevice(kAsleep);
+  const int awake = PciFindDevice(kAwake);
+  ASSERT_THAT(asleep, t::Ge(0));
+  ASSERT_THAT(awake, t::Ge(0));
+  const uint32_t bar0 = pci_->Peek32(kAsleep, kPciBar0Offset);
+
+  DriverContext ctx;
+  ASSERT_THAT(ctx.Claim(asleep), t::Eq(0));
+  EXPECT_THAT(pci_->Peek16(kAsleep, kPmcsr) & kPciPmcsrPowerStateMask,
+              t::Eq(0U));
+  // 10 ms of recovery time from D3hot before the device is touched again.
+  EXPECT_THAT(driver_env_->slept_us_, t::ElementsAre(10000));
+  // The BARs and the Command bits that the reset cleared are back.
+  EXPECT_THAT(pci_->Peek32(kAsleep, kPciBar0Offset), t::Eq(bar0));
+  EXPECT_THAT(pci_->Peek16(kAsleep, kPciCommandOffset),
+              t::Eq(kPciCommandMemorySpace | kPciCommandInterruptDisable));
+  EXPECT_THAT(pci_->BarWritesWhileDecoding(), t::Eq(0));
+  // The console names the device and the state that it left.
+  EXPECT_THAT(driver_env_->logs_,
+              t::ElementsAre("[PCI] 00:06.0: woke from D3hot\n"));
+
+  ASSERT_THAT(ctx.Claim(awake), t::Eq(0));
+  EXPECT_THAT(driver_env_->slept_us_, t::ElementsAre(10000));
+  EXPECT_THAT(driver_env_->logs_, t::SizeIs(1));
 }
 
 TEST_F(DriverTest, MmioMapEnforcesBarOwnershipMsixWithholdingAndGuardPages) {
@@ -329,24 +393,22 @@ TEST_F(DriverTest, MmioMapEnforcesBarOwnershipMsixWithholdingAndGuardPages) {
 
 TEST_F(DriverTest, DmaAllocEnforcesAlignmentFlagsZeroingAndQuota) {
   DriverContext ctx;
-  uint64_t phys = 0;
 
-  EXPECT_THAT(ctx.DmaAlloc(nullptr, 0, 0, &phys), t::Eq(kSyscallErrorInvalid));
-  EXPECT_THAT(ctx.DmaAlloc(nullptr, 100, 0, &phys),
+  EXPECT_THAT(ctx.DmaAlloc(nullptr, 0, 0).status(),
               t::Eq(kSyscallErrorInvalid));
-  EXPECT_THAT(ctx.DmaAlloc(nullptr, kSyscallDmaMaxSize + 0x1000, 0, &phys),
+  EXPECT_THAT(ctx.DmaAlloc(nullptr, 100, 0).status(),
               t::Eq(kSyscallErrorInvalid));
-  EXPECT_THAT(ctx.DmaAlloc(nullptr, 0x1000, 0x2, &phys),
+  EXPECT_THAT(ctx.DmaAlloc(nullptr, kSyscallDmaMaxSize + 0x1000, 0).status(),
               t::Eq(kSyscallErrorInvalid));
-  EXPECT_THAT(ctx.DmaAlloc(nullptr, 0x1000, 0, nullptr),
+  EXPECT_THAT(ctx.DmaAlloc(nullptr, 0x1000, 0x2).status(),
               t::Eq(kSyscallErrorInvalid));
 
   // Allocate 2 pages with kSyscallDmaBelow4GiB.
-  const int64_t va1 =
-      ctx.DmaAlloc(nullptr, 0x2000, kSyscallDmaBelow4GiB, &phys);
-  EXPECT_FALSE(SyscallIsError(va1));
-  EXPECT_THAT(static_cast<uintptr_t>(va1), t::Eq(kDriverDmaWindowBase));
-  EXPECT_THAT(phys, t::Eq(0x00200000ULL));
+  const StatusOr<DriverDmaAllocation> alloc1 =
+      ctx.DmaAlloc(nullptr, 0x2000, kSyscallDmaBelow4GiB);
+  ASSERT_TRUE(alloc1.ok());
+  EXPECT_THAT(alloc1->user_addr, t::Eq(kDriverDmaWindowBase));
+  EXPECT_THAT(alloc1->phys_addr, t::Eq(0x00200000ULL));
   EXPECT_THAT(driver_env_->last_alloc_max_phys_, t::Eq(0x100000000ULL));
   ASSERT_THAT(driver_env_->zeroed_ranges_.size(), t::Eq(1U));
   EXPECT_THAT(driver_env_->zeroed_ranges_[0],
@@ -354,22 +416,17 @@ TEST_F(DriverTest, DmaAllocEnforcesAlignmentFlagsZeroingAndQuota) {
 
   // Next allocation starts after 1 guard page (+ 3 * 0x1000) and uses full
   // identity-map limit when flags == 0.
-  uint64_t phys2 = 0;
-  const int64_t va2 = ctx.DmaAlloc(nullptr, 0x1000, 0, &phys2);
-  EXPECT_FALSE(SyscallIsError(va2));
-  EXPECT_THAT(static_cast<uintptr_t>(va2),
-              t::Eq(kDriverDmaWindowBase + 3 * 0x1000ULL));
+  const StatusOr<DriverDmaAllocation> alloc2 = ctx.DmaAlloc(nullptr, 0x1000, 0);
+  ASSERT_TRUE(alloc2.ok());
+  EXPECT_THAT(alloc2->user_addr, t::Eq(kDriverDmaWindowBase + 3 * 0x1000ULL));
   EXPECT_THAT(driver_env_->last_alloc_max_phys_, t::Eq(kIdentityMapLimit));
 
   // Per-process 16 MiB quota: allocating 16 * 1 MiB more exceeds the quota on
   // the 16th 1 MiB call because 3 pages are already allocated.
   for (int i = 0; i < 15; ++i) {
-    uint64_t p = 0;
-    ASSERT_FALSE(
-        SyscallIsError(ctx.DmaAlloc(nullptr, kSyscallDmaMaxSize, 0, &p)));
+    ASSERT_TRUE(ctx.DmaAlloc(nullptr, kSyscallDmaMaxSize, 0).ok());
   }
-  uint64_t over_phys = 0;
-  EXPECT_THAT(ctx.DmaAlloc(nullptr, kSyscallDmaMaxSize, 0, &over_phys),
+  EXPECT_THAT(ctx.DmaAlloc(nullptr, kSyscallDmaMaxSize, 0).status(),
               t::Eq(kSyscallErrorNoMemory));
 }
 
@@ -410,8 +467,7 @@ TEST_F(DriverTest, IrqAllocRollbackAndOrderedRelease) {
                 t::Eq(kSyscallErrorBusy));
     EXPECT_THAT(DeviceIrqUsedVectorCount(), t::Eq(3));
 
-    DriverReleaseRecord rec{};
-    ctx.Release(/*address_space_alive=*/true, &rec);
+    const DriverReleaseRecord rec = ctx.Release(/*address_space_alive=*/true);
     EXPECT_THAT(rec.quiesced_count, t::Eq(2));
     EXPECT_THAT(rec.freed_vectors, t::Eq(3));
     EXPECT_THAT(rec.released_claims, t::Eq(2));
@@ -432,12 +488,6 @@ TEST_F(DriverTest, IrqAllocRollbackAndOrderedRelease) {
   EXPECT_THAT(last.quiesced_count, t::Eq(2));
   EXPECT_THAT(last.freed_vectors, t::Eq(3));
   EXPECT_THAT(last.released_claims, t::Eq(2));
-}
-
-TEST_F(DriverTest, PciInfoNonZeroIndexWithNullBufferReturnsFault) {
-  DriverContext ctx;
-  EXPECT_THAT(ctx.PciInfo(1, nullptr), t::Eq(kSyscallErrorFault));
-  EXPECT_THAT(ctx.PciInfo(8, nullptr), t::Eq(kSyscallErrorFault));
 }
 
 TEST_F(DriverTest, ClaimEnforcesMaxClaimsLimitAndIdempotencyAtCap) {
@@ -547,11 +597,10 @@ TEST_F(DriverTest,
 
 TEST_F(DriverTest, DmaAllocRollsBackUnmappedFramesAndHandlesAllocFailure) {
   DriverContext ctx;
-  uint64_t phys = 0;
 
   // Frame allocation failure returns ENOMEM without advancing quota.
   driver_env_->fail_alloc_frames_ = true;
-  EXPECT_THAT(ctx.DmaAlloc(nullptr, 0x1000, 0, &phys),
+  EXPECT_THAT(ctx.DmaAlloc(nullptr, 0x1000, 0).status(),
               t::Eq(kSyscallErrorNoMemory));
   EXPECT_THAT(ctx.DmaTotalBytes(), t::Eq(0));
   driver_env_->fail_alloc_frames_ = false;
@@ -559,7 +608,7 @@ TEST_F(DriverTest, DmaAllocRollsBackUnmappedFramesAndHandlesAllocFailure) {
   // Partial mapping failure on page 1 of a 3-page allocation frees the 2
   // remaining unmapped frames and does not charge quota.
   driver_env_->fail_map_after_ = 1;
-  EXPECT_THAT(ctx.DmaAlloc(nullptr, 0x3000, 0, &phys),
+  EXPECT_THAT(ctx.DmaAlloc(nullptr, 0x3000, 0).status(),
               t::Eq(kSyscallErrorNoMemory));
   EXPECT_THAT(driver_env_->allocated_frames_, t::Eq(3));
   EXPECT_THAT(driver_env_->freed_frames_, t::Eq(2));
@@ -568,12 +617,10 @@ TEST_F(DriverTest, DmaAllocRollsBackUnmappedFramesAndHandlesAllocFailure) {
 
   // Exact 16 MiB quota can still be allocated across 16 calls of 1 MiB.
   for (int i = 0; i < 16; ++i) {
-    uint64_t page_phys = 0;
-    ASSERT_FALSE(SyscallIsError(
-        ctx.DmaAlloc(nullptr, kSyscallDmaMaxSize, 0, &page_phys)));
+    ASSERT_TRUE(ctx.DmaAlloc(nullptr, kSyscallDmaMaxSize, 0).ok());
   }
   EXPECT_THAT(ctx.DmaTotalBytes(), t::Eq(kSyscallDmaMaxTotalSize));
-  EXPECT_THAT(ctx.DmaAlloc(nullptr, 0x1000, 0, &phys),
+  EXPECT_THAT(ctx.DmaAlloc(nullptr, 0x1000, 0).status(),
               t::Eq(kSyscallErrorNoMemory));
 }
 
@@ -632,20 +679,266 @@ TEST_F(DriverTest,
   EXPECT_THAT(ctx.IrqWait(1ULL, 0, nullptr, nullptr), t::Eq(1));
 
   // First Release records the teardown metrics; a second Release is a no-op.
-  DriverReleaseRecord first_rec{};
-  ctx.Release(/*address_space_alive=*/true, &first_rec);
+  const DriverReleaseRecord first_rec =
+      ctx.Release(/*address_space_alive=*/true);
   EXPECT_THAT(first_rec.quiesced_count, t::Eq(2));
   EXPECT_THAT(first_rec.freed_vectors, t::Eq(32));
   EXPECT_THAT(first_rec.released_claims, t::Eq(2));
   EXPECT_TRUE(first_rec.quiesced_before_vectors_freed);
   EXPECT_TRUE(first_rec.quiesced_before_address_space_destroyed);
 
-  DriverReleaseRecord second_rec{};
-  second_rec.quiesced_count = 99;
-  ctx.Release(/*address_space_alive=*/false, &second_rec);
-  EXPECT_THAT(second_rec.quiesced_count, t::Eq(99));
+  const DriverReleaseRecord second_rec =
+      ctx.Release(/*address_space_alive=*/false);
+  EXPECT_THAT(second_rec.quiesced_count, t::Eq(0));
   EXPECT_TRUE(
       DriverLastReleaseRecord().quiesced_before_address_space_destroyed);
+}
+
+TEST_F(DriverTest, ClaimWakesTheBridgesAboveADeviceFromTheRootBusDown) {
+  // Root port 00:1c.0 (buses 2-3), a switch port 02:00.0 below it (bus 3) and
+  // an Ethernet controller 03:00.0, each with a Power Management capability.
+  constexpr PciAddress kRootPort = {0, 0x1C, 0};
+  constexpr PciAddress kSwitchPort = {2, 0, 0};
+  constexpr PciAddress kNic = {3, 0, 0};
+  constexpr int kPmcsr = 0x40 + kPciPmControlStatusOffset;
+  pci_->AddFunction(kRootPort, {.vendor_id = 0x8086,
+                                .device_id = 0x1E10,
+                                .class_code = 0x06,
+                                .subclass = 0x04,
+                                .header_type = 0x01,
+                                .command = 0x0007});
+  pci_->SetBridgeBuses(kRootPort, 0, 2, 3);
+  pci_->AddFunction(kSwitchPort, {.vendor_id = 0x10B5,
+                                  .device_id = 0x8606,
+                                  .class_code = 0x06,
+                                  .subclass = 0x04,
+                                  .header_type = 0x01,
+                                  .command = 0x0000});
+  pci_->SetBridgeBuses(kSwitchPort, 2, 3, 3);
+  pci_->AddFunction(
+      kNic, {.vendor_id = 0x8086, .device_id = 0x10D3, .class_code = 0x02});
+  pci_->SetBar(kNic,  //
+               0,     //
+               {.kind = FakePciConfigSpace::BarKind::kMem64,
+                .base = 0xFC000000u,
+                .size = 0x20000});
+  pci_->AddMsix(
+      kNic, 0x90,
+      {.table_size = 4, .table_bar = 0, .pba_bar = 0, .pba_offset = 0x1000});
+  pci_->SetRaw16(kNic, 0x92, kPciMsixControlEnable | 0x0003);
+  for (const PciAddress address : {kRootPort, kSwitchPort}) {
+    pci_->AddPowerManagement(address, 0x40, {.power_state = 0});
+  }
+  pci_->AddPowerManagement(kNic, 0x40, {.power_state = 3});
+  PciResetForTest();
+  PciInit(pci_);
+  const int nic = PciFindDevice(kNic);
+  ASSERT_THAT(nic, t::Ge(0));
+  const uint32_t bar0 = pci_->Peek32(kNic, kPciBar0Offset);
+  // The bridges went to D3hot after the enumeration (they reset when they
+  // leave it): the controller is out of reach.
+  pci_->SetRaw16(kRootPort, kPmcsr, 3);
+  pci_->SetRaw16(kSwitchPort, kPmcsr, 3);
+
+  DriverContext ctx;
+  ASSERT_THAT(ctx.Claim(nic), t::Eq(0));
+  for (const PciAddress address : {kRootPort, kSwitchPort, kNic}) {
+    EXPECT_THAT(pci_->Peek16(address, kPmcsr) & kPciPmcsrPowerStateMask,
+                t::Eq(0U))
+        << t::PrintToString(address);
+  }
+  EXPECT_THAT(driver_env_->slept_us_, t::ElementsAre(10000, 10000, 10000));
+  EXPECT_THAT(driver_env_->logs_,
+              t::ElementsAre("[PCI] 00:1c.0: woke from D3hot\n",
+                             "[PCI] 02:00.0: woke from D3hot\n",
+                             "[PCI] 03:00.0: woke from D3hot\n"));
+  // The bridges route bus 3 again, and the controller has its BAR back.
+  EXPECT_THAT(pci_->Peek8(kRootPort, kPciSecondaryBusOffset), t::Eq(2));
+  EXPECT_THAT(pci_->Peek8(kRootPort, kPciSubordinateBusOffset), t::Eq(3));
+  EXPECT_THAT(pci_->Peek8(kSwitchPort, kPciSecondaryBusOffset), t::Eq(3));
+  EXPECT_THAT(pci_->Peek16(kRootPort, kPciCommandOffset), t::Eq(0x0007));
+  EXPECT_THAT(pci_->Peek16(kSwitchPort, kPciCommandOffset),
+              t::Eq(kPciCommandMemorySpace | kPciCommandBusMaster));
+  EXPECT_THAT(pci_->Peek32(kNic, kPciBar0Offset), t::Eq(bar0));
+  EXPECT_THAT(pci_->Peek16(kNic, kPciCommandOffset),
+              t::Eq(kPciCommandMemorySpace | kPciCommandInterruptDisable));
+  EXPECT_THAT(pci_->Peek16(kNic, 0x92) & kPciMsixControlEnable, t::Eq(0U));
+  EXPECT_THAT(pci_->BarWritesWhileDecoding(), t::Eq(0));
+
+  // If the endpoint itself stays in D0 while an upstream bridge goes to D3hot,
+  // claiming it wakes the bridge and still configures the endpoint once the
+  // bridge forwards transactions again.
+  ctx.Release(/*address_space_alive=*/true);
+  pci_->SetRaw16(kNic, kPciCommandOffset, 0);
+  pci_->SetRaw16(kNic, 0x92, kPciMsixControlEnable | 0x0003);
+  pci_->SetRaw16(kSwitchPort, kPciCommandOffset, 0);
+  pci_->SetRaw16(kRootPort, kPmcsr, 3);
+  DriverContext ctx2;
+  ASSERT_THAT(ctx2.Claim(nic), t::Eq(0));
+  EXPECT_THAT(pci_->Peek16(kSwitchPort, kPciCommandOffset),
+              t::Eq(kPciCommandMemorySpace | kPciCommandBusMaster));
+  EXPECT_THAT(pci_->Peek16(kNic, kPciCommandOffset),
+              t::Eq(kPciCommandMemorySpace | kPciCommandInterruptDisable));
+  EXPECT_THAT(pci_->Peek16(kNic, 0x92) & kPciMsixControlEnable, t::Eq(0U));
+}
+
+TEST_F(DriverTest, ClaimWaitsUntilAWokenDeviceAnswersForAtMostAboutASecond) {
+  constexpr PciAddress kSlow = {0, 6, 0};
+  constexpr PciAddress kDead = {0, 7, 0};
+  for (const PciAddress address : {kSlow, kDead}) {
+    pci_->AddFunction(
+        address,
+        {.vendor_id = 0x8086, .device_id = 0x10D3, .class_code = 0x02});
+    pci_->SetBar(address,  //
+                 0,        //
+                 {.kind = FakePciConfigSpace::BarKind::kMem32,
+                  .base = (address == kSlow) ? 0xFC000000u : 0xFC100000u,
+                  .size = 0x1000});
+  }
+  // Still initializing for 3 reads after the recovery time; and for good.
+  pci_->AddPowerManagement(kSlow,  //
+                           0x40,   //
+                           {.power_state = 3, .reads_until_ready = 3});
+  pci_->AddPowerManagement(kDead,  //
+                           0x40,   //
+                           {.power_state = 3, .reads_until_ready = 1000});
+  PciResetForTest();
+  PciInit(pci_);
+
+  DriverContext ctx;
+  ASSERT_THAT(ctx.Claim(PciFindDevice(kSlow)), t::Eq(0));
+  EXPECT_THAT(driver_env_->slept_us_, t::ElementsAre(10000, 1000, 2000, 4000));
+  EXPECT_THAT(pci_->Peek32(kSlow, kPciBar0Offset), t::Eq(0xFC000000u));
+  EXPECT_THAT(driver_env_->logs_,
+              t::ElementsAre("[PCI] 00:06.0: woke from D3hot\n"));
+
+  driver_env_->slept_us_.clear();
+  driver_env_->logs_.clear();
+  ASSERT_THAT(ctx.Claim(PciFindDevice(kDead)), t::Eq(0));
+  int64_t polled_us = 0;
+  for (int i = 1; i < static_cast<int>(driver_env_->slept_us_.size()); ++i) {
+    polled_us += driver_env_->slept_us_[i];
+  }
+  EXPECT_THAT(driver_env_->slept_us_, t::SizeIs(11));
+  EXPECT_THAT(polled_us, t::AllOf(t::Ge(1000000), t::Lt(1100000)));
+  EXPECT_THAT(driver_env_->logs_,
+              t::ElementsAre("[PCI] 00:07.0: not ready after leaving D3hot\n",
+                             "[PCI] 00:07.0: woke from D3hot\n"));
+}
+
+TEST_F(DriverTest, ClaimCorrectsBarsThatPciInitSizedWronglyInD3hot) {
+  // A controller that ignores BAR writes in D3hot looks like it had a 64 KiB
+  // BAR at 0xFC010000.
+  constexpr PciAddress kAddress = {0, 6, 0};
+  pci_->AddFunction(
+      kAddress, {.vendor_id = 0x8086, .device_id = 0x10D3, .class_code = 0x02});
+  pci_->SetBar(kAddress,  //
+               0,         //
+               {.kind = FakePciConfigSpace::BarKind::kMem32,
+                .base = 0xFC010000u,
+                .size = 0x1000});
+  pci_->AddPowerManagement(
+      kAddress, 0x40, {.power_state = 3, .ignores_bar_writes_in_d3hot = true});
+  PciResetForTest();
+  PciInit(pci_);
+  const int index = PciFindDevice(kAddress);
+  DriverContext ctx;
+  StatusOr<DriverPciInfoResult> info = ctx.PciInfo(index);
+  ASSERT_TRUE(info.ok());
+  ASSERT_THAT(info->info.bars[0].size, t::Eq(0x10000));
+
+  ASSERT_THAT(ctx.Claim(index), t::Eq(0));
+  EXPECT_THAT(driver_env_->logs_,
+              t::ElementsAre("[PCI] 00:06.0: woke from D3hot\n",
+                             "[PCI] 00:06.0: corrected BAR sizes in D0\n"));
+  info = ctx.PciInfo(index);
+  ASSERT_TRUE(info.ok());
+  EXPECT_THAT(info->info.bars[0].phys_base, t::Eq(0xFC010000u));
+  EXPECT_THAT(info->info.bars[0].size, t::Eq(0x1000));
+  // Beyond the real BAR, mmio_map now refuses.
+  EXPECT_THAT(ctx.MmioMap(nullptr, 0xFC011000u, 0x1000),
+              t::Eq(kSyscallErrorAccess));
+  EXPECT_FALSE(SyscallIsError(ctx.MmioMap(nullptr, 0xFC010000u, 0x1000)));
+}
+
+TEST_F(DriverTest, ClaimRoutesTheUsbPortsOfAnIntelXhciFromEhci) {
+  constexpr PciAddress kXhci = {0, 0x14, 0};
+  constexpr PciAddress kEhci = {0, 0x1A, 0};
+  pci_->AddFunction(kXhci, {.vendor_id = 0x8086,
+                            .device_id = 0x8C31,
+                            .class_code = 0x0C,
+                            .subclass = 0x03,
+                            .prog_if = 0x30});
+  pci_->SetWritable(kXhci, 0xD0, 4, 0x00007FFF);
+  pci_->SetWritable(kXhci, 0xD8, 4, 0x0000003F);
+  pci_->SetRaw32(kXhci, 0xD4, 0x00007FFF);
+  pci_->SetRaw32(kXhci, 0xDC, 0x0000003F);
+  pci_->AddFunction(kEhci, {.vendor_id = 0x8086,
+                            .device_id = 0x8C2D,
+                            .class_code = 0x0C,
+                            .subclass = 0x03,
+                            .prog_if = 0x20});
+  PciResetForTest();
+  PciInit(pci_);
+
+  DriverContext ctx;
+  ASSERT_THAT(ctx.Claim(PciFindDevice(kXhci)), t::Eq(0));
+  EXPECT_THAT(pci_->Peek32(kXhci, 0xD8), t::Eq(0x0000003Fu));
+  EXPECT_THAT(pci_->Peek32(kXhci, 0xD0), t::Eq(0x00007FFFu));
+  EXPECT_THAT(driver_env_->logs_,
+              t::ElementsAre("[PCI] 00:14.0: routed USB ports from EHCI: "
+                             "SuperSpeed 0x0000003f, USB 2.0 0x00007fff\n"));
+  // QEMU's xHCI needs nothing.
+  ASSERT_THAT(ctx.Claim(PciFindDevice({0, 4, 0})), t::Eq(0));
+  EXPECT_THAT(driver_env_->logs_, t::SizeIs(1));
+}
+
+TEST_F(DriverTest, IrqAllocFailsCleanlyWithoutACpuThatMsisCanAddress) {
+  DriverContext ctx;
+  const int msix_dev = PciFindDevice({0, 4, 0});
+  const int msi_dev = PciFindDevice({1, 1, 0});
+  ASSERT_THAT(ctx.Claim(msix_dev), t::Eq(0));
+  ASSERT_THAT(ctx.Claim(msi_dev), t::Eq(0));
+  // E.g. only x2APIC IDs of 0x100 and up, and no interrupt remapping.
+  irq_env_->msi_destination_ = -1;
+  EXPECT_THAT(ctx.IrqAlloc(msix_dev, 2, kSyscallIrqModeAuto, nullptr),
+              t::Eq(kSyscallErrorInvalid));
+  EXPECT_THAT(ctx.IrqAlloc(msi_dev, 1, kSyscallIrqModeAuto, nullptr),
+              t::Eq(kSyscallErrorInvalid));
+  EXPECT_THAT(DeviceIrqUsedVectorCount(), t::Eq(0));
+  EXPECT_THAT(ctx.NextIrqBit(), t::Eq(0));
+  EXPECT_THAT(pci_->Peek16({0, 4, 0}, 0x92) & kPciMsixControlEnable, t::Eq(0U));
+
+  irq_env_->msi_destination_ = 1;
+  EXPECT_THAT(ctx.IrqAlloc(msix_dev, 2, kSyscallIrqModeAuto, nullptr),
+              t::Eq(0));
+  EXPECT_THAT(irq_env_->msix_words_[msix_dev][0], t::Eq(0xFEE01000U));
+}
+
+TEST_F(DriverTest, ADeviceWithVectorsGetsNoSecondSetOfThem) {
+  DriverContext ctx;
+  const int msix_dev = PciFindDevice({0, 4, 0});
+  const int msi_dev = PciFindDevice({1, 1, 0});
+  ASSERT_THAT(ctx.Claim(msix_dev), t::Eq(0));
+  ASSERT_THAT(ctx.Claim(msi_dev), t::Eq(0));
+
+  // Vectors from IrqAlloc.
+  ASSERT_THAT(ctx.IrqAlloc(msix_dev, 2, kSyscallIrqModeAuto, nullptr),
+              t::Eq(0));
+  EXPECT_THAT(ctx.IrqAlloc(msix_dev, 1, kSyscallIrqModeAuto, nullptr),
+              t::Eq(kSyscallErrorBusy));
+  EXPECT_FALSE(ctx.BindVectorsForSelftest(msix_dev, 1, nullptr));
+
+  // Vectors from BindVectorsForSelftest, which leaves the device unprogrammed.
+  ASSERT_TRUE(ctx.BindVectorsForSelftest(msi_dev, 1, nullptr));
+  EXPECT_FALSE(ctx.BindVectorsForSelftest(msi_dev, 1, nullptr));
+  EXPECT_THAT(ctx.IrqAlloc(msi_dev, 1, kSyscallIrqModeAuto, nullptr),
+              t::Eq(kSyscallErrorBusy));
+
+  EXPECT_THAT(ctx.NextIrqBit(), t::Eq(3));
+  EXPECT_THAT(DeviceIrqUsedVectorCount(), t::Eq(3));
+  EXPECT_THAT(DeviceIrqVectorForBit(ctx.OwnerToken(), 2), t::Ge(0));
+  EXPECT_THAT(DeviceIrqVectorForBit(ctx.OwnerToken(), 3), t::Lt(0));
 }
 
 }  // namespace

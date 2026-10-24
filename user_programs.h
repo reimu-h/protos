@@ -3,6 +3,7 @@
 
 #include <cstdint>
 
+#include "status_or.h"
 #include "user_mode.h"
 
 // The user programs that the kernel image embeds (user_programs.S).
@@ -17,27 +18,28 @@ extern "C" const uint8_t g_usbkbd_elf_end[];
 
 namespace protos {
 
-// user/init.cpp: the first user process (kernel.cpp).
+// user/init/init.cpp: the first user process (kernel.cpp).
 inline UserProgram InitProgram() {
   return UserProgram{g_init_elf_start, g_init_elf_end - g_init_elf_start};
 }
 inline UserProgram InitUserProgram() { return InitProgram(); }
 
-// user/sh.cpp: the interactive user-space shell.
+// user/sh/sh.cpp: the interactive user-space shell.
 inline UserProgram ShProgram() {
   return UserProgram{g_sh_elf_start, g_sh_elf_end - g_sh_elf_start};
 }
 inline UserProgram ShUserProgram() { return ShProgram(); }
 inline UserProgram ShellProgram() { return ShProgram(); }
 
-// user/usertest.cpp: the user-mode boot self-tests' program (user/usertest.h).
+// user/usertest/usertest.cpp: the user-mode boot self-tests' program
+// (user/usertest/usertest.h).
 inline UserProgram UserTestProgram() {
   return UserProgram{g_usertest_elf_start,
                      g_usertest_elf_end - g_usertest_elf_start};
 }
 inline UserProgram UsertestUserProgram() { return UserTestProgram(); }
 
-// user/usbkbd.cpp: the ring-3 xHCI USB keyboard driver.
+// user/usbkbd/usbkbd.cpp: the ring-3 xHCI USB keyboard driver.
 inline UserProgram UsbkbdProgram() {
   return UserProgram{g_usbkbd_elf_start, g_usbkbd_elf_end - g_usbkbd_elf_start};
 }
@@ -63,27 +65,22 @@ constexpr bool UserProgramNameEquals(const char* const name,  //
 }
 
 // Looks up the embedded user program whose name is `[name, name + name_len)`.
-// If found, writes the program descriptor to `*out` (when non-null) and
-// returns true; otherwise returns false.
-inline bool FindUserProgram(const char* const name,  //
-                            const int64_t name_len,  //
-                            UserProgram* const out) {
-  UserProgram found{};
+// Returns the program descriptor if found, or an error otherwise.
+inline StatusOr<UserProgram> FindUserProgram(const char* const name,
+                                             const int64_t name_len) {
   if (UserProgramNameEquals(name, name_len, "init")) {
-    found = InitProgram();
-  } else if (UserProgramNameEquals(name, name_len, "sh")) {
-    found = ShProgram();
-  } else if (UserProgramNameEquals(name, name_len, "usertest")) {
-    found = UserTestProgram();
-  } else if (UserProgramNameEquals(name, name_len, "usbkbd")) {
-    found = UsbkbdProgram();
-  } else {
-    return false;
+    return InitProgram();
   }
-  if (out != nullptr) {
-    *out = found;
+  if (UserProgramNameEquals(name, name_len, "sh")) {
+    return ShProgram();
   }
-  return true;
+  if (UserProgramNameEquals(name, name_len, "usertest")) {
+    return UserTestProgram();
+  }
+  if (UserProgramNameEquals(name, name_len, "usbkbd")) {
+    return UsbkbdProgram();
+  }
+  return kStatusError;
 }
 
 }  // namespace protos

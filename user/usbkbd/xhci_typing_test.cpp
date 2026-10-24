@@ -4,12 +4,12 @@
 
 #include "gmock/gmock.h"
 #include "gtest/gtest.h"
-#include "user/usb_hid.h"
-#include "user/xhci_controller.h"
-#include "user/xhci_regs.h"
-#include "xhci_sim.h"
-#include "xhci_sim_usb.h"
-#include "xhci_sim_world.h"
+#include "user/usbkbd/usb_hid.h"
+#include "user/usbkbd/xhci_controller.h"
+#include "user/usbkbd/xhci_regs.h"
+#include "user/usbkbd/xhci_sim.h"
+#include "user/usbkbd/xhci_sim_usb.h"
+#include "user/usbkbd/xhci_sim_world.h"
 
 namespace protos::xhci_sim {
 namespace {
@@ -158,19 +158,32 @@ TEST(XhciTypingTest,
   world.TypeAscii(kbd, "a");
   EXPECT_THAT(world.platform().input(), t::Eq("a"));
 
-  // 1 transient transaction error on the interrupt IN endpoint: recovered via
-  // Reset Endpoint + Set TR Dequeue Pointer without detaching the keyboard.
+  // Press 'b' (1 report -> device & host data toggle become DATA1), then inject
+  // 1 transient transaction error before releasing 'b': recovered via Soft
+  // Retry (Reset Endpoint TSP=1 + Set TR Dequeue Pointer) without clearing
+  // DATA1 or dropping the release report.
+  kbd.PressKey(usb::kHidUsageA + 1);
+  world.ServiceReady();
+  EXPECT_THAT(kbd.interrupt_toggle(), t::Eq(1u));
   kbd.InjectInterruptError(IntrOutcome::kTransactionError, 1);
   world.ServiceReady();
   EXPECT_THAT(world.controller(idx).attached_keyboard_count(), t::Eq(1));
-  world.TypeAscii(kbd, "b");
+  EXPECT_THAT(kbd.interrupt_toggle(), t::Eq(1u));
+  kbd.ReleaseKey(usb::kHidUsageA + 1);
+  world.ServiceReady();
+  EXPECT_THAT(world.sim(idx).dropped_in_packets(), t::Eq(0));
   EXPECT_THAT(world.platform().input(), t::Eq("ab"));
 
-  // 2 consecutive STALL errors on the interrupt IN endpoint: still below the
-  // 3-strike threshold, recovers in place and resumes typing.
+  // After > 1 s of healthy operation, the interrupt error counter decays so
+  // 2 consecutive STALL errors still recover in-place via Reset Endpoint
+  // (TSP=0) + Set TR Dequeue Pointer + CLEAR_FEATURE(ENDPOINT_HALT).
+  world.RunForMs(1100);
   kbd.InjectInterruptError(IntrOutcome::kStall, 2);
   world.ServiceReady();
   EXPECT_THAT(world.controller(idx).attached_keyboard_count(), t::Eq(1));
+  EXPECT_THAT(kbd.clear_halt_count(), t::Eq(2));
+  EXPECT_FALSE(kbd.interrupt_halted());
+  EXPECT_THAT(world.sim(idx).dropped_in_packets(), t::Eq(0));
   world.TypeAscii(kbd, "c");
   EXPECT_THAT(world.platform().input(), t::Eq("abc"));
 
@@ -242,6 +255,67 @@ TEST(XhciTypingTest,
   kbd_hs.ReleaseAllKeys();
   kbd_fs.ReleaseAllKeys();
   kbd_ls.ReleaseAllKeys();
+  world.ServiceReady();
+}
+
+TEST(XhciTypingTest,
+     SimultaneousKeyboardsAcrossRootPortUsb2HubUsb3HubAndNestedHub) {
+  SimWorld world;
+  const int idx = world.AddController("00:04.0");
+  // 1. Direct root-port High-Speed keyboard on port 6.
+  SimUsbKeyboard& kbd_root =
+      world.AttachKeyboard(idx, 6, HighSpeedKeyboardConfig());
+  // 2. USB 2.0 High-Speed Multi-TT hub on port 5 with:
+  //    - Full-Speed keyboard on hub port 1
+  //    - Nested Full-Speed hub on hub port 2 -> Low-Speed keyboard on port 3
+  SimUsbHub& usb2_hub =
+      world.AttachHub(idx, 5, Usb2HighSpeedMultiTtHubConfig(4));
+  SimUsbKeyboard& kbd_usb2_hub =
+      world.AttachKeyboardToHub(usb2_hub, 1, FullSpeedKeyboardConfig(64));
+  SimUsbHub& nested_hub =
+      world.AttachHubToHub(usb2_hub, 2, Usb2FullSpeedHubConfig(4));
+  SimUsbKeyboard& kbd_nested =
+      world.AttachKeyboardToHub(nested_hub, 3, LowSpeedKeyboardConfig());
+  // 3. USB 3.0 SuperSpeed hub on port 1 with SuperSpeed keyboard on hub port 4.
+  SimUsbHub& usb3_hub = world.AttachHub(idx, 1, Usb3SuperSpeedHubConfig(4));
+  SimUsbKeyboard& kbd_usb3_hub =
+      world.AttachKeyboardToHub(usb3_hub, 4, SuperSpeedKeyboardConfig());
+
+  ASSERT_THAT(world.BringUp(idx), t::Eq(usb::XhciStatus::kOk));
+  ASSERT_TRUE(world.RunUntil(
+      [&] { return world.controller(idx).attached_keyboard_count() == 4; }));
+  EXPECT_THAT(world.sim(idx).enabled_slot_count(), t::Eq(7));
+
+  // Hold Left Shift + 'a' on kbd_usb2_hub (Slot 5): emits 'A'.
+  kbd_usb2_hub.PressKey(usb::kHidUsageA, usb::kHidModLeftShift);
+  world.ServiceReady();
+  EXPECT_THAT(world.platform().input(), t::Eq("A"));
+
+  // While Left Shift + 'a' remain held on kbd_usb2_hub, press 'b' on kbd_root
+  // (Slot 3), 'c' on kbd_usb3_hub (Slot 4), and 'd' on kbd_nested (Slot 7)
+  // concurrently: per-device modifier and rollover state are isolated.
+  kbd_root.PressKey(usb::kHidUsageA + 1);
+  kbd_usb3_hub.PressKey(usb::kHidUsageA + 2);
+  kbd_nested.PressKey(usb::kHidUsageA + 3);
+  world.ServiceReady();
+  EXPECT_THAT(world.platform().input(), t::Eq("Abcd"));
+
+  // Toggle Caps Lock from kbd_nested (shared KeyboardLocks across all slots),
+  // then concurrently press 'e' on kbd_usb3_hub (no Shift + Caps Lock ON ->
+  // 'E') and 'f' on kbd_usb2_hub (Shift held + Caps Lock ON -> 'f').
+  kbd_nested.TapKey(usb::kHidUsageCapsLock);
+  world.ServiceReady();
+  EXPECT_TRUE(world.locks().caps_lock);
+
+  kbd_usb3_hub.PressKey(usb::kHidUsageA + 4);
+  kbd_usb2_hub.PressKey(usb::kHidUsageA + 5, usb::kHidModLeftShift);
+  world.ServiceReady();
+  EXPECT_THAT(world.platform().input(), t::Eq("AbcdEf"));
+
+  kbd_root.ReleaseAllKeys();
+  kbd_usb2_hub.ReleaseAllKeys();
+  kbd_nested.ReleaseAllKeys();
+  kbd_usb3_hub.ReleaseAllKeys();
   world.ServiceReady();
 }
 

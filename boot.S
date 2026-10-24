@@ -8,6 +8,19 @@
  * leaves unchanged), AM, TS and EM. */
 .set KERNEL_CR0, ((1 << 31) | (1 << 16) | (1 << 5) | (1 << 4) | (1 << 1) | (1 << 0))
 
+/* CR4 value loaded by both the BSP and the APs before they enable paging: PAE
+ * (5), OSFXSR (9) and OSXMMEXCPT (10), plus MCE (6) if it is set already.
+ * Multiboot leaves CR4 undefined, and loaders pass on what the firmware set,
+ * so a complete value is loaded here too, while paging is off (EFER.LMA = 0,
+ * the only time LA57 can change). This clears, among others, LA57, with which
+ * the kernel's 4-level page tables would be walked as 5-level ones, PGE, PKE,
+ * CET, UMIP and TSD. MCE is kept as Linux keeps it: the kernel sets it later
+ * anyway if the CPU has it (CpuCr4ForConfig() in cpu.h, which decides every
+ * CR4 bit from then on), and clearing it would only turn a machine check
+ * before that into a shutdown. */
+.set CR4_MCE, (1 << 6)
+.set KERNEL_BOOT_CR4, ((1 << 5) | (1 << 9) | (1 << 10))
+
 /* IA32_EFER MSR and its bits; NXE is reserved (WRMSR faults) unless CPUID
  * 0x80000001 reports EDX.NX. */
 .set MSR_IA32_EFER, 0xC0000080
@@ -180,16 +193,21 @@ _start:
     mov eax, offset pml4_table
     mov cr3, eax
 
-    /* Enable PAE (bit 5), OSFXSR (bit 9), and OSXMMEXCPT (bit 10) in CR4 */
+    /* Load CR4 (see KERNEL_BOOT_CR4) */
     mov eax, cr4
-    or  eax, ((1 << 5) | (1 << 9) | (1 << 10))
+    and eax, CR4_MCE
+    or  eax, KERNEL_BOOT_CR4
     mov cr4, eax
 
-    /* Enable long mode (EFER.LME) and, if the CPU supports it, no-execute
-     * pages (EFER.NXE) */
+    /* Load IA32_EFER with long mode (LME) and, if the CPU supports it,
+     * no-execute pages (NXE), and nothing else: like CR4, a complete value
+     * clears what the loader left. With SCE set, a user `syscall` would enter
+     * CPL 0 at a stale IA32_LSTAR (the kernel is entered only through int
+     * 0x80, see CpuMsrValuesFor() in cpu.h); with AMD's FFXSR set, FXSAVE at
+     * CPL 0 would skip the XMM registers of user processes (fpu.h). */
     mov ecx, MSR_IA32_EFER
-    rdmsr
-    or  eax, EFER_LME
+    mov eax, EFER_LME
+    xor edx, edx
     test edi, CPUID_80000001_EDX_NX
     jz .Lwrite_efer
     or  eax, EFER_NXE
@@ -412,27 +430,30 @@ ap_pm32_entry:
     .extern g_ap_boot_started
     mov dword ptr [g_ap_boot_started], 1
 
-    /* Enable PAE (bit 5), OSFXSR (bit 9), and OSXMMEXCPT (bit 10) in CR4 */
+    /* Load CR4 as the BSP does (see KERNEL_BOOT_CR4; INIT cleared it) */
     mov eax, cr4
-    or  eax, ((1 << 5) | (1 << 9) | (1 << 10))
+    and eax, CR4_MCE
+    or  eax, KERNEL_BOOT_CR4
     mov cr4, eax
 
     /* Load CR3 with physical base address of the shared kernel PML4 table */
     mov eax, offset pml4_table
     mov cr3, eax
 
-    /* Enable long mode (EFER.LME) and, if this CPU supports it, no-execute
-     * pages (EFER.NXE). Each AP checks its own CPUID because firmware can hide
-     * NX per logical processor (IA32_MISC_ENABLE). The BSP already verified
-     * that CPUID leaf 0x80000001 exists. */
+    /* Load IA32_EFER as the BSP does: long mode (EFER.LME) and, if this CPU
+     * supports it, no-execute pages (EFER.NXE), and nothing else (INIT leaves
+     * IA32_EFER unchanged). Each AP checks its own CPUID because firmware can
+     * hide NX per logical processor (IA32_MISC_ENABLE); CpuInitAp() then stops
+     * the kernel if the BSP has NX and this AP doesn't. The BSP already
+     * verified that CPUID leaf 0x80000001 exists. */
     mov eax, 0x80000001
     cpuid
     test edx, CPUID_80000001_EDX_LM
     jz .Lap_no_long_mode
     mov edi, edx
     mov ecx, MSR_IA32_EFER
-    rdmsr
-    or  eax, EFER_LME
+    mov eax, EFER_LME
+    xor edx, edx
     test edi, CPUID_80000001_EDX_NX
     jz .Lap_write_efer
     or  eax, EFER_NXE
@@ -471,6 +492,15 @@ ap_trampoline_end:
 .align 16
 .code64
 ap_long_mode_entry:
+    /* This AP's stack and the 32-entry IDT that the BSP filled in above
+     * (idt64) first: from here on, an NMI (such as the stop NMI of a CPU that
+     * panics, see ApKernelEntry()) returns through nmi_isr_stub on this stack.
+     * Until here, RSP and IDTR hold their INIT values (0, and base 0), so an
+     * NMI resets the machine. */
+    .extern g_ap_boot_stack
+    mov rsp, qword ptr [g_ap_boot_stack]
+    lidt [idt64_pointer]
+
     /* Switch to the permanent 64-bit GDT in kernel memory */
     lgdt [gdt64_pointer]
 
@@ -482,9 +512,9 @@ ap_long_mode_entry:
     mov ss, ax
 
     /* Bind this AP's CpuLocal: point IA32_GS_BASE at it (after the GS load
-     * above, which zeroes the base). This precedes loading the kernel IDT, so
-     * no C++ code, exception handlers included, ever runs on this AP with GS
-     * base 0. */
+     * above, which zeroes the base). This precedes loading the kernel IDT
+     * (IdtLoad() in ApKernelEntry()), so no C++ code, exception handlers
+     * included, ever runs on this AP with GS base 0. */
     .extern g_ap_boot_cpu_local
     mov ecx, MSR_IA32_GS_BASE
     mov eax, dword ptr [g_ap_boot_cpu_local]
@@ -496,13 +526,8 @@ ap_long_mode_entry:
     xor edx, edx
     wrmsr
 
-    /* Switch to the kernel IDT */
-    lidt [idt64_pointer]
-
-    /* Load this AP's dedicated 64-bit stack pointer, reset RFLAGS, and load CPU slot index */
-    .extern g_ap_boot_stack
+    /* Reset RFLAGS and load CPU slot index */
     .extern g_ap_boot_cpu_index
-    mov rsp, qword ptr [g_ap_boot_stack]
     push 0
     popfq
     mov edi, dword ptr [g_ap_boot_cpu_index]

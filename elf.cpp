@@ -81,10 +81,9 @@ static bool SharePage(const ElfSegment& a, const ElfSegment& b) {
 }
 
 // Checks the loadable segment `header`, whose memory size is not 0, of a file
-// of `file_size` bytes, and stores it in `*out`.
-static ElfError ParseSegment(const Elf64ProgramHeader& header,  //
-                             const uint64_t file_size,          //
-                             ElfSegment* const out) {
+// of `file_size` bytes.
+static StatusOr<ElfSegment, ElfError> ParseSegment(
+    const Elf64ProgramHeader& header, const uint64_t file_size) {
   if ((header.vaddr & kPageMask) != 0 || header.file_size > header.mem_size ||
       header.offset > file_size ||
       header.file_size > file_size - header.offset) {
@@ -99,24 +98,23 @@ static ElfError ParseSegment(const Elf64ProgramHeader& header,  //
   if (writable && executable) {
     return ElfError::kWritableAndExecutable;
   }
-  out->vaddr = header.vaddr;
-  out->mem_size = static_cast<int64_t>(header.mem_size);
-  out->file_offset = static_cast<int64_t>(header.offset);
-  out->file_size = static_cast<int64_t>(header.file_size);
-  out->access = writable     ? UserPageAccess::kReadWrite
-                : executable ? UserPageAccess::kReadExecute
-                             : UserPageAccess::kRead;
-  return ElfError::kNone;
+  ElfSegment out{};
+  out.vaddr = header.vaddr;
+  out.mem_size = static_cast<int64_t>(header.mem_size);
+  out.file_offset = static_cast<int64_t>(header.offset);
+  out.file_size = static_cast<int64_t>(header.file_size);
+  out.access = writable     ? UserPageAccess::kReadWrite
+               : executable ? UserPageAccess::kReadExecute
+                            : UserPageAccess::kRead;
+  return out;
 }
 
 }  // namespace
 
-ElfError ElfParseExecutable(const uint8_t* const data,  //
-                            const int64_t size,         //
-                            ElfExecutable* const out) {
+StatusOr<ElfExecutable, ElfError> ElfParseExecutable(const uint8_t* const data,
+                                                     const int64_t size) {
   DCHECK(size >= 0);
   DCHECK(data != nullptr || size == 0);
-  DCHECK(out != nullptr);
   const uint64_t file_size = static_cast<uint64_t>(size);
   if (file_size < sizeof(Elf64Header)) {
     return ElfError::kTruncated;
@@ -161,17 +159,17 @@ ElfError ElfParseExecutable(const uint8_t* const data,  //
     if (executable.segment_count == kElfMaxSegments) {
       return ElfError::kTooManySegments;
     }
-    ElfSegment segment;
-    const ElfError error = ParseSegment(program_header, file_size, &segment);
-    if (error != ElfError::kNone) {
-      return error;
+    const StatusOr<ElfSegment, ElfError> segment =
+        ParseSegment(program_header, file_size);
+    if (!segment.ok()) {
+      return segment.status();
     }
     for (int j = 0; j < executable.segment_count; ++j) {
-      if (SharePage(segment, executable.segments[j])) {
+      if (SharePage(*segment, executable.segments[j])) {
         return ElfError::kOverlappingSegments;
       }
     }
-    executable.segments[executable.segment_count++] = segment;
+    executable.segments[executable.segment_count++] = *segment;
   }
 
   bool entry_in_code = false;
@@ -186,8 +184,7 @@ ElfError ElfParseExecutable(const uint8_t* const data,  //
   if (!entry_in_code) {
     return ElfError::kBadEntry;
   }
-  *out = executable;
-  return ElfError::kNone;
+  return executable;
 }
 
 }  // namespace protos

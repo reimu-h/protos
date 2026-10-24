@@ -42,9 +42,9 @@ static void CaptureAppendLocked(const char* const str) {
 // Default no-op UART RX stubs for host unit tests (multiboot_test, pmm_test,
 // smp_test) that link console.cpp without uart.cpp. console_test.cpp overrides
 // these with strong definitions.
-[[gnu::weak, gnu::noinline]] bool UartTryGetc(char* const out) {
-  asm volatile("" : : "r"(out) : "memory");
-  return false;
+[[gnu::weak, gnu::noinline]] StatusOr<char> UartTryGetc() {
+  asm volatile("" : : : "memory");
+  return kStatusError;
 }
 
 [[gnu::weak, gnu::noinline]] void UartPushRx(const char* const data,
@@ -78,7 +78,7 @@ void ConsoleWriteDec(const uint64_t value) {
   ConsoleWrite(FormatDec(value, buffer));
 }
 
-bool ConsoleTryReadc(char* const out) { return UartTryGetc(out); }
+StatusOr<char> ConsoleTryReadc() { return UartTryGetc(); }
 
 void ConsolePushInput(const char* const data, const int64_t size) {
   UartPushRx(data, size);

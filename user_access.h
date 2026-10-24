@@ -34,6 +34,10 @@ namespace protos {
 // its system calls runs (only its own task maps and unmaps them, before it
 // enters user mode and after it has left), so a copy of a checked range can't
 // fault; if it does, the kernel panics as for any other fault of kernel code.
+// The contents of the pages can change, though: the program waits for its
+// system call, but a device may write a driver's DMA pages (owned RAM, which
+// passes the checks) at any time. So the kernel must not assume that two reads
+// of the same user bytes agree (see UserProcess::Spin()).
 
 // Copies the `size` bytes at `user_src` in the active address space to `dst`.
 // Returns false, copying nothing, unless `[user_src, user_src + size)` lies in

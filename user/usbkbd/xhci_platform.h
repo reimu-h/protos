@@ -1,15 +1,16 @@
-#ifndef PROTOS_USER_XHCI_PLATFORM_H_
-#define PROTOS_USER_XHCI_PLATFORM_H_
+#ifndef PROTOS_USER_USBKBD_XHCI_PLATFORM_H_
+#define PROTOS_USER_USBKBD_XHCI_PLATFORM_H_
 
 #include <cstdint>
 #include <type_traits>
 
 // The services that the freestanding xHCI USB keyboard driver core
-// (user/xhci_regs.h, user/xhci_controller.h, user/usb_hid.h) needs from the
-// program that hosts it, and small helpers built on them. The ring-3 driver
-// implements `Platform` with system calls and wraps its mmio_map() mapping in
-// a `MappedMmioWindow`; the host unit tests implement both with a simulated
-// controller (xhci_sim.h). The core itself makes no system calls.
+// (user/usbkbd/xhci_regs.h, user/usbkbd/xhci_controller.h,
+// user/usbkbd/usb_hid.h) needs from the program that hosts it, and small
+// helpers built on them. The ring-3 driver implements `Platform` with system
+// calls and wraps its mmio_map() mapping in a `MappedMmioWindow`; the host unit
+// tests implement both with a simulated controller (user/usbkbd/xhci_sim.h).
+// The core itself makes no system calls.
 //
 // Rules for all core headers. User programs link one translation unit with
 // user/crt.o and get no C++ runtime (no operator new/delete, no __cxa_*
@@ -84,52 +85,102 @@ class MmioWindow {
 // returns for an offset outside the window.
 constexpr uint32_t kMmioAllOnes = 0xFFFFFFFFu;
 
-// An `MmioWindow` over mapped registers (ring 3: the uncacheable mapping that
-// mmio_map() returns). Accesses outside [0, size) or unaligned ones are not
+// An `MmioWindow` over mapped registers (ring 3: the uncacheable mappings that
+// mmio_map() returns): one mapping of the whole window, or segments mapped
+// separately with holes between them (the kernel does not map pages that
+// hold the device's MSI-X table or PBA). Size() is the end of the last
+// segment. Accesses outside every segment or unaligned ones are not
 // performed: reads return kMmioAllOnes and writes are dropped, so a bad
 // offset can't fault the driver.
 class MappedMmioWindow final : public MmioWindow {
  public:
+  // A PCI function has at most two contiguous MSI-X structures (one MSI-X Table
+  // and one PBA), which can create at most 2 unmappable holes in BAR0 and split
+  // it into at most 2 + 1 = 3 mappable segments. Fixed inline storage is used
+  // because freestanding user programs have no heap.
+  static constexpr int kMaxSegments = 4;
+
   constexpr MappedMmioWindow() = default;
 
+  // One mapping of registers [0, size) at `base` (none if `base` is null).
   void Init(volatile uint8_t* const base, const int64_t size) {
-    base_ = base;
-    size_ = (base != nullptr && size > 0) ? size : 0;
+    segment_count_ = 0;
+    (void)AddSegment(0, base, size);
+  }
+
+  // Adds the mapping of registers [offset, offset + size) at `base`, above
+  // the segments added before. Returns false and adds nothing if `base` is
+  // null, the range is empty, not dword-aligned or not above the previous
+  // segment, or the window has kMaxSegments segments already.
+  bool AddSegment(const int64_t offset,          //
+                  volatile uint8_t* const base,  //
+                  const int64_t size) {
+    if (base == nullptr || offset < Size() || size <= 0 ||
+        ((offset | size) & 3) != 0 || offset > INT64_MAX - size ||
+        segment_count_ >= kMaxSegments) {
+      return false;
+    }
+    segments_[segment_count_++] = Segment{offset, size, base};
+    return true;
   }
 
   uint32_t Read32(const int64_t offset) override {
-    if (!Contains(offset)) {
+    volatile uint8_t* const address = Translate(offset);
+    if (address == nullptr) {
       return kMmioAllOnes;
     }
     // Every MMIO access is a two-sided compiler barrier so DMA reads/writes
     // cannot be reordered across it.
     asm volatile("" ::: "memory");
-    const uint32_t value =
-        *reinterpret_cast<volatile uint32_t*>(base_ + offset);
+    const uint32_t value = *reinterpret_cast<volatile uint32_t*>(address);
     asm volatile("" ::: "memory");
     return value;
   }
 
   void Write32(const int64_t offset, const uint32_t value) override {
-    if (!Contains(offset)) {
+    volatile uint8_t* const address = Translate(offset);
+    if (address == nullptr) {
       return;
     }
     // Earlier stores to DMA memory (e.g. TRBs before a doorbell write) and
     // later loads/stores must not move across this write.
     asm volatile("" ::: "memory");
-    *reinterpret_cast<volatile uint32_t*>(base_ + offset) = value;
+    *reinterpret_cast<volatile uint32_t*>(address) = value;
     asm volatile("" ::: "memory");
   }
 
-  int64_t Size() const override { return size_; }
-
- private:
-  bool Contains(const int64_t offset) const {
-    return offset >= 0 && (offset & 3) == 0 && offset <= size_ - 4;
+  int64_t Size() const override {
+    if (segment_count_ == 0) {
+      return 0;
+    }
+    const Segment& last = segments_[segment_count_ - 1];
+    return last.offset + last.size;
   }
 
-  volatile uint8_t* base_ = nullptr;
-  int64_t size_ = 0;
+ private:
+  struct Segment {
+    int64_t offset = 0;
+    int64_t size = 0;
+    volatile uint8_t* base = nullptr;
+  };
+
+  // The mapped address of the dword at `offset`, or nullptr.
+  volatile uint8_t* Translate(const int64_t offset) const {
+    if ((offset & 3) != 0) {
+      return nullptr;
+    }
+    for (int i = 0; i < segment_count_; ++i) {
+      const Segment& segment = segments_[i];
+      if (offset >= segment.offset &&
+          offset - segment.offset <= segment.size - 4) {
+        return segment.base + (offset - segment.offset);
+      }
+    }
+    return nullptr;
+  }
+
+  Segment segments_[kMaxSegments] = {};
+  int segment_count_ = 0;
 };
 
 static_assert(std::is_trivially_destructible_v<MappedMmioWindow>);
@@ -282,4 +333,4 @@ inline void FormatBdf(const int bus,       //
 
 }  // namespace protos::usb
 
-#endif  // PROTOS_USER_XHCI_PLATFORM_H_
+#endif  // PROTOS_USER_USBKBD_XHCI_PLATFORM_H_

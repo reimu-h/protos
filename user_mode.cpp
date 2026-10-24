@@ -249,17 +249,34 @@ void UserProcess::Kill() {
 }
 
 uintptr_t UserProcess::LookupUserPage(const uintptr_t user_addr) const {
+  const IrqSpinLockGuard guard(space_lock_);
   return (space_ != nullptr) ? space_->PageFrame(user_addr) : 0;
 }
 
-bool UserProcess::QueryUserPage(const uintptr_t user_addr,
-                                UserPageInfo* const info) const {
-  return space_ != nullptr && space_->QueryPage(user_addr, info);
+StatusOr<UserPageInfo> UserProcess::QueryUserPage(
+    const uintptr_t user_addr) const {
+  const IrqSpinLockGuard guard(space_lock_);
+  if (space_ == nullptr) {
+    return kStatusError;
+  }
+  return space_->QueryPage(user_addr);
 }
 
 bool UserProcess::BindVectorsForSelftest(const int device_index,
                                          const int count) {
-  return driver_.BindVectorsForSelftest(device_index, count, task_);
+  // The creator calls it after Start() (see `task_`): a vector bound to no
+  // task would never wake the process in irq_wait. Nor would one bound to a
+  // task that Wait() reclaimed, or that ends because it was killed.
+  Task* owner_task = nullptr;
+  {
+    const IrqSpinLockGuard guard(kill_lock_);
+    DCHECK(task_ != nullptr);
+    if (task_reclaimed_ || IsKillRequested()) {
+      return false;
+    }
+    owner_task = task_;
+  }
+  return driver_.BindVectorsForSelftest(device_index, count, owner_task);
 }
 
 UserProcessStats UserProcess::stats() const {
@@ -328,13 +345,13 @@ void UserProcess::TaskEntry(void* const raw_process) {
 
 void UserProcess::Run() {
   // `result_` says kLoadFailed until the program ends.
-  ElfExecutable executable;
-  if (ElfParseExecutable(program_.image, program_.size, &executable) !=
-      ElfError::kNone) {
+  const StatusOr<ElfExecutable, ElfError> executable =
+      ElfParseExecutable(program_.image, program_.size);
+  if (!executable.ok()) {
     return;
   }
   const std::unique_ptr<AddressSpace> space = AddressSpace::Create();
-  if (space == nullptr || !Load(executable, *space)) {
+  if (space == nullptr || !Load(*executable, *space)) {
     return;
   }
   // The program's x87/MMX/SSE/AVX registers, which start in the architectural
@@ -347,7 +364,10 @@ void UserProcess::Run() {
   fpu_state_.store(reinterpret_cast<uintptr_t>(fpu_state.get()),
                    std::memory_order_release);
   TaskScheduler* const scheduler = GetTaskScheduler();
-  space_ = space.get();
+  {
+    const IrqSpinLockGuard guard(space_lock_);
+    space_ = space.get();
+  }
   scheduler->SetAddressSpace(space_);
   scheduler->SetFpuState(fpu_state.get());
   // A program killed before this point never enters user mode. A later kill
@@ -362,7 +382,7 @@ void UserProcess::Run() {
   } else {
     // Returns once an interrupt handler has stored the result and called
     // End().
-    UserModeEnter(executable.entry, kUserStackTop - 8, arg_, this);
+    UserModeEnter(executable->entry, kUserStackTop - 8, arg_, this);
   }
   // Quiesce any claimed PCI devices, disable MSI/MSI-X, and release vectors
   // and PCI claims while `space_` is still alive, before DMA frames are
@@ -394,7 +414,10 @@ void UserProcess::Run() {
   // own runs here; nothing saves them anymore.
   scheduler->SetFpuState(nullptr);
   scheduler->SetAddressSpace(nullptr);
-  space_ = nullptr;
+  {
+    const IrqSpinLockGuard guard(space_lock_);
+    space_ = nullptr;
+  }
   CleanupChildren();
 }
 
@@ -535,10 +558,13 @@ void UserProcess::OnSyscall(InterruptFrame* const frame) {
                                 frame->rdx);
         break;
       case kSyscallIrqAlloc:
+        // The vectors wake the task that runs this call, the process's own.
+        // Not `task_`: Start() stores it only after CreateTask() has
+        // returned, and the task may already be running by then.
         ret = process->driver_.IrqAlloc(static_cast<int64_t>(frame->rdi),  //
                                         static_cast<int64_t>(frame->rsi),  //
                                         static_cast<int64_t>(frame->rdx),  //
-                                        process->task_);
+                                        GetTaskScheduler()->CurrentTask());
         break;
       case kSyscallIrqWait:
         ret = process->IrqWait(frame->rdi, static_cast<int64_t>(frame->rsi));
@@ -626,13 +652,18 @@ int64_t UserProcess::Spin(const uintptr_t buffer,  //
     return kSyscallErrorFault;
   }
   const int64_t checksum = ChecksumUserMemory(buffer, size);
+  bool changed = false;
   meter->Add(ReadCpuClock());
   while (meter->ticks() < ticks && !IsKillRequested()) {
-    // Nothing but the program could change the buffer, and it waits for this
-    // call, so every pass reads the same bytes, also after the task moved to
-    // another CPU.
-    const int64_t again = ChecksumUserMemory(buffer, size);
-    DCHECK(again == checksum);
+    // The program waits for this call, so every pass reads the same bytes,
+    // also after the task moved to another CPU, unless a device writes them
+    // (a driver's DMA buffer passes MayRead() like other memory of the
+    // program). The kernel must not assert on what user space or a device
+    // controls: the call fails instead.
+    if (ChecksumUserMemory(buffer, size) != checksum) {
+      changed = true;
+      break;
+    }
     meter->Add(ReadCpuClock());
   }
   if (IsKillRequested()) {
@@ -651,7 +682,7 @@ int64_t UserProcess::Spin(const uintptr_t buffer,  //
     }
 #endif
   }
-  return checksum;
+  return changed ? kSyscallErrorBusy : checksum;
 }
 
 int64_t UserProcess::Read(const uintptr_t buffer, const int64_t size) {
@@ -664,8 +695,8 @@ int64_t UserProcess::Read(const uintptr_t buffer, const int64_t size) {
   if (!MayWrite(buffer, size)) {
     return kSyscallErrorFault;
   }
-  char first = 0;
-  while (!ConsoleTryReadc(&first)) {
+  StatusOr<char> first = ConsoleTryReadc();
+  while (!first.ok()) {
     if (IsKillRequested()) {
       {
         const ScopedIrqDisable irq_disable;
@@ -687,18 +718,19 @@ int64_t UserProcess::Read(const uintptr_t buffer, const int64_t size) {
       scheduler->Yield();
     }
     asm volatile("pause" : : : "memory");
+    first = ConsoleTryReadc();
   }
 
   char chunk[kReadChunkSize];
-  chunk[0] = first;
+  chunk[0] = *first;
   int chunk_len = 1;
   int64_t done = 0;
   while (done + chunk_len < size && !IsKillRequested()) {
-    char next = 0;
-    if (!ConsoleTryReadc(&next)) {
+    const StatusOr<char> next = ConsoleTryReadc();
+    if (!next.ok()) {
       break;
     }
-    chunk[chunk_len++] = next;
+    chunk[chunk_len++] = *next;
     if (chunk_len == kReadChunkSize) {
       WriteUserMemory(buffer + static_cast<uintptr_t>(done), chunk, chunk_len);
       done += chunk_len;
@@ -728,8 +760,8 @@ int64_t UserProcess::Spawn(const uintptr_t name_ptr,  //
   }
   char name[kSyscallSpawnMaxNameLength];
   ReadUserMemory(name, name_ptr, name_len);
-  UserProgram program;
-  if (!FindUserProgram(name, name_len, &program)) {
+  const StatusOr<UserProgram> program = FindUserProgram(name, name_len);
+  if (!program.ok()) {
     return kSyscallErrorInvalid;
   }
   int64_t slot = -1;
@@ -748,7 +780,7 @@ int64_t UserProcess::Spawn(const uintptr_t name_ptr,  //
     return kSyscallErrorInvalid;
   }
   std::unique_ptr<UserProcess> child =
-      UserProcess::Start(program, arg, child_caps);
+      UserProcess::Start(*program, arg, child_caps);
   if (child == nullptr) {
     return kSyscallErrorInvalid;
   }
@@ -793,7 +825,19 @@ int64_t UserProcess::WaitChild(const int64_t pid, const uintptr_t result_ptr) {
   }
   const UserProgramResult child_result = child->Wait();
   children_[slot].reset();
-  WriteUserMemory(result_ptr, &child_result, sizeof(child_result));
+  // User space gets a copy built field by field in zeroed memory, as Linux
+  // clears a structure before it fills it for copy_to_user(): every byte that
+  // reaches user memory is one that the kernel chose, and the reserved fields
+  // are zero. (The struct has no padding either, syscall_abi.h.)
+  UserProgramResult user_result;
+  __builtin_memset(static_cast<void*>(&user_result), 0, sizeof(user_result));
+  user_result.outcome = child_result.outcome;
+  user_result.exit_status = child_result.exit_status;
+  user_result.fault_vector = child_result.fault_vector;
+  user_result.fault_error_code = child_result.fault_error_code;
+  user_result.fault_rip = child_result.fault_rip;
+  user_result.fault_address = child_result.fault_address;
+  WriteUserMemory(result_ptr, &user_result, sizeof(user_result));
   if (IsKillRequested()) {
     const ScopedIrqDisable irq_disable;
     RecordKillNoticeIrqsOff();
@@ -804,18 +848,22 @@ int64_t UserProcess::WaitChild(const int64_t pid, const uintptr_t result_ptr) {
 int64_t UserProcess::PciInfo(const int64_t index,
                              const uintptr_t info_ptr) const {
   if (info_ptr == 0) {
-    return driver_.PciInfo(index, nullptr);
+    const int count = PciDeviceCount();
+    if (index == 0) {
+      return count;
+    }
+    return (index < 0 || index >= count) ? kSyscallErrorNoDevice
+                                         : kSyscallErrorFault;
   }
   if (!MayWrite(info_ptr, sizeof(PciDeviceInfo))) {
     return kSyscallErrorFault;
   }
-  PciDeviceInfo info{};
-  const int64_t ret = driver_.PciInfo(index, &info);
-  if (ret < 0) {
-    return ret;
+  const StatusOr<DriverPciInfoResult> res = driver_.PciInfo(index);
+  if (!res.ok()) {
+    return res.status();
   }
-  WriteUserMemory(info_ptr, &info, sizeof(info));
-  return ret;
+  WriteUserMemory(info_ptr, &res->info, sizeof(res->info));
+  return res->count;
 }
 
 int64_t UserProcess::DmaAlloc(const int64_t size,            //
@@ -828,13 +876,13 @@ int64_t UserProcess::DmaAlloc(const int64_t size,            //
   if (phys_out_ptr == 0 || !MayWrite(phys_out_ptr, sizeof(uint64_t))) {
     return kSyscallErrorFault;
   }
-  uint64_t phys = 0;
-  const int64_t ret = driver_.DmaAlloc(space_, size, flags, &phys);
-  if (SyscallIsError(ret)) {
-    return ret;
+  const StatusOr<DriverDmaAllocation> alloc =
+      driver_.DmaAlloc(space_, size, flags);
+  if (!alloc.ok()) {
+    return alloc.status();
   }
-  WriteUserMemory(phys_out_ptr, &phys, sizeof(phys));
-  return ret;
+  WriteUserMemory(phys_out_ptr, &alloc->phys_addr, sizeof(alloc->phys_addr));
+  return static_cast<int64_t>(alloc->user_addr);
 }
 
 int64_t UserProcess::IrqWait(const uint64_t mask, const int64_t timeout_ticks) {

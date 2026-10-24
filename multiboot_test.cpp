@@ -4,6 +4,7 @@
 #include <gtest/gtest.h>
 #include <sys/mman.h>
 
+#include <cstddef>
 #include <cstdint>
 #include <cstring>
 #include <memory>
@@ -514,6 +515,8 @@ TEST(MultibootTest, Multiboot2FramebufferTagValidatesPitchAndDimensions) {
     Multiboot2TagMmap mmap;
     Multiboot2MmapEntry entry;
     Multiboot2TagFramebuffer fb;
+    MultibootRgbColorInfo rgb;
+    uint8_t fb_padding[2];
     Multiboot2Tag end;
   };
   constexpr uintptr_t kFbAddr = 0xFD000000;
@@ -525,13 +528,16 @@ TEST(MultibootTest, Multiboot2FramebufferTagValidatesPitchAndDimensions) {
   buf.mmap.entry_size = sizeof(Multiboot2MmapEntry);
   buf.entry = {0x200000, 16 * kPageBytes, kMemoryTypeAvailable, 0};
   buf.fb.type = kMultiboot2TagFramebuffer;
-  buf.fb.size = sizeof(Multiboot2TagFramebuffer);
+  buf.fb.size = sizeof(Multiboot2TagFramebufferRgb);
   buf.fb.framebuffer_addr = kFbAddr;
   buf.fb.framebuffer_pitch = 640 * 4;
   buf.fb.framebuffer_width = 640;
   buf.fb.framebuffer_height = 480;
   buf.fb.framebuffer_bpp = 32;
   buf.fb.framebuffer_type = kMultiboot2FramebufferTypeRgb;
+  // A layout with the reserved byte at the bottom, as GOP bitmask modes can
+  // have.
+  buf.rgb = {24, 8, 16, 8, 8, 8};
   buf.end.type = kMultiboot2TagEnd;
   buf.end.size = sizeof(Multiboot2Tag);
 
@@ -544,20 +550,30 @@ TEST(MultibootTest, Multiboot2FramebufferTagValidatesPitchAndDimensions) {
                                    &parsed);
   };
 
-  // Valid 32-bpp and 24-bpp framebuffer tags are accepted.
+  // Valid 32-bpp and 24-bpp framebuffer tags are accepted, with their color
+  // channels.
   ASSERT_TRUE(parse());
   EXPECT_THAT(parsed.fb_addr, t::Eq(kFbAddr));
   EXPECT_THAT(parsed.fb_pitch, t::Eq(640 * 4));
   EXPECT_THAT(parsed.fb_width, t::Eq(640));
   EXPECT_THAT(parsed.fb_height, t::Eq(480));
   EXPECT_THAT(parsed.fb_bpp, t::Eq(32));
+  EXPECT_THAT(parsed.fb_red_position, t::Eq(24));
+  EXPECT_THAT(parsed.fb_red_size, t::Eq(8));
+  EXPECT_THAT(parsed.fb_green_position, t::Eq(16));
+  EXPECT_THAT(parsed.fb_green_size, t::Eq(8));
+  EXPECT_THAT(parsed.fb_blue_position, t::Eq(8));
+  EXPECT_THAT(parsed.fb_blue_size, t::Eq(8));
 
   buf.fb.framebuffer_bpp = 24;
   buf.fb.framebuffer_pitch = 640 * 3;
+  buf.rgb = {0, 8, 8, 8, 16, 8};
   ASSERT_TRUE(parse());
   EXPECT_THAT(parsed.fb_addr, t::Eq(kFbAddr));
   EXPECT_THAT(parsed.fb_pitch, t::Eq(640 * 3));
   EXPECT_THAT(parsed.fb_bpp, t::Eq(24));
+  EXPECT_THAT(parsed.fb_red_position, t::Eq(0));
+  EXPECT_THAT(parsed.fb_blue_position, t::Eq(16));
 
   // pitch < width * (bpp / 8) is rejected for both 24-bpp and 32-bpp.
   buf.fb.framebuffer_pitch = 640 * 3 - 1;
@@ -603,6 +619,15 @@ TEST(MultibootTest, Multiboot2FramebufferTagValidatesPitchAndDimensions) {
   buf.fb.framebuffer_type = 2;
   ASSERT_TRUE(parse());
   EXPECT_THAT(parsed.fb_addr, t::Eq(0u));
+
+  // So is an RGB framebuffer tag that is too small for the color information.
+  buf.fb.framebuffer_type = kMultiboot2FramebufferTypeRgb;
+  ASSERT_TRUE(parse());
+  EXPECT_THAT(parsed.fb_addr, t::Eq(kFbAddr));
+  buf.fb.size = sizeof(Multiboot2TagFramebuffer);
+  ASSERT_TRUE(parse());
+  EXPECT_THAT(parsed.fb_addr, t::Eq(0u));
+  EXPECT_THAT(parsed.fb_red_size, t::Eq(0));
 }
 
 // Writes a Multiboot2 tag header at `offset` in `info`.
@@ -680,21 +705,22 @@ TEST(MultibootTest, Multiboot2MapInfoMapsTheHeaderAndThenTheWholeStructure) {
   std::memcpy(info, &header, sizeof(header));
   const uintptr_t info_addr = AddrOf(info);
 
-  int64_t total_size = -1;
-  EXPECT_THAT(Multiboot2MapInfo(info_addr, kIdentityMapLimit, &RecordingMapper,
-                                &total_size),
-              t::Eq(info));
-  EXPECT_THAT(total_size, t::Eq(48));
+  const StatusOr<Multiboot2MappedInfo> mapped =
+      Multiboot2MapInfo(info_addr, kIdentityMapLimit, &RecordingMapper);
+  ASSERT_TRUE(mapped.ok());
+  EXPECT_THAT(mapped->data, t::Eq(info));
+  EXPECT_THAT(mapped->total_size, t::Eq(48));
   EXPECT_THAT(g_env.map_calls,
               t::ElementsAre(MapCall{info_addr, sizeof(Multiboot2InfoHeader)},
                              MapCall{info_addr, 48}));
 
   // The structure may end exactly at `max_physical_addr`.
-  EXPECT_THAT(Multiboot2MapInfo(info_addr,         //
-                                info_addr + 48,    //
-                                &RecordingMapper,  //
-                                &total_size),
-              t::Eq(info));
+  const StatusOr<Multiboot2MappedInfo> mapped_exact =
+      Multiboot2MapInfo(info_addr,       //
+                        info_addr + 48,  //
+                        &RecordingMapper);
+  ASSERT_TRUE(mapped_exact.ok());
+  EXPECT_THAT(mapped_exact->data, t::Eq(info));
 }
 
 TEST(MultibootTest, Multiboot2MapInfoRejectsBadAddressesSizesAndMapFailures) {
@@ -707,11 +733,13 @@ TEST(MultibootTest, Multiboot2MapInfoRejectsBadAddressesSizesAndMapFailures) {
   };
   const auto map_info = [](const uintptr_t addr,
                            const uintptr_t max_physical_addr) {
-    int64_t total_size = -1;
-    const uint8_t* const mapped = Multiboot2MapInfo(
-        addr, max_physical_addr, &RecordingMapper, &total_size);
-    EXPECT_THAT(total_size, t::Eq(mapped == nullptr ? 0 : 48));
-    return mapped;
+    const StatusOr<Multiboot2MappedInfo> mapped =
+        Multiboot2MapInfo(addr, max_physical_addr, &RecordingMapper);
+    if (mapped.ok()) {
+      EXPECT_THAT(mapped->total_size, t::Eq(48));
+      return mapped->data;
+    }
+    return static_cast<const uint8_t*>(nullptr);
   };
   set_total_size(sizeof(info));
 
@@ -742,6 +770,283 @@ TEST(MultibootTest, Multiboot2MapInfoRejectsBadAddressesSizesAndMapFailures) {
   g_env.map_calls.clear();
   g_env.fail_map_call = -1;
   EXPECT_THAT(map_info(info_addr, kIdentityMapLimit), t::Eq(info));
+}
+
+// Multiboot1 boot information up to the end of its framebuffer fields.
+struct [[gnu::packed]] Mb1InfoWithFramebuffer {
+  Multiboot1Info info;
+  uint8_t other_fields[36];
+  Multiboot1FramebufferInfo fb;
+};
+static_assert(offsetof(Mb1InfoWithFramebuffer, fb) ==
+              kMultiboot1FramebufferInfoOffset);
+
+// Fills `fb` with GRUB's description of VGA text mode, which it also passes
+// with Multiboot2 (except for the color information).
+static void SetVgaTextMode(Multiboot1FramebufferInfo* const fb) {
+  *fb = {};
+  fb->framebuffer_addr = 0xB8000;
+  fb->framebuffer_pitch = 160;
+  fb->framebuffer_width = 80;
+  fb->framebuffer_height = 25;
+  fb->framebuffer_bpp = 16;
+  fb->framebuffer_type = kMultiboot2FramebufferTypeEgaText;
+}
+
+TEST(MultibootTest, Multiboot1FramebufferFieldsAreParsedWhenFlagged) {
+  ResetFakeEnv();
+  Mb1InfoWithFramebuffer mb1 = {};
+  mb1.info.flags = kMultiboot1FlagMemBasic | kMultiboot1FlagFramebuffer;
+  mb1.info.mem_lower = 639;
+  mb1.info.mem_upper = 130048;
+  // What GRUB passes for the GOP framebuffer of a UEFI QEMU VM.
+  mb1.fb.framebuffer_addr = 0xC0000000;
+  mb1.fb.framebuffer_pitch = 800 * 3;
+  mb1.fb.framebuffer_width = 800;
+  mb1.fb.framebuffer_height = 600;
+  mb1.fb.framebuffer_bpp = 24;
+  mb1.fb.framebuffer_type = kMultiboot2FramebufferTypeRgb;
+  mb1.fb.rgb = {16, 8, 8, 8, 0, 8};
+  const uintptr_t mb1_addr = AddrOf(&mb1);
+  MultibootMemoryMap parsed = {};
+  const auto parse = [&](const uintptr_t max_physical_addr) {
+    return MultibootParseMemoryMap(kMultiboot1Magic,   //
+                                   mb1_addr,           //
+                                   max_physical_addr,  //
+                                   &parsed);
+  };
+
+  ASSERT_TRUE(parse(kIdentityMapLimit));
+  EXPECT_THAT(parsed.fb_addr, t::Eq(0xC0000000u));
+  EXPECT_THAT(parsed.fb_pitch, t::Eq(800 * 3));
+  EXPECT_THAT(parsed.fb_width, t::Eq(800));
+  EXPECT_THAT(parsed.fb_height, t::Eq(600));
+  EXPECT_THAT(parsed.fb_bpp, t::Eq(24));
+  EXPECT_THAT(parsed.fb_red_position, t::Eq(16));
+  EXPECT_THAT(parsed.fb_red_size, t::Eq(8));
+  EXPECT_THAT(parsed.fb_green_position, t::Eq(8));
+  EXPECT_THAT(parsed.fb_green_size, t::Eq(8));
+  EXPECT_THAT(parsed.fb_blue_position, t::Eq(0));
+  EXPECT_THAT(parsed.fb_blue_size, t::Eq(8));
+  EXPECT_THAT(parsed.mb_reserved_start, t::Eq(mb1_addr));
+  EXPECT_THAT(parsed.mb_reserved_end, t::Eq(mb1_addr + sizeof(mb1)));
+
+  // Framebuffer fields that would reach past `max_physical_addr` are ignored.
+  ASSERT_TRUE(parse(mb1_addr + sizeof(mb1) - 1));
+  EXPECT_THAT(parsed.fb_addr, t::Eq(0u));
+  EXPECT_THAT(parsed.mb_reserved_end, t::Eq(mb1_addr + sizeof(Multiboot1Info)));
+
+  // VGA text mode is no framebuffer to draw on.
+  SetVgaTextMode(&mb1.fb);
+  ASSERT_TRUE(parse(kIdentityMapLimit));
+  EXPECT_THAT(parsed.fb_addr, t::Eq(0u));
+
+  // Without the flag, the parser reads nothing past the fixed fields, which
+  // here end right before an inaccessible page.
+  const Low32BitBuffer buffer(1);
+  if (!buffer.ok()) {
+    GTEST_SKIP() << "cannot map host memory below 4 GiB (MAP_32BIT)";
+  }
+  Multiboot1Info* const info = reinterpret_cast<Multiboot1Info*>(
+      buffer.EndMinus(sizeof(Multiboot1Info)));
+  *info = mb1.info;
+  info->flags = kMultiboot1FlagMemBasic;
+  ASSERT_TRUE(MultibootParseMemoryMap(kMultiboot1Magic,   //
+                                      AddrOf(info),       //
+                                      kIdentityMapLimit,  //
+                                      &parsed));
+  EXPECT_THAT(parsed.fb_addr, t::Eq(0u));
+  EXPECT_THAT(parsed.mb_reserved_end,
+              t::Eq(AddrOf(info) + sizeof(Multiboot1Info)));
+}
+
+// Builds a Multiboot2 boot information structure from tags.
+class Mb2InfoBuilder {
+ public:
+  // Appends the `size` bytes at `tag`, a tag whose header holds `size`, at the
+  // next 8-byte aligned offset.
+  void Add(const void* const tag, const int64_t size) {
+    std::memcpy(bytes_ + size_, tag, size);
+    size_ = (size_ + size + 7) & ~int64_t{7};
+  }
+
+  // Appends a tag of type `type` without contents.
+  void AddEmpty(const uint32_t type) {
+    const Multiboot2Tag tag = {type, sizeof(Multiboot2Tag)};
+    Add(&tag, sizeof(tag));
+  }
+
+  // Appends the end tag and returns the address of the structure.
+  uintptr_t Finish() {
+    AddEmpty(kMultiboot2TagEnd);
+    const Multiboot2InfoHeader header = {static_cast<uint32_t>(size_), 0};
+    std::memcpy(bytes_, &header, sizeof(header));
+    return AddrOf(bytes_);
+  }
+
+ private:
+  alignas(8) uint8_t bytes_[256] = {};
+  int64_t size_ = sizeof(Multiboot2InfoHeader);
+};
+
+// Returns a Multiboot2 framebuffer tag of type `type` at `addr`, of the size
+// that GRUB gives it.
+static Multiboot2TagFramebufferRgb MakeFramebufferTag(const uint8_t type,
+                                                      const uint64_t addr) {
+  Multiboot2TagFramebufferRgb tag = {};
+  tag.common.type = kMultiboot2TagFramebuffer;
+  tag.common.framebuffer_addr = addr;
+  tag.common.framebuffer_type = type;
+  if (type == kMultiboot2FramebufferTypeRgb) {
+    tag.common.size = sizeof(Multiboot2TagFramebufferRgb);
+    tag.common.framebuffer_pitch = 800 * 3;
+    tag.common.framebuffer_width = 800;
+    tag.common.framebuffer_height = 600;
+    tag.common.framebuffer_bpp = 24;
+    tag.rgb = {16, 8, 8, 8, 0, 8};
+  } else {
+    tag.common.size = sizeof(Multiboot2TagFramebuffer);
+    tag.common.framebuffer_pitch = 160;
+    tag.common.framebuffer_width = 80;
+    tag.common.framebuffer_height = 25;
+    tag.common.framebuffer_bpp = 16;
+  }
+  return tag;
+}
+
+TEST(MultibootTest, HasVgaTextModeFollowsTheMultiboot2FramebufferAndEfiTags) {
+  ResetFakeEnv();
+  const auto has_vga_text = [](Mb2InfoBuilder* const builder) {
+    return MultibootHasVgaTextMode(kMultiboot2Magic,   //
+                                   builder->Finish(),  //
+                                   kIdentityMapLimit);
+  };
+  const auto add_framebuffer = [](Mb2InfoBuilder* const builder,
+                                  const uint8_t type, const uint64_t addr) {
+    const Multiboot2TagFramebufferRgb tag = MakeFramebufferTag(type, addr);
+    builder->Add(&tag, tag.common.size);
+  };
+
+  {
+    // What GRUB passes on a BIOS machine in text mode.
+    Mb2InfoBuilder builder;
+    builder.AddEmpty(kMultiboot2TagAcpiOld);
+    add_framebuffer(&builder, kMultiboot2FramebufferTypeEgaText, 0xB8000);
+    EXPECT_TRUE(has_vga_text(&builder));
+  }
+  {
+    // The monochrome text buffer, whose CRT controller is elsewhere.
+    Mb2InfoBuilder builder;
+    add_framebuffer(&builder, kMultiboot2FramebufferTypeEgaText, 0xB0000);
+    EXPECT_FALSE(has_vga_text(&builder));
+  }
+  {
+    // What GRUB passes on a UEFI machine with a GOP framebuffer.
+    Mb2InfoBuilder builder;
+    add_framebuffer(&builder, kMultiboot2FramebufferTypeRgb, 0xC0000000);
+    builder.AddEmpty(kMultiboot2TagEfi64);
+    builder.AddEmpty(kMultiboot2TagEfiMmap);
+    EXPECT_FALSE(has_vga_text(&builder));
+  }
+  {
+    // A graphics mode on a BIOS machine.
+    Mb2InfoBuilder builder;
+    add_framebuffer(&builder, kMultiboot2FramebufferTypeRgb, 0xC0000000);
+    EXPECT_FALSE(has_vga_text(&builder));
+  }
+  {
+    Mb2InfoBuilder builder;
+    add_framebuffer(&builder, kMultiboot2FramebufferTypeIndexed, 0xA0000);
+    EXPECT_FALSE(has_vga_text(&builder));
+  }
+  {
+    // No framebuffer tag and no EFI tag: a BIOS boot.
+    Mb2InfoBuilder builder;
+    builder.AddEmpty(kMultiboot2TagAcpiOld);
+    EXPECT_TRUE(has_vga_text(&builder));
+  }
+  // No framebuffer tag but an EFI tag: a UEFI boot without a framebuffer.
+  for (const uint32_t efi_tag :
+       {kMultiboot2TagEfi32, kMultiboot2TagEfi64, kMultiboot2TagEfiMmap,
+        kMultiboot2TagEfiBootServices, kMultiboot2TagEfi32ImageHandle,
+        kMultiboot2TagEfi64ImageHandle}) {
+    Mb2InfoBuilder builder;
+    builder.AddEmpty(kMultiboot2TagAcpiNew);
+    builder.AddEmpty(efi_tag);
+    EXPECT_FALSE(has_vga_text(&builder)) << "EFI tag " << efi_tag;
+  }
+  {
+    // The framebuffer tag decides when there is one.
+    Mb2InfoBuilder builder;
+    builder.AddEmpty(kMultiboot2TagEfi64);
+    add_framebuffer(&builder, kMultiboot2FramebufferTypeEgaText, 0xB8000);
+    EXPECT_TRUE(has_vga_text(&builder));
+  }
+  {
+    // Boot information that cannot be read tells nothing.
+    Mb2InfoBuilder builder;
+    const uintptr_t info_addr = builder.Finish();
+    g_env.fail_bootstrap_map = true;
+    EXPECT_FALSE(MultibootHasVgaTextMode(kMultiboot2Magic,  //
+                                         info_addr,         //
+                                         kIdentityMapLimit));
+    g_env.fail_bootstrap_map = false;
+    EXPECT_TRUE(MultibootHasVgaTextMode(kMultiboot2Magic,  //
+                                        info_addr,         //
+                                        kIdentityMapLimit));
+    EXPECT_FALSE(
+        MultibootHasVgaTextMode(0x12345678, info_addr, kIdentityMapLimit));
+    EXPECT_FALSE(
+        MultibootHasVgaTextMode(kMultiboot2Magic, 0, kIdentityMapLimit));
+    EXPECT_FALSE(
+        MultibootHasVgaTextMode(kMultiboot2Magic, info_addr, info_addr));
+  }
+  EXPECT_THAT(g_env.uart_log, t::IsEmpty());
+  EXPECT_THAT(g_env.vga_log, t::IsEmpty());
+}
+
+TEST(MultibootTest, HasVgaTextModeFollowsTheMultiboot1Framebuffer) {
+  ResetFakeEnv();
+  Mb1InfoWithFramebuffer mb1 = {};
+  mb1.info.flags = kMultiboot1FlagMemBasic | kMultiboot1FlagFramebuffer;
+  const uintptr_t mb1_addr = AddrOf(&mb1);
+  const auto has_vga_text = [mb1_addr](const uintptr_t max_physical_addr) {
+    return MultibootHasVgaTextMode(kMultiboot1Magic,  //
+                                   mb1_addr,          //
+                                   max_physical_addr);
+  };
+
+  // What GRUB passes on a BIOS machine in text mode.
+  SetVgaTextMode(&mb1.fb);
+  EXPECT_TRUE(has_vga_text(kIdentityMapLimit));
+  // Unless the framebuffer fields are out of reach.
+  EXPECT_FALSE(has_vga_text(mb1_addr + sizeof(mb1) - 1));
+  g_env.fail_bootstrap_map = true;
+  EXPECT_FALSE(has_vga_text(kIdentityMapLimit));
+  g_env.fail_bootstrap_map = false;
+
+  mb1.fb.framebuffer_addr = 0xB0000;
+  EXPECT_FALSE(has_vga_text(kIdentityMapLimit));
+
+  // What GRUB passes on a UEFI machine with a GOP framebuffer.
+  mb1.fb.framebuffer_addr = 0xC0000000;
+  mb1.fb.framebuffer_type = kMultiboot2FramebufferTypeRgb;
+  EXPECT_FALSE(has_vga_text(kIdentityMapLimit));
+
+  // Without framebuffer fields: a BIOS boot. They are not read then, and here
+  // they would lie in an inaccessible page.
+  const Low32BitBuffer buffer(1);
+  if (!buffer.ok()) {
+    GTEST_SKIP() << "cannot map host memory below 4 GiB (MAP_32BIT)";
+  }
+  Multiboot1Info* const info = reinterpret_cast<Multiboot1Info*>(
+      buffer.EndMinus(sizeof(Multiboot1Info)));
+  *info = {};
+  info->flags = kMultiboot1FlagMemBasic;
+  EXPECT_TRUE(MultibootHasVgaTextMode(kMultiboot1Magic,  //
+                                      AddrOf(info),      //
+                                      kIdentityMapLimit));
+  EXPECT_THAT(g_env.uart_log, t::IsEmpty());
 }
 
 }  // namespace

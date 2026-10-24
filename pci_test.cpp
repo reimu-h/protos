@@ -1452,7 +1452,33 @@ TEST_F(PciTest, ReleaseQuiescesTheDevice) {
               t::Eq(0x000F | kPciMsixControlFunctionMask));
 }
 
-TEST_F(PciTest, ClaimOpensMemorySpaceOnUpstreamBridgesButNotBusMaster) {
+TEST_F(PciTest, ClaimTurnsOffMsiAndMsixThatWereLeftOn) {
+  const PciAddress address = {0, 4, 0};
+  fake_->AddFunction(address, EndpointSpec(0x0006));
+  fake_->SetBar(address,  //
+                0,        //
+                {.kind = BarKind::kMem64, .base = 0xFEA70000, .size = 0x4000});
+  fake_->AddMsix(address,  //
+                 0x90,     //
+                 {.table_size = 16,
+                  .table_bar = 0,
+                  .table_offset = 0x3000,
+                  .pba_bar = 0,
+                  .pba_offset = 0x3800});
+  fake_->AddMsi(address, 0x70, {.is_64bit = true, .vectors_log2 = 4});
+  fake_->SetRaw16(address, 0x92, kPciMsixControlEnable | 0x000F);
+  fake_->SetRaw16(address, 0x72, 0x0088 | kPciMsiControlEnable);
+  Init();
+  ASSERT_THAT(PciClaim(0, kOwnerA), t::Eq(PciStatus::kOk));
+  EXPECT_THAT(fake_->Peek16(address, 0x92), t::Eq(0x000F));
+  EXPECT_THAT(fake_->Peek16(address, 0x72), t::Eq(0x0088));
+  // A repeated claim changes nothing.
+  fake_->SetRaw16(address, 0x72, 0x0088 | kPciMsiControlEnable);
+  EXPECT_THAT(PciClaim(0, kOwnerA), t::Eq(PciStatus::kOk));
+  EXPECT_THAT(fake_->Peek16(address, 0x72), t::Eq(0x0089));
+}
+
+TEST_F(PciTest, ClaimOpensMemorySpaceAndBusMasterOnUpstreamBridgesOnly) {
   fake_->AddFunction({0, 5, 0}, BridgeSpec(0x0000, kStatusErrorBits));
   fake_->SetBridgeBuses({0, 5, 0}, 0, 1, 2);
   fake_->AddFunction({1, 0, 0}, BridgeSpec(0x0100));
@@ -1463,8 +1489,8 @@ TEST_F(PciTest, ClaimOpensMemorySpaceOnUpstreamBridgesButNotBusMaster) {
   fake_->ClearAccesses();
   ASSERT_THAT(PciClaim(PciFindDevice({2, 3, 0}), kOwnerA),
               t::Eq(PciStatus::kOk));
-  EXPECT_THAT(Command({0, 5, 0}), t::Eq(0x0002));
-  EXPECT_THAT(Command({1, 0, 0}), t::Eq(0x0102));
+  EXPECT_THAT(Command({0, 5, 0}), t::Eq(0x0006));
+  EXPECT_THAT(Command({1, 0, 0}), t::Eq(0x0106));
   EXPECT_THAT(Command({2, 3, 0}), t::Eq(0x0402));
   EXPECT_THAT(fake_->Peek16({0, 5, 0}, kPciStatusOffset),
               t::Eq(kStatusErrorBits));
@@ -1514,6 +1540,10 @@ TEST_F(PciTest, BusMasterOpensEveryUpstreamBridgeBeforeTheDevice) {
   Init();
   const int index = PciFindDevice({2, 3, 0});
   ASSERT_THAT(PciClaim(index, kOwnerA), t::Eq(PciStatus::kOk));
+  EXPECT_THAT(Command({1, 0, 0}), t::Eq(0x0006));
+  EXPECT_THAT(Command({0, 5, 0}), t::Eq(0x0107));
+  fake_->SetRaw16({0, 5, 0}, kPciCommandOffset, 0x0103);
+  fake_->SetRaw16({1, 0, 0}, kPciCommandOffset, 0x0000);
   fake_->ClearAccesses();
   EXPECT_THAT(PciSetBusMaster(index, kOwnerA, true), t::Eq(PciStatus::kOk));
   EXPECT_THAT(Command({1, 0, 0}), t::Eq(0x0006));
@@ -1571,13 +1601,13 @@ TEST_F(PciTest, BusMasterNeedsTheOwner) {
   EXPECT_THAT(fake_->Accesses(), t::IsEmpty());
 }
 
-TEST_F(PciTest, BusMasterOpensTheBridgeThatSeaBiosLeavesClosed) {
+TEST_F(PciTest, ClaimOpensTheBridgeThatSeaBiosLeavesClosed) {
   AddQemuPcMachine(fake_.get(), QemuFirmware::kSeaBios, QemuTopology::kMulti);
   Init();
   const int index = PciFindDevice({1, 1, 0});
   ASSERT_THAT(Command({0, 5, 0}), t::Eq(0x0103));
   ASSERT_THAT(PciClaim(index, kOwnerA), t::Eq(PciStatus::kOk));
-  EXPECT_THAT(Command({0, 5, 0}), t::Eq(0x0103));
+  EXPECT_THAT(Command({0, 5, 0}), t::Eq(0x0107));
   EXPECT_THAT(Command({1, 1, 0}), t::Eq(0x0507));
   ASSERT_THAT(PciSetBusMaster(index, kOwnerA, true), t::Eq(PciStatus::kOk));
   EXPECT_THAT(Command({0, 5, 0}), t::Eq(0x0107));
@@ -1659,6 +1689,545 @@ TEST_F(PciTest, UpdateAndQuiesceSkipWriteWhenRegisterReadsAllOnes) {
   EXPECT_THAT(result.command, t::Eq(0xFFFF));
   EXPECT_THAT(result.msi_control, t::Eq(0xFFFF));
   EXPECT_THAT(Writes(), t::IsEmpty());
+}
+
+// --- Power management ---
+
+constexpr int kPmOffset = 0x40;
+constexpr int kPmcsrOffset = kPmOffset + kPciPmControlStatusOffset;
+
+TEST_F(PciTest, PowerManagementCapabilityIsRecordedIfItFits) {
+  fake_->AddFunction({0, 3, 0}, EndpointSpec());
+  fake_->AddPowerManagement({0, 3, 0}, kPmOffset, {});
+  fake_->AddFunction({0, 4, 0}, EndpointSpec());
+  fake_->AddFunction({0, 5, 0}, EndpointSpec());
+  fake_->AddCapability({0, 5, 0}, 0xFC, kPciCapabilityPowerManagement);
+  Init();
+  EXPECT_THAT(DeviceAt({0, 3, 0}).pm_offset, t::Eq(kPmOffset));
+  EXPECT_THAT(DeviceAt({0, 4, 0}).pm_offset, t::Eq(0));
+  EXPECT_THAT(DeviceAt({0, 5, 0}).pm_offset, t::Eq(0));
+}
+
+TEST_F(PciTest, SetPowerStateD0WakesAFunctionFromD3hotAndKeepsPmeStatus) {
+  const PciAddress address = {0, 3, 0};
+  fake_->AddFunction(address, EndpointSpec());
+  fake_->AddPowerManagement(address,    //
+                            kPmOffset,  //
+                            {.power_state = 3, .no_soft_reset = true});
+  fake_->SetRaw16(address,       //
+                  kPmcsrOffset,  //
+                  kPciPmcsrPmeStatus | kPciPmcsrNoSoftReset | 3);
+  Init();
+  ASSERT_THAT(PciClaim(0, kOwnerA), t::Eq(PciStatus::kOk));
+  fake_->ClearAccesses();
+  const StatusOr<PciPowerTransition, PciStatus> transition =
+      PciSetPowerStateD0(0, kOwnerA, /*save_context=*/false);
+  ASSERT_THAT(transition.status(), t::Eq(PciStatus::kOk));
+  EXPECT_THAT(transition->from, t::Eq(PciPowerState::kD3hot));
+  EXPECT_THAT(fake_->Peek16(address, kPmcsrOffset),
+              t::Eq(kPciPmcsrPmeStatus | kPciPmcsrNoSoftReset));
+  EXPECT_THAT(fake_->Accesses(),
+              t::ElementsAre(IsAccess(false, 2, kPmcsrOffset),
+                             IsAccess(true, 2, kPmcsrOffset)));
+}
+
+TEST_F(PciTest, SetPowerStateD0ReportsD1AndD2) {
+  fake_->AddFunction({0, 3, 0}, EndpointSpec());
+  fake_->AddPowerManagement({0, 3, 0}, kPmOffset, {.power_state = 1});
+  fake_->AddFunction({0, 4, 0}, EndpointSpec());
+  fake_->AddPowerManagement({0, 4, 0}, kPmOffset, {.power_state = 2});
+  Init();
+  ASSERT_THAT(PciClaim(0, kOwnerA), t::Eq(PciStatus::kOk));
+  ASSERT_THAT(PciClaim(1, kOwnerA), t::Eq(PciStatus::kOk));
+  const StatusOr<PciPowerTransition, PciStatus> t0 =
+      PciSetPowerStateD0(0, kOwnerA);
+  ASSERT_THAT(t0.status(), t::Eq(PciStatus::kOk));
+  EXPECT_THAT(t0->from, t::Eq(PciPowerState::kD1));
+  const StatusOr<PciPowerTransition, PciStatus> t1 =
+      PciSetPowerStateD0(1, kOwnerA);
+  ASSERT_THAT(t1.status(), t::Eq(PciStatus::kOk));
+  EXPECT_THAT(t1->from, t::Eq(PciPowerState::kD2));
+  EXPECT_THAT(fake_->Peek16({0, 3, 0}, kPmcsrOffset), t::Eq(0));
+  EXPECT_THAT(fake_->Peek16({0, 4, 0}, kPmcsrOffset), t::Eq(0));
+}
+
+TEST_F(PciTest, SetPowerStateD0WritesNothingInD0OrWithoutTheCapability) {
+  fake_->AddFunction({0, 3, 0}, EndpointSpec());
+  fake_->AddPowerManagement({0, 3, 0}, kPmOffset, {.power_state = 0});
+  fake_->AddFunction({0, 4, 0}, EndpointSpec());
+  Init();
+  ASSERT_THAT(PciClaim(0, kOwnerA), t::Eq(PciStatus::kOk));
+  ASSERT_THAT(PciClaim(1, kOwnerA), t::Eq(PciStatus::kOk));
+  fake_->ClearAccesses();
+  const StatusOr<PciPowerTransition, PciStatus> t0 =
+      PciSetPowerStateD0(0, kOwnerA);
+  ASSERT_THAT(t0.status(), t::Eq(PciStatus::kOk));
+  EXPECT_THAT(t0->from, t::Eq(PciPowerState::kD0));
+  const StatusOr<PciPowerTransition, PciStatus> t1 =
+      PciSetPowerStateD0(1, kOwnerA);
+  ASSERT_THAT(t1.status(), t::Eq(PciStatus::kOk));
+  EXPECT_THAT(t1->from, t::Eq(PciPowerState::kD0));
+  EXPECT_THAT(Writes(), t::IsEmpty());
+  EXPECT_THAT(AccessesTo({0, 4, 0}), t::IsEmpty());
+}
+
+TEST_F(PciTest, SetPowerStateD0SkipsAFunctionThatReadsAllOnes) {
+  const PciAddress address = {0, 3, 0};
+  fake_->AddFunction(address, EndpointSpec());
+  fake_->AddPowerManagement(address, kPmOffset, {.power_state = 3});
+  Init();
+  ASSERT_THAT(PciClaim(0, kOwnerA), t::Eq(PciStatus::kOk));
+  fake_->SetRaw16(address, kPmcsrOffset, 0xFFFF);
+  fake_->ClearAccesses();
+  const StatusOr<PciPowerTransition, PciStatus> transition =
+      PciSetPowerStateD0(0, kOwnerA);
+  ASSERT_THAT(transition.status(), t::Eq(PciStatus::kOk));
+  EXPECT_THAT(transition->from, t::Eq(PciPowerState::kD0));
+  EXPECT_THAT(Writes(), t::IsEmpty());
+}
+
+TEST_F(PciTest, PowerManagementNeedsTheOwnerAndAValidIndex) {
+  const PciAddress address = {0, 3, 0};
+  fake_->AddFunction(address, EndpointSpec());
+  fake_->AddPowerManagement(address, kPmOffset, {.power_state = 3});
+  Init();
+  EXPECT_THAT(PciSetPowerStateD0(0, kOwnerA).status(),
+              t::Eq(PciStatus::kNotOwner));
+  ASSERT_THAT(PciClaim(0, kOwnerA), t::Eq(PciStatus::kOk));
+  fake_->ClearAccesses();
+  EXPECT_THAT(PciSetPowerStateD0(0, kOwnerB).status(),
+              t::Eq(PciStatus::kNotOwner));
+  EXPECT_THAT(PciRestoreAfterPowerUp(0, kOwnerB).status(),
+              t::Eq(PciStatus::kNotOwner));
+  EXPECT_THAT(PciSetPowerStateD0(1, kOwnerA).status(),
+              t::Eq(PciStatus::kNoDevice));
+  EXPECT_THAT(PciSetPowerStateD0(-1, kOwnerA).status(),
+              t::Eq(PciStatus::kNoDevice));
+  EXPECT_THAT(PciRestoreAfterPowerUp(1, kOwnerA).status(),
+              t::Eq(PciStatus::kNoDevice));
+  EXPECT_THAT(fake_->Accesses(), t::IsEmpty());
+  EXPECT_DEATH((void)PciSetPowerStateD0(0, kPciNoOwner), "Check failed");
+  EXPECT_DEATH((void)PciRestoreAfterPowerUp(0, kPciNoOwner), "Check failed");
+}
+
+TEST_F(PciTest, PowerUpDelaysFollowTheRecoveryTimes) {
+  EXPECT_THAT(PciPowerUpDelayMicroseconds(PciPowerState::kD0), t::Eq(0));
+  EXPECT_THAT(PciPowerUpDelayMicroseconds(PciPowerState::kD1), t::Eq(0));
+  EXPECT_THAT(PciPowerUpDelayMicroseconds(PciPowerState::kD2), t::Eq(200));
+  EXPECT_THAT(PciPowerUpDelayMicroseconds(PciPowerState::kD3hot), t::Eq(10000));
+}
+
+TEST_F(PciTest, RestoreAfterPowerUpRewritesBarsThatTheResetClearedDecodingOff) {
+  const PciAddress address = {0, 3, 0};
+  fake_->AddFunction(address, EndpointSpec());
+  fake_->SetBar(address,  //
+                0,        //
+                {.kind = BarKind::kMem64,
+                 .base = 0x4000000000,
+                 .size = 0x10000,
+                 .prefetchable = true});
+  fake_->SetBar(address,  //
+                2,        //
+                {.kind = BarKind::kMem32, .base = 0xFEB00000, .size = 0x1000});
+  fake_->SetBar(address, 4, {.kind = BarKind::kIo, .base = 0xC000, .size = 32});
+  fake_->AddPowerManagement(address, kPmOffset, {.power_state = 3});
+  Init();
+  const uint32_t bar_registers[6] = {
+      fake_->Peek32(address, kPciBar0Offset),
+      fake_->Peek32(address, kPciBar0Offset + 4),
+      fake_->Peek32(address, kPciBar0Offset + 8),
+      fake_->Peek32(address, kPciBar0Offset + 12),
+      fake_->Peek32(address, kPciBar0Offset + 16),
+      fake_->Peek32(address, kPciBar0Offset + 20),
+  };
+  ASSERT_THAT(PciClaim(0, kOwnerA), t::Eq(PciStatus::kOk));
+  const StatusOr<PciPowerTransition, PciStatus> transition =
+      PciSetPowerStateD0(0, kOwnerA);
+  ASSERT_THAT(transition.status(), t::Eq(PciStatus::kOk));
+  ASSERT_THAT(transition->from, t::Eq(PciPowerState::kD3hot));
+  // The function reset itself (No_Soft_Reset is clear).
+  ASSERT_THAT(fake_->Peek32(address, kPciBar0Offset + 4), t::Eq(0u));
+  ASSERT_THAT(Command(address), t::Eq(0));
+
+  EXPECT_THAT(PciRestoreAfterPowerUp(0, kOwnerA).status(),
+              t::Eq(PciStatus::kOk));
+  for (int i = 0; i < 6; ++i) {
+    EXPECT_THAT(fake_->Peek32(address, kPciBar0Offset + 4 * i),
+                t::Eq(bar_registers[i]))
+        << "BAR register " << i;
+  }
+  EXPECT_THAT(Command(address),
+              t::Eq(kPciCommandMemorySpace | kPciCommandInterruptDisable));
+  EXPECT_THAT(fake_->BarWritesWhileDecoding(), t::Eq(0));
+}
+
+TEST_F(PciTest, RestoreAfterPowerUpWithoutResetOnlyChecksTheBarSizes) {
+  const PciAddress address = {0, 3, 0};
+  fake_->AddFunction(address, EndpointSpec());
+  fake_->SetBar(address,  //
+                0,        //
+                {.kind = BarKind::kMem32, .base = 0xFEB00000, .size = 0x1000});
+  fake_->AddPowerManagement(address,    //
+                            kPmOffset,  //
+                            {.power_state = 3, .no_soft_reset = true});
+  Init();
+  ASSERT_THAT(PciClaim(0, kOwnerA), t::Eq(PciStatus::kOk));
+  const StatusOr<PciPowerTransition, PciStatus> transition =
+      PciSetPowerStateD0(0, kOwnerA);
+  ASSERT_THAT(transition.status(), t::Eq(PciStatus::kOk));
+  ASSERT_THAT(transition->from, t::Eq(PciPowerState::kD3hot));
+  ASSERT_TRUE(transition->context.saved);
+  fake_->ClearAccesses();
+  // PciInit() sized the BARs in D3hot, so the first restore sizes them again
+  // (decoding off), and finds them unchanged.
+  StatusOr<bool, PciStatus> resized =
+      PciRestoreAfterPowerUp(0, kOwnerA, &transition->context);
+  ASSERT_THAT(resized.status(), t::Eq(PciStatus::kOk));
+  EXPECT_FALSE(*resized);
+  for (const Access& access : Writes()) {
+    EXPECT_THAT(
+        access.offset == kPciCommandOffset || access.offset == kPciBar0Offset,
+        t::IsTrue())
+        << t::PrintToString(access);
+  }
+  EXPECT_THAT(fake_->BarWritesWhileDecoding(), t::Eq(0));
+  EXPECT_THAT(DeviceAt(0).bars[0],
+              IsBar(PciBarType::kMem32, false, 0xFEB00000, 0x1000));
+  EXPECT_THAT(fake_->Peek32(address, kPciBar0Offset), t::Eq(0xFEB00000u));
+  EXPECT_THAT(Command(address),
+              t::Eq(kPciCommandMemorySpace | kPciCommandInterruptDisable));
+  // Only once.
+  fake_->ClearAccesses();
+  resized = PciRestoreAfterPowerUp(0, kOwnerA, &transition->context);
+  EXPECT_THAT(resized.status(), t::Eq(PciStatus::kOk));
+  EXPECT_THAT(Writes(), t::IsEmpty());
+}
+
+// An endpoint with firmware's settings in the registers that PCI-3 names:
+// Cache Line Size, Latency Timer, and the PCI Express Device Control (256-byte
+// Max_Payload_Size, 4096-byte Max_Read_Request_Size, error reporting), Link
+// Control (ASPM, Common Clock) and Device Control 2 (LTR, completion timeout).
+constexpr int kPcieOffset = 0x60;
+constexpr uint16_t kFirmwareDeviceControl = 0x583F;
+constexpr uint16_t kFirmwareLinkControl = 0x0043;
+constexpr uint16_t kFirmwareDeviceControl2 = 0x0405;
+
+TEST_F(PciTest, RestoreAfterPowerUpWritesBackWhatTheSoftResetCleared) {
+  const PciAddress address = {0, 3, 0};
+  fake_->AddFunction(address, EndpointSpec(0x0146));
+  fake_->SetBar(address,  //
+                0,        //
+                {.kind = BarKind::kMem32, .base = 0xFEB00000, .size = 0x1000});
+  fake_->AddPowerManagement(address, kPmOffset, {.power_state = 3});
+  fake_->AddPcie(address, kPcieOffset, {.version = 2, .port_type = 0});
+  fake_->SetRaw8(address, kPciCacheLineSizeOffset, 0x10);
+  fake_->SetRaw8(address, kPciLatencyTimerOffset, 0x20);
+  fake_->SetRaw16(address,                                       //
+                  kPcieOffset + kPciExpressDeviceControlOffset,  //
+                  kFirmwareDeviceControl);
+  fake_->SetRaw16(address,                                     //
+                  kPcieOffset + kPciExpressLinkControlOffset,  //
+                  kFirmwareLinkControl);
+  fake_->SetRaw16(address,                                        //
+                  kPcieOffset + kPciExpressDeviceControl2Offset,  //
+                  kFirmwareDeviceControl2);
+  Init();
+  EXPECT_THAT(DeviceAt(0).pcie_offset, t::Eq(kPcieOffset));
+  ASSERT_THAT(PciClaim(0, kOwnerA), t::Eq(PciStatus::kOk));
+  const StatusOr<PciPowerTransition, PciStatus> transition =
+      PciSetPowerStateD0(0, kOwnerA);
+  ASSERT_THAT(transition.status(), t::Eq(PciStatus::kOk));
+  ASSERT_THAT(transition->from, t::Eq(PciPowerState::kD3hot));
+  // The function reset itself (No_Soft_Reset is clear).
+  ASSERT_THAT(fake_->Peek8(address, kPciCacheLineSizeOffset), t::Eq(0));
+  ASSERT_THAT(
+      fake_->Peek16(address, kPcieOffset + kPciExpressDeviceControlOffset),
+      t::Eq(0x2810));
+  ASSERT_THAT(Command(address), t::Eq(0));
+
+  fake_->ClearAccesses();
+  EXPECT_THAT(PciRestoreAfterPowerUp(0, kOwnerA, &transition->context).status(),
+              t::Eq(PciStatus::kOk));
+  EXPECT_THAT(fake_->Peek8(address, kPciCacheLineSizeOffset), t::Eq(0x10));
+  EXPECT_THAT(fake_->Peek8(address, kPciLatencyTimerOffset), t::Eq(0x20));
+  EXPECT_THAT(
+      fake_->Peek16(address, kPcieOffset + kPciExpressDeviceControlOffset),
+      t::Eq(kFirmwareDeviceControl));
+  EXPECT_THAT(
+      fake_->Peek16(address, kPcieOffset + kPciExpressLinkControlOffset),
+      t::Eq(kFirmwareLinkControl));
+  EXPECT_THAT(
+      fake_->Peek16(address, kPcieOffset + kPciExpressDeviceControl2Offset),
+      t::Eq(kFirmwareDeviceControl2));
+  EXPECT_THAT(fake_->Peek32(address, kPciBar0Offset), t::Eq(0xFEB00000u));
+  EXPECT_THAT(fake_->BarWritesWhileDecoding(), t::Eq(0));
+  // Command as firmware and the claim left it (Parity Error Response, SERR#
+  // Enable, Memory Space, Interrupt Disable), but without Bus Master; and it
+  // is written last.
+  EXPECT_THAT(Command(address), t::Eq(0x0542));
+  ASSERT_THAT(Writes(), t::Not(t::IsEmpty()));
+  EXPECT_THAT(Writes().back(), IsAccess(true, 2, kPciCommandOffset));
+}
+
+TEST_F(PciTest, PowerUpOfABridgeAboveAnOwnedDeviceRestoresItsBusesAndWindows) {
+  // Root port 00:1c.0 (bus 1) with a slot, and an endpoint behind it.
+  const PciAddress port = {0, 0x1C, 0};
+  const PciAddress endpoint = {1, 0, 0};
+  fake_->AddFunction(port, BridgeSpec(0x0007));
+  fake_->SetBridgeBuses(port, 0, 1, 1);
+  fake_->AddPowerManagement(port, kPmOffset, {.power_state = 0});
+  fake_->AddPcie(port,         //
+                 kPcieOffset,  //
+                 {.version = 2, .port_type = 0x4, .slot_implemented = true});
+  // I/O, memory and prefetchable windows, Bridge Control (SERR# Enable).
+  const int kWindows[] = {0x20, 0x24, 0x28, 0x2C, 0x30};
+  for (const int offset : kWindows) {
+    fake_->SetWritable(port, offset, 4, 0xFFFFFFFF);
+  }
+  fake_->SetWritable(port, 0x1C, 2, 0xFFFF);
+  fake_->SetWritable(port, 0x3E, 2, 0x0FFF);
+  fake_->SetRaw16(port, 0x1C, 0x2010);
+  fake_->SetRaw32(port, 0x20, 0xFE90FE80);
+  fake_->SetRaw32(port, 0x24, 0xC1F1C001);
+  fake_->SetRaw32(port, 0x28, 0x00000040);
+  fake_->SetRaw32(port, 0x2C, 0x00000040);
+  fake_->SetRaw32(port, 0x30, 0x00000000);
+  fake_->SetRaw16(port, 0x3E, 0x0002);
+  fake_->SetRaw16(port, kPcieOffset + kPciExpressSlotControlOffset, 0x05E8);
+  fake_->SetRaw16(port, kPcieOffset + kPciExpressRootControlOffset, 0x0008);
+  fake_->AddFunction(endpoint, EndpointSpec());
+  fake_->AddFunction({0, 0x1D, 0}, BridgeSpec());
+  fake_->SetBridgeBuses({0, 0x1D, 0}, 0, 2, 2);
+  Init();
+  const int port_index = PciFindDevice(port);
+  const int endpoint_index = PciFindDevice(endpoint);
+  const int other_bridge = PciFindDevice({0, 0x1D, 0});
+  ASSERT_THAT(endpoint_index, t::Ge(0));
+  ASSERT_THAT(PciClaim(endpoint_index, kOwnerA), t::Eq(PciStatus::kOk));
+  // The port went to D3hot after the enumeration: the endpoint is unreachable.
+  fake_->SetRaw16(port, kPmcsrOffset, 3);
+  ASSERT_THAT(fake_->Read16(endpoint, kPciVendorIdOffset), t::Eq(0xFFFF));
+
+  // Only the owner of a function behind a bridge may wake that bridge.
+  fake_->ClearAccesses();
+  EXPECT_THAT(PciSetPowerStateD0(port_index, kOwnerB).status(),
+              t::Eq(PciStatus::kNotOwner));
+  EXPECT_THAT(PciSetPowerStateD0(other_bridge, kOwnerA).status(),
+              t::Eq(PciStatus::kNotOwner));
+  EXPECT_THAT(PciRestoreAfterPowerUp(port_index, kOwnerB).status(),
+              t::Eq(PciStatus::kNotOwner));
+  EXPECT_THAT(fake_->Accesses(), t::IsEmpty());
+
+  const StatusOr<PciPowerTransition, PciStatus> transition =
+      PciSetPowerStateD0(port_index, kOwnerA);
+  ASSERT_THAT(transition.status(), t::Eq(PciStatus::kOk));
+  ASSERT_THAT(transition->from, t::Eq(PciPowerState::kD3hot));
+  // The port reset itself: no buses, no windows.
+  ASSERT_THAT(fake_->Peek8(port, kPciSecondaryBusOffset), t::Eq(0));
+  ASSERT_THAT(fake_->Peek32(port, 0x20), t::Eq(0u));
+  ASSERT_THAT(Command(port), t::Eq(0));
+
+  EXPECT_THAT(PciRestoreAfterPowerUp(port_index, kOwnerA, &transition->context)
+                  .status(),
+              t::Eq(PciStatus::kOk));
+  EXPECT_THAT(fake_->Peek8(port, kPciSecondaryBusOffset), t::Eq(1));
+  EXPECT_THAT(fake_->Peek8(port, kPciSubordinateBusOffset), t::Eq(1));
+  EXPECT_THAT(fake_->Peek16(port, 0x1C), t::Eq(0x2010));
+  EXPECT_THAT(fake_->Peek32(port, 0x20), t::Eq(0xFE90FE80u));
+  EXPECT_THAT(fake_->Peek32(port, 0x24), t::Eq(0xC1F1C001u));
+  EXPECT_THAT(fake_->Peek32(port, 0x28), t::Eq(0x40u));
+  EXPECT_THAT(fake_->Peek32(port, 0x2C), t::Eq(0x40u));
+  EXPECT_THAT(fake_->Peek16(port, 0x3E), t::Eq(0x0002));
+  EXPECT_THAT(fake_->Peek16(port, kPcieOffset + kPciExpressSlotControlOffset),
+              t::Eq(0x05E8));
+  EXPECT_THAT(fake_->Peek16(port, kPcieOffset + kPciExpressRootControlOffset),
+              t::Eq(0x0008));
+  // The Command bits that it had, and the Memory Space of the claim.
+  EXPECT_THAT(Command(port), t::Eq(0x0007));
+  EXPECT_THAT(fake_->Read16(endpoint, kPciVendorIdOffset), t::Eq(0x8086));
+}
+
+TEST_F(PciTest, FunctionRespondsOnceItAnswersConfigurationReads) {
+  const PciAddress address = {0, 3, 0};
+  fake_->AddFunction(address, EndpointSpec());
+  fake_->AddPowerManagement(address,    //
+                            kPmOffset,  //
+                            {.power_state = 3, .reads_until_ready = 2});
+  Init();
+  ASSERT_THAT(PciClaim(0, kOwnerA), t::Eq(PciStatus::kOk));
+  EXPECT_TRUE(PciFunctionResponds(0));
+  ASSERT_THAT(PciSetPowerStateD0(0, kOwnerA).status(), t::Eq(PciStatus::kOk));
+  EXPECT_FALSE(PciFunctionResponds(0));
+  EXPECT_FALSE(PciFunctionResponds(0));
+  EXPECT_TRUE(PciFunctionResponds(0));
+  EXPECT_DEATH(PciFunctionResponds(1), "Check failed");
+}
+
+TEST_F(PciTest, BarsThatPciInitSizedWronglyInD3hotAreCorrectedInD0) {
+  // A function that ignores BAR writes in D3hot reads its base back as the
+  // size probe: 0xFEA70000 looks like a 64 KiB BAR. Its MSI-X table at 32 KiB
+  // looks valid then, but lies outside the real 16 KiB BAR.
+  const PciAddress address = {0, 3, 0};
+  fake_->AddFunction(address, EndpointSpec());
+  fake_->SetBar(address,  //
+                0,        //
+                {.kind = BarKind::kMem64, .base = 0xFEA70000, .size = 0x4000});
+  fake_->AddMsix(address,  //
+                 0x90,     //
+                 {.table_size = 4,
+                  .table_bar = 0,
+                  .table_offset = 0x8000,
+                  .pba_bar = 0,
+                  .pba_offset = 0x9000});
+  fake_->AddPowerManagement(
+      address, kPmOffset,
+      {.power_state = 3, .ignores_bar_writes_in_d3hot = true});
+  Init();
+  ASSERT_THAT(DeviceAt(0).bars[0],
+              IsBar(PciBarType::kMem64, false, 0xFEA70000, 0x10000));
+  ASSERT_TRUE(DeviceAt(0).msix.valid);
+
+  ASSERT_THAT(PciClaim(0, kOwnerA), t::Eq(PciStatus::kOk));
+  const StatusOr<PciPowerTransition, PciStatus> transition =
+      PciSetPowerStateD0(0, kOwnerA);
+  ASSERT_THAT(transition.status(), t::Eq(PciStatus::kOk));
+  const StatusOr<bool, PciStatus> resized =
+      PciRestoreAfterPowerUp(0, kOwnerA, &transition->context);
+  ASSERT_THAT(resized.status(), t::Eq(PciStatus::kOk));
+  EXPECT_TRUE(*resized);
+  EXPECT_THAT(DeviceAt(0).bars[0],
+              IsBar(PciBarType::kMem64, false, 0xFEA70000, 0x4000));
+  EXPECT_FALSE(DeviceAt(0).msix.valid);
+  EXPECT_THAT(DeviceAt(0).msix.table_phys, t::Eq(0u));
+  const StatusOr<PciDevice> copy = PciCopyDevice(0);
+  ASSERT_TRUE(copy.ok());
+  EXPECT_THAT(copy->bars[0],
+              IsBar(PciBarType::kMem64, false, 0xFEA70000, 0x4000));
+  EXPECT_FALSE(copy->msix.valid);
+  EXPECT_THAT(fake_->Peek32(address, kPciBar0Offset), t::Eq(0xFEA70004u));
+  EXPECT_THAT(fake_->BarWritesWhileDecoding(), t::Eq(0));
+  EXPECT_THAT(Command(address),
+              t::Eq(kPciCommandMemorySpace | kPciCommandInterruptDisable));
+}
+
+TEST_F(PciTest, CopyDeviceChecksTheIndex) {
+  fake_->AddFunction({0, 3, 0}, EndpointSpec());
+  Init();
+  const StatusOr<PciDevice> copy = PciCopyDevice(0);
+  ASSERT_TRUE(copy.ok());
+  EXPECT_THAT(copy->address, t::Eq(PciAddress{0, 3, 0}));
+  EXPECT_FALSE(PciCopyDevice(1).ok());
+  EXPECT_FALSE(PciCopyDevice(-1).ok());
+}
+
+// --- Claim quirks ---
+
+// The xHCI of an Intel 7-series PCH (Panther Point), its EHCI companion, and
+// the port routing registers of the xHCI.
+constexpr PciAddress kIntelXhci = {0, 0x14, 0};
+constexpr PciAddress kIntelEhci = {0, 0x1D, 0};
+constexpr int kXusb2pr = 0xD0;
+constexpr int kXusb2prm = 0xD4;
+constexpr int kUsb3Pssen = 0xD8;
+constexpr int kUsb3prm = 0xDC;
+
+static FunctionSpec UsbSpec(const uint16_t vendor_id,  //
+                            const uint16_t device_id,  //
+                            const uint8_t prog_if) {
+  return {.vendor_id = vendor_id,
+          .device_id = device_id,
+          .class_code = 0x0C,
+          .subclass = 0x03,
+          .prog_if = prog_if};
+}
+
+static void AddIntelXhci(FakePciConfigSpace* const fake) {
+  fake->AddFunction(kIntelXhci, UsbSpec(0x8086, 0x1E31, 0x30));
+  fake->SetWritable(kIntelXhci, kXusb2pr, 4, 0x00003FFF);
+  fake->SetWritable(kIntelXhci, kUsb3Pssen, 4, 0x0000000F);
+  fake->SetRaw32(kIntelXhci, kXusb2prm, 0x00000F0F);
+  fake->SetRaw32(kIntelXhci, kUsb3prm, 0x0000000F);
+}
+
+TEST_F(PciTest, ClaimQuirksRouteIntelUsbPortsFromEhciToXhci) {
+  AddIntelXhci(fake_.get());
+  fake_->AddFunction(kIntelEhci, UsbSpec(0x8086, 0x1E26, 0x20));
+  Init();
+  const int xhci = PciFindDevice(kIntelXhci);
+  ASSERT_THAT(PciClaim(xhci, kOwnerA), t::Eq(PciStatus::kOk));
+  fake_->ClearAccesses();
+  EXPECT_THAT(PciApplyClaimQuirks(xhci, kOwnerB).status(),
+              t::Eq(PciStatus::kNotOwner));
+  EXPECT_THAT(PciApplyClaimQuirks(-1, kOwnerA).status(),
+              t::Eq(PciStatus::kNoDevice));
+  EXPECT_THAT(fake_->Accesses(), t::IsEmpty());
+
+  const StatusOr<PciClaimQuirks, PciStatus> quirks =
+      PciApplyClaimQuirks(xhci, kOwnerA);
+  ASSERT_THAT(quirks.status(), t::Eq(PciStatus::kOk));
+  EXPECT_TRUE(quirks->intel_usb_ports_routed);
+  EXPECT_THAT(quirks->usb3_ports, t::Eq(0x0000000Fu));
+  EXPECT_THAT(quirks->usb2_ports, t::Eq(0x00000F0Fu));
+  EXPECT_THAT(fake_->Peek32(kIntelXhci, kUsb3Pssen), t::Eq(0x0000000Fu));
+  EXPECT_THAT(fake_->Peek32(kIntelXhci, kXusb2pr), t::Eq(0x00000F0Fu));
+  // The SuperSpeed terminations first, then the USB 2.0 lines.
+  EXPECT_THAT(WritesTo(kIntelXhci),
+              t::ElementsAre(IsAccess(true, 4, kUsb3Pssen),
+                             IsAccess(true, 4, kXusb2pr)));
+}
+
+TEST_F(PciTest, ClaimQuirksLeaveOtherUsbControllersAlone) {
+  struct Case {
+    const char* name;
+    bool intel_ehci;
+    bool other_ehci;
+    bool sony_vaio_t;
+  };
+  for (const Case& c : {Case{"no EHCI", false, false, false},
+                        Case{"EHCI of another vendor", false, true, false},
+                        Case{"Sony VAIO T-series", true, false, true}}) {
+    SCOPED_TRACE(c.name);
+    PciResetForTest();
+    fake_ = std::make_shared<FakePciConfigSpace>();
+    AddIntelXhci(fake_.get());
+    if (c.intel_ehci) {
+      fake_->AddFunction(kIntelEhci, UsbSpec(0x8086, 0x1E26, 0x20));
+    }
+    if (c.other_ehci) {
+      fake_->AddFunction(kIntelEhci, UsbSpec(0x1033, 0x00E0, 0x20));
+    }
+    if (c.sony_vaio_t) {
+      fake_->SetRaw16(kIntelXhci, kPciSubsystemVendorIdOffset, 0x104D);
+      fake_->SetRaw16(kIntelXhci, kPciSubsystemIdOffset, 0x90A8);
+    }
+    Init();
+    const int xhci = PciFindDevice(kIntelXhci);
+    ASSERT_THAT(PciClaim(xhci, kOwnerA), t::Eq(PciStatus::kOk));
+    fake_->ClearAccesses();
+    const StatusOr<PciClaimQuirks, PciStatus> quirks =
+        PciApplyClaimQuirks(xhci, kOwnerA);
+    ASSERT_THAT(quirks.status(), t::Eq(PciStatus::kOk));
+    EXPECT_FALSE(quirks->intel_usb_ports_routed);
+    EXPECT_THAT(Writes(), t::IsEmpty());
+  }
+
+  // Not an Intel xHCI: QEMU's xHCI, and the Intel EHCI itself.
+  PciResetForTest();
+  fake_ = std::make_shared<FakePciConfigSpace>();
+  AddQemuPcMachine(fake_.get(), QemuFirmware::kSeaBios, QemuTopology::kSingle);
+  fake_->AddFunction(kIntelEhci, UsbSpec(0x8086, 0x1E26, 0x20));
+  Init();
+  for (const PciAddress address : {PciAddress{0, 4, 0}, kIntelEhci}) {
+    SCOPED_TRACE(t::PrintToString(address));
+    const int index = PciFindDevice(address);
+    ASSERT_THAT(PciClaim(index, kOwnerA), t::Eq(PciStatus::kOk));
+    fake_->ClearAccesses();
+    const StatusOr<PciClaimQuirks, PciStatus> quirks =
+        PciApplyClaimQuirks(index, kOwnerA);
+    ASSERT_THAT(quirks.status(), t::Eq(PciStatus::kOk));
+    EXPECT_FALSE(quirks->intel_usb_ports_routed);
+    EXPECT_THAT(fake_->Accesses(), t::IsEmpty());
+  }
 }
 
 // --- Boot report ---

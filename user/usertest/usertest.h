@@ -1,11 +1,12 @@
-#ifndef PROTOS_USER_USERTEST_H_
-#define PROTOS_USER_USERTEST_H_
+#ifndef PROTOS_USER_USERTEST_USERTEST_H_
+#define PROTOS_USER_USERTEST_USERTEST_H_
 
 #include <cstdint>
 
-// The interface of user/usertest.cpp, a user program that the boot self-tests
-// (selftest/boot_selftest.cpp) run in many ways to check user mode: system
-// calls, faults, preemption, kills and the x87/SSE/AVX state of processes.
+// The interface of user/usertest/usertest.cpp, a user program that the boot
+// self-tests (selftest/boot_selftest.cpp) run in many ways to check user mode:
+// system calls, faults, preemption, kills and the x87/SSE/AVX state of
+// processes.
 
 namespace protos::usertest {
 
@@ -195,6 +196,16 @@ enum class Mode : uint8_t {
   // Exercises `irq_alloc` and `irq_wait` on `DriverDeviceIndex(arg)` according
   // to `DriverSubmode(arg)` (`DriverIrqSubmode`).
   kDriverIrqWait,
+  // Claims the xHCI controller `DriverDeviceIndex(arg)` and does what usbkbd's
+  // bring-up does before it enables Bus Master: takes the controller over
+  // from firmware (USB Legacy Support handoff, firmware SMIs disabled), halts
+  // it if it runs and resets it (HCRST), all without touching Bus Master.
+  // Until a driver starts it again, the controller then neither runs nor
+  // accesses memory, whatever firmware or a killed driver left in it. Exits
+  // with 0 if the controller was halted already, with
+  // `kXhciResetWasRunningStatus` if it ran and was halted, or with another
+  // `kXhciReset*Status` if a step failed.
+  kDriverXhciReset,
 };
 
 enum class SpawnTestSubmode : uint8_t {
@@ -233,6 +244,18 @@ enum class DriverIrqSubmode : uint8_t {
   kIrqBlockingWakeup = 2,
   kIrqKillWhileBlocked = 3,
 };
+
+// The exit statuses of `kDriverXhciReset` besides 0: the controller ran and
+// was halted before its reset; the device can't be claimed or is not an xHCI
+// with a memory BAR 0; its registers read all-ones (or don't map); its
+// capability registers are invalid; it did not halt; HCRST or then CNR did
+// not clear, or it ran after the reset.
+constexpr int64_t kXhciResetWasRunningStatus = 1;
+constexpr int64_t kXhciResetNotXhciStatus = 2;
+constexpr int64_t kXhciResetNotDecodingStatus = 3;
+constexpr int64_t kXhciResetBadCapabilitiesStatus = 4;
+constexpr int64_t kXhciResetHaltTimeoutStatus = 5;
+constexpr int64_t kXhciResetTimeoutStatus = 6;
 
 constexpr int64_t kExitStatus = -0x123456789AB;
 // The vector that `kKernelInterrupt` raises: the wakeup IPI's (idt.h), whose
@@ -436,4 +459,4 @@ static_assert(DriverBarIndex(DriverArg(Mode::kDriverHold, 2, 5, 3)) == 3);
 
 }  // namespace protos::usertest
 
-#endif  // PROTOS_USER_USERTEST_H_
+#endif  // PROTOS_USER_USERTEST_USERTEST_H_

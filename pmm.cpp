@@ -557,20 +557,28 @@ void PmmInit(const uint32_t multiboot_magic,
                                 &g_memory_map));
 
   if (g_memory_map.fb_addr != 0) {
-    VgaInitFramebuffer(g_memory_map.fb_addr,    //
-                       g_memory_map.fb_pitch,   //
-                       g_memory_map.fb_width,   //
-                       g_memory_map.fb_height,  //
-                       g_memory_map.fb_bpp);
-    ConsoleWrite("[PMM] Framebuffer: addr=");
-    ConsoleWriteHex(g_memory_map.fb_addr);
-    ConsoleWrite(" width=");
-    ConsoleWriteDec(g_memory_map.fb_width);
-    ConsoleWrite(" height=");
-    ConsoleWriteDec(g_memory_map.fb_height);
-    ConsoleWrite(" bpp=");
-    ConsoleWriteDec(g_memory_map.fb_bpp);
-    ConsoleWrite("\n");
+    const VgaPixelFormat fb_format = {g_memory_map.fb_red_position,    //
+                                      g_memory_map.fb_red_size,        //
+                                      g_memory_map.fb_green_position,  //
+                                      g_memory_map.fb_green_size,      //
+                                      g_memory_map.fb_blue_position,   //
+                                      g_memory_map.fb_blue_size};
+    if (VgaInitFramebuffer(g_memory_map.fb_addr,    //
+                           g_memory_map.fb_pitch,   //
+                           g_memory_map.fb_width,   //
+                           g_memory_map.fb_height,  //
+                           g_memory_map.fb_bpp,     //
+                           fb_format)) {
+      ConsoleWrite("[PMM] Framebuffer: addr=");
+      ConsoleWriteHex(g_memory_map.fb_addr);
+      ConsoleWrite(" width=");
+      ConsoleWriteDec(g_memory_map.fb_width);
+      ConsoleWrite(" height=");
+      ConsoleWriteDec(g_memory_map.fb_height);
+      ConsoleWrite(" bpp=");
+      ConsoleWriteDec(g_memory_map.fb_bpp);
+      ConsoleWrite("\n");
+    }
   }
 
   const uintptr_t kernel_start = KernelStartAddr();

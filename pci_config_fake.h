@@ -21,13 +21,17 @@ namespace protos {
 // - Every bit of a function's 256 bytes is read-only, writable, or
 //   write-1-to-clear, and writes honor that: AddFunction() makes Command's
 //   I/O Space, Memory Space, Bus Master, Parity Error Response, SERR# Enable
-//   and Interrupt Disable bits writable and Status's error bits
-//   write-1-to-clear (so a 32-bit write to Command clears them, as on
-//   hardware); everything else is read-only unless a builder below makes it
-//   writable.
+//   and Interrupt Disable bits, Cache Line Size and Latency Timer writable and
+//   Status's error bits write-1-to-clear (so a 32-bit write to Command clears
+//   them, as on hardware); everything else is read-only unless a builder below
+//   makes it writable.
 // - A BAR is modeled by its size: its address bits below the size and its flag
 //   bits are read-only, so writing all ones to it reads back the size mask, and
 //   writing the saved value back restores it.
+// - A function on a bus behind a PCI-to-PCI bridge (within the bridge's
+//   secondary and subordinate bus numbers) that is in D1, D2 or D3hot reads
+//   as all ones and ignores writes (counted as absent): such a bridge forwards
+//   no configuration requests [PCIe Base 6.0 §5.3.1.4.1].
 // - An access that is not naturally aligned or not inside the 256 bytes fails
 //   the test (mechanism #1 cannot express it).
 //
@@ -77,6 +81,31 @@ class FakePciConfigSpace final : public PciConfigSpace {
     uint32_t pba_offset = 0;
   };
 
+  struct PmSpec {
+    // PMCSR bits 1:0 at the start: 0 (D0) to 3 (D3hot).
+    uint8_t power_state = 0;
+    // PMCSR No_Soft_Reset. Without it, a write that takes the function from
+    // D3hot to D0 resets it, as on hardware: every writable bit except those
+    // of PMCSR returns to its reset value (0, or the one that AddPcie() gives).
+    bool no_soft_reset = false;
+    // After it leaves D3hot, the function reads as all ones and ignores writes
+    // for this many reads, like a function that is still initializing (it
+    // answers with Configuration Request Retry Status, which the Root Complex
+    // finally completes as all ones).
+    int reads_until_ready = 0;
+    // A function that ignores writes to its BARs while it is in D3hot, so that
+    // sizing them there reads back their base (which the spec forbids).
+    bool ignores_bar_writes_in_d3hot = false;
+  };
+
+  // The PCI Express capability: its version, Device/Port Type and Slot
+  // Implemented bit.
+  struct PcieSpec {
+    int version = 2;
+    int port_type = 0;  // PCI Express Endpoint
+    bool slot_implemented = false;
+  };
+
   struct Access {
     bool write = false;
     int width = 0;  // bytes
@@ -112,6 +141,18 @@ class FakePciConfigSpace final : public PciConfigSpace {
   // Appends an MSI-X capability: Message Control's Function Mask and Enable
   // bits are writable.
   void AddMsix(PciAddress address, int offset, const MsixSpec& msix);
+  // Appends a Power Management capability: PMCSR's power state and PME_En
+  // bits are writable and PME_Status is write-1-to-clear.
+  void AddPowerManagement(PciAddress address, int offset, const PmSpec& pm);
+  // Appends a PCI Express capability [PCIe Base 6.0 §7.5.3] whose registers
+  // that hold configuration are writable, as far as `pcie` has them: Device
+  // Control (bits 14:0; reset value 0x2810: Relaxed Ordering, No Snoop, a
+  // 512-byte Max_Read_Request_Size), Link Control (except Retrain Link), Slot
+  // Control, Root Control and Device Control 2.
+  void AddPcie(PciAddress address, int offset, const PcieSpec& pcie);
+  // Makes the bits `mask` of the `width`-byte register at `offset` writable
+  // (e.g. a bridge's windows, or vendor-specific registers).
+  void SetWritable(PciAddress address, int offset, int width, uint32_t mask);
   // Set registers of an added function directly, ignoring the write masks (for
   // malformed devices), without recording an access.
   void SetRaw8(PciAddress address, int offset, uint8_t value);
@@ -141,12 +182,24 @@ class FakePciConfigSpace final : public PciConfigSpace {
     std::array<uint8_t, kPciConfigSpaceSize> bytes = {};
     std::array<uint8_t, kPciConfigSpaceSize> writable = {};
     std::array<uint8_t, kPciConfigSpaceSize> write_one_to_clear = {};
+    // The values that writable bits take when the function resets.
+    std::array<uint8_t, kPciConfigSpaceSize> reset_values = {};
     std::vector<int> capability_offsets;
+    // Offset of the Power Management capability, 0 if none.
+    int pm_offset = 0;
+    // PmSpec::reads_until_ready and ignores_bar_writes_in_d3hot, and how many
+    // more reads the function answers as all ones.
+    int reads_until_ready = 0;
+    bool ignores_bar_writes_in_d3hot = false;
+    int reads_until_ready_left = 0;
   };
 
   static uint32_t Key(PciAddress address);
   Function& FunctionLocked(PciAddress address);
   const Function* FindLocked(PciAddress address) const;
+  // Whether a bridge in D1, D2 or D3hot keeps requests from reaching `bus`.
+  bool BehindSleepingBridgeLocked(int bus) const;
+  static int PowerState(const Function& function);
   static void LinkCapabilityLocked(Function* function, int offset, uint8_t id);
   static uint32_t Load(const Function& function, int offset, int width);
   static void Store(std::array<uint8_t, kPciConfigSpaceSize>* bytes,  //

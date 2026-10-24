@@ -1,4 +1,4 @@
-#include "xhci_sim.h"
+#include "user/usbkbd/xhci_sim.h"
 
 #include <gmock/gmock.h>
 #include <gtest/gtest-spi.h>

@@ -1,13 +1,15 @@
 // usertest: a user program that the boot self-tests run in many ways to check
-// user mode (see user/usertest.h).
+// user mode (see user/usertest/usertest.h).
 
-#include "user/usertest.h"
+#include "user/usertest/usertest.h"
 
 #include <cstddef>
 #include <cstdint>
 
 #include "syscall_abi.h"
 #include "user/syscall.h"
+#include "user/usbkbd/xhci_platform.h"
+#include "user/usbkbd/xhci_regs.h"
 
 static_assert(protos::kSyscallGetCpu == 2);
 static_assert(protos::kSyscallSpin == 3);
@@ -743,7 +745,6 @@ static int64_t RunSyscallChecks() {
   }
   ++check;
   char scratch[8] = {};
-  UserProgramResult wait_result;
   if (Read(nullptr, 0) != 0 || Read(scratch, -1) != kSyscallErrorInvalid ||
       Read(scratch, kSyscallReadMaxSize + 1) != kSyscallErrorInvalid ||
       Read(nullptr, -1) != kSyscallErrorInvalid ||
@@ -758,10 +759,10 @@ static int64_t RunSyscallChecks() {
       Spawn("no_such_program", 15, 0) != kSyscallErrorInvalid ||
       Spawn(reinterpret_cast<const char*>(usertest::kKernelAddress), 4, 0) !=
           kSyscallErrorFault ||
-      Wait(0, &wait_result) != kSyscallErrorInvalid ||
-      Wait(-1, &wait_result) != kSyscallErrorInvalid ||
-      Wait(kMaxUserChildProcesses + 1, &wait_result) != kSyscallErrorInvalid ||
-      Wait(1, &wait_result) != kSyscallErrorInvalid) {
+      Wait(0).status() != kSyscallErrorInvalid ||
+      Wait(-1).status() != kSyscallErrorInvalid ||
+      Wait(kMaxUserChildProcesses + 1).status() != kSyscallErrorInvalid ||
+      Wait(1).status() != kSyscallErrorInvalid) {
     return check;
   }
   return 0;
@@ -1657,8 +1658,7 @@ static int64_t RunSpawnAndWait(const usertest::SpawnTestSubmode submode) {
     if (pid < 1) {
       return 1;
     }
-    UserProgramResult result;
-    (void)Wait(pid, &result);
+    (void)Wait(pid);
     return 2;
   }
   if (submode == SpawnTestSubmode::kOrphanOnExit) {
@@ -1706,11 +1706,10 @@ static int64_t RunSpawnAndWait(const usertest::SpawnTestSubmode submode) {
     return check;
   }
   ++check;
-  UserProgramResult result;
-  if (Wait(0, &result) != kSyscallErrorInvalid ||
-      Wait(-1, &result) != kSyscallErrorInvalid ||
-      Wait(kMaxUserChildProcesses + 1, &result) != kSyscallErrorInvalid ||
-      Wait(1, &result) != kSyscallErrorInvalid) {
+  if (Wait(0).status() != kSyscallErrorInvalid ||
+      Wait(-1).status() != kSyscallErrorInvalid ||
+      Wait(kMaxUserChildProcesses + 1).status() != kSyscallErrorInvalid ||
+      Wait(1).status() != kSyscallErrorInvalid) {
     return check;
   }
   ++check;
@@ -1722,47 +1721,56 @@ static int64_t RunSpawnAndWait(const usertest::SpawnTestSubmode submode) {
   ++check;
   // Bad / read-only `result` pointers on a valid PID must return
   // kSyscallErrorFault without reaping the child.
-  if (Wait(exit_pid, nullptr) != kSyscallErrorFault ||
-      Wait(exit_pid, reinterpret_cast<UserProgramResult*>(
-                         usertest::kKernelAddress)) != kSyscallErrorFault ||
-      Wait(exit_pid, reinterpret_cast<UserProgramResult*>(
-                         kNonCanonicalAddress)) != kSyscallErrorFault ||
-      Wait(exit_pid, reinterpret_cast<UserProgramResult*>(
-                         kUnmappedUserAddress)) != kSyscallErrorFault ||
-      Wait(exit_pid, reinterpret_cast<UserProgramResult*>(const_cast<uint64_t*>(
-                         &kReadOnlyWord))) != kSyscallErrorFault ||
-      Wait(exit_pid, reinterpret_cast<UserProgramResult*>(
-                         &SyscallChangedRegisterBits)) != kSyscallErrorFault) {
+  const uint64_t exit_pid_u = static_cast<uint64_t>(exit_pid);
+  if (Syscall(kSyscallWait, exit_pid_u, 0) != kSyscallErrorFault ||
+      Syscall(kSyscallWait, exit_pid_u, usertest::kKernelAddress) !=
+          kSyscallErrorFault ||
+      Syscall(kSyscallWait, exit_pid_u, kNonCanonicalAddress) !=
+          kSyscallErrorFault ||
+      Syscall(kSyscallWait, exit_pid_u, kUnmappedUserAddress) !=
+          kSyscallErrorFault ||
+      Syscall(kSyscallWait, exit_pid_u,
+              reinterpret_cast<uintptr_t>(&kReadOnlyWord)) !=
+          kSyscallErrorFault ||
+      Syscall(kSyscallWait, exit_pid_u,
+              reinterpret_cast<uintptr_t>(&SyscallChangedRegisterBits)) !=
+          kSyscallErrorFault) {
     return check;
   }
   ++check;
-  if (Wait(exit_pid, &result) != 0 ||
-      result.outcome != UserProgramOutcome::kExited ||
-      result.exit_status != usertest::kExitStatus) {
+  const StatusOr<UserProgramResult> exit_res = Wait(exit_pid);
+  if (!exit_res.ok() || exit_res->outcome != UserProgramOutcome::kExited ||
+      exit_res->exit_status != usertest::kExitStatus) {
     return check;
   }
   ++check;
   // Waiting a second time on an already-reaped PID must fail with
   // kSyscallErrorInvalid.
-  if (Wait(exit_pid, &result) != kSyscallErrorInvalid) {
+  if (Wait(exit_pid).status() != kSyscallErrorInvalid) {
     return check;
   }
   ++check;
   // Spawn a child that faults with #UD (vector 6).
   const int64_t ud_pid = Spawn("usertest", usertest::Arg(Mode::kInvalidOpcode));
-  if (ud_pid < 1 || Wait(ud_pid, &result) != 0 ||
-      result.outcome != UserProgramOutcome::kFaulted ||
-      result.fault_vector != 6) {
+  if (ud_pid < 1) {
+    return check;
+  }
+  const StatusOr<UserProgramResult> ud_res = Wait(ud_pid);
+  if (!ud_res.ok() || ud_res->outcome != UserProgramOutcome::kFaulted ||
+      ud_res->fault_vector != 6) {
     return check;
   }
   ++check;
   // Spawn a child that faults with #PF (vector 14) on kKernelAddress.
   const int64_t pf_pid =
       Spawn("usertest", usertest::Arg(Mode::kReadKernelMemory));
-  if (pf_pid < 1 || Wait(pf_pid, &result) != 0 ||
-      result.outcome != UserProgramOutcome::kFaulted ||
-      result.fault_vector != 14 ||
-      result.fault_address != usertest::kKernelAddress) {
+  if (pf_pid < 1) {
+    return check;
+  }
+  const StatusOr<UserProgramResult> pf_res = Wait(pf_pid);
+  if (!pf_res.ok() || pf_res->outcome != UserProgramOutcome::kFaulted ||
+      pf_res->fault_vector != 14 ||
+      pf_res->fault_address != usertest::kKernelAddress) {
     return check;
   }
   ++check;
@@ -1780,9 +1788,9 @@ static int64_t RunSpawnAndWait(const usertest::SpawnTestSubmode submode) {
     return check;
   }
   for (int i = 0; i < kMaxUserChildProcesses; ++i) {
-    if (Wait(pids[i], &result) != 0 ||
-        result.outcome != UserProgramOutcome::kExited ||
-        result.exit_status != 0) {
+    const StatusOr<UserProgramResult> child_res = Wait(pids[i]);
+    if (!child_res.ok() || child_res->outcome != UserProgramOutcome::kExited ||
+        child_res->exit_status != 0) {
       return check;
     }
   }
@@ -1790,11 +1798,10 @@ static int64_t RunSpawnAndWait(const usertest::SpawnTestSubmode submode) {
 }
 
 static int64_t RunDriverDenied() {
-  uint64_t phys = 0;
   if (SpawnDriver("usertest", 8, 0) != kSyscallErrorPermission) {
     return 1;
   }
-  if (GetPciInfo(0, nullptr) != kSyscallErrorPermission) {
+  if (GetPciDeviceCount() != kSyscallErrorPermission) {
     return 2;
   }
   if (PciClaim(0) != kSyscallErrorPermission) {
@@ -1803,10 +1810,10 @@ static int64_t RunDriverDenied() {
   if (PciBusMaster(0, 1) != kSyscallErrorPermission) {
     return 4;
   }
-  if (MmioMap(0x1000, 4096) != kSyscallErrorPermission) {
+  if (MmioMap(0x1000, 4096).status() != kSyscallErrorPermission) {
     return 5;
   }
-  if (DmaAlloc(4096, &phys, 0) != kSyscallErrorPermission) {
+  if (DmaAlloc(4096, 0).status() != kSyscallErrorPermission) {
     return 6;
   }
   if (IrqAlloc(0, 1, kSyscallIrqModeAuto) != kSyscallErrorPermission) {
@@ -1838,7 +1845,7 @@ static int64_t RunDriverCapProbe(const uint64_t arg) {
   if (submode == DriverCapProbeSubmode::kProbeDriverRole) {
     // Allowed for a driver: returns the number of PCI functions, which is 0 on
     // a machine without PCI (such as a Hyper-V Generation 2 VM).
-    if (GetPciInfo(0, nullptr) < 0) {
+    if (GetPciDeviceCount() < 0) {
       return 1;
     }
     if (SpawnDriver("usertest", 8, 0) != kSyscallErrorPermission) {
@@ -1852,22 +1859,21 @@ static int64_t RunDriverCapProbe(const uint64_t arg) {
     if (child_pid < 1) {
       return 4;
     }
-    UserProgramResult child_result{};
-    if (Wait(child_pid, &child_result) != 0 ||
-        child_result.outcome != UserProgramOutcome::kExited ||
-        child_result.exit_status != 0) {
+    const StatusOr<UserProgramResult> child_result = Wait(child_pid);
+    if (!child_result.ok() ||
+        child_result->outcome != UserProgramOutcome::kExited ||
+        child_result->exit_status != 0) {
       return 5;
     }
     return 0;
   }
 
   // kProbeSpawnerRole: process has kUserCapSpawnDrivers only.
-  uint64_t phys = 0;
-  if (GetPciInfo(0, nullptr) != kSyscallErrorPermission ||
+  if (GetPciDeviceCount() != kSyscallErrorPermission ||
       PciClaim(0) != kSyscallErrorPermission ||
       PciBusMaster(0, 1) != kSyscallErrorPermission ||
-      MmioMap(0x1000, 4096) != kSyscallErrorPermission ||
-      DmaAlloc(4096, &phys, 0) != kSyscallErrorPermission ||
+      MmioMap(0x1000, 4096).status() != kSyscallErrorPermission ||
+      DmaAlloc(4096, 0).status() != kSyscallErrorPermission ||
       IrqAlloc(0, 1, kSyscallIrqModeAuto) != kSyscallErrorPermission ||
       IrqWait(1, 0) != kSyscallErrorPermission ||
       ConsolePush("a", 1) != kSyscallErrorPermission || GetTicks() < 0) {
@@ -1890,10 +1896,10 @@ static int64_t RunDriverCapProbe(const uint64_t arg) {
   if (unpriv_pid < 1) {
     return 12;
   }
-  UserProgramResult unpriv_result{};
-  if (Wait(unpriv_pid, &unpriv_result) != 0 ||
-      unpriv_result.outcome != UserProgramOutcome::kExited ||
-      unpriv_result.exit_status != 0) {
+  const StatusOr<UserProgramResult> unpriv_result = Wait(unpriv_pid);
+  if (!unpriv_result.ok() ||
+      unpriv_result->outcome != UserProgramOutcome::kExited ||
+      unpriv_result->exit_status != 0) {
     return 13;
   }
   const int64_t drv_pid = SpawnDriver(
@@ -1904,10 +1910,9 @@ static int64_t RunDriverCapProbe(const uint64_t arg) {
   if (drv_pid < 1) {
     return 14;
   }
-  UserProgramResult drv_result{};
-  if (Wait(drv_pid, &drv_result) != 0 ||
-      drv_result.outcome != UserProgramOutcome::kExited ||
-      drv_result.exit_status != 0) {
+  const StatusOr<UserProgramResult> drv_result = Wait(drv_pid);
+  if (!drv_result.ok() || drv_result->outcome != UserProgramOutcome::kExited ||
+      drv_result->exit_status != 0) {
     return 15;
   }
   return 0;
@@ -1932,13 +1937,12 @@ static int64_t RunDriverHold(const uint64_t arg) {
   if (PciBusMaster(dev_idx, 1) != 0) {
     return 2;
   }
-  PciDeviceInfo info{};
-  if (GetPciInfo(dev_idx, &info) < 1) {
+  const StatusOr<PciDeviceInfo> info = GetPciInfo(dev_idx);
+  if (!info.ok()) {
     return 3;
   }
-  if (bar_idx >= 0 && bar_idx < 6 && IsMemoryBar(info.bars[bar_idx])) {
-    const int64_t mmio_va = MmioMap(info.bars[bar_idx].phys_base, 4096);
-    if (SyscallIsError(mmio_va)) {
+  if (bar_idx >= 0 && bar_idx < 6 && IsMemoryBar(info->bars[bar_idx])) {
+    if (!MmioMap(info->bars[bar_idx].phys_base, 4096).ok()) {
       return 4;
     }
   }
@@ -1947,12 +1951,11 @@ static int64_t RunDriverHold(const uint64_t arg) {
     return 0;
   }
 
-  uint64_t dma_phys = 0;
-  const int64_t dma_va = DmaAlloc(4 * 4096, &dma_phys, 0);
-  if (SyscallIsError(dma_va) || dma_phys == 0) {
+  const StatusOr<DmaAllocation> dma = DmaAlloc(4 * 4096, 0);
+  if (!dma.ok() || dma->phys == 0) {
     return 5;
   }
-  if (info.msi_vectors != 0 || info.msix_vectors > 0) {
+  if (info->msi_vectors != 0 || info->msix_vectors > 0) {
     if (IrqAlloc(dev_idx, 1, kSyscallIrqModeAuto) != 0) {
       return 6;
     }
@@ -1980,16 +1983,16 @@ static int64_t RunDriverForeign(const uint64_t arg) {
   const int dev_idx = usertest::DriverDeviceIndex(arg);
   const int bar_idx = usertest::DriverBarIndex(arg);
 
-  PciDeviceInfo info{};
-  if (GetPciInfo(dev_idx, &info) < 1) {
+  const StatusOr<PciDeviceInfo> info = GetPciInfo(dev_idx);
+  if (!info.ok()) {
     return 1;
   }
-  const uint64_t bar_phys = info.bars[bar_idx].phys_base;
+  const uint64_t bar_phys = info->bars[bar_idx].phys_base;
 
   if (submode == DriverForeignSubmode::kUnclaimedDevice) {
     if (PciBusMaster(dev_idx, 1) != kSyscallErrorAccess ||
         PciBusMaster(dev_idx, 0) != kSyscallErrorAccess ||
-        MmioMap(bar_phys, 4096) != kSyscallErrorAccess ||
+        MmioMap(bar_phys, 4096).status() != kSyscallErrorAccess ||
         IrqAlloc(dev_idx, 1, kSyscallIrqModeAuto) != kSyscallErrorAccess) {
       return 2;
     }
@@ -2000,7 +2003,7 @@ static int64_t RunDriverForeign(const uint64_t arg) {
     if (PciClaim(dev_idx) != kSyscallErrorBusy ||
         PciBusMaster(dev_idx, 0) != kSyscallErrorAccess ||
         PciBusMaster(dev_idx, 1) != kSyscallErrorAccess ||
-        MmioMap(bar_phys, 4096) != kSyscallErrorAccess ||
+        MmioMap(bar_phys, 4096).status() != kSyscallErrorAccess ||
         IrqAlloc(dev_idx, 1, kSyscallIrqModeAuto) != kSyscallErrorAccess) {
       return 3;
     }
@@ -2008,24 +2011,24 @@ static int64_t RunDriverForeign(const uint64_t arg) {
   }
 
   // kValidationAndClaimToggle:
-  const int64_t count = GetPciInfo(0, nullptr);
+  const int64_t count = GetPciDeviceCount();
   if (count < 1) {
     return 10;
   }
-  if (GetPciInfo(-1, &info) != kSyscallErrorNoDevice ||
-      GetPciInfo(count, &info) != kSyscallErrorNoDevice ||
-      GetPciInfo(1, nullptr) != kSyscallErrorFault) {
+  const uint64_t dev_idx_u = static_cast<uint64_t>(dev_idx);
+  if (GetPciInfo(-1).status() != kSyscallErrorNoDevice ||
+      GetPciInfo(count).status() != kSyscallErrorNoDevice ||
+      Syscall(kSyscallPciInfo, 1, 0) != kSyscallErrorFault) {
     return 11;
   }
-  if (GetPciInfo(dev_idx,
-                 reinterpret_cast<PciDeviceInfo*>(usertest::kKernelAddress)) !=
+  if (Syscall(kSyscallPciInfo, dev_idx_u, usertest::kKernelAddress) !=
           kSyscallErrorFault ||
-      GetPciInfo(dev_idx, reinterpret_cast<PciDeviceInfo*>(
-                              kNonCanonicalAddress)) != kSyscallErrorFault ||
-      GetPciInfo(dev_idx, reinterpret_cast<PciDeviceInfo*>(
-                              kUnmappedUserAddress)) != kSyscallErrorFault ||
-      GetPciInfo(dev_idx, reinterpret_cast<PciDeviceInfo*>(
-                              const_cast<uint64_t*>(&kReadOnlyWord))) !=
+      Syscall(kSyscallPciInfo, dev_idx_u, kNonCanonicalAddress) !=
+          kSyscallErrorFault ||
+      Syscall(kSyscallPciInfo, dev_idx_u, kUnmappedUserAddress) !=
+          kSyscallErrorFault ||
+      Syscall(kSyscallPciInfo, dev_idx_u,
+              reinterpret_cast<uintptr_t>(&kReadOnlyWord)) !=
           kSyscallErrorFault) {
     return 12;
   }
@@ -2059,64 +2062,72 @@ static int64_t RunDriverMmioChecks(const uint64_t arg) {
   if (PciClaim(dev_idx) != 0) {
     return 1;
   }
-  PciDeviceInfo info{};
-  if (GetPciInfo(dev_idx, &info) < 1) {
+  const StatusOr<PciDeviceInfo> info = GetPciInfo(dev_idx);
+  if (!info.ok()) {
     return 2;
   }
-  const uint64_t bar_phys = info.bars[bar_idx].phys_base;
-  const int64_t bar_size = info.bars[bar_idx].size;
+  const uint64_t bar_phys = info->bars[bar_idx].phys_base;
+  const int64_t bar_size = info->bars[bar_idx].size;
   if (bar_phys == 0 || bar_size < 4096) {
     return 3;
   }
   // Invalid alignment, size, or overflow -> kSyscallErrorInvalid.
-  if (MmioMap(0, 4096) != kSyscallErrorInvalid ||
-      MmioMap(bar_phys + 1, 4096) != kSyscallErrorInvalid ||
-      MmioMap(bar_phys, 0) != kSyscallErrorInvalid ||
-      MmioMap(bar_phys, -4096) != kSyscallErrorInvalid ||
-      MmioMap(bar_phys, 100) != kSyscallErrorInvalid ||
-      MmioMap(bar_phys, kSyscallMmioMaxSize + 4096) != kSyscallErrorInvalid) {
+  if (MmioMap(0, 4096).status() != kSyscallErrorInvalid ||
+      MmioMap(bar_phys + 1, 4096).status() != kSyscallErrorInvalid ||
+      MmioMap(bar_phys, 0).status() != kSyscallErrorInvalid ||
+      MmioMap(bar_phys, -4096).status() != kSyscallErrorInvalid ||
+      MmioMap(bar_phys, 100).status() != kSyscallErrorInvalid ||
+      MmioMap(bar_phys, kSyscallMmioMaxSize + 4096).status() !=
+          kSyscallErrorInvalid) {
     return 4;
   }
+  uint64_t unmapped_phys = bar_phys + static_cast<uint64_t>(bar_size);
+  for (int pass = 0; pass < 6; ++pass) {
+    for (int b = 0; b < 6; ++b) {
+      const uint64_t b_base = info->bars[b].phys_base;
+      const uint64_t b_size = static_cast<uint64_t>(info->bars[b].size);
+      if (IsMemoryBar(info->bars[b]) && unmapped_phys >= b_base &&
+          unmapped_phys - b_base < b_size) {
+        unmapped_phys = b_base + b_size;
+      }
+    }
+  }
   // Physical address outside any claimed BAR -> kSyscallErrorAccess.
-  if (MmioMap(bar_phys + static_cast<uint64_t>(bar_size), 4096) !=
-          kSyscallErrorAccess ||
-      MmioMap(0x100000ULL, 4096) != kSyscallErrorAccess) {
+  if (MmioMap(unmapped_phys, 4096).status() != kSyscallErrorAccess ||
+      MmioMap(0x100000ULL, 4096).status() != kSyscallErrorAccess) {
     return 5;
   }
-  // If the device has MSI-X in this BAR, attempting to map the entire BAR
-  // (including the MSI-X table/PBA page) must be rejected with
-  // kSyscallErrorAccess.
-  if (info.msix_vectors > 0 && bar_size > 4096) {
-    if (MmioMap(bar_phys, bar_size) != kSyscallErrorAccess) {
+  // If this BAR holds an MSI-X structure and fits in kSyscallMmioMaxSize,
+  // attempting to map the entire BAR (including the MSI-X table/PBA page) must
+  // be rejected with kSyscallErrorAccess.
+  if ((submode & 2) != 0) {
+    if (MmioMap(bar_phys, bar_size).status() != kSyscallErrorAccess) {
       return 6;
     }
   }
   // Map the first 4 KiB page of the BAR (non-MSI-X register page).
-  const int64_t va1 = MmioMap(bar_phys, 4096);
-  if (SyscallIsError(va1) ||
-      static_cast<uint64_t>(va1) != 0xFFFF900000000000ULL) {
+  const StatusOr<uintptr_t> va1 = MmioMap(bar_phys, 4096);
+  if (!va1.ok() || *va1 != 0xFFFF900000000000ULL) {
     return 7;
   }
   // Mapping the same page a second time places it after the first mapping's
   // 4 KiB guard page (`va1 + 2 * 4096`).
-  const int64_t va2 = MmioMap(bar_phys, 4096);
-  if (SyscallIsError(va2) || va2 != va1 + 2 * 4096) {
+  const StatusOr<uintptr_t> va2 = MmioMap(bar_phys, 4096);
+  if (!va2.ok() || *va2 != *va1 + 2 * 4096) {
     return 8;
   }
-  const uint32_t reg0 = *Launder(
-      reinterpret_cast<const volatile uint32_t*>(static_cast<uintptr_t>(va1)));
+  const uint32_t reg0 =
+      *Launder(reinterpret_cast<const volatile uint32_t*>(*va1));
   (void)reg0;
   // Device MMIO pages carry kPteNotOwned, so kernel user-copy helpers
   // (MayRead/MayWrite -> PagingUserRangeAccessible) reject them with EFAULT.
-  if (Write(reinterpret_cast<const char*>(static_cast<uintptr_t>(va1)), 4) !=
+  if (Write(reinterpret_cast<const char*>(*va1), 4) != kSyscallErrorFault ||
+      ConsolePush(reinterpret_cast<const char*>(*va1), 4) !=
           kSyscallErrorFault ||
-      ConsolePush(reinterpret_cast<const char*>(static_cast<uintptr_t>(va1)),
-                  4) != kSyscallErrorFault ||
-      Read(reinterpret_cast<char*>(static_cast<uintptr_t>(va1)), 4) !=
-          kSyscallErrorFault) {
+      Read(reinterpret_cast<char*>(*va1), 4) != kSyscallErrorFault) {
     return 9;
   }
-  if (submode == 1) {
+  if ((submode & 1) != 0) {
     (void)IrqWait(0, kSyscallIrqWaitMaxTicks);
   }
   return 0;
@@ -2132,20 +2143,20 @@ static int64_t RunDriverMmioFault(const uint64_t arg) {
   if (PciClaim(dev_idx) != 0) {
     return 1;
   }
-  PciDeviceInfo info{};
-  if (GetPciInfo(dev_idx, &info) < 1) {
+  const StatusOr<PciDeviceInfo> info = GetPciInfo(dev_idx);
+  if (!info.ok()) {
     return 2;
   }
-  const int64_t va = MmioMap(info.bars[bar_idx].phys_base, 4096);
-  if (SyscallIsError(va)) {
+  const StatusOr<uintptr_t> va = MmioMap(info->bars[bar_idx].phys_base, 4096);
+  if (!va.ok()) {
     return 3;
   }
   if (submode == DriverMmioFaultSubmode::kFaultExecuteMmio) {
-    Launder(reinterpret_cast<void (*)()>(static_cast<uintptr_t>(va)))();
+    Launder(reinterpret_cast<void (*)()>(*va))();
     return 4;
   }
   // Read the unmapped guard page right after the 1-page mapping (`va + 4096`).
-  const uintptr_t guard_page = static_cast<uintptr_t>(va) + 4096;
+  const uintptr_t guard_page = *va + 4096;
   const uint32_t word =
       *Launder(reinterpret_cast<const volatile uint32_t*>(guard_page));
   (void)word;
@@ -2154,69 +2165,68 @@ static int64_t RunDriverMmioFault(const uint64_t arg) {
 
 static int64_t RunDriverDmaChecks(const uint64_t arg) {
   const uint8_t submode = usertest::DriverSubmode(arg);
-  uint64_t phys = 0;
-  if (DmaAlloc(0, &phys, 0) != kSyscallErrorInvalid ||
-      DmaAlloc(-4096, &phys, 0) != kSyscallErrorInvalid ||
-      DmaAlloc(100, &phys, 0) != kSyscallErrorInvalid ||
-      DmaAlloc(kSyscallDmaMaxSize + 4096, &phys, 0) != kSyscallErrorInvalid ||
-      DmaAlloc(4096, &phys, 2) != kSyscallErrorInvalid) {
+  if (DmaAlloc(0, 0).status() != kSyscallErrorInvalid ||
+      DmaAlloc(-4096, 0).status() != kSyscallErrorInvalid ||
+      DmaAlloc(100, 0).status() != kSyscallErrorInvalid ||
+      DmaAlloc(kSyscallDmaMaxSize + 4096, 0).status() != kSyscallErrorInvalid ||
+      DmaAlloc(4096, 2).status() != kSyscallErrorInvalid) {
     return 1;
   }
-  if (DmaAlloc(4096, nullptr, 0) != kSyscallErrorFault ||
-      DmaAlloc(4096, reinterpret_cast<uint64_t*>(usertest::kKernelAddress),
-               0) != kSyscallErrorFault ||
-      DmaAlloc(4096, reinterpret_cast<uint64_t*>(kNonCanonicalAddress), 0) !=
+  if (Syscall(kSyscallDmaAlloc, 4096, 0, 0) != kSyscallErrorFault ||
+      Syscall(kSyscallDmaAlloc, 4096, usertest::kKernelAddress, 0) !=
           kSyscallErrorFault ||
-      DmaAlloc(4096, reinterpret_cast<uint64_t*>(kUnmappedUserAddress), 0) !=
+      Syscall(kSyscallDmaAlloc, 4096, kNonCanonicalAddress, 0) !=
           kSyscallErrorFault ||
-      DmaAlloc(4096, const_cast<uint64_t*>(&kReadOnlyWord), 0) !=
-          kSyscallErrorFault) {
+      Syscall(kSyscallDmaAlloc, 4096, kUnmappedUserAddress, 0) !=
+          kSyscallErrorFault ||
+      Syscall(kSyscallDmaAlloc, 4096,
+              reinterpret_cast<uintptr_t>(&kReadOnlyWord),
+              0) != kSyscallErrorFault) {
     return 2;
   }
-  uint64_t phys1 = 0;
-  const int64_t va1 = DmaAlloc(4 * 4096, &phys1, kSyscallDmaBelow4GiB);
-  if (SyscallIsError(va1) ||
-      static_cast<uint64_t>(va1) != 0xFFFFA00000000000ULL || phys1 == 0 ||
-      (phys1 & 0xFFFULL) != 0 || phys1 + 4 * 4096 > 0x100000000ULL) {
+  const StatusOr<DmaAllocation> dma1 = DmaAlloc(4 * 4096, kSyscallDmaBelow4GiB);
+  if (!dma1.ok() || dma1->va != 0xFFFFA00000000000ULL || dma1->phys == 0 ||
+      (dma1->phys & 0xFFFULL) != 0 || dma1->phys + 4 * 4096 > 0x100000000ULL) {
     return 3;
   }
   // Second allocation sits after the 4 pages of `va1` plus its 1 guard page
   // (`va1 + 5 * 4096`).
-  uint64_t phys2 = 0;
-  const int64_t va2 = DmaAlloc(4096, &phys2, 0);
-  if (SyscallIsError(va2) || va2 != va1 + 5 * 4096 || phys2 == 0 ||
-      (phys2 & 0xFFFULL) != 0 || phys2 == phys1) {
+  const StatusOr<DmaAllocation> dma2 = DmaAlloc(4096, 0);
+  if (!dma2.ok() || dma2->va != dma1->va + 5 * 4096 || dma2->phys == 0 ||
+      (dma2->phys & 0xFFFULL) != 0 || dma2->phys == dma1->phys) {
     return 4;
   }
+  const uintptr_t va1 = dma1->va;
+  const uint64_t phys1 = dma1->phys;
+  const uintptr_t va2 = dma2->va;
+  const uint64_t phys2 = dma2->phys;
   const volatile uint64_t* const words1 =
-      reinterpret_cast<const volatile uint64_t*>(static_cast<uintptr_t>(va1));
+      reinterpret_cast<const volatile uint64_t*>(va1);
   for (int i = 0; i < (4 * 4096) / 8; ++i) {
     if (words1[i] != 0) {
       return 5;
     }
   }
   const volatile uint64_t* const words2 =
-      reinterpret_cast<const volatile uint64_t*>(static_cast<uintptr_t>(va2));
+      reinterpret_cast<const volatile uint64_t*>(va2);
   for (int i = 0; i < 4096 / 8; ++i) {
     if (words2[i] != 0) {
       return 6;
     }
   }
-  volatile uint64_t* const mut1 =
-      reinterpret_cast<volatile uint64_t*>(static_cast<uintptr_t>(va1));
+  volatile uint64_t* const mut1 = reinterpret_cast<volatile uint64_t*>(va1);
   mut1[0] = phys1;
   for (int p = 1; p < 4; ++p) {
     mut1[p * (4096 / 8)] = 0xD0A0000000000000ULL + static_cast<uint64_t>(p);
   }
-  volatile uint64_t* const mut2 =
-      reinterpret_cast<volatile uint64_t*>(static_cast<uintptr_t>(va2));
+  volatile uint64_t* const mut2 = reinterpret_cast<volatile uint64_t*>(va2);
   mut2[0] = phys2;
 
   if (submode == 1) {
     // Write a RET instruction (0xC3) at va1 and jump to it to trigger an NX
     // instruction-fetch #PF on the DMA page.
-    *reinterpret_cast<volatile uint8_t*>(static_cast<uintptr_t>(va1)) = 0xC3;
-    Launder(reinterpret_cast<void (*)()>(static_cast<uintptr_t>(va1)))();
+    *reinterpret_cast<volatile uint8_t*>(va1) = 0xC3;
+    Launder(reinterpret_cast<void (*)()>(va1))();
     return 7;
   }
   (void)IrqWait(0, kSyscallIrqWaitMaxTicks);
@@ -2256,10 +2266,11 @@ static int64_t RunDriverIrqWait(const uint64_t arg) {
   if (PciClaim(dev_idx) != 0) {
     return 1;
   }
-  PciDeviceInfo info{};
-  if (GetPciInfo(dev_idx, &info) < 1) {
+  const StatusOr<PciDeviceInfo> info_or = GetPciInfo(dev_idx);
+  if (!info_or.ok()) {
     return 2;
   }
+  const PciDeviceInfo& info = *info_or;
   const bool has_hw_irq = info.msi_vectors != 0 || info.msix_vectors != 0;
   const int64_t count = (!has_hw_irq || info.msix_vectors >= 2) ? 2 : 1;
 
@@ -2366,6 +2377,270 @@ static int64_t RunDriverIrqWait(const uint64_t arg) {
   return 51;
 }
 
+// The xHCI programming interface: PCI class 0C (serial bus controller),
+// subclass 03 (USB), programming interface 30.
+constexpr uint8_t kPciClassSerialBus = 0x0C;
+constexpr uint8_t kPciSubclassUsb = 0x03;
+constexpr uint8_t kPciProgIfXhci = 0x30;
+
+// The timer ticks to wait so that at least `ms` milliseconds pass: rounded
+// up, plus one tick because the current tick may end right after the start
+// was read (usb::TicksForMs()).
+static constexpr int64_t TicksForMs(const int64_t ms) {
+  return (ms * kSyscallTicksPerSecond + 999) / 1000 + 1;
+}
+
+// The bounds of the steps of `kDriverXhciReset`, those of usbkbd's bring-up
+// (user/usbkbd/xhci_controller.h): firmware gets 1 s to release the controller
+// before the program takes it by force (like Linux); CNR gets 5 s to clear
+// before the first operational register write, and the program goes on
+// after a timeout (like Linux); a running controller halts within 16 ms
+// after Run/Stop clears (xHCI 5.4.1; Linux allows 32 ms); no register is
+// accessed for 1 ms after HCRST is set (Intel controllers need that); then
+// HCRST and CNR must clear within 10 s each (Linux XHCI_RESET_LONG_USEC).
+constexpr int64_t kXhciHandoffTicks = TicksForMs(1000);
+constexpr int64_t kXhciReadyTicks = TicksForMs(5000);
+constexpr int64_t kXhciHaltTicks = TicksForMs(32);
+constexpr int64_t kXhciPostResetTicks = TicksForMs(1);
+constexpr int64_t kXhciResetTicks = TicksForMs(10000);
+
+// The registers of a memory BAR of a claimed device, each 4 KiB page mapped
+// with mmio_map() on its first access. mmio_map() withholds the pages of the
+// MSI-X table and PBA, which may lie anywhere in the BAR, so the BAR may not
+// map in one piece, while the xHCI reset touches only a few pages (the
+// capability, operational and extended capability registers). Accesses that
+// are unaligned, outside the BAR or to a page that doesn't map are not
+// performed: reads return all-ones and writes are dropped.
+class PagedMmioWindow final : public usb::MmioWindow {
+ public:
+  PagedMmioWindow(const uint64_t phys_base, const int64_t size)
+      : phys_base_(phys_base), size_(size) {}
+
+  uint32_t Read32(const int64_t offset) override {
+    volatile uint32_t* const reg = Register(offset);
+    if (reg == nullptr) {
+      return usb::kMmioAllOnes;
+    }
+    asm volatile("" ::: "memory");
+    const uint32_t value = *reg;
+    asm volatile("" ::: "memory");
+    return value;
+  }
+
+  void Write32(const int64_t offset, const uint32_t value) override {
+    volatile uint32_t* const reg = Register(offset);
+    if (reg == nullptr) {
+      return;
+    }
+    asm volatile("" ::: "memory");
+    *reg = value;
+    asm volatile("" ::: "memory");
+  }
+
+  int64_t Size() const override { return size_; }
+
+ private:
+  static constexpr int kMaxPages = 8;
+
+  volatile uint32_t* Register(const int64_t offset) {
+    if (offset < 0 || (offset & 3) != 0 || offset > size_ - 4) {
+      return nullptr;
+    }
+    const int64_t page = offset / kPageSize;
+    int slot = 0;
+    while (slot < page_count_ && pages_[slot] != page) {
+      ++slot;
+    }
+    if (slot == page_count_) {
+      if (page_count_ == kMaxPages) {
+        return nullptr;
+      }
+      const StatusOr<uintptr_t> va =
+          MmioMap(phys_base_ + static_cast<uint64_t>(page * kPageSize),  //
+                  kPageSize);
+      if (!va.ok()) {
+        return nullptr;
+      }
+      pages_[slot] = page;
+      vas_[slot] = *va;
+      ++page_count_;
+    }
+    return reinterpret_cast<volatile uint32_t*>(
+        vas_[slot] + static_cast<uintptr_t>(offset % kPageSize));
+  }
+
+  const uint64_t phys_base_;
+  const int64_t size_;
+  int64_t pages_[kMaxPages] = {};
+  uintptr_t vas_[kMaxPages] = {};
+  int page_count_ = 0;
+};
+
+enum class PollResult { kMatched, kTimedOut, kNotDecoding };
+
+// Polls the register at `offset` until its `mask` bits read `expected` or
+// `timeout_ticks` timer ticks have passed, sleeping until the next tick
+// between two polls. Polls once more after the deadline, so that a program
+// that was preempted past it reports no false timeout. A register that reads
+// all-ones means that the controller stopped decoding its BAR.
+static PollResult PollRegister(usb::MmioWindow& mmio,    //
+                               const int64_t offset,     //
+                               const uint32_t mask,      //
+                               const uint32_t expected,  //
+                               const int64_t timeout_ticks) {
+  const int64_t deadline = GetTicks() + timeout_ticks;
+  for (;;) {
+    const bool last_poll = GetTicks() >= deadline;
+    const uint32_t value = mmio.Read32(offset);
+    if (value == usb::kMmioAllOnes) {
+      return PollResult::kNotDecoding;
+    }
+    if ((value & mask) == expected) {
+      return PollResult::kMatched;
+    }
+    if (last_poll) {
+      return PollResult::kTimedOut;
+    }
+    (void)IrqWait(0, 1);
+  }
+}
+
+// Takes the xHCI controller behind `mmio` over from firmware (xHCI 4.22.1):
+// sets the OS Owned semaphore, waits until firmware clears its BIOS Owned
+// semaphore (or clears it by force after kXhciHandoffTicks), and disables
+// and acknowledges every firmware SMI.
+static int64_t TakeXhciFromFirmware(usb::MmioWindow& mmio,
+                                    const usb::XhciCaps& caps) {
+  if (caps.legacy_offset == 0) {
+    return 0;
+  }
+  const int64_t legsup = caps.legacy_offset + usb::kLegSup;
+  const uint32_t value = mmio.Read32(legsup);
+  if (value == usb::kMmioAllOnes) {
+    return usertest::kXhciResetNotDecodingStatus;
+  }
+  if ((value & usb::kLegSupOsOwned) == 0) {
+    mmio.Write32(legsup, value | usb::kLegSupOsOwned);
+  }
+  if ((value & usb::kLegSupBiosOwned) != 0) {
+    const PollResult released = PollRegister(mmio,                   //
+                                             legsup,                 //
+                                             usb::kLegSupBiosOwned,  //
+                                             0,                      //
+                                             kXhciHandoffTicks);
+    if (released == PollResult::kNotDecoding) {
+      return usertest::kXhciResetNotDecodingStatus;
+    }
+    if (released == PollResult::kTimedOut) {
+      const uint32_t current = mmio.Read32(legsup);
+      if (current == usb::kMmioAllOnes) {
+        return usertest::kXhciResetNotDecodingStatus;
+      }
+      mmio.Write32(legsup,
+                   (current | usb::kLegSupOsOwned) & ~usb::kLegSupBiosOwned);
+    }
+  }
+  const int64_t legctlsts = caps.legacy_offset + usb::kLegCtlSts;
+  const uint32_t control = mmio.Read32(legctlsts);
+  if (control == usb::kMmioAllOnes) {
+    return usertest::kXhciResetNotDecodingStatus;
+  }
+  mmio.Write32(legctlsts, usb::LegacyControlDisablingSmis(control));
+  return 0;
+}
+
+// Halts the xHCI controller behind `mmio` if it runs (xHCI 5.4.1: Run/Stop
+// cleared, the controller halts once its current work is done) and resets it
+// (HCRST, which a controller must not get while it runs). Leaves Bus Master
+// alone: a controller that runs on with Bus Master off fails its next memory
+// access and halts with Host System Error, which the reset clears too.
+static int64_t HaltAndResetXhci(usb::MmioWindow& mmio,
+                                const usb::XhciCaps& caps) {
+  const int64_t usbcmd = caps.Op(usb::kOpUsbCmd);
+  const int64_t usbsts = caps.Op(usb::kOpUsbSts);
+  // No operational register may be written before CNR clears (xHCI 4.2).
+  if (PollRegister(mmio, usbsts, usb::kUsbStsCnr, 0, kXhciReadyTicks) ==
+      PollResult::kNotDecoding) {
+    return usertest::kXhciResetNotDecodingStatus;
+  }
+  const uint32_t command = mmio.Read32(usbcmd);
+  const uint32_t status = mmio.Read32(usbsts);
+  if (command == usb::kMmioAllOnes || status == usb::kMmioAllOnes) {
+    return usertest::kXhciResetNotDecodingStatus;
+  }
+  const bool was_running = (status & usb::kUsbStsHch) == 0;
+  if ((command & usb::kUsbCmdHaltMask) != 0) {
+    mmio.Write32(usbcmd, command & ~usb::kUsbCmdHaltMask);
+  }
+  const PollResult halted = PollRegister(mmio,             //
+                                         usbsts,           //
+                                         usb::kUsbStsHch,  //
+                                         usb::kUsbStsHch,  //
+                                         kXhciHaltTicks);
+  if (halted != PollResult::kMatched) {
+    return (halted == PollResult::kNotDecoding)
+               ? usertest::kXhciResetNotDecodingStatus
+               : usertest::kXhciResetHaltTimeoutStatus;
+  }
+  const uint32_t halted_command = mmio.Read32(usbcmd);
+  if (halted_command == usb::kMmioAllOnes) {
+    return usertest::kXhciResetNotDecodingStatus;
+  }
+  mmio.Write32(usbcmd,
+               (halted_command & ~(usb::kUsbCmdHaltMask | usb::kUsbCmdLhcrst |
+                                   usb::kUsbCmdCss | usb::kUsbCmdCrs)) |
+                   usb::kUsbCmdHcrst);
+  const int64_t delay_end = GetTicks() + kXhciPostResetTicks;
+  while (GetTicks() < delay_end) {
+    (void)IrqWait(0, 1);
+  }
+  PollResult reset =
+      PollRegister(mmio, usbcmd, usb::kUsbCmdHcrst, 0, kXhciResetTicks);
+  if (reset == PollResult::kMatched) {
+    reset = PollRegister(mmio, usbsts, usb::kUsbStsCnr, 0, kXhciResetTicks);
+  }
+  if (reset != PollResult::kMatched) {
+    return (reset == PollResult::kNotDecoding)
+               ? usertest::kXhciResetNotDecodingStatus
+               : usertest::kXhciResetTimeoutStatus;
+  }
+  const uint32_t reset_status = mmio.Read32(usbsts);
+  if (reset_status == usb::kMmioAllOnes) {
+    return usertest::kXhciResetNotDecodingStatus;
+  }
+  if ((reset_status & usb::kUsbStsHch) == 0) {
+    return usertest::kXhciResetTimeoutStatus;
+  }
+  return was_running ? usertest::kXhciResetWasRunningStatus : 0;
+}
+
+static int64_t RunDriverXhciReset(const uint64_t arg) {
+  const int dev_idx = usertest::DriverDeviceIndex(arg);
+  if (PciClaim(dev_idx) != 0) {
+    return usertest::kXhciResetNotXhciStatus;
+  }
+  const StatusOr<PciDeviceInfo> info = GetPciInfo(dev_idx);
+  if (!info.ok() || info->class_code != kPciClassSerialBus ||
+      info->subclass != kPciSubclassUsb || info->prog_if != kPciProgIfXhci ||
+      !IsMemoryBar(info->bars[0])) {
+    return usertest::kXhciResetNotXhciStatus;
+  }
+  PagedMmioWindow mmio(info->bars[0].phys_base, info->bars[0].size);
+  StatusOr<usb::XhciCaps, usb::XhciStatus> caps = usb::DecodeCaps(mmio);
+  usb::XhciStatus decoded =
+      caps.ok() ? usb::ParseExtendedCaps(mmio, &*caps) : caps.status();
+  if (decoded != usb::XhciStatus::kOk) {
+    return (decoded == usb::XhciStatus::kNotDecoding)
+               ? usertest::kXhciResetNotDecodingStatus
+               : usertest::kXhciResetBadCapabilitiesStatus;
+  }
+  const int64_t handoff = TakeXhciFromFirmware(mmio, *caps);
+  if (handoff != 0) {
+    return handoff;
+  }
+  return HaltAndResetXhci(mmio, *caps);
+}
+
 }  // namespace
 
 int64_t Main(const uint64_t arg) {
@@ -2446,6 +2721,8 @@ int64_t Main(const uint64_t arg) {
       return RunDriverConsolePush();
     case Mode::kDriverIrqWait:
       return RunDriverIrqWait(arg);
+    case Mode::kDriverXhciReset:
+      return RunDriverXhciReset(arg);
   }
   // The mode should have faulted, or it is unknown.
   return -1;

@@ -61,6 +61,9 @@ CpuidLeaves CpuReadCpuidLeaves(const CpuidFn cpuid) {
     leaves.leaf_xsave = cpuid(0xD, 0);
   }
   leaves.max_extended_leaf = cpuid(kCpuidExtendedLeafMax, 0).eax;
+  if (leaves.max_extended_leaf >= kCpuidExtendedLeaf1) {
+    leaves.leaf_ext1 = cpuid(kCpuidExtendedLeaf1, 0);
+  }
   if (leaves.max_extended_leaf >= kCpuidExtendedLeaf8) {
     leaves.leaf_ext8 = cpuid(kCpuidExtendedLeaf8, 0);
   }
@@ -89,6 +92,12 @@ CpuConfig CpuChooseConfig(const CpuidLeaves& leaves) {
       (leaves.max_basic_leaf >= 7) ? leaves.leaf7.ebx : 0;
   config.smep = (leaf7_ebx & kCpuid7EbxSmep) != 0;
   config.smap = (leaf7_ebx & kCpuid7EbxSmap) != 0;
+  // Neither do NX and the machine-check exception.
+  const uint32_t ext1_edx = (leaves.max_extended_leaf >= kCpuidExtendedLeaf1)
+                                ? leaves.leaf_ext1.edx
+                                : 0;
+  config.nx = (ext1_edx & kCpuidExt1EdxNx) != 0;
+  config.mce = (leaves.leaf1.edx & kCpuid1EdxMce) != 0;
   if (!config.fxsr || (leaves.leaf1.ecx & kCpuid1EcxXsave) == 0 ||
       leaves.max_basic_leaf < 0xD) {
     return config;
@@ -132,13 +141,17 @@ bool CpuSupportsConfig(const CpuidLeaves& leaves, const CpuConfig& config) {
   if ((config.smep && !own.smep) || (config.smap && !own.smap)) {
     return false;
   }
+  if ((config.nx && !own.nx) || (config.mce && !own.mce)) {
+    return false;
+  }
   return true;
 }
 
-uint64_t CpuCr4ForConfig(const uint64_t cr4, const CpuConfig& config) {
-  constexpr uint64_t kManaged =
-      kCr4Osxsave | kCr4Smep | kCr4Smap | kCr4Fsgsbase;
-  uint64_t value = (cr4 & ~kManaged) | kCr4Osfxsr | kCr4Osxmmexcpt;
+uint64_t CpuCr4ForConfig(const CpuConfig& config) {
+  uint64_t value = kCr4Pae | kCr4Osfxsr | kCr4Osxmmexcpt;
+  if (config.mce) {
+    value |= kCr4Mce;
+  }
   if (config.xsave) {
     value |= kCr4Osxsave;
   }
@@ -149,6 +162,26 @@ uint64_t CpuCr4ForConfig(const uint64_t cr4, const CpuConfig& config) {
     value |= kCr4Smap;
   }
   return value;
+}
+
+CpuMsrValues CpuMsrValuesFor(const CpuidLeaves& leaves) {
+  CpuMsrValues msrs;
+  const auto add = [&msrs](const uint32_t msr, const uint64_t value) {
+    msrs.values[msrs.count] = {msr, value};
+    ++msrs.count;
+  };
+  if ((leaves.leaf1.edx & kCpuid1EdxSep) != 0) {
+    add(kMsrSysenterCs, 0);
+    add(kMsrSysenterEsp, 0);
+    add(kMsrSysenterEip, 0);
+  }
+  add(kMsrStar, 0);
+  add(kMsrLstar, 0);
+  add(kMsrFmask, 0);
+  if ((leaves.leaf1.edx & kCpuid1EdxPat) != 0) {
+    add(kMsrPat, kCpuPat);
+  }
+  return msrs;
 }
 
 void CpuWriteBootReport(const CpuConfig& config,   //
@@ -211,13 +244,41 @@ static void WriteXcr0(const uint64_t value) {
                : "memory");
 }
 
+static void WriteMsr(const uint32_t msr, const uint64_t value) {
+  asm volatile("wrmsr"
+               :
+               : "c"(msr), "a"(static_cast<uint32_t>(value)),
+                 "d"(static_cast<uint32_t>(value >> 32))
+               : "memory");
+}
+
+// Flushes the calling CPU's TLB by reloading CR3 (no page is global).
+static void FlushTlb() {
+  uint64_t cr3 = 0;
+  asm volatile("mov %0, cr3" : "=r"(cr3));
+  asm volatile("mov cr3, %0" : : "r"(cr3) : "memory");
+}
+
+// Loads the MSR values of CpuMsrValuesFor(leaves) on the calling CPU, whose
+// CPUID reports `leaves`, and then flushes its TLB, which may hold memory
+// types of the previous IA32_PAT (Linux does the same). The new PAT needs no
+// cache flush: so far, the kernel maps everything with entry 0, which firmware
+// leaves WB.
+static void ApplyMsrValues(const CpuidLeaves& leaves) {
+  const CpuMsrValues msrs = CpuMsrValuesFor(leaves);
+  for (int i = 0; i < msrs.count; ++i) {
+    WriteMsr(msrs.values[i].msr, msrs.values[i].value);
+  }
+  FlushTlb();
+}
+
 // Applies `config` to the calling CPU and returns the size of its register
 // state (fpu.h). CR4 comes first (with SMEP and SMAP as chosen), because
 // XSETBV raises #UD while CR4.OSXSAVE is clear, and the size is read last,
 // because CPUID.(EAX=0DH,ECX=0):EBX is the XSAVE area size of the XCR0 in
 // effect.
 static int ApplyConfig(const CpuConfig& config) {
-  WriteCr4(CpuCr4ForConfig(ReadCr4(), config));
+  WriteCr4(CpuCr4ForConfig(config));
   if (!config.xsave) {
     return kFpuFxsaveSize;
   }
@@ -226,11 +287,13 @@ static int ApplyConfig(const CpuConfig& config) {
 }
 
 void CpuInitBsp() {
-  const CpuConfig config = CpuChooseConfig(CpuReadCpuidLeaves(ExecuteCpuid));
+  const CpuidLeaves leaves = CpuReadCpuidLeaves(ExecuteCpuid);
+  const CpuConfig config = CpuChooseConfig(leaves);
   const bool cpu_has_fxsr_sse_sse2 = config.fxsr;
   CHECK(cpu_has_fxsr_sse_sse2);
   // Before CR4.SMAP: once it is set, a copy without STAC would fault.
   g_cpu_smap_enabled.store(config.smap, std::memory_order_relaxed);
+  ApplyMsrValues(leaves);
   const int fpu_state_size = ApplyConfig(config);
   const FpuConfig fpu_config = {
       .xsave = config.xsave,
@@ -246,9 +309,10 @@ void CpuInitBsp() {
 }
 
 void CpuInitAp() {
-  const bool ap_supports_bsp_config =
-      CpuSupportsConfig(CpuReadCpuidLeaves(ExecuteCpuid), g_config);
+  const CpuidLeaves leaves = CpuReadCpuidLeaves(ExecuteCpuid);
+  const bool ap_supports_bsp_config = CpuSupportsConfig(leaves, g_config);
   CHECK(ap_supports_bsp_config);
+  ApplyMsrValues(leaves);
   const bool ap_fpu_state_fits = ApplyConfig(g_config) <= FpuStateSize();
   CHECK(ap_fpu_state_fits);
 }

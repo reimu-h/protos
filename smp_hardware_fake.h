@@ -68,8 +68,12 @@ class FakeSmpHardware final : public SmpHardware {
     uint32_t cpuid_max_leaf = 0x0B;
     // Whether CPUID leaf 0x0B enumerates the topology.
     bool cpuid_leaf_0b = true;
+    // CPUID leaf 0x15 (TSC/crystal ratio EBX/EAX, crystal clock in ECX) and
+    // leaf 0x16 (base and bus frequencies in MHz, EAX and ECX).
+    uint32_t cpuid_leaf15_eax = 1;
     uint32_t cpuid_leaf15_ebx = 0;
     uint32_t cpuid_leaf15_ecx = 0;
+    uint32_t cpuid_leaf16_eax = 0;
     uint32_t cpuid_leaf16_ecx = 0;
     // IA32_APIC_BASE at power-on: base 0xFEE00000, enabled, BSP flag on the
     // BSP. SetApicBaseMsr() overrides it for one CPU.

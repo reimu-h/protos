@@ -58,9 +58,9 @@ class AddressSpace {
   // `user_addr` maps to, or 0 if it is not mapped.
   uintptr_t PageFrame(uintptr_t user_addr) const;
 
-  // Fills `*info` with the attributes of the mapped user page at `user_addr`
-  // and returns true, or returns false if it is not mapped.
-  bool QueryPage(uintptr_t user_addr, UserPageInfo* info) const;
+  // Returns the attributes of the mapped user page at `user_addr`, or an error
+  // if it is not mapped.
+  StatusOr<UserPageInfo> QueryPage(uintptr_t user_addr) const;
 
   // The root of the page tables: the physical address of the PML4.
   uintptr_t root() const { return root_; }

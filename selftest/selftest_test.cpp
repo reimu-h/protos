@@ -67,5 +67,32 @@ TEST_F(SelfTestTest, StressTestsWithFreshSeedsForeverIfTheBootSelfTestsPass) {
   EXPECT_THAT(g_stress_seed_overrides, t::ElementsAre(0u, 0u, 0u));
 }
 
+TEST(BootSelfTestMayUsePciFunctionTest, SkipsDisplayControllers) {
+  EXPECT_FALSE(BootSelfTestMayUsePciFunction(0x03, 0x00, 0x00));  // VGA
+  EXPECT_FALSE(BootSelfTestMayUsePciFunction(0x03, 0x02, 0x00));  // 3D
+  EXPECT_FALSE(BootSelfTestMayUsePciFunction(0x03, 0x80, 0x00));  // Other
+}
+
+TEST(BootSelfTestMayUsePciFunctionTest, UsesXhciButNoOtherUsbHostController) {
+  EXPECT_TRUE(BootSelfTestMayUsePciFunction(0x0C, 0x03, 0x30));   // xHCI
+  EXPECT_FALSE(BootSelfTestMayUsePciFunction(0x0C, 0x03, 0x00));  // UHCI
+  EXPECT_FALSE(BootSelfTestMayUsePciFunction(0x0C, 0x03, 0x10));  // OHCI
+  EXPECT_FALSE(BootSelfTestMayUsePciFunction(0x0C, 0x03, 0x20));  // EHCI
+  EXPECT_FALSE(BootSelfTestMayUsePciFunction(0x0C, 0x03, 0x40));  // USB4
+  EXPECT_FALSE(BootSelfTestMayUsePciFunction(0x0C, 0x03, 0x80));  // Other
+}
+
+TEST(BootSelfTestMayUsePciFunctionTest, SkipsBaseSystemPeripherals) {
+  EXPECT_FALSE(BootSelfTestMayUsePciFunction(0x08, 0x06, 0x00));  // IOMMU
+  EXPECT_FALSE(BootSelfTestMayUsePciFunction(0x08, 0x80, 0x00));  // Other
+}
+
+TEST(BootSelfTestMayUsePciFunctionTest, UsesOtherFunctions) {
+  EXPECT_TRUE(BootSelfTestMayUsePciFunction(0x02, 0x00, 0x00));  // Ethernet
+  EXPECT_TRUE(BootSelfTestMayUsePciFunction(0x01, 0x08, 0x02));  // NVMe
+  EXPECT_TRUE(BootSelfTestMayUsePciFunction(0x04, 0x03, 0x00));  // HD Audio
+  EXPECT_TRUE(BootSelfTestMayUsePciFunction(0x0C, 0x05, 0x00));  // SMBus
+}
+
 }  // namespace
 }  // namespace protos

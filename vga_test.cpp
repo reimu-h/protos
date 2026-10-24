@@ -6,6 +6,7 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
+#include <set>
 #include <string>
 #include <thread>
 #include <vector>
@@ -73,7 +74,8 @@ constexpr uint8_t kUntouchedByte = 0xAA;
 
 // Host-memory framebuffers. They have static storage because the console keeps
 // drawing into the last attached framebuffer after a test ends; every test
-// attaches one of them before writing anything.
+// attaches one of them before writing anything (except the first one, which
+// writes before any framebuffer is attached).
 alignas(64) uint8_t g_fb32_a[kFb32Bytes];
 alignas(64) uint8_t g_fb32_b[kFb32Bytes];
 alignas(64) uint8_t g_fb24[kFb24Bytes];
@@ -155,7 +157,46 @@ static bool RowPaddingUntouched(const Framebuffer& fb) {
   return true;
 }
 
+// Returns the distinct pixel values in console cell (`row`, `col`) of `fb`
+// (little-endian, 3 or 4 bytes per pixel).
+static std::set<uint32_t> CellPixelValues(const Framebuffer& fb,  //
+                                          const int row,          //
+                                          const int col) {
+  const int bytes_per_pixel = fb.bpp / 8;
+  std::set<uint32_t> values;
+  for (int y = row * kGlyphHeight; y < (row + 1) * kGlyphHeight; ++y) {
+    const uint8_t* const line = fb.bytes + static_cast<int64_t>(y) * fb.pitch;
+    for (int x = col * kGlyphWidth; x < (col + 1) * kGlyphWidth; ++x) {
+      uint32_t value = 0;
+      std::memcpy(&value, line + x * bytes_per_pixel, bytes_per_pixel);
+      values.insert(value);
+    }
+  }
+  return values;
+}
+
 static void ResetEnv() { g_env = FakeVgaEnv{}; }
+
+// Runs first, before any test attaches a framebuffer: until the console knows
+// its screen, text goes only to its memory (writing to the legacy VGA text
+// buffer at 0xB8000 or the CRT ports would crash this host process), and a
+// framebuffer attached later shows it.
+TEST(VgaTest, TextWrittenBeforeTheScreenIsKnownShowsOnTheFramebufferLater) {
+  ResetEnv();
+  VgaClear();
+  VgaWrite("$%0F");
+  EXPECT_THAT(VgaGetCursorCol(), t::Eq(4));
+
+  std::memset(g_fb32_b, kUntouchedByte, sizeof(g_fb32_b));
+  ASSERT_TRUE(VgaInitFramebuffer(kFb32B.addr(),  //
+                                 kPitch32,       //
+                                 kFbWidth,       //
+                                 kFbHeight,      //
+                                 32));
+  EXPECT_THAT(CellRows(kFb32B, 0, 3), t::Contains(".######."));
+  EXPECT_THAT(CellRows(kFb32B, 0, 4), t::Each(t::Eq("........")));
+  EXPECT_THAT(CellRows(kFb32B, 1, 0), t::Each(t::Eq("........")));
+}
 
 TEST(VgaTest, GlyphsAreDrawnTopRowFirstWithBitZeroOnTheLeft) {
   ResetEnv();
@@ -217,6 +258,46 @@ TEST(VgaTest, RendersOnto24BitFramebuffers) {
                                                     "###..##.",  //
                                                     ".#####.."));
   EXPECT_TRUE(RowPaddingUntouched(kFb24));
+}
+
+TEST(VgaTest, DrawsWhiteWithEveryChannelBitOfThePixelFormat) {
+  struct FormatCase {
+    const char* name;
+    Framebuffer fb;
+    VgaPixelFormat format;
+    uint32_t white;
+  };
+  const FormatCase kCases[] = {
+      // The usual layouts: white has all 24 color bits set either way.
+      {"32-bpp BGRX", kFb32A, {16, 8, 8, 8, 0, 8}, 0x00FFFFFF},
+      {"32-bpp RGBX", kFb32A, {0, 8, 8, 8, 16, 8}, 0x00FFFFFF},
+      {"24-bpp RGB", kFb24, {0, 8, 8, 8, 16, 8}, 0x00FFFFFF},
+      // A GOP bitmask mode with the reserved byte at the bottom: white must
+      // leave it clear and set the top byte.
+      {"32-bpp XBGR", kFb32A, {24, 8, 16, 8, 8, 8}, 0xFFFFFF00},
+      {"32-bpp 10:10:10", kFb32A, {20, 10, 10, 10, 0, 10}, 0x3FFFFFFF},
+      {"24-bpp 6:6:6", kFb24, {12, 6, 6, 6, 0, 6}, 0x0003FFFF},
+  };
+  for (const FormatCase& format_case : kCases) {
+    ResetEnv();
+    const Framebuffer& fb = format_case.fb;
+    std::memset(fb.bytes, kUntouchedByte, fb.size());
+    ASSERT_TRUE(VgaInitFramebuffer(fb.addr(),  //
+                                   fb.pitch,   //
+                                   kFbWidth,   //
+                                   kFbHeight,  //
+                                   fb.bpp,     //
+                                   format_case.format))
+        << format_case.name;
+    VgaClear();
+    VgaWrite("#");
+    EXPECT_THAT(CellPixelValues(fb, 0, 0),
+                t::ElementsAre(0u, format_case.white))
+        << format_case.name;
+    EXPECT_THAT(CellPixelValues(fb, 0, 1), t::ElementsAre(0u))
+        << format_case.name;
+    EXPECT_TRUE(RowPaddingUntouched(fb)) << format_case.name;
+  }
 }
 
 TEST(VgaTest, InitFramebufferRendersCurrentTextAndMapsWholeFramebuffer) {
@@ -294,7 +375,8 @@ TEST(VgaTest, InitFramebufferRejectsUnsupportedFramebuffersWithoutSideEffects) {
         << bad.name;
   }
   EXPECT_THAT(g_env.uart_log,
-              t::HasSubstr(" pitch=2560 width=640 height=400 bpp=32\n"));
+              t::HasSubstr(" pitch=2560 width=640 height=400 bpp=32 "
+                           "size=8:8:8 shift=16:8:0\n"));
   EXPECT_THAT(g_env.map_calls, t::Eq(1));  // AttachAndClear only.
 
   const std::vector<uint8_t> expected_sentinel(sizeof(g_sentinel), 0x55);
@@ -303,6 +385,51 @@ TEST(VgaTest, InitFramebufferRejectsUnsupportedFramebuffersWithoutSideEffects) {
       t::Eq(0));
 
   // The console still draws on the framebuffer that was attached before.
+  VgaPutc('F');
+  EXPECT_THAT(CellRows(kFb32A, 0, 0), t::Contains(".######."));
+}
+
+TEST(VgaTest, InitFramebufferRejectsUnsupportedPixelFormats) {
+  ResetEnv();
+  AttachAndClear(kFb32A);
+  std::memset(g_sentinel, 0x55, sizeof(g_sentinel));
+  const uintptr_t sentinel = reinterpret_cast<uintptr_t>(g_sentinel);
+
+  struct BadFormat {
+    const char* name;
+    int bpp;
+    VgaPixelFormat format;
+  };
+  const BadFormat kBadFormats[] = {
+      {"empty channel", 32, {16, 8, 8, 0, 0, 8}},
+      {"negative size", 32, {16, 8, 8, -8, 0, 8}},
+      {"negative position", 32, {16, 8, 8, 8, -1, 8}},
+      {"overlapping channels", 32, {16, 8, 8, 9, 0, 8}},
+      {"channel past 32 bits", 32, {28, 8, 8, 8, 0, 8}},
+      {"channel past 24 bits", 24, {24, 8, 8, 8, 0, 8}},
+      {"position past the pixel", 32, {255, 8, 8, 8, 0, 8}},
+      {"no color information", 32, {0, 0, 0, 0, 0, 0}},
+  };
+  for (const BadFormat& bad : kBadFormats) {
+    g_env.uart_log.clear();
+    EXPECT_FALSE(VgaInitFramebuffer(sentinel,      //
+                                    kFbWidth * 4,  //
+                                    kFbWidth,      //
+                                    kFbHeight,     //
+                                    bad.bpp,       //
+                                    bad.format))
+        << bad.name;
+    EXPECT_THAT(g_env.uart_log,
+                t::StartsWith("[VGA] Ignoring unsupported framebuffer: addr="))
+        << bad.name;
+  }
+  EXPECT_THAT(g_env.uart_log, t::EndsWith(" size=0:0:0 shift=0:0:0\n"));
+  EXPECT_THAT(g_env.map_calls, t::Eq(1));  // AttachAndClear only.
+  const std::vector<uint8_t> expected_sentinel(sizeof(g_sentinel), 0x55);
+  EXPECT_THAT(
+      std::memcmp(g_sentinel, expected_sentinel.data(), sizeof(g_sentinel)),
+      t::Eq(0));
+
   VgaPutc('F');
   EXPECT_THAT(CellRows(kFb32A, 0, 0), t::Contains(".######."));
 }

@@ -28,6 +28,18 @@ constexpr int kPrimaryBusOffset = 0x18;
 constexpr uint16_t kMsiWritableControlBits = 0x0071;
 constexpr uint16_t kMsixWritableControlBits =
     kPciMsixControlFunctionMask | kPciMsixControlEnable;
+constexpr uint16_t kPmcsrPmeEnable = 1u << 8;
+constexpr uint16_t kPmcsrStateD3hot = 3;
+// PCI Express capability sizes (versions 1 and 2), Slot Implemented, the
+// writable bits of Device Control (not Initiate Function Level Reset) and Link
+// Control (not Retrain Link), and Device Control's reset value: Relaxed
+// Ordering and No Snoop enabled, a 512-byte Max_Read_Request_Size.
+constexpr int kPcieBytesV1 = 0x24;
+constexpr int kPcieBytesV2 = 0x3C;
+constexpr uint32_t kPcieSlotImplemented = 1u << 8;
+constexpr uint32_t kPcieDeviceControlWritable = 0x7FFF;
+constexpr uint32_t kPcieDeviceControlReset = 0x2810;
+constexpr uint32_t kPcieLinkControlWritable = 0x0FDB;
 
 static bool IsValidAccess(const int offset, const int width) {
   return offset >= 0 && offset + width <= kPciConfigSpaceSize &&
@@ -127,9 +139,16 @@ uint32_t FakePciConfigSpace::Read(const PciAddress address,  //
   const AccessInProgress in_progress(&accesses_in_progress_,
                                      &max_concurrent_accesses_);
   const std::lock_guard<std::mutex> lock(mutex_);
-  const Function* const function = FindLocked(address);
-  const uint32_t value =
-      (function != nullptr) ? Load(*function, offset, width) : AllOnes(width);
+  const auto it = functions_.find(Key(address));
+  uint32_t value = AllOnes(width);
+  if (it != functions_.end() && !BehindSleepingBridgeLocked(address.bus)) {
+    Function& function = it->second;
+    if (function.reads_until_ready_left > 0) {
+      --function.reads_until_ready_left;
+    } else {
+      value = Load(function, offset, width);
+    }
+  }
   accesses_.push_back(Access{/*write=*/false, width, address, offset, value});
   return value;
 }
@@ -147,11 +166,14 @@ void FakePciConfigSpace::Write(const PciAddress address,  //
   const std::lock_guard<std::mutex> lock(mutex_);
   accesses_.push_back(Access{/*write=*/true, width, address, offset, value});
   const auto it = functions_.find(Key(address));
-  if (it == functions_.end()) {
+  if (it == functions_.end() || BehindSleepingBridgeLocked(address.bus)) {
     ++writes_to_absent_functions_;
     return;
   }
   Function& function = it->second;
+  if (function.reads_until_ready_left > 0) {
+    return;
+  }
   const int bars_end =
       kPciBar0Offset + 4 * BarCount(function.bytes[kPciHeaderTypeOffset]);
   const uint32_t command = Load(function, kPciCommandOffset, 2);
@@ -159,8 +181,20 @@ void FakePciConfigSpace::Write(const PciAddress address,  //
       (command & (kPciCommandIoSpace | kPciCommandMemorySpace)) != 0) {
     ++bar_writes_while_decoding_;
   }
+  const int pmcsr = (function.pm_offset != 0)
+                        ? function.pm_offset + kPciPmControlStatusOffset
+                        : -1;
+  const bool writes_pmcsr =
+      pmcsr >= 0 && offset < pmcsr + 2 && pmcsr < offset + width;
+  const uint32_t old_state =
+      writes_pmcsr ? (Load(function, pmcsr, 2) & kPciPmcsrPowerStateMask) : 0;
+  const bool bars_frozen = function.ignores_bar_writes_in_d3hot &&
+                           PowerState(function) == kPmcsrStateD3hot;
   for (int i = 0; i < width; ++i) {
     const int b = offset + i;
+    if (bars_frozen && b >= kPciBar0Offset && b < bars_end) {
+      continue;
+    }
     const uint8_t written = static_cast<uint8_t>(value >> (8 * i));
     const uint8_t writable = function.writable[b];
     uint8_t byte = static_cast<uint8_t>((function.bytes[b] & ~writable) |
@@ -169,6 +203,49 @@ void FakePciConfigSpace::Write(const PciAddress address,  //
                                 ~(written & function.write_one_to_clear[b]));
     function.bytes[b] = byte;
   }
+  if (writes_pmcsr) {
+    const uint32_t pmcsr_value = Load(function, pmcsr, 2);
+    if (old_state == kPmcsrStateD3hot &&
+        (pmcsr_value & kPciPmcsrPowerStateMask) == 0) {
+      // From D3hot to D0 without No_Soft_Reset: the function resets itself.
+      if ((pmcsr_value & kPciPmcsrNoSoftReset) == 0) {
+        for (int b = 0; b < kPciConfigSpaceSize; ++b) {
+          if (b != pmcsr && b != pmcsr + 1) {
+            function.bytes[b] = static_cast<uint8_t>(
+                (function.bytes[b] & ~function.writable[b]) |
+                (function.reset_values[b] & function.writable[b]));
+          }
+        }
+      }
+      function.reads_until_ready_left = function.reads_until_ready;
+    }
+  }
+}
+
+int FakePciConfigSpace::PowerState(const Function& function) {
+  return (function.pm_offset != 0)
+             ? static_cast<int>(
+                   Load(function,
+                        function.pm_offset + kPciPmControlStatusOffset, 2) &
+                   kPciPmcsrPowerStateMask)
+             : 0;
+}
+
+bool FakePciConfigSpace::BehindSleepingBridgeLocked(const int bus) const {
+  for (const auto& entry : functions_) {
+    const Function& bridge = entry.second;
+    if ((bridge.bytes[kPciHeaderTypeOffset] & kPciHeaderTypeLayoutMask) !=
+        kPciHeaderTypeBridge) {
+      continue;
+    }
+    const int secondary = bridge.bytes[kPciSecondaryBusOffset];
+    const int subordinate = bridge.bytes[kPciSubordinateBusOffset];
+    if (secondary != 0 && secondary <= bus && bus <= subordinate &&
+        PowerState(bridge) != 0) {
+      return true;
+    }
+  }
+  return false;
 }
 
 void FakePciConfigSpace::AddFunction(const PciAddress address,
@@ -187,6 +264,8 @@ void FakePciConfigSpace::AddFunction(const PciAddress address,
   function.bytes[kPciHeaderTypeOffset] = spec.header_type;
   Store(&function.writable, kPciCommandOffset, 2, kWritableCommandBits);
   Store(&function.write_one_to_clear, kPciStatusOffset, 2, kStatusErrorBits);
+  function.writable[kPciCacheLineSizeOffset] = 0xFF;
+  function.writable[kPciLatencyTimerOffset] = 0xFF;
   function.writable[kInterruptLineOffset] = 0xFF;
 }
 
@@ -352,6 +431,87 @@ void FakePciConfigSpace::AddMsix(const PciAddress address,  //
         offset + 8,       //
         4,                //
         msix.pba_offset | (static_cast<uint32_t>(msix.pba_bar) & 7u));
+}
+
+void FakePciConfigSpace::AddPowerManagement(const PciAddress address,  //
+                                            const int offset,          //
+                                            const PmSpec& pm) {
+  const std::lock_guard<std::mutex> lock(mutex_);
+  Function& function = FunctionLocked(address);
+  if (offset + kPciPmCapabilityBytes > kPciConfigSpaceSize ||
+      pm.power_state > kPmcsrStateD3hot) {
+    ADD_FAILURE() << "invalid Power Management capability at " << offset;
+    return;
+  }
+  LinkCapabilityLocked(&function, offset, kPciCapabilityPowerManagement);
+  const int pmcsr = offset + kPciPmControlStatusOffset;
+  Store(&function.bytes,  //
+        pmcsr,            //
+        2,                //
+        pm.power_state | (pm.no_soft_reset ? kPciPmcsrNoSoftReset : 0u));
+  Store(&function.writable,  //
+        pmcsr,               //
+        2,                   //
+        kPciPmcsrPowerStateMask | kPmcsrPmeEnable);
+  Store(&function.write_one_to_clear, pmcsr, 2, kPciPmcsrPmeStatus);
+  function.pm_offset = offset;
+  function.reads_until_ready = pm.reads_until_ready;
+  function.ignores_bar_writes_in_d3hot = pm.ignores_bar_writes_in_d3hot;
+}
+
+void FakePciConfigSpace::AddPcie(const PciAddress address,  //
+                                 const int offset,          //
+                                 const PcieSpec& pcie) {
+  const std::lock_guard<std::mutex> lock(mutex_);
+  Function& function = FunctionLocked(address);
+  const int bytes = (pcie.version >= 2) ? kPcieBytesV2 : kPcieBytesV1;
+  if (offset + bytes > kPciConfigSpaceSize) {
+    ADD_FAILURE() << "PCI Express capability at " << offset << " does not fit";
+    return;
+  }
+  LinkCapabilityLocked(&function, offset, kPciCapabilityExpress);
+  Store(&function.bytes,                         //
+        offset + kPciExpressCapabilitiesOffset,  //
+        2,                                       //
+        (static_cast<uint32_t>(pcie.version) & 0xFu) |
+            ((static_cast<uint32_t>(pcie.port_type) & 0xFu) << 4) |
+            (pcie.slot_implemented ? kPcieSlotImplemented : 0u));
+  // A register that starts at its reset value, with `mask` writable.
+  const auto add_register = [&](const int reg,        //
+                                const uint32_t mask,  //
+                                const uint32_t reset) {
+    Store(&function.bytes, offset + reg, 2, reset);
+    Store(&function.writable, offset + reg, 2, mask);
+    Store(&function.reset_values, offset + reg, 2, reset);
+  };
+  const int type = pcie.port_type;
+  add_register(kPciExpressDeviceControlOffset,  //
+               kPcieDeviceControlWritable,      //
+               kPcieDeviceControlReset);
+  if (type == 0x0 || type == 0x1 || (type >= 0x4 && type <= 0x8)) {
+    add_register(kPciExpressLinkControlOffset, kPcieLinkControlWritable, 0);
+  }
+  if ((type == 0x4 || type == 0x6 || type == 0x7) && pcie.slot_implemented) {
+    add_register(kPciExpressSlotControlOffset, 0x1FFFu, 0);
+  }
+  if (type == 0x4 || type == 0xA) {
+    add_register(kPciExpressRootControlOffset, 0x001Fu, 0);
+  }
+  if (pcie.version >= 2) {
+    add_register(kPciExpressDeviceControl2Offset, 0xFFFFu, 0);
+  }
+}
+
+void FakePciConfigSpace::SetWritable(const PciAddress address,  //
+                                     const int offset,          //
+                                     const int width,           //
+                                     const uint32_t mask) {
+  const std::lock_guard<std::mutex> lock(mutex_);
+  if (!IsValidAccess(offset, width)) {
+    ADD_FAILURE() << "invalid " << width << "-byte register at " << offset;
+    return;
+  }
+  Store(&FunctionLocked(address).writable, offset, width, mask);
 }
 
 void FakePciConfigSpace::SetRaw8(const PciAddress address,  //

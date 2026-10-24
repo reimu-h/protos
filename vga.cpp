@@ -17,13 +17,15 @@ constexpr int kVgaHeight = 25;
 constexpr uint8_t kVgaColorWhiteOnBlack = 0x0F;
 constexpr int kGlyphWidth = 8;
 constexpr int kGlyphHeight = 16;
-// Lit glyph pixel in a 32-bpp framebuffer (white; the top byte is unused).
-constexpr uint32_t kWhitePixel32 = 0x00FFFFFF;
 
 IrqSpinLock g_vga_lock;
 int g_cursor_row = 0;
 int g_cursor_col = 0;
 char g_text_shadow[kVgaHeight][kVgaWidth];
+
+// Whether the screen is in VGA text mode (VgaEnableLegacyText()), so that the
+// text buffer at 0xB8000 and the CRT controller exist.
+bool g_legacy_text = false;
 
 bool g_fb_active = false;
 uintptr_t g_fb_addr = 0;
@@ -31,6 +33,9 @@ int g_fb_pitch = 0;
 int g_fb_width = 0;
 int g_fb_height = 0;
 int g_fb_bpp = 0;
+// Value of a lit glyph pixel (white) in the framebuffer's pixel format; a
+// 24-bpp framebuffer stores its low 3 bytes.
+uint32_t g_fb_white_pixel = 0;
 
 // Compact 8x8 bitmap font for ASCII 0x20..0x7E (each uint64_t packs 8 rows of
 // 8 horizontal pixels, byte 0 on top, bit 0 on the left; rendered at 2x
@@ -168,15 +173,16 @@ static void RenderCellToFramebuffer(const int row,  //
       volatile uint32_t* const pixels =
           reinterpret_cast<volatile uint32_t*>(line) + base_x;
       for (int px = 0; px < kGlyphWidth; ++px) {
-        pixels[px] = ((row_bits >> px) & 1u) != 0 ? kWhitePixel32 : 0u;
+        pixels[px] = ((row_bits >> px) & 1u) != 0 ? g_fb_white_pixel : 0u;
       }
     } else {
       volatile uint8_t* const pixels = line + base_x * 3;
       for (int px = 0; px < kGlyphWidth; ++px) {
-        const uint8_t intensity = ((row_bits >> px) & 1u) != 0 ? 0xFF : 0x00;
-        pixels[px * 3 + 0] = intensity;
-        pixels[px * 3 + 1] = intensity;
-        pixels[px * 3 + 2] = intensity;
+        const uint32_t value =
+            ((row_bits >> px) & 1u) != 0 ? g_fb_white_pixel : 0u;
+        pixels[px * 3 + 0] = static_cast<uint8_t>(value);
+        pixels[px * 3 + 1] = static_cast<uint8_t>(value >> 8);
+        pixels[px * 3 + 2] = static_cast<uint8_t>(value >> 16);
       }
     }
   }
@@ -188,16 +194,54 @@ static void Outb(const uint16_t port, const uint8_t value) {
   asm volatile("out{b %0, %w1| %w1, %0}" : : "a"(value), "Nd"(port));
 }
 
+// Returns the bits of a color channel of `size` bits at bit `position`, for
+// `0 <= position` and `1 <= size <= 32 - position`.
+static uint32_t ChannelMask(const int position, const int size) {
+  return static_cast<uint32_t>(((uint64_t{1} << size) - 1) << position);
+}
+
+// Returns the value of a white pixel in `format`, which IsSupportedFramebuffer
+// must have accepted: every bit of every color channel set, all other bits
+// (unused or alpha) clear.
+static uint32_t WhitePixel(const VgaPixelFormat& format) {
+  return ChannelMask(format.red_position, format.red_size) |
+         ChannelMask(format.green_position, format.green_size) |
+         ChannelMask(format.blue_position, format.blue_size);
+}
+
+// Returns true if every color channel of `format` has at least one bit and lies
+// within a pixel of `bpp` bits, and no two channels overlap.
+static bool IsSupportedPixelFormat(const VgaPixelFormat& format,
+                                   const int bpp) {
+  const int positions[] = {format.red_position, format.green_position,
+                           format.blue_position};
+  const int sizes[] = {format.red_size, format.green_size, format.blue_size};
+  uint32_t used_bits = 0;
+  for (int i = 0; i < 3; ++i) {
+    if (positions[i] < 0 || sizes[i] <= 0 || sizes[i] > bpp - positions[i]) {
+      return false;
+    }
+    const uint32_t mask = ChannelMask(positions[i], sizes[i]);
+    if ((used_bits & mask) != 0) {
+      return false;
+    }
+    used_bits |= mask;
+  }
+  return true;
+}
+
 // Returns true if the 80x25 console fits on the described framebuffer and
 // RenderCellToFramebuffer can draw on it (see VgaInitFramebuffer in vga.h).
 static bool IsSupportedFramebuffer(const uintptr_t addr,  //
                                    const int pitch,       //
                                    const int width,       //
                                    const int height,      //
-                                   const int bpp) {
+                                   const int bpp,         //
+                                   const VgaPixelFormat& format) {
   if (addr == 0 || (bpp != 32 && bpp != 24) ||
       width < kVgaWidth * kGlyphWidth || height < kVgaHeight * kGlyphHeight ||
-      static_cast<int64_t>(pitch) < static_cast<int64_t>(width) * (bpp / 8)) {
+      static_cast<int64_t>(pitch) < static_cast<int64_t>(width) * (bpp / 8) ||
+      !IsSupportedPixelFormat(format, bpp)) {
     return false;
   }
   if (bpp == 32 && ((addr % 4) != 0 || (pitch % 4) != 0)) {
@@ -217,7 +261,7 @@ static void UartWriteInt(const int value) {
 }
 
 static void UpdateCursor() {
-  if (g_fb_active) {
+  if (g_fb_active || !g_legacy_text) {
     return;
   }
   const uint16_t pos =
@@ -241,6 +285,9 @@ static void WriteCell(const int row, const int col, const char ch) {
     return;
   }
   g_text_shadow[row][col] = ch;
+  if (!g_legacy_text) {
+    return;
+  }
   volatile uint16_t* const vga =
       reinterpret_cast<volatile uint16_t*>(kVgaBufferAddress);
   vga[row * kVgaWidth + col] =
@@ -413,13 +460,37 @@ void VgaPanicWrite(const char* const str) {
   UpdateCursor();
 }
 
+void VgaEnableLegacyText() {
+  const IrqSpinLockGuard lock_guard(g_vga_lock);
+  g_legacy_text = true;
+  if (g_fb_active) {
+    return;
+  }
+  // Show the text written so far, which only g_text_shadow holds.
+  for (int r = 0; r < kVgaHeight; ++r) {
+    for (int c = 0; c < kVgaWidth; ++c) {
+      if (g_text_shadow[r][c] == '\0') {
+        g_text_shadow[r][c] = ' ';
+      }
+      WriteCell(r, c, g_text_shadow[r][c]);
+    }
+  }
+  UpdateCursor();
+}
+
 bool VgaInitFramebuffer(const uintptr_t fb_phys_addr,  //
                         const int pitch,               //
                         const int width,               //
                         const int height,              //
-                        const int bpp) {
+                        const int bpp,                 //
+                        const VgaPixelFormat& format) {
   const char* rejection = nullptr;
-  if (!IsSupportedFramebuffer(fb_phys_addr, pitch, width, height, bpp)) {
+  if (!IsSupportedFramebuffer(fb_phys_addr,  //
+                              pitch,         //
+                              width,         //
+                              height,        //
+                              bpp,           //
+                              format)) {
     rejection = "unsupported";
   } else if (!PagingMapBootstrapRange(fb_phys_addr,
                                       static_cast<int64_t>(pitch) * height)) {
@@ -427,6 +498,7 @@ bool VgaInitFramebuffer(const uintptr_t fb_phys_addr,  //
   }
   if (rejection != nullptr) {
     // The serial port is the only console that is sure to be visible here.
+    // The color channels are listed as Linux's efifb does: red:green:blue.
     UartWrite("[VGA] Ignoring ");
     UartWrite(rejection);
     UartWrite(" framebuffer: addr=");
@@ -439,6 +511,18 @@ bool VgaInitFramebuffer(const uintptr_t fb_phys_addr,  //
     UartWriteInt(height);
     UartWrite(" bpp=");
     UartWriteInt(bpp);
+    UartWrite(" size=");
+    UartWriteInt(format.red_size);
+    UartWrite(":");
+    UartWriteInt(format.green_size);
+    UartWrite(":");
+    UartWriteInt(format.blue_size);
+    UartWrite(" shift=");
+    UartWriteInt(format.red_position);
+    UartWrite(":");
+    UartWriteInt(format.green_position);
+    UartWrite(":");
+    UartWriteInt(format.blue_position);
     UartWrite("\n");
     return false;
   }
@@ -449,6 +533,7 @@ bool VgaInitFramebuffer(const uintptr_t fb_phys_addr,  //
   g_fb_width = width;
   g_fb_height = height;
   g_fb_bpp = bpp;
+  g_fb_white_pixel = WhitePixel(format);
   g_fb_active = true;
 
   for (int r = 0; r < kVgaHeight; ++r) {
@@ -460,6 +545,19 @@ bool VgaInitFramebuffer(const uintptr_t fb_phys_addr,  //
     }
   }
   return true;
+}
+
+bool VgaInitFramebuffer(const uintptr_t fb_phys_addr,  //
+                        const int pitch,               //
+                        const int width,               //
+                        const int height,              //
+                        const int bpp) {
+  return VgaInitFramebuffer(fb_phys_addr,  //
+                            pitch,         //
+                            width,         //
+                            height,        //
+                            bpp,           //
+                            kVgaDefaultPixelFormat);
 }
 
 }  // namespace protos

@@ -3,6 +3,8 @@
 
 #include <cstdint>
 
+#include "status_or.h"
+
 namespace protos {
 
 // Multiboot1 and Multiboot2 bootloader magic numbers passed in EAX.
@@ -13,6 +15,9 @@ constexpr uint32_t kMultiboot1FlagMemBasic = 1u << 0;
 // Multiboot1 info `flags` bit 6: `mmap_length` and `mmap_addr` fields are
 // valid.
 constexpr uint32_t kMultiboot1FlagMmap = 1u << 6;
+// Multiboot1 info `flags` bit 12: the framebuffer fields
+// (`Multiboot1FramebufferInfo`) are valid.
+constexpr uint32_t kMultiboot1FlagFramebuffer = 1u << 12;
 // Multiboot2 tag types: the end tag that terminates the tag list, the memory
 // map, the framebuffer, and copies of the ACPI 1.0 RSDP (old) and the ACPI 2.0+
 // RSDP (new).
@@ -21,9 +26,21 @@ constexpr uint32_t kMultiboot2TagMmap = 6;
 constexpr uint32_t kMultiboot2TagFramebuffer = 8;
 constexpr uint32_t kMultiboot2TagAcpiOld = 14;
 constexpr uint32_t kMultiboot2TagAcpiNew = 15;
-// Multiboot2 framebuffer tag `framebuffer_type` of a direct-color (RGB)
-// framebuffer.
+// Multiboot2 tags that only a UEFI boot loader passes: the EFI system table
+// pointer (32- and 64-bit), the EFI memory map, the marker for EFI boot
+// services left running, and the EFI image handle (32- and 64-bit).
+constexpr uint32_t kMultiboot2TagEfi32 = 11;
+constexpr uint32_t kMultiboot2TagEfi64 = 12;
+constexpr uint32_t kMultiboot2TagEfiMmap = 17;
+constexpr uint32_t kMultiboot2TagEfiBootServices = 18;
+constexpr uint32_t kMultiboot2TagEfi32ImageHandle = 19;
+constexpr uint32_t kMultiboot2TagEfi64ImageHandle = 20;
+// Framebuffer types (`framebuffer_type` of the Multiboot2 framebuffer tag and
+// of the Multiboot1 framebuffer fields): indexed color, direct color (RGB), and
+// EGA text, which GRUB reports for VGA text mode (80x25 cells at 0xB8000).
+constexpr uint8_t kMultiboot2FramebufferTypeIndexed = 0;
 constexpr uint8_t kMultiboot2FramebufferTypeRgb = 1;
+constexpr uint8_t kMultiboot2FramebufferTypeEgaText = 2;
 // Multiboot memory map entry type indicating usable RAM.
 constexpr uint32_t kMemoryTypeAvailable = 1;
 // Largest Multiboot2 boot information structure, and largest Multiboot1 memory
@@ -32,6 +49,20 @@ constexpr int64_t kMaxMultibootStructureBytes = 4 * 1024 * 1024;
 // Maximum number of memory map regions stored in `MultibootMemoryMap`
 // (sized for large UEFI memory maps which often exceed 100+ descriptors).
 constexpr int kMaxMemoryRegions = 512;
+
+// Color information of a direct-color (RGB) framebuffer, which follows the
+// fixed framebuffer fields of either Multiboot version: for each color channel,
+// the bit position of its least significant bit within a pixel and its width
+// in bits.
+struct [[gnu::packed]] MultibootRgbColorInfo {
+  uint8_t red_field_position;
+  uint8_t red_mask_size;
+  uint8_t green_field_position;
+  uint8_t green_mask_size;
+  uint8_t blue_field_position;
+  uint8_t blue_mask_size;
+};
+static_assert(sizeof(MultibootRgbColorInfo) == 6);
 
 // Multiboot1 boot information, up to the memory map fields.
 struct [[gnu::packed]] Multiboot1Info {
@@ -47,6 +78,27 @@ struct [[gnu::packed]] Multiboot1Info {
   uint32_t mmap_addr;
 };
 static_assert(sizeof(Multiboot1Info) == 52);
+
+// Multiboot1 framebuffer information: the last fields of the boot information,
+// at byte offset `kMultiboot1FramebufferInfoOffset`, valid if its `flags` have
+// `kMultiboot1FlagFramebuffer`. `rgb` is valid for RGB framebuffers only (the
+// same bytes hold the palette location of an indexed-color one).
+struct [[gnu::packed]] Multiboot1FramebufferInfo {
+  uint64_t framebuffer_addr;
+  uint32_t framebuffer_pitch;
+  uint32_t framebuffer_width;
+  uint32_t framebuffer_height;
+  uint8_t framebuffer_bpp;
+  uint8_t framebuffer_type;
+  // The specification's table puts the color information at byte 110 of the
+  // boot information, but its example header, whose `struct multiboot_info`
+  // GRUB fills in, holds it in a union with a 32-bit member, which the
+  // compiler aligns to byte 112.
+  uint8_t padding[2];
+  MultibootRgbColorInfo rgb;
+};
+static_assert(sizeof(Multiboot1FramebufferInfo) == 30);
+constexpr int64_t kMultiboot1FramebufferInfoOffset = 88;
 
 // Multiboot1 memory map entry. `size` does not count the `size` field itself,
 // so consecutive entries are `size + 4` bytes apart.
@@ -108,21 +160,33 @@ struct [[gnu::packed]] Multiboot2TagFramebuffer {
 };
 static_assert(sizeof(Multiboot2TagFramebuffer) == 32);
 
+// Multiboot2 framebuffer tag of an RGB framebuffer, with its color information
+// (GRUB's tag `size` is 38).
+struct [[gnu::packed]] Multiboot2TagFramebufferRgb {
+  Multiboot2TagFramebuffer common;
+  MultibootRgbColorInfo rgb;
+};
+static_assert(sizeof(Multiboot2TagFramebufferRgb) == 38);
+
 // Returns a pointer through which the `size` bytes of physical memory at
 // `phys_addr` can be read, or nullptr if they cannot be mapped.
 using MultibootPhysicalMapper = const void* (*)(uintptr_t phys_addr,
                                                 int64_t size);
 
+struct Multiboot2MappedInfo {
+  const uint8_t* data = nullptr;
+  int64_t total_size = 0;
+};
+
 // Maps the Multiboot2 boot information structure at physical address
 // `info_addr` with `map`: first its fixed header, then the `total_size` bytes
-// that the header declares. Returns the mapped structure and stores its
-// `total_size` in `*out_total_size`. Returns nullptr if `info_addr` is 0, if
-// `map` fails, or if `total_size` is smaller than the header, larger than
-// `kMaxMultibootStructureBytes`, or reaches past `max_physical_addr`.
-const uint8_t* Multiboot2MapInfo(uintptr_t info_addr,
-                                 uintptr_t max_physical_addr,
-                                 MultibootPhysicalMapper map,
-                                 int64_t* out_total_size);
+// that the header declares. Returns the mapped structure and its `total_size`,
+// or an error if `info_addr` is 0, if `map` fails, or if `total_size` is
+// smaller than the header, larger than `kMaxMultibootStructureBytes`, or
+// reaches past `max_physical_addr`.
+StatusOr<Multiboot2MappedInfo> Multiboot2MapInfo(uintptr_t info_addr,
+                                                 uintptr_t max_physical_addr,
+                                                 MultibootPhysicalMapper map);
 
 // Walks the tags of a mapped Multiboot2 boot information structure of
 // `total_size` bytes (see `Multiboot2MapInfo`):
@@ -181,12 +245,22 @@ struct MultibootMemoryMap {
   uintptr_t mb_reserved_end;
   uintptr_t mb1_mmap_reserved_start;
   uintptr_t mb1_mmap_reserved_end;
+  // The linear framebuffer, if the boot information describes a direct-color
+  // (RGB) one with 24 or 32 bits per pixel and consistent dimensions (`fb_addr`
+  // is 0 otherwise), and the bit position and width of each of its color
+  // channels (as in `MultibootRgbColorInfo`).
   uintptr_t fb_addr;
   int fb_pitch;
   int fb_width;
   int fb_height;
   int fb_bpp;
   int fb_type;
+  int fb_red_position;
+  int fb_red_size;
+  int fb_green_position;
+  int fb_green_size;
+  int fb_blue_position;
+  int fb_blue_size;
 };
 
 // Records a single memory map entry into `*out_map`, coalescing adjacent or
@@ -200,13 +274,14 @@ bool MultibootRecordMmapEntry(MultibootMemoryMap* out_map,  //
 
 // Parses the Multiboot1 (`0x2BADB002`) or Multiboot2 (`0x36D76289`) boot
 // information at physical address `multiboot_info_addr` (which must lie below
-// `max_physical_addr`) into `*out_map`: the memory map, the Multiboot2
-// framebuffer tag, and the physical ranges occupied by the Multiboot
-// structures. Structures above the 64 MiB bootstrap identity map are mapped on
-// demand with `PagingMapBootstrapRange`. Also logs the magic number and every
-// memory map entry to the console ("[PMM] mmap entry: ..."); `PmmInit` calls
-// this at boot. Returns true if a valid memory map with usable RAM was found
-// without overflowing the region table.
+// `max_physical_addr`) into `*out_map`: the memory map, the framebuffer (the
+// Multiboot2 framebuffer tag or the Multiboot1 framebuffer fields), and the
+// physical ranges occupied by the Multiboot structures. Structures above the
+// 64 MiB bootstrap identity map are mapped on demand with
+// `PagingMapBootstrapRange`. Also logs the magic number and every memory map
+// entry to the console ("[PMM] mmap entry: ..."); `PmmInit` calls this at boot.
+// Returns true if a valid memory map with usable RAM was found without
+// overflowing the region table.
 bool MultibootParseMemoryMap(uint32_t multiboot_magic,
                              uint64_t multiboot_info_addr,
                              uintptr_t max_physical_addr,
@@ -217,6 +292,25 @@ bool MultibootParseMemoryMapQuiet(uint32_t multiboot_magic,
                                   uint64_t multiboot_info_addr,
                                   uintptr_t max_physical_addr,
                                   MultibootMemoryMap* out_map);
+
+// Returns true if the Multiboot1 or Multiboot2 boot information at physical
+// address `multiboot_info_addr` (below `max_physical_addr`) shows that the
+// screen is in VGA text mode, so that the legacy VGA text buffer at 0xB8000 and
+// the CRT controller at I/O ports 0x3D4/0x3D5 exist. Machines without a VGA
+// (UEFI class 3 systems, which have no CSM) may decode neither. Says yes for an
+// EGA text framebuffer at 0xB8000, which GRUB reports for text mode on BIOS
+// machines, and for a BIOS boot without framebuffer information: Multiboot2
+// information without a framebuffer tag or EFI tags (`kMultiboot2TagEfi64` and
+// so on), or Multiboot1 information without framebuffer fields (Multiboot1 has
+// no EFI tags, so a UEFI boot loader that finds no framebuffer cannot be told
+// apart). Says no for pixel framebuffers, for Multiboot2 UEFI boots without a
+// framebuffer (such as headless machines), and for boot information that
+// cannot be read. Maps the boot information like `MultibootParseMemoryMap`,
+// without any console output, so that the console can call it before it
+// writes anything to the screen.
+bool MultibootHasVgaTextMode(uint32_t multiboot_magic,
+                             uint64_t multiboot_info_addr,
+                             uintptr_t max_physical_addr);
 
 }  // namespace protos
 

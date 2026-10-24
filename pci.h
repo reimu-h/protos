@@ -4,6 +4,8 @@
 #include <cstdint>
 #include <memory>
 
+#include "status_or.h"
+
 namespace protos {
 
 // PCI functions, their configuration space and their owners, for the generic
@@ -25,7 +27,9 @@ namespace protos {
 // disabled. Multi-access sequences (a read-modify-write of a register, the
 // sizing of a function's BARs, a claim with its command updates) are atomic
 // with respect to each other. The device records need no lock: they never
-// change after PciInit().
+// change after PciInit(), except for the BARs and the MSI-X geometry of a
+// function that PciInit() had to size in a low-power state, which the first
+// PciRestoreAfterPowerUp() of its owner may correct (see there).
 
 // The location of a function: bus 0..255, device 0..31, function 0..7.
 struct PciAddress {
@@ -83,10 +87,14 @@ inline constexpr int kPciDeviceIdOffset = 0x02;             // 16
 inline constexpr int kPciCommandOffset = 0x04;              // 16
 inline constexpr int kPciStatusOffset = 0x06;               // 16
 inline constexpr int kPciRevisionOffset = 0x08;             // 8
+inline constexpr int kPciCacheLineSizeOffset = 0x0C;        // 8
+inline constexpr int kPciLatencyTimerOffset = 0x0D;         // 8
 inline constexpr int kPciHeaderTypeOffset = 0x0E;           // 8
 inline constexpr int kPciBar0Offset = 0x10;                 // 32 each
 inline constexpr int kPciSecondaryBusOffset = 0x19;         // 8, header type 1
 inline constexpr int kPciSubordinateBusOffset = 0x1A;       // 8, header type 1
+inline constexpr int kPciSubsystemVendorIdOffset = 0x2C;    // 16, header type 0
+inline constexpr int kPciSubsystemIdOffset = 0x2E;          // 16, header type 0
 inline constexpr int kPciCapabilitiesPointerOffset = 0x34;  // 8, types 0, 1
 
 inline constexpr uint16_t kPciCommandIoSpace = 1u << 0;
@@ -118,6 +126,29 @@ inline constexpr uint16_t kPciMsixControlEnable = 1u << 15;
 // Bytes per MSI-X table entry, and table entries per 64-bit PBA entry.
 inline constexpr int kPciMsixEntryBytes = 16;
 inline constexpr int kPciMsixVectorsPerPbaEntry = 64;
+
+// The Power Management capability [PCI Bus Power Management 1.2 §3.2]: 8
+// bytes, whose Control/Status register (PMCSR, capability + 4, 16 bits) holds
+// the power state in bits 1:0.
+inline constexpr uint8_t kPciCapabilityPowerManagement = 0x01;
+inline constexpr int kPciPmCapabilityBytes = 8;
+inline constexpr int kPciPmControlStatusOffset = 4;
+inline constexpr uint16_t kPciPmcsrPowerStateMask = 0x0003;
+inline constexpr uint16_t kPciPmcsrNoSoftReset = 1u << 3;
+inline constexpr uint16_t kPciPmcsrPmeStatus = 1u << 15;  // write 1 to clear
+
+// The PCI Express capability [PCIe Base 6.0 §7.5.3] and its 16-bit registers
+// that hold configuration (all at the capability's offset plus these). The
+// PCI Express Capabilities register holds the capability version in bits 3:0,
+// the Device/Port Type in bits 7:4 and Slot Implemented in bit 8; which of
+// the other registers exist depends on them.
+inline constexpr uint8_t kPciCapabilityExpress = 0x10;
+inline constexpr int kPciExpressCapabilitiesOffset = 0x02;
+inline constexpr int kPciExpressDeviceControlOffset = 0x08;
+inline constexpr int kPciExpressLinkControlOffset = 0x10;
+inline constexpr int kPciExpressSlotControlOffset = 0x18;
+inline constexpr int kPciExpressRootControlOffset = 0x1C;
+inline constexpr int kPciExpressDeviceControl2Offset = 0x28;  // version >= 2
 
 inline constexpr int kPciMaxBars = 6;
 // Capacity of the device table. Functions beyond it are counted (the boot
@@ -209,6 +240,13 @@ struct PciDevice {
   int parent_index = kPciNoParent;
   PciMsi msi;
   PciMsix msix;
+  // Configuration-space offset of the Power Management capability; 0 if the
+  // function has none (or one that does not fit in the configuration space).
+  int pm_offset = 0;
+  // Configuration-space offset of the PCI Express capability; 0 if the
+  // function has none (or one whose Device Control register does not fit in
+  // the configuration space).
+  int pcie_offset = 0;
 };
 
 // Enumerates every function through `config` (non-null), which pci.cpp then
@@ -216,19 +254,30 @@ struct PciDevice {
 // them, then every other bus on which function 0 of a device answers (peer
 // root buses). Decodes the IDs, the BARs (sizing the assigned BARs of
 // claimable functions, each function with its I/O and memory decoding briefly
-// disabled), and the MSI and MSI-X capabilities. Writes nothing to the
-// consoles, and to configuration space only while it sizes BARs; it restores
-// every register it changes.
+// disabled), and the MSI, MSI-X, Power Management and PCI Express
+// capabilities. Writes nothing to the consoles, and to configuration space
+// only while it sizes BARs; it restores every register it changes. A function
+// in a low-power state answers configuration accesses, so its BARs are sized
+// there too; the first PciRestoreAfterPowerUp() after its owner took it to D0
+// checks the sizes.
 // Call it once at boot, before any user process exists and before anything
 // accesses device BARs (while a function's decoding is off, its BARs do not
 // respond); host tests call it again after PciResetForTest(). CHECK-fails if
-// a device is claimed.
+// a device is claimed. A function behind a bridge that firmware left in D1,
+// D2 or D3hot is not found: such a bridge forwards no configuration requests
+// to its secondary bus [PCIe Base 6.0 §5.3.1.4.1].
 void PciInit(std::shared_ptr<PciConfigSpace> config);
 
 int PciDeviceCount();
 // The record of device `index`, or nullptr unless 0 <= index <
-// PciDeviceCount(). The record stays valid and unchanged for good.
+// PciDeviceCount(). The record stays valid for good, and unchanged but for
+// the correction that PciRestoreAfterPowerUp() describes, which only the
+// device's owner can cause; read the record of a device that the caller does
+// not own with PciCopyDevice().
 const PciDevice* PciGetDevice(int index);
+// Copies the record of device `index` under the PCI lock and returns it, or
+// returns an error unless 0 <= index < PciDeviceCount().
+StatusOr<PciDevice> PciCopyDevice(int index);
 // The index of the function at `address`, or -1 if there is none.
 int PciFindDevice(PciAddress address);
 
@@ -290,10 +339,15 @@ enum class PciStatus {
 
 // Makes `owner` (not kPciNoOwner, CHECKed) the owner of device `index`: kOk
 // also if it already was (then nothing changes), kBusy if another owner is,
-// kNoDevice or kNotClaimable. A new claim sets Memory Space on every bridge
-// between the device and its root bus (so that its BARs are reachable), then
-// Memory Space and Interrupt Disable (no legacy INTx) on the device, and leaves
-// Bus Master as it was.
+// kNoDevice or kNotClaimable. A new claim sets Memory Space and Bus Master on
+// every bridge between the device and its root bus (as Linux's
+// pci_enable_bridge() does: USB4/Thunderbolt bridges block even BAR read
+// completions while firmware's pre-boot DMA protection leaves Bus Master off,
+// and a bridge initiates no DMA of its own), then Memory Space and Interrupt
+// Disable (no legacy INTx) on the device, clears MSI Enable and MSI-X Enable
+// (as Linux's pci_msi_init() does: firmware may have left one on, and the
+// owner's irq_alloc must find both off), and leaves the device's Bus Master as
+// it was.
 PciStatus PciClaim(int index, uintptr_t owner);
 // If `owner` owns device `index`: PciQuiesce()s it, frees the claim and returns
 // kOk. Otherwise changes nothing and returns kNotOwner or kNoDevice.
@@ -310,6 +364,112 @@ int PciClaimedCount();
 // clears the device's Bus Master. Bridges are shared, so nothing ever clears
 // their bits. Returns kOk, kNotOwner or kNoDevice.
 PciStatus PciSetBusMaster(int index, uintptr_t owner, bool enable);
+
+// Device power states [PCI Bus Power Management 1.2 §5], as PMCSR encodes
+// them. Firmware may leave a function that it doesn't use in D3hot, where the
+// function still answers configuration accesses but decodes no memory or I/O
+// accesses (its BARs read all ones). A bridge in D1, D2 or D3hot forwards no
+// requests to its secondary bus at all [PCIe Base 6.0 §5.3.1.4.1].
+enum class PciPowerState : uint8_t { kD0 = 0, kD1 = 1, kD2 = 2, kD3hot = 3 };
+
+// The configuration of a function that PciSetPowerStateD0() saves before it
+// takes the function out of a low-power state, for PciRestoreAfterPowerUp():
+// leaving D3hot without No_Soft_Reset resets the function [PCI Bus Power
+// Management 1.2 §5.4.1], and firmware's settings of these registers matter
+// (e.g. a Max_Payload_Size that matches the upstream port). The BARs are in
+// the device record.
+struct PciPowerUpContext {
+  struct Register {
+    int offset = 0;
+    int width = 0;  // bytes: 1, 2 or 4
+    uint32_t value = 0;
+  };
+  static constexpr int kMaxRegisters = 16;
+
+  // Whether PciSetPowerStateD0() saved anything.
+  bool saved = false;
+  uint16_t command = 0;
+  // Cache Line Size and Latency Timer; the PCI Express Device Control, Link
+  // Control, Slot Control, Root Control and Device Control 2 registers that
+  // the function has; and a bridge's bus numbers, I/O, memory and
+  // prefetchable windows, and Bridge Control.
+  int register_count = 0;
+  Register registers[kMaxRegisters];
+};
+
+struct PciPowerTransition {
+  PciPowerState from = PciPowerState::kD0;
+  PciPowerUpContext context{};
+};
+
+// If `owner` owns device `index`, or `index` is a bridge between such a device
+// and its root bus (bridges must be in D0 before anything behind them can be
+// reached; wake them first, from the root bus down): if the function has a
+// Power Management capability whose power state is not D0, saves its
+// configuration in `context` (when `save_context` is true), writes D0 (leaving
+// PME_Status as it is) and sets `from` to the state that it left; otherwise
+// writes nothing and sets `from` to kD0. A function that left a lower state
+// may only be accessed after PciPowerUpDelayMicroseconds(from), and once
+// PciFunctionResponds(); then it needs PciRestoreAfterPowerUp(). Returns the
+// transition on success, or kNotOwner / kNoDevice.
+StatusOr<PciPowerTransition, PciStatus> PciSetPowerStateD0(
+    int index, uintptr_t owner, bool save_context = true);
+
+// The recovery time that a function needs after it left `from` for D0 before
+// it may be accessed [PCI Bus Power Management 1.2 §5.6.1]: 10 ms from D3hot,
+// 200 us from D2, none from D1 or D0.
+int64_t PciPowerUpDelayMicroseconds(PciPowerState from);
+
+// Whether function `index` (CHECKed) completes configuration reads: whether its
+// Command and Status registers read as something other than all ones. After
+// its recovery time a function may still be initializing, and answers
+// configuration requests with Configuration Request Retry Status meanwhile,
+// which the Root Complex retries and finally completes as all ones [PCIe Base
+// 6.0 §2.3.1].
+bool PciFunctionResponds(int index);
+
+// After PciSetPowerStateD0() and the recovery time, if `owner` may manage
+// function `index` as for PciSetPowerStateD0(): writes back what a reset
+// cleared, each register only if it differs: the BARs (from the record), a
+// bridge's bus numbers and windows (these with the function's decoding off),
+// and the other registers saved in `context` (if not null). Then, for the
+// owned device, sets Memory Space and Bus Master on its upstream bridges and
+// Memory Space and Interrupt Disable on the device, as PciClaim() did, and the
+// other Command bits that `context` saved except Bus Master (which the driver
+// sets when it is ready); for a bridge, sets the Command bits that `context`
+// saved (nothing clears a bridge's bits).
+// If PciInit() sized the owned device's BARs while it was in a low-power
+// state, also sizes them again, once, now that it is in D0: a function that
+// ignored the size probes there would have reported its base alignment as its
+// size. If the BARs differ, corrects them and the MSI-X geometry in the record
+// under the PCI lock and returns true; otherwise returns false. Returns
+// kNotOwner or kNoDevice on error.
+StatusOr<bool, PciStatus> PciRestoreAfterPowerUp(
+    int index, uintptr_t owner, const PciPowerUpContext* context = nullptr);
+
+// What PciApplyClaimQuirks() changed.
+struct PciClaimQuirks {
+  // The Intel xHCI port routing, and the masks of the ports that it routed to
+  // the xHCI as read back: SuperSpeed (USB3_PSSEN) and USB 2.0 (XUSB2PR).
+  bool intel_usb_ports_routed = false;
+  uint32_t usb3_ports = 0;
+  uint32_t usb2_ports = 0;
+};
+
+// If `owner` owns device `index`: applies the fixups that some devices need
+// before their driver touches them and returns them; otherwise changes nothing
+// and returns kNotOwner or kNoDevice. Call it after PciRestoreAfterPowerUp():
+// a reset would undo them. The one fixup: the USB ports that the EHCI and xHCI
+// controllers of Intel 7/8/9-series PCHs share stay routed to EHCI, for which
+// there is no driver, until the OS switches them. So for an Intel xHCI (class
+// 0C0330) while an Intel EHCI (class 0C0320) exists, as Linux's
+// usb_enable_intel_xhci_ports() does, writes USB3PRM (0xDC) to USB3_PSSEN
+// (0xD8), which turns on the SuperSpeed terminations of the switchable ports,
+// and then XUSB2PRM (0xD4) to XUSB2PR (0xD0), which switches their USB 2.0
+// lines to the xHCI; except on Sony VAIO T-series laptops (subsystem
+// 104D:90A8), which can't switch them.
+StatusOr<PciClaimQuirks, PciStatus> PciApplyClaimQuirks(int index,
+                                                        uintptr_t owner);
 
 // The registers that PciQuiesce() read back at its end.
 struct PciQuiesceResult {

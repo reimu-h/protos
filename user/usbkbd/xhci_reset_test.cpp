@@ -13,10 +13,10 @@
 #include <string>
 #include <vector>
 
-#include "user/xhci_controller.h"
-#include "user/xhci_platform.h"
-#include "user/xhci_regs.h"
-#include "xhci_sim.h"
+#include "user/usbkbd/xhci_controller.h"
+#include "user/usbkbd/xhci_platform.h"
+#include "user/usbkbd/xhci_regs.h"
+#include "user/usbkbd/xhci_sim.h"
 
 namespace protos::usb {
 

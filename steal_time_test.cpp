@@ -135,21 +135,26 @@ TEST(StealTimeTest, StealNsFromSnapshotAndReadKvmStealNsSeqlock) {
 
 TEST(StealTimeTest, TimerTickBoundsAndStealNsToTicksConversion) {
   // Invalid inputs return 0.
-  EXPECT_THAT(TimerTickNsUpperBound(0), t::Eq(0));
-  EXPECT_THAT(TimerTickNsLowerBound(0), t::Eq(0));
+  EXPECT_THAT(TickNsUpperBound(0), t::Eq(0));
+  EXPECT_THAT(TickNsLowerBound(0), t::Eq(0));
+  EXPECT_THAT(TickNsUpperBound(-4000000), t::Eq(0));
+  EXPECT_THAT(TickNsLowerBound(-4000000), t::Eq(0));
 
-  // Nominal 250 Hz tick (initial_count = 250,000, divide-by-16) is
-  // 4,000,000 ns. Upper bound is strictly larger and lower bound is strictly
-  // smaller.
-  const int64_t cal_upper = TimerTickNsUpperBound(250000);
-  const int64_t cal_lower = TimerTickNsLowerBound(250000);
-  EXPECT_GT(cal_upper, 4000000);
-  EXPECT_LT(cal_lower, 4000000);
-  EXPECT_GT(cal_lower, 0);
+  // A nominal 250 Hz tick lasts 4,000,000 ns. The upper bound on a tick of at
+  // most that is strictly larger (by 1/1024 and 1 ns), and the lower bound on
+  // a tick of at least that strictly smaller (by 1/1024).
+  const int64_t cal_upper = TickNsUpperBound(4000000);
+  const int64_t cal_lower = TickNsLowerBound(4000000);
+  EXPECT_THAT(cal_upper, t::Eq(4000000 + 3906 + 1));
+  EXPECT_THAT(cal_lower, t::Eq(4000000 - 3906));
 
-  // Larger initial_count yields proportionally larger bounds.
-  EXPECT_GT(TimerTickNsUpperBound(375000), 6000000);
-  EXPECT_LT(TimerTickNsLowerBound(375000), 6000000);
+  // Longer ticks yield proportionally larger bounds.
+  EXPECT_GT(TickNsUpperBound(6000000), 6000000);
+  EXPECT_LT(TickNsLowerBound(6000000), 6000000);
+  EXPECT_GT(TickNsLowerBound(6000000), cal_upper);
+  // The upper bound saturates instead of overflowing.
+  EXPECT_THAT(TickNsUpperBound(INT64_MAX), t::Eq(INT64_MAX));
+  EXPECT_THAT(TickNsUpperBound(INT64_MAX - 1), t::Eq(INT64_MAX));
 
   // StealNsToTicks uses floor division so steal ticks are never over-counted.
   EXPECT_THAT(StealNsToTicks(0, cal_upper), t::Eq(0));

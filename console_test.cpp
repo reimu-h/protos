@@ -38,13 +38,11 @@ void VgaWrite(const char* const str) {
   g_consoles.write_order.push_back('V');
 }
 
-bool UartTryGetc(char* const out) {
-  if (out == nullptr ||
-      g_consoles.read_pos >= static_cast<int>(g_consoles.rx_buffer.size())) {
-    return false;
+StatusOr<char> UartTryGetc() {
+  if (g_consoles.read_pos >= static_cast<int>(g_consoles.rx_buffer.size())) {
+    return kStatusError;
   }
-  *out = g_consoles.rx_buffer[g_consoles.read_pos++];
-  return true;
+  return g_consoles.rx_buffer[g_consoles.read_pos++];
 }
 
 void UartPushRx(const char* const data, const int64_t size) {
@@ -94,9 +92,7 @@ TEST_F(ConsoleTest, NumbersAreFormattedOnceAndWrittenToBothConsoles) {
 }
 
 TEST_F(ConsoleTest, PushInputAndTryReadcPopBytesInFifoOrder) {
-  char ch = '\0';
-  EXPECT_FALSE(ConsoleTryReadc(&ch));
-  EXPECT_FALSE(ConsoleTryReadc(nullptr));
+  EXPECT_FALSE(ConsoleTryReadc().ok());
 
   ConsolePushInput("sh\n", 3);
   ConsolePushInput("exit\n", 5);
@@ -105,25 +101,26 @@ TEST_F(ConsoleTest, PushInputAndTryReadcPopBytesInFifoOrder) {
   ConsolePushInput("x", -1);
 
   std::string out;
-  while (ConsoleTryReadc(&ch)) {
-    out.push_back(ch);
+  for (StatusOr<char> ch = ConsoleTryReadc(); ch.ok(); ch = ConsoleTryReadc()) {
+    out.push_back(*ch);
   }
   EXPECT_THAT(out, t::Eq("sh\nexit\n"));
-  EXPECT_FALSE(ConsoleTryReadc(&ch));
+  EXPECT_FALSE(ConsoleTryReadc().ok());
 }
 
 TEST_F(ConsoleTest, ClearInputDiscardsUnreadBytes) {
   ConsolePushInput("abc", 3);
-  char ch = '\0';
-  ASSERT_TRUE(ConsoleTryReadc(&ch));
-  EXPECT_THAT(ch, t::Eq('a'));
+  StatusOr<char> ch = ConsoleTryReadc();
+  ASSERT_TRUE(ch.ok());
+  EXPECT_THAT(*ch, t::Eq('a'));
 
   ConsoleClearInput();
-  EXPECT_FALSE(ConsoleTryReadc(&ch));
+  EXPECT_FALSE(ConsoleTryReadc().ok());
 
   ConsolePushInput("z", 1);
-  ASSERT_TRUE(ConsoleTryReadc(&ch));
-  EXPECT_THAT(ch, t::Eq('z'));
+  ch = ConsoleTryReadc();
+  ASSERT_TRUE(ch.ok());
+  EXPECT_THAT(*ch, t::Eq('z'));
 }
 
 TEST_F(ConsoleTest, DisablingVgaEchoSuppressesScreenWritesOnly) {

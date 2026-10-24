@@ -674,8 +674,10 @@ TEST(IdtTest, ArmedFaultProbeEndsAtAPageFaultOfKernelCode) {
   ArmFaultProbe(&cpu, &probe);
 
   InterruptFrame frame = KernelPageFault(0x104321, kProbeResumeRsp - 8);
+  frame.rflags |= kRflagsDirectionBit;
   IdtDispatch(&frame);
-  // Back at the resume point, with AC clear and interrupts still disabled.
+  // Back at the resume point, with AC and DF clear and interrupts still
+  // disabled.
   EXPECT_THAT(frame.rip, t::Eq(kProbeResumeRip));
   EXPECT_THAT(frame.rsp, t::Eq(kProbeResumeRsp));
   EXPECT_THAT(frame.rflags, t::Eq(0x46u));

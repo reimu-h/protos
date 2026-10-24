@@ -1,4 +1,4 @@
-#include "user/xhci_regs.h"
+#include "user/usbkbd/xhci_regs.h"
 
 #include <gmock/gmock.h>
 #include <gtest/gtest.h>
@@ -9,7 +9,7 @@
 #include <random>
 #include <vector>
 
-#include "xhci_sim.h"
+#include "user/usbkbd/xhci_sim.h"
 
 namespace protos::usb {
 
@@ -114,8 +114,9 @@ class XhciRegsSimTest : public t::Test {
 
 TEST_F(XhciRegsSimTest, DecodesQemuCapabilities) {
   XhciSim& sim = Create(XhciSimConfig{});
-  XhciCaps caps;
-  ASSERT_THAT(DecodeCaps(sim, &caps), t::Eq(XhciStatus::kOk));
+  const StatusOr<XhciCaps, XhciStatus> decoded = DecodeCaps(sim);
+  ASSERT_THAT(decoded.status(), t::Eq(XhciStatus::kOk));
+  const XhciCaps& caps = *decoded;
   EXPECT_THAT(caps.cap_length, t::Eq(0x40));
   EXPECT_THAT(caps.hci_version, t::Eq(0x0100));
   EXPECT_THAT(caps.max_slots, t::Eq(64));
@@ -150,8 +151,9 @@ TEST_F(XhciRegsSimTest, DecodesARealHardwareProfileAndMasksOffsetJunk) {
   config.db_off_raw = 0x3003;   // bits 1:0 reserved
   config.rts_off_raw = 0x201F;  // bits 4:0 reserved
   XhciSim& sim = Create(config);
-  XhciCaps caps;
-  ASSERT_THAT(DecodeCaps(sim, &caps), t::Eq(XhciStatus::kOk));
+  const StatusOr<XhciCaps, XhciStatus> decoded = DecodeCaps(sim);
+  ASSERT_THAT(decoded.status(), t::Eq(XhciStatus::kOk));
+  const XhciCaps& caps = *decoded;
   EXPECT_THAT(caps.cap_length, t::Eq(0x80));
   EXPECT_THAT(caps.hci_version, t::Eq(0x0110));
   EXPECT_THAT(caps.max_ports, t::Eq(16));
@@ -174,10 +176,8 @@ TEST_F(XhciRegsSimTest, RejectsInvalidCapabilityLength) {
     config.cap_length = cap_length;
     config.ext_caps.clear();
     XhciSim& sim = Create(config);
-    XhciCaps caps;
-    EXPECT_THAT(DecodeCaps(sim, &caps), t::Eq(XhciStatus::kBadCapabilities))
+    EXPECT_THAT(DecodeCaps(sim).status(), t::Eq(XhciStatus::kBadCapabilities))
         << "CAPLENGTH 0x" << std::hex << cap_length;
-    EXPECT_THAT(caps.cap_length, t::Eq(0));
     ExpectReadOnlyAccesses();
   }
 }
@@ -189,8 +189,7 @@ TEST_F(XhciRegsSimTest, RejectsZeroSlotsPortsOrInterrupters) {
     config.max_ports = which == 1 ? 0 : 8;
     config.max_interrupters = which == 2 ? 0 : 16;
     XhciSim& sim = Create(config);
-    XhciCaps caps;
-    EXPECT_THAT(DecodeCaps(sim, &caps), t::Eq(XhciStatus::kBadCapabilities))
+    EXPECT_THAT(DecodeCaps(sim).status(), t::Eq(XhciStatus::kBadCapabilities))
         << which;
     ExpectReadOnlyAccesses();
   }
@@ -223,8 +222,7 @@ TEST_F(XhciRegsSimTest, RejectsRegisterRegionsOutsideTheBarOrOverlapping) {
     config.db_off_raw = layout.db_off;
     config.rts_off_raw = layout.rts_off;
     XhciSim& sim = Create(config);
-    XhciCaps caps;
-    EXPECT_THAT(DecodeCaps(sim, &caps), t::Eq(XhciStatus::kBadCapabilities))
+    EXPECT_THAT(DecodeCaps(sim).status(), t::Eq(XhciStatus::kBadCapabilities))
         << layout.name;
     ExpectReadOnlyAccesses();
   }
@@ -235,8 +233,7 @@ TEST_F(XhciRegsSimTest, WindowTooSmallForTheCapabilitiesIsNotRead) {
   config.bar_size = 0x1C;
   config.ext_caps.clear();
   XhciSim& sim = Create(config);
-  XhciCaps caps;
-  EXPECT_THAT(DecodeCaps(sim, &caps), t::Eq(XhciStatus::kBadCapabilities));
+  EXPECT_THAT(DecodeCaps(sim).status(), t::Eq(XhciStatus::kBadCapabilities));
   EXPECT_THAT(sim.accesses(), t::IsEmpty());
 }
 
@@ -244,15 +241,15 @@ TEST_F(XhciRegsSimTest, ControllerThatDoesNotDecodeIsReportedAsSuch) {
   XhciSimConfig config;
   config.all_ones = true;
   XhciSim& sim = Create(config);
-  XhciCaps caps;
-  EXPECT_THAT(DecodeCaps(sim, &caps), t::Eq(XhciStatus::kNotDecoding));
+  EXPECT_THAT(DecodeCaps(sim).status(), t::Eq(XhciStatus::kNotDecoding));
   ExpectReadOnlyAccesses();
 }
 
 TEST_F(XhciRegsSimTest, ExtendedCapabilitiesOfQemu) {
   XhciSim& sim = Create(XhciSimConfig{});
-  XhciCaps caps;
-  ASSERT_THAT(DecodeCaps(sim, &caps), t::Eq(XhciStatus::kOk));
+  const StatusOr<XhciCaps, XhciStatus> decoded = DecodeCaps(sim);
+  ASSERT_THAT(decoded.status(), t::Eq(XhciStatus::kOk));
+  XhciCaps caps = *decoded;
   ASSERT_THAT(ParseExtendedCaps(sim, &caps), t::Eq(XhciStatus::kOk));
   EXPECT_THAT(caps.legacy_offset, t::Eq(0));
   ASSERT_THAT(caps.protocol_count, t::Eq(2));
@@ -278,8 +275,9 @@ TEST_F(XhciRegsSimTest, FindsTheLegacyCapabilityBetweenOtherCapabilities) {
       ProtocolCap(0x8040, 2, 0, 1, 10),    LegacyCap(0x8100),
       ProtocolCap(0x8200, 3, 0x20, 11, 6), VendorCap(0x8300, 0xFF, 1)};
   XhciSim& sim = Create(config);
-  XhciCaps caps;
-  ASSERT_THAT(DecodeCaps(sim, &caps), t::Eq(XhciStatus::kOk));
+  const StatusOr<XhciCaps, XhciStatus> decoded = DecodeCaps(sim);
+  ASSERT_THAT(decoded.status(), t::Eq(XhciStatus::kOk));
+  XhciCaps caps = *decoded;
   ASSERT_THAT(ParseExtendedCaps(sim, &caps), t::Eq(XhciStatus::kOk));
   EXPECT_THAT(caps.legacy_offset, t::Eq(0x8100));
   ASSERT_THAT(caps.protocol_count, t::Eq(2));
@@ -295,8 +293,9 @@ TEST_F(XhciRegsSimTest, NoExtendedCapabilities) {
   XhciSimConfig config;
   config.ext_caps.clear();
   XhciSim& sim = Create(config);
-  XhciCaps caps;
-  ASSERT_THAT(DecodeCaps(sim, &caps), t::Eq(XhciStatus::kOk));
+  const StatusOr<XhciCaps, XhciStatus> decoded = DecodeCaps(sim);
+  ASSERT_THAT(decoded.status(), t::Eq(XhciStatus::kOk));
+  XhciCaps caps = *decoded;
   EXPECT_THAT(caps.xecp_offset, t::Eq(0));
   const int reads = static_cast<int>(sim.accesses().size());
   ASSERT_THAT(ParseExtendedCaps(sim, &caps), t::Eq(XhciStatus::kOk));
@@ -345,9 +344,9 @@ TEST_F(XhciRegsSimTest, MalformedListsAreRejectedWithoutLeavingTheWindow) {
     config.ext_caps = test_case.ext_caps;
     config.xecp_override = test_case.xecp_override;
     XhciSim& sim = Create(config);
-    XhciCaps caps;
-    ASSERT_THAT(DecodeCaps(sim, &caps), t::Eq(XhciStatus::kOk))
-        << test_case.name;
+    const StatusOr<XhciCaps, XhciStatus> decoded = DecodeCaps(sim);
+    ASSERT_THAT(decoded.status(), t::Eq(XhciStatus::kOk)) << test_case.name;
+    XhciCaps caps = *decoded;
     EXPECT_THAT(ParseExtendedCaps(sim, &caps),
                 t::Eq(XhciStatus::kBadCapabilities))
         << test_case.name;
@@ -369,8 +368,9 @@ TEST_F(XhciRegsSimTest, ExtendedCapabilityWalkIsBounded) {
   }
   config.ext_caps.push_back(LegacyCap(0x8000 + 4 * 60));
   XhciSim& sim = Create(config);
-  XhciCaps caps;
-  ASSERT_THAT(DecodeCaps(sim, &caps), t::Eq(XhciStatus::kOk));
+  const StatusOr<XhciCaps, XhciStatus> decoded = DecodeCaps(sim);
+  ASSERT_THAT(decoded.status(), t::Eq(XhciStatus::kOk));
+  XhciCaps caps = *decoded;
   const int before = static_cast<int>(sim.accesses().size());
   EXPECT_THAT(ParseExtendedCaps(sim, &caps),
               t::Eq(XhciStatus::kBadCapabilities));
@@ -386,8 +386,9 @@ TEST_F(XhciRegsSimTest, AllOnesCapabilityHeaderMeansNotDecoding) {
   config.ext_caps[1].dwords[0] = 0xFFFF0000u;  // id/next filled in: 0xFFFF00FF
   config.ext_caps[1].next_override = 0xFF;     // header 0xFFFFFFFF
   XhciSim& sim = Create(config);
-  XhciCaps caps;
-  ASSERT_THAT(DecodeCaps(sim, &caps), t::Eq(XhciStatus::kOk));
+  const StatusOr<XhciCaps, XhciStatus> decoded = DecodeCaps(sim);
+  ASSERT_THAT(decoded.status(), t::Eq(XhciStatus::kOk));
+  XhciCaps caps = *decoded;
   EXPECT_THAT(sim.Peek(0x30), t::Eq(0xFFFFFFFFu));
   EXPECT_THAT(ParseExtendedCaps(sim, &caps), t::Eq(XhciStatus::kNotDecoding));
   ExpectReadOnlyAccesses();
@@ -405,8 +406,9 @@ TEST_F(XhciRegsSimTest, SupportedProtocolRangesAreClampedToThePorts) {
   };
   config.cap_length = 0x80;
   XhciSim& sim = Create(config);
-  XhciCaps caps;
-  ASSERT_THAT(DecodeCaps(sim, &caps), t::Eq(XhciStatus::kOk));
+  const StatusOr<XhciCaps, XhciStatus> decoded = DecodeCaps(sim);
+  ASSERT_THAT(decoded.status(), t::Eq(XhciStatus::kOk));
+  XhciCaps caps = *decoded;
   ASSERT_THAT(ParseExtendedCaps(sim, &caps), t::Eq(XhciStatus::kOk));
   ASSERT_THAT(caps.protocol_count, t::Eq(2));
   EXPECT_THAT(caps.protocols[0].first_port, t::Eq(7));
@@ -429,8 +431,9 @@ TEST_F(XhciRegsSimTest, AtMostEightProtocolRangesAreRecorded) {
   }
   config.max_ports = 10;
   XhciSim& sim = Create(config);
-  XhciCaps caps;
-  ASSERT_THAT(DecodeCaps(sim, &caps), t::Eq(XhciStatus::kOk));
+  const StatusOr<XhciCaps, XhciStatus> decoded = DecodeCaps(sim);
+  ASSERT_THAT(decoded.status(), t::Eq(XhciStatus::kOk));
+  XhciCaps caps = *decoded;
   ASSERT_THAT(ParseExtendedCaps(sim, &caps), t::Eq(XhciStatus::kOk));
   EXPECT_THAT(caps.protocol_count, t::Eq(kMaxProtocolRanges));
   EXPECT_THAT(caps.PortProtocolMajor(8), t::Eq(2));
@@ -457,10 +460,11 @@ TEST_F(XhciRegsSimTest, RandomListsAlwaysTerminateInsideTheWindow) {
     config.cap_length = 0x20 + 0x10 * count;  // The capabilities fit in
     config.xecp_override = static_cast<int>(random() % 0x1100);
     XhciSim& sim = Create(config);
-    XhciCaps caps;
-    if (DecodeCaps(sim, &caps) != XhciStatus::kOk) {
+    const StatusOr<XhciCaps, XhciStatus> decoded = DecodeCaps(sim);
+    if (!decoded.ok()) {
       continue;
     }
+    XhciCaps caps = *decoded;
     const XhciStatus status = ParseExtendedCaps(sim, &caps);
     EXPECT_THAT(status, t::AnyOf(t::Eq(XhciStatus::kOk),
                                  t::Eq(XhciStatus::kBadCapabilities),

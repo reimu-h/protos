@@ -38,11 +38,17 @@ PROJECT_INCLUDE_FLAGS := -iquote .
 # -mgeneral-regs-only keeps the kernel off the x87/MMX/SSE/AVX registers, which
 # hold the values of the interrupted user program until the scheduler saves
 # them (fpu.h).
+# -U_GLIBCXX_ASSERTIONS and -fcf-protection=none (also for the user programs)
+# undo hardening that some distributions' GCC enables by default: the
+# libstdc++ assertions call std::__glibcxx_assert_fail, which neither the
+# kernel nor the user programs define, and CET adds endbr64 instructions and
+# GNU property notes, which they don't use.
 CXXFLAGS := -m64 -masm=intel -std=c++20 -O2 -Wall -Wextra $(WERROR_FLAG) \
             -ffreestanding -nostdlib -fno-builtin \
             -fno-exceptions -fno-rtti -mno-red-zone \
             -mgeneral-regs-only -fno-stack-protector -fno-pie \
             -fstack-clash-protection \
+            -U_GLIBCXX_ASSERTIONS -fcf-protection=none \
             -DPROTOS_SELFTEST=$(if $(filter 1,$(SELFTEST)),1,0) \
             $(PROJECT_INCLUDE_FLAGS) -I$(BUILD_DIR)/include
 
@@ -75,13 +81,15 @@ USER_CXXFLAGS := -m64 -masm=intel -std=c++20 -O2 -Wall -Wextra $(WERROR_FLAG) \
                  -fno-stack-protector -fno-pie \
                  -mcmodel=kernel -fno-asynchronous-unwind-tables \
                  -fno-tree-loop-distribute-patterns \
+                 -U_GLIBCXX_ASSERTIONS -fcf-protection=none \
                  $(PROJECT_INCLUDE_FLAGS) -I$(BUILD_DIR)/include
 USER_LDFLAGS := -m elf_x86_64 -z max-page-size=0x1000 -z noexecstack \
                 -static -nostdlib -T user/user.ld
-USER_HDRS := syscall_abi.h user/syscall.h user/sh_lib.h user/usertest.h \
-             user/usb_descriptors.h user/usb_hid.h user/xhci_context.h \
-             user/xhci_controller.h user/xhci_platform.h user/xhci_regs.h \
-             user/xhci_ring.h
+USER_HDRS := status_or.h syscall_abi.h user/syscall.h user/sh/sh_lib.h \
+             user/usertest/usertest.h user/usbkbd/usb_descriptors.h \
+             user/usbkbd/usb_hid.h user/usbkbd/xhci_context.h \
+             user/usbkbd/xhci_controller.h user/usbkbd/xhci_platform.h \
+             user/usbkbd/xhci_regs.h user/usbkbd/xhci_ring.h
 USER_ELFS := $(patsubst %,$(BUILD_DIR)/user/%.elf,$(USER_PROGRAMS))
 
 TEST_BUILD_MODES := debug opt
@@ -103,10 +111,10 @@ TEST_SAN_ENV_ubsan := UBSAN_OPTIONS=print_stacktrace=1:halt_on_error=1
 TEST_SAN_ENV_lsan := LSAN_OPTIONS=print_suppressions=0
 TEST_SAN_ENV_tsan := TSAN_OPTIONS=halt_on_error=1
 
-# Unit tests: every *_test.cpp file in the root and in selftest/. A test is
-# named after its file without the directory (selftest/stress_test.cpp is
+# Unit tests: every *_test.cpp file in the root, selftest/, and user/*/. A test
+# is named after its file without the directory (selftest/stress_test.cpp is
 # stress_test), so test file names must be unique.
-HOST_TEST_SRCS := $(sort $(wildcard *_test.cpp selftest/*_test.cpp))
+HOST_TEST_SRCS := $(sort $(wildcard *_test.cpp selftest/*_test.cpp user/*/*_test.cpp))
 HOST_TESTS := $(notdir $(basename $(HOST_TEST_SRCS)))
 ifneq ($(words $(HOST_TESTS)),$(words $(sort $(HOST_TESTS))))
 $(error Unit test file names must be unique: $(HOST_TEST_SRCS))
@@ -199,6 +207,7 @@ CXX_SRCS := \
 CXX_HDRS := \
     check.h \
     format.h \
+    status_or.h \
     interrupts.h \
     spinlock.h \
     uart.h \
@@ -234,15 +243,15 @@ CXX_HDRS := \
     user_access.h \
     user_programs.h \
     user/syscall.h \
-    user/sh_lib.h \
-    user/usertest.h \
-    user/usb_descriptors.h \
-    user/usb_hid.h \
-    user/xhci_context.h \
-    user/xhci_controller.h \
-    user/xhci_platform.h \
-    user/xhci_regs.h \
-    user/xhci_ring.h \
+    user/sh/sh_lib.h \
+    user/usertest/usertest.h \
+    user/usbkbd/usb_descriptors.h \
+    user/usbkbd/usb_hid.h \
+    user/usbkbd/xhci_context.h \
+    user/usbkbd/xhci_controller.h \
+    user/usbkbd/xhci_platform.h \
+    user/usbkbd/xhci_regs.h \
+    user/usbkbd/xhci_ring.h \
     selftest/selftest.h \
     selftest/boot_selftest.h \
     selftest/fpu_lifecycle_layout.h \
@@ -276,8 +285,6 @@ KERNEL_MB1_ISO := $(BUILD_DIR)/kernel-mb1.iso
 DOCKER ?= docker
 DOCKER_IMAGE ?= x86-64-kernel-build
 DOCKER_PLATFORM ?= linux/amd64
-HOST_UID ?= $(shell id -u)
-HOST_GID ?= $(shell id -g)
 DOCKER_STAMP := $(BUILD_DIR)/.docker.stamp
 
 NPROC := $(shell nproc 2>/dev/null || getconf _NPROCESSORS_ONLN 2>/dev/null || echo 1)
@@ -340,6 +347,19 @@ endif
 BOOT_TEST_ENV_VARS := BIOS_TIMEOUT_SECS UEFI_TIMEOUT_SECS MIN_STRESS_PASSES OVMF OVMF_VARS REQUIRE_UEFI BOOT_TEST_JOBS BOOT_TEST_USB QEMU_USB_FLAGS USB_SESSION_TIMEOUT_SECS
 
 ifeq ($(USE_DOCKER),1)
+# The container runs as the host user, so that the files it writes in the
+# bind-mounted checkout are the user's. Rootless Docker and Podman map
+# container root to the host user instead (and the other container users to
+# subordinate IDs, which can't write the checkout), so with them it runs as
+# root. HOST_UID and HOST_GID override the choice.
+ifeq ($(origin HOST_UID)$(origin HOST_GID),undefinedundefined)
+DOCKER_ROOTLESS := $(shell $(DOCKER) info --format '{{json .}}' 2>/dev/null | grep -Eq '"name=rootless"|"rootless": ?true' && echo 1)
+endif
+HOST_UID ?= $(if $(DOCKER_ROOTLESS),0,$(shell id -u))
+HOST_GID ?= $(if $(DOCKER_ROOTLESS),0,$(shell id -g))
+# SELinux lets containers use only files with a container label, which ':z'
+# gives the checkout.
+DOCKER_VOLUME_OPTS ?= $(if $(filter 1,$(shell cat /sys/fs/selinux/enforce 2>/dev/null)),:z)
 # With KVM=1 the container gets the host's /dev/kvm, membership in the group
 # that owns the device (so that the container user may open it), and KVM=1 for
 # test_boot.sh.
@@ -349,11 +369,18 @@ DOCKER_RUN_ARGS := --rm --platform=$(DOCKER_PLATFORM) \
                    --user $(HOST_UID):$(HOST_GID) \
                    -e HOME=/tmp $(foreach var,$(BOOT_TEST_ENV_VARS),-e $(var)) \
                    $(DOCKER_KVM_ARGS) \
-                   -v "$(CURDIR):/workspace" \
+                   -v "$(CURDIR):/workspace$(DOCKER_VOLUME_OPTS)" \
                    -w /workspace
 DOCKER_RUN := $(DOCKER) run $(DOCKER_RUN_ARGS) $(DOCKER_IMAGE)
 DOCKER_RUN_INTERACTIVE := $(DOCKER) run -it $(DOCKER_RUN_ARGS) $(DOCKER_IMAGE)
 DOCKER_DEPS := $(DOCKER_STAMP)
+# The stamp holds the ID of the image that this checkout's Dockerfile built.
+# Every checkout (and deflake.py) uses the same image tag, so the image is
+# built again (mostly from the build cache) whenever the tag names no image or
+# another one: after `docker image prune -a`, or after a checkout with another
+# Dockerfile built its image.
+DOCKER_IMAGE_ID := $(shell $(DOCKER) image inspect --format '{{.Id}}' $(DOCKER_IMAGE) 2>/dev/null)
+DOCKER_IMAGE_STALE := $(if $(DOCKER_IMAGE_ID),$(if $(filter $(DOCKER_IMAGE_ID),$(shell cat $(DOCKER_STAMP) 2>/dev/null)),,1),1)
 else
 DOCKER_RUN :=
 DOCKER_RUN_INTERACTIVE :=
@@ -390,11 +417,11 @@ endif
 $(BUILD_DIR):
 	mkdir -p $(BUILD_DIR)
 
-$(DOCKER_STAMP): Dockerfile | $(BUILD_DIR)
+$(DOCKER_STAMP): Dockerfile $(if $(DOCKER_IMAGE_STALE),FORCE) | $(BUILD_DIR)
 	$(DOCKER) build --platform=$(DOCKER_PLATFORM) -t $(DOCKER_IMAGE) .
 	mkdir -p $(BUILD_DIR)/include
 	$(DOCKER_RUN) cp -r /usr/include/gmock /usr/include/gtest $(BUILD_DIR)/include/
-	touch $(DOCKER_STAMP)
+	$(DOCKER) image inspect --format '{{.Id}}' $(DOCKER_IMAGE) >$@
 
 $(FREESTANDING_CXX_CONFIG): Makefile | $(BUILD_DIR)
 	mkdir -p $(dir $@)
@@ -412,18 +439,20 @@ $(BUILD_DIR)/%.o: %.cpp $(CXX_HDRS) $(FREESTANDING_CXX_CONFIG) $(KERNEL_CONFIG_S
 	@mkdir -p $(@D)
 	$(DOCKER_RUN) $(CXX) $(CXXFLAGS) -c $< -o $@
 
-# User programs. These rules have shorter stems than the kernel's, so make
-# prefers them for $(BUILD_DIR)/user/.
-$(BUILD_DIR)/user/%.o: user/%.cpp $(USER_HDRS) $(FREESTANDING_CXX_CONFIG) $(KERNEL_CONFIG_STAMP) $(DOCKER_DEPS) | $(BUILD_DIR)
+# User programs. Their objects have a static pattern rule, which every GNU make
+# prefers to the kernel's pattern rule above for them: make 3.81 (macOS's
+# /usr/bin/make) would pick between two pattern rules in the order they are
+# defined, not by the shortest stem.
+USER_OBJS := $(BUILD_DIR)/user/crt.o $(foreach p,$(USER_PROGRAMS),$(BUILD_DIR)/user/$(p)/$(p).o)
+$(USER_OBJS): $(BUILD_DIR)/user/%.o: user/%.cpp $(USER_HDRS) $(FREESTANDING_CXX_CONFIG) $(KERNEL_CONFIG_STAMP) $(DOCKER_DEPS) | $(BUILD_DIR)
 	@mkdir -p $(@D)
 	$(DOCKER_RUN) $(CXX) $(USER_CXXFLAGS) -c $< -o $@
 
-$(BUILD_DIR)/user/%.elf: $(BUILD_DIR)/user/%.o $(BUILD_DIR)/user/crt.o user/user.ld $(KERNEL_CONFIG_STAMP) $(DOCKER_DEPS)
-	$(DOCKER_RUN) $(LD) $(USER_LDFLAGS) $(BUILD_DIR)/user/crt.o $< -o $@
-
-# Keep the user program objects, which make would otherwise delete as
-# intermediate files.
-.SECONDARY: $(patsubst %,$(BUILD_DIR)/user/%.o,$(USER_PROGRAMS))
+define DEFINE_USER_PROGRAM
+$(BUILD_DIR)/user/$(1).elf: $(BUILD_DIR)/user/$(1)/$(1).o $(BUILD_DIR)/user/crt.o user/user.ld $(KERNEL_CONFIG_STAMP) $(DOCKER_DEPS)
+	$(DOCKER_RUN) $(LD) $(USER_LDFLAGS) $(BUILD_DIR)/user/crt.o $$< -o $$@
+endef
+$(foreach p,$(USER_PROGRAMS),$(eval $(call DEFINE_USER_PROGRAM,$(p))))
 
 $(BUILD_DIR)/user_programs.o: $(USER_ELFS)
 
@@ -545,9 +574,12 @@ endif
 
 test-host: unit-test
 
-run-boot-test: $(KERNEL_ISO) $(KERNEL_MB1_ISO) $(DOCKER_DEPS)
+# test_boot.sh's Docker fallback passes its options and ISO files on in
+# BOOT_TEST_OPTS and BOOT_TEST_ISOS, as words for the shell. Without ISO files
+# the boot test boots the ISOs of the working tree, which it builds first.
+run-boot-test: $(if $(BOOT_TEST_ISOS),,$(KERNEL_ISO) $(KERNEL_MB1_ISO)) $(DOCKER_DEPS)
 	$(if $(filter 1,$(SELFTEST)),,$(error run-boot-test needs the self-tests; do not set SELFTEST=0))
-	$(DOCKER_RUN) ./test_boot.sh $(KERNEL_ISO) $(KERNEL_MB1_ISO)
+	$(DOCKER_RUN) ./test_boot.sh $(BOOT_TEST_OPTS) $(or $(BOOT_TEST_ISOS),$(KERNEL_ISO) $(KERNEL_MB1_ISO))
 
 # Boots the kernel interactively; the serial console is attached to the
 # terminal (press Ctrl-A X to quit QEMU). KVM=1 enables KVM acceleration.

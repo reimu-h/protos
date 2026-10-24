@@ -438,10 +438,11 @@ CpuidResult FakeSmpHardware::Cpuid(const uint32_t leaf,
     result.ecx = 1u << 8;
     result.edx = initial_apic_id;
   } else if (leaf == 0x15) {
-    result.eax = 1;
+    result.eax = options_.cpuid_leaf15_eax;
     result.ebx = options_.cpuid_leaf15_ebx;
     result.ecx = options_.cpuid_leaf15_ecx;
   } else if (leaf == 0x16) {
+    result.eax = options_.cpuid_leaf16_eax;
     result.ecx = options_.cpuid_leaf16_ecx;
   }
   return result;

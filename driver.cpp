@@ -13,6 +13,11 @@
 #include "pmm.h"
 #include "spinlock.h"
 #include "syscall_abi.h"
+#if !__STDC_HOSTED__
+#include "console.h"
+#include "smp.h"
+#include "task.h"
+#endif
 
 namespace protos {
 namespace {
@@ -49,6 +54,181 @@ static bool PageOverlapsRange(const uint64_t page_phys,   //
   return page_phys < range_end && range_phys < page_end;
 }
 
+static const char* PowerStateName(const PciPowerState state) {
+  switch (state) {
+    case PciPowerState::kD0:
+      return "D0";
+    case PciPowerState::kD1:
+      return "D1";
+    case PciPowerState::kD2:
+      return "D2";
+    case PciPowerState::kD3hot:
+      return "D3hot";
+  }
+  return "?";
+}
+
+// A console line about a PCI function, "[PCI] bb:dd.f: <text>\n", built in
+// place; text beyond its capacity is cut off.
+class DeviceLogLine {
+ public:
+  explicit DeviceLogLine(const PciDevice& dev) {
+    Append("[PCI] ");
+    AppendHex(dev.address.bus, 2);
+    Append(":");
+    AppendHex(dev.address.device, 2);
+    Append(".");
+    AppendHex(dev.address.function, 1);
+    Append(": ");
+  }
+
+  DeviceLogLine& Append(const char* text) {
+    while (*text != '\0' && length_ < kCapacity - 2) {
+      buffer_[length_++] = *text++;
+    }
+    return *this;
+  }
+
+  // Lowercase hexadecimal, without a prefix, `digits` digits.
+  DeviceLogLine& AppendHex(const uint32_t value, const int digits) {
+    for (int i = digits - 1; i >= 0 && length_ < kCapacity - 2; --i) {
+      buffer_[length_++] = "0123456789abcdef"[(value >> (4 * i)) & 0xF];
+    }
+    return *this;
+  }
+
+  // Ends the line and writes it to the kernel console.
+  void Emit() {
+    buffer_[length_++] = '\n';
+    buffer_[length_] = '\0';
+    g_driver_env->Log(buffer_);
+  }
+
+ private:
+  static constexpr int kCapacity = 112;
+  char buffer_[kCapacity] = {};
+  int length_ = 0;
+};
+
+// How long, at most, PowerUpFunction() waits after the recovery time for a
+// function to answer configuration reads again: the 1 s within which PCI
+// Express requires a function to complete them after a Conventional Reset
+// [PCIe Base 6.0 §6.6.1]. It polls like Linux's pci_dev_wait(), sleeping 1, 2,
+// 4, ... ms in between.
+constexpr int64_t kPowerUpReadyTimeoutMicroseconds = 1000000;
+constexpr int64_t kPowerUpFirstPollMicroseconds = 1000;
+
+// Waits, without a lock held, until function `index` answers configuration
+// reads (PciFunctionResponds()), for at most about
+// kPowerUpReadyTimeoutMicroseconds. Returns whether it answers.
+static bool WaitUntilFunctionResponds(const int index) {
+  int64_t waited_us = 0;
+  for (int64_t poll_us = kPowerUpFirstPollMicroseconds;; poll_us *= 2) {
+    if (PciFunctionResponds(index)) {
+      return true;
+    }
+    if (waited_us >= kPowerUpReadyTimeoutMicroseconds) {
+      return false;
+    }
+    g_driver_env->SleepMicroseconds(poll_us);
+    waited_us += poll_us;
+  }
+}
+
+// Puts function `index` (a device that `owner` has just claimed, or a bridge
+// above it) into D0 (pci.h), in case firmware left it in a low-power state
+// where it decodes no memory accesses and forwards nothing to the buses behind
+// it. Waits out its recovery time and until it answers again, without a lock
+// held, and then writes back the configuration that the transition reset (or,
+// when `force_restore` is set because an ancestor bridge just woke, applies the
+// claim-time configuration that PciClaim() deferred while the bridge was
+// asleep). Logs "[PCI] bb:dd.f: woke from <state>". Returns whether `index`
+// left a low-power state.
+static bool PowerUpFunction(const int index,        //
+                            const uintptr_t owner,  //
+                            const bool force_restore = false) {
+  const StatusOr<PciPowerTransition, PciStatus> transition =
+      PciSetPowerStateD0(index, owner);
+  if (!transition.ok()) {
+    return false;
+  }
+  const PciPowerState from = transition->from;
+  if (from == PciPowerState::kD0) {
+    if (force_restore) {
+      const StatusOr<bool, PciStatus> resized =
+          PciRestoreAfterPowerUp(index, owner);
+      if (resized.ok() && *resized) {
+        CHECK(g_driver_env != nullptr);
+        DeviceLogLine(*PciGetDevice(index))
+            .Append("corrected BAR sizes in D0")
+            .Emit();
+      }
+    }
+    return false;
+  }
+  CHECK(g_driver_env != nullptr);
+  const PciDevice* const dev = PciGetDevice(index);
+  const int64_t delay_us = PciPowerUpDelayMicroseconds(from);
+  if (delay_us > 0) {
+    g_driver_env->SleepMicroseconds(delay_us);
+  }
+  // A function that is still not ready drops the writes below, as if it had
+  // never been woken; its driver then finds it not decoding.
+  if (!WaitUntilFunctionResponds(index)) {
+    DeviceLogLine(*dev)
+        .Append("not ready after leaving ")
+        .Append(PowerStateName(from))
+        .Emit();
+  }
+  const StatusOr<bool, PciStatus> resized =
+      PciRestoreAfterPowerUp(index, owner, &transition->context);
+  DeviceLogLine(*dev).Append("woke from ").Append(PowerStateName(from)).Emit();
+  if (resized.ok() && *resized) {
+    DeviceLogLine(*dev).Append("corrected BAR sizes in D0").Emit();
+  }
+  return true;
+}
+
+// Puts device `dev_idx`, which `owner` has just claimed, into D0, and first
+// every bridge between it and its root bus, from the root bus down: a bridge
+// in D1, D2 or D3hot forwards no requests to its secondary bus, so nothing
+// behind it can be woken or reached [PCIe Base 6.0 §5.3.1.4.1] (as Linux's
+// pci_enable_bridge() wakes the upstream bridges first).
+static void PowerUpClaimedDevice(const int dev_idx, const uintptr_t owner) {
+  int depth = 0;
+  for (int bridge = PciGetDevice(dev_idx)->parent_index; bridge != kPciNoParent;
+       bridge = PciGetDevice(bridge)->parent_index) {
+    ++depth;
+  }
+  bool ancestor_woke = false;
+  for (int level = depth; level >= 0; --level) {
+    int index = dev_idx;
+    for (int i = 0; i < level; ++i) {
+      index = PciGetDevice(index)->parent_index;
+    }
+    if (PowerUpFunction(index, owner, level == 0 && ancestor_woke)) {
+      ancestor_woke = true;
+    }
+  }
+}
+
+// Applies the claim-time fixups of device `dev_idx`, which `owner` has just
+// claimed and woken (PciApplyClaimQuirks()), and logs what they changed.
+static void ApplyClaimQuirks(const int dev_idx, const uintptr_t owner) {
+  const StatusOr<PciClaimQuirks, PciStatus> quirks =
+      PciApplyClaimQuirks(dev_idx, owner);
+  if (!quirks.ok() || !quirks->intel_usb_ports_routed) {
+    return;
+  }
+  CHECK(g_driver_env != nullptr);
+  DeviceLogLine(*PciGetDevice(dev_idx))
+      .Append("routed USB ports from EHCI: SuperSpeed 0x")
+      .AppendHex(quirks->usb3_ports, 8)
+      .Append(", USB 2.0 0x")
+      .AppendHex(quirks->usb2_ports, 8)
+      .Emit();
+}
+
 }  // namespace
 
 void DriverInit(std::shared_ptr<DriverEnvironment> driver_env,
@@ -66,36 +246,35 @@ void DriverInit() {
 }
 #endif
 
-void DriverFillPciDeviceInfo(const PciDevice& src, PciDeviceInfo* const dst) {
-  CHECK(dst != nullptr);
-  *dst = PciDeviceInfo{};
-  dst->bus = src.address.bus;
-  dst->device = src.address.device;
-  dst->function = src.address.function;
-  dst->header_type =
+PciDeviceInfo DriverFillPciDeviceInfo(const PciDevice& src) {
+  PciDeviceInfo dst{};
+  dst.bus = src.address.bus;
+  dst.device = src.address.device;
+  dst.function = src.address.function;
+  dst.header_type =
       src.header_type | (src.multi_function ? kPciHeaderTypeMultiFunction : 0);
-  dst->vendor_id = src.vendor_id;
-  dst->device_id = src.device_id;
-  dst->class_code = src.class_code;
-  dst->subclass = src.subclass;
-  dst->prog_if = src.prog_if;
-  dst->revision = src.revision;
-  dst->claimable = src.claimable ? 1 : 0;
-  dst->msi_vectors = src.msi.offset != 0
-                         ? static_cast<uint8_t>(1U << src.msi.vectors_log2)
+  dst.vendor_id = src.vendor_id;
+  dst.device_id = src.device_id;
+  dst.class_code = src.class_code;
+  dst.subclass = src.subclass;
+  dst.prog_if = src.prog_if;
+  dst.revision = src.revision;
+  dst.claimable = src.claimable ? 1 : 0;
+  dst.msi_vectors = src.msi.offset != 0
+                        ? static_cast<uint8_t>(1U << src.msi.vectors_log2)
+                        : 0;
+  dst.msix_vectors = (src.msix.offset != 0 && src.msix.valid)
+                         ? static_cast<uint16_t>(src.msix.table_size)
                          : 0;
-  dst->msix_vectors = (src.msix.offset != 0 && src.msix.valid)
-                          ? static_cast<uint16_t>(src.msix.table_size)
-                          : 0;
   for (int i = 0; i < kPciMaxBars; ++i) {
-    dst->bars[i].type = ToAbiBarType(src.bars[i].type);
-    dst->bars[i].prefetchable = src.bars[i].prefetchable ? 1 : 0;
-    dst->bars[i].phys_base = src.bars[i].base;
-    dst->bars[i].size = src.bars[i].size;
+    dst.bars[i].type = ToAbiBarType(src.bars[i].type);
+    dst.bars[i].prefetchable = src.bars[i].prefetchable ? 1 : 0;
+    dst.bars[i].phys_base = src.bars[i].base;
+    dst.bars[i].size = src.bars[i].size;
   }
-  dst->parent_index = static_cast<int32_t>(src.parent_index);
-  dst->msi_masking =
-      (src.msi.offset != 0 && src.msi.per_vector_masking) ? 1 : 0;
+  dst.parent_index = static_cast<int32_t>(src.parent_index);
+  dst.msi_masking = (src.msi.offset != 0 && src.msi.per_vector_masking) ? 1 : 0;
+  return dst;
 }
 
 bool DriverPageHoldsMsixStructure(const PciMsix& msix,
@@ -108,20 +287,19 @@ bool DriverPageHoldsMsixStructure(const PciMsix& msix,
          PageOverlapsRange(aligned_page, msix.pba_phys, msix.pba_bytes);
 }
 
-int64_t DriverFindClaimedBarForRange(const int* const claimed_indices,  //
-                                     const int claimed_count,           //
-                                     const uint64_t phys_addr,          //
-                                     const int64_t size,                //
-                                     int* const out_device_index,       //
-                                     int* const out_bar_index) {
+StatusOr<ClaimedBarMatch> DriverFindClaimedBarForRange(
+    const int* const claimed_indices,  //
+    const int claimed_count,           //
+    const uint64_t phys_addr,          //
+    const int64_t size) {
   if (phys_addr == 0 || (phys_addr & kPageMask) != 0 || size <= 0 ||
       (static_cast<uint64_t>(size) & kPageMask) != 0 ||
       size > kSyscallMmioMaxSize ||
       phys_addr > UINT64_MAX - static_cast<uint64_t>(size)) {
-    return kSyscallErrorInvalid;
+    return Error(kSyscallErrorInvalid);
   }
   if (claimed_indices == nullptr || claimed_count <= 0) {
-    return kSyscallErrorAccess;
+    return Error(kSyscallErrorAccess);
   }
 
   for (int c = 0; c < claimed_count; ++c) {
@@ -139,19 +317,13 @@ int64_t DriverFindClaimedBarForRange(const int* const claimed_indices,  //
         const uint64_t page_phys =
             phys_addr + static_cast<uint64_t>(p) * kPageSize;
         if (DriverPageHoldsMsixStructure(dev->msix, page_phys)) {
-          return kSyscallErrorAccess;
+          return Error(kSyscallErrorAccess);
         }
       }
-      if (out_device_index != nullptr) {
-        *out_device_index = dev_idx;
-      }
-      if (out_bar_index != nullptr) {
-        *out_bar_index = b;
-      }
-      return 0;
+      return ClaimedBarMatch{.device_index = dev_idx, .bar_index = b};
     }
   }
-  return kSyscallErrorAccess;
+  return Error(kSyscallErrorAccess);
 }
 
 DriverReleaseRecord DriverLastReleaseRecord() {
@@ -159,35 +331,38 @@ DriverReleaseRecord DriverLastReleaseRecord() {
   return g_last_release_record;
 }
 
-DriverContext::~DriverContext() { Release(/*address_space_alive=*/false); }
-
-bool DriverContext::IsClaimed(const int index) const {
-  for (int i = 0; i < claimed_count_; ++i) {
-    if (claimed_[i] == index) {
-      return true;
-    }
-  }
-  return false;
+DriverContext::~DriverContext() {
+  (void)Release(/*address_space_alive=*/false);
 }
 
-int64_t DriverContext::PciInfo(const int64_t index,
-                               PciDeviceInfo* const out_info) const {
+int DriverContext::FindClaimedSlotLocked(const int index) const {
+  for (int i = 0; i < claimed_count_; ++i) {
+    if (claimed_[i] == index) {
+      return i;
+    }
+  }
+  return -1;
+}
+
+bool DriverContext::IsClaimed(const int index) const {
+  const IrqSpinLockGuard guard(lock_);
+  return FindClaimedSlotLocked(index) >= 0;
+}
+
+StatusOr<DriverPciInfoResult> DriverContext::PciInfo(
+    const int64_t index) const {
   const int count = PciDeviceCount();
-  if (out_info == nullptr && index == 0) {
-    return count;
-  }
   if (index < 0 || index >= count) {
-    return kSyscallErrorNoDevice;
+    return Error(kSyscallErrorNoDevice);
   }
-  if (out_info == nullptr) {
-    return kSyscallErrorFault;
+  // Under the PCI lock: another process's claim may be correcting the record
+  // (PciRestoreAfterPowerUp()).
+  const StatusOr<PciDevice> dev = PciCopyDevice(static_cast<int>(index));
+  if (!dev.ok()) {
+    return Error(kSyscallErrorNoDevice);
   }
-  const PciDevice* const dev = PciGetDevice(static_cast<int>(index));
-  if (dev == nullptr) {
-    return kSyscallErrorNoDevice;
-  }
-  DriverFillPciDeviceInfo(*dev, out_info);
-  return count;
+  return DriverPciInfoResult{.count = count,
+                             .info = DriverFillPciDeviceInfo(*dev)};
 }
 
 int64_t DriverContext::Claim(const int64_t index) {
@@ -206,7 +381,7 @@ int64_t DriverContext::Claim(const int64_t index) {
   if (!dev->claimable) {
     return kSyscallErrorInvalid;
   }
-  if (claimed_count_ >= kSyscallMaxClaims) {
+  if (ClaimedCount() >= kSyscallMaxClaims) {
     const uintptr_t cur_owner = PciOwner(dev_idx);
     if (cur_owner != kPciNoOwner && cur_owner != OwnerToken()) {
       return kSyscallErrorBusy;
@@ -216,10 +391,18 @@ int64_t DriverContext::Claim(const int64_t index) {
 
   const PciStatus status = PciClaim(dev_idx, OwnerToken());
   switch (status) {
-    case PciStatus::kOk:
+    case PciStatus::kOk: {
+      PowerUpClaimedDevice(dev_idx, OwnerToken());
+      ApplyClaimQuirks(dev_idx, OwnerToken());
       DeviceIrqResetDevice(dev_idx);
-      claimed_[claimed_count_++] = dev_idx;
+      // Only the process's own task claims devices and releases them.
+      const IrqSpinLockGuard guard(lock_);
+      DCHECK(!released_ && claimed_count_ < kSyscallMaxClaims);
+      claimed_[claimed_count_] = dev_idx;
+      irq_allocated_[claimed_count_] = false;
+      ++claimed_count_;
       return 0;
+    }
     case PciStatus::kBusy:
       return kSyscallErrorBusy;
     case PciStatus::kNoDevice:
@@ -258,12 +441,19 @@ int64_t DriverContext::MmioMap(AddressSpace* const space,  //
                                const uint64_t phys_addr,   //
                                const int64_t size) {
   CHECK(g_driver_env != nullptr);
-  int dev_idx = -1;
-  int bar_idx = -1;
-  const int64_t check_rc = DriverFindClaimedBarForRange(
-      claimed_, claimed_count_, phys_addr, size, &dev_idx, &bar_idx);
-  if (check_rc != 0) {
-    return check_rc;
+  int claimed_snapshot[kSyscallMaxClaims] = {};
+  int claimed_count_snapshot = 0;
+  {
+    const IrqSpinLockGuard guard(lock_);
+    claimed_count_snapshot = claimed_count_;
+    for (int i = 0; i < claimed_count_snapshot; ++i) {
+      claimed_snapshot[i] = claimed_[i];
+    }
+  }
+  const StatusOr<ClaimedBarMatch> bar_match = DriverFindClaimedBarForRange(
+      claimed_snapshot, claimed_count_snapshot, phys_addr, size);
+  if (!bar_match.ok()) {
+    return bar_match.status();
   }
   if (g_driver_env->RangeOverlapsUsableRam(phys_addr, size)) {
     return kSyscallErrorAccess;
@@ -292,18 +482,17 @@ int64_t DriverContext::MmioMap(AddressSpace* const space,  //
   return static_cast<int64_t>(user_base);
 }
 
-int64_t DriverContext::DmaAlloc(AddressSpace* const space,  //
-                                const int64_t size,         //
-                                const uint64_t flags,       //
-                                uint64_t* const out_phys) {
+StatusOr<DriverDmaAllocation> DriverContext::DmaAlloc(
+    AddressSpace* const space,  //
+    const int64_t size,         //
+    const uint64_t flags) {
   CHECK(g_driver_env != nullptr);
   if (size <= 0 || (static_cast<uint64_t>(size) & kPageMask) != 0 ||
-      size > kSyscallDmaMaxSize || (flags & ~kSyscallDmaFlagsMask) != 0 ||
-      out_phys == nullptr) {
-    return kSyscallErrorInvalid;
+      size > kSyscallDmaMaxSize || (flags & ~kSyscallDmaFlagsMask) != 0) {
+    return Error(kSyscallErrorInvalid);
   }
   if (dma_total_bytes_ + size > kSyscallDmaMaxTotalSize) {
-    return kSyscallErrorNoMemory;
+    return Error(kSyscallErrorNoMemory);
   }
 
   const int64_t pages = size / kPageSize;
@@ -311,7 +500,7 @@ int64_t DriverContext::DmaAlloc(AddressSpace* const space,  //
       static_cast<uintptr_t>(pages + 1) * static_cast<uintptr_t>(kPageSize);
   const uintptr_t window_end = kDriverDmaWindowBase + kDriverDmaWindowSize;
   if (span_bytes > window_end - next_dma_addr_) {
-    return kSyscallErrorNoMemory;
+    return Error(kSyscallErrorNoMemory);
   }
 
   const uintptr_t max_phys =
@@ -319,7 +508,7 @@ int64_t DriverContext::DmaAlloc(AddressSpace* const space,  //
   const uintptr_t phys_base =
       g_driver_env->AllocContiguousFrames(pages, max_phys);
   if (phys_base == 0) {
-    return kSyscallErrorNoMemory;
+    return Error(kSyscallErrorNoMemory);
   }
 
   g_driver_env->ZeroPhysicalRange(phys_base, size);
@@ -333,13 +522,42 @@ int64_t DriverContext::DmaAlloc(AddressSpace* const space,  //
                                          static_cast<uintptr_t>(kPageSize);
     if (!g_driver_env->MapUserOwnedFrame(space, va, pa)) {
       g_driver_env->FreeContiguousFrames(pa, pages - p);
-      return kSyscallErrorNoMemory;
+      return Error(kSyscallErrorNoMemory);
     }
   }
 
   dma_total_bytes_ += size;
-  *out_phys = static_cast<uint64_t>(phys_base);
-  return static_cast<int64_t>(user_base);
+  return DriverDmaAllocation{.user_addr = user_base,
+                             .phys_addr = static_cast<uint64_t>(phys_base)};
+}
+
+int64_t DriverContext::ReserveIrqBitsLocked(const int index, const int count) {
+  const int slot = FindClaimedSlotLocked(index);
+  if (released_ || slot < 0) {
+    return kSyscallErrorAccess;
+  }
+  if (irq_allocated_[slot]) {
+    return kSyscallErrorBusy;
+  }
+  if (next_irq_bit_ + count > kSyscallIrqMaxCount) {
+    return kSyscallErrorNoMemory;
+  }
+  irq_allocated_[slot] = true;
+  const int first_bit = next_irq_bit_;
+  next_irq_bit_ += count;
+  return first_bit;
+}
+
+void DriverContext::UnreserveIrqBitsLocked(const int index, const int first_bit,
+                                           const int count) {
+  const int slot = FindClaimedSlotLocked(index);
+  if (slot >= 0) {
+    irq_allocated_[slot] = false;
+  }
+  // Bits reserved since then stay reserved, and these stay unused.
+  if (next_irq_bit_ == first_bit + count) {
+    next_irq_bit_ = first_bit;
+  }
 }
 
 int64_t DriverContext::IrqAlloc(const int64_t index,  //
@@ -359,42 +577,47 @@ int64_t DriverContext::IrqAlloc(const int64_t index,  //
     return kSyscallErrorInvalid;
   }
   const int int_count = static_cast<int>(count);
-  if (next_irq_bit_ + int_count > kSyscallIrqMaxCount) {
-    return kSyscallErrorNoMemory;
+  int64_t reserved = 0;
+  {
+    const IrqSpinLockGuard guard(lock_);
+    reserved = ReserveIrqBitsLocked(dev_idx, int_count);
   }
+  if (reserved < 0) {
+    return reserved;
+  }
+  const int first_bit = static_cast<int>(reserved);
 
+  // Without `lock_`: mapping the MSI-X table may need a TLB shootdown, which
+  // must not run under an IrqSpinLock.
   int vectors[kSyscallIrqMaxCount] = {};
-  const DeviceIrqStatus alloc_status =
-      DeviceIrqAllocateVectors(OwnerToken(), dev_idx, int_count, next_irq_bit_,
-                               &irq_pending_, owner_task, vectors);
-  if (alloc_status == DeviceIrqStatus::kBusy) {
-    return kSyscallErrorBusy;
-  }
-  if (alloc_status == DeviceIrqStatus::kNoMemory) {
-    return kSyscallErrorNoMemory;
-  }
-  if (alloc_status != DeviceIrqStatus::kOk) {
-    return kSyscallErrorInvalid;
-  }
-
-  const DeviceIrqStatus prog_status =
-      DeviceIrqProgramDevice(dev_idx, int_count, mode, vectors);
-  if (prog_status != DeviceIrqStatus::kOk) {
-    DeviceIrqFreeDeviceVectors(OwnerToken(), dev_idx);
-    switch (prog_status) {
-      case DeviceIrqStatus::kBusy:
-        return kSyscallErrorBusy;
-      case DeviceIrqStatus::kNoMemory:
-        return kSyscallErrorNoMemory;
-      case DeviceIrqStatus::kInvalid:
-      case DeviceIrqStatus::kOk:
-        return kSyscallErrorInvalid;
+  DeviceIrqStatus status = DeviceIrqAllocateVectors(OwnerToken(),   //
+                                                    dev_idx,        //
+                                                    int_count,      //
+                                                    first_bit,      //
+                                                    &irq_pending_,  //
+                                                    owner_task,     //
+                                                    vectors);
+  if (status == DeviceIrqStatus::kOk) {
+    status = DeviceIrqProgramDevice(dev_idx, int_count, mode, vectors);
+    if (status != DeviceIrqStatus::kOk) {
+      DeviceIrqFreeDeviceVectors(OwnerToken(), dev_idx);
     }
   }
-
-  const int first_bit = next_irq_bit_;
-  next_irq_bit_ += int_count;
-  return first_bit;
+  if (status != DeviceIrqStatus::kOk) {
+    const IrqSpinLockGuard guard(lock_);
+    UnreserveIrqBitsLocked(dev_idx, first_bit, int_count);
+  }
+  switch (status) {
+    case DeviceIrqStatus::kOk:
+      return first_bit;
+    case DeviceIrqStatus::kBusy:
+      return kSyscallErrorBusy;
+    case DeviceIrqStatus::kNoMemory:
+      return kSyscallErrorNoMemory;
+    case DeviceIrqStatus::kInvalid:
+      return kSyscallErrorInvalid;
+  }
+  return kSyscallErrorInvalid;
 }
 
 int64_t DriverContext::IrqWait(const uint64_t mask,                        //
@@ -408,34 +631,55 @@ int64_t DriverContext::IrqWait(const uint64_t mask,                        //
 bool DriverContext::BindVectorsForSelftest(const int device_index,  //
                                            const int count,         //
                                            Task* const owner_task) {
-  if (!IsClaimed(device_index) || count < 1 || count > kSyscallIrqMaxCount ||
-      next_irq_bit_ + count > kSyscallIrqMaxCount) {
+  if (count < 1 || count > kSyscallIrqMaxCount) {
     return false;
   }
+  // Under `lock_` throughout (allocating vectors maps nothing), so that a
+  // concurrent Release() either comes first or frees these vectors too.
+  const IrqSpinLockGuard guard(lock_);
+  const int64_t reserved = ReserveIrqBitsLocked(device_index, count);
+  if (reserved < 0) {
+    return false;
+  }
+  const int first_bit = static_cast<int>(reserved);
   int vectors[kSyscallIrqMaxCount] = {};
-  if (DeviceIrqAllocateVectors(OwnerToken(), device_index, count, next_irq_bit_,
-                               &irq_pending_, owner_task,
+  if (DeviceIrqAllocateVectors(OwnerToken(),   //
+                               device_index,   //
+                               count,          //
+                               first_bit,      //
+                               &irq_pending_,  //
+                               owner_task,     //
                                vectors) != DeviceIrqStatus::kOk) {
+    UnreserveIrqBitsLocked(device_index, first_bit, count);
     return false;
   }
-  next_irq_bit_ += count;
   return true;
 }
 
-void DriverContext::Release(const bool address_space_alive,
-                            DriverReleaseRecord* const out_record) {
-  if (released_) {
-    return;
+DriverReleaseRecord DriverContext::Release(const bool address_space_alive) {
+  int claimed_snapshot[kSyscallMaxClaims] = {};
+  int claimed_count_snapshot = 0;
+  {
+    const IrqSpinLockGuard guard(lock_);
+    if (released_) {
+      return DriverReleaseRecord{};
+    }
+    released_ = true;
+    claimed_count_snapshot = claimed_count_;
+    for (int i = 0; i < claimed_count_snapshot; ++i) {
+      claimed_snapshot[i] = claimed_[i];
+      irq_allocated_[i] = false;
+    }
+    claimed_count_ = 0;
   }
-  released_ = true;
 
   DriverReleaseRecord record{};
   // Step 1: Quiesce every claimed device in PCI config space (stops DMA and
   // MSI/MSI-X generation and flushes posted writes with a non-posted config
   // read-back), then mask MSI-X table entries in MMIO while Memory Space is
   // still enabled and unmap the kernel MSI-X mapping.
-  for (int i = 0; i < claimed_count_; ++i) {
-    const int dev_idx = claimed_[i];
+  for (int i = 0; i < claimed_count_snapshot; ++i) {
+    const int dev_idx = claimed_snapshot[i];
     PciQuiesce(dev_idx);
     DeviceIrqReleaseDevice(dev_idx);
     ++record.quiesced_count;
@@ -443,7 +687,7 @@ void DriverContext::Release(const bool address_space_alive,
 
   // Step 2: Unregister IDT handlers and free vectors in [0x50, 0x7F].
   const bool all_quiesced_before_free =
-      (record.quiesced_count == claimed_count_);
+      (record.quiesced_count == claimed_count_snapshot);
   record.freed_vectors = DeviceIrqFreeVectors(OwnerToken());
   record.quiesced_before_vectors_freed =
       all_quiesced_before_free && (DeviceIrqFreeVectors(OwnerToken()) == 0) &&
@@ -451,21 +695,18 @@ void DriverContext::Release(const bool address_space_alive,
   record.quiesced_before_address_space_destroyed = address_space_alive;
 
   // Step 3: Release PCI ownership so another driver can claim the devices.
-  for (int i = 0; i < claimed_count_; ++i) {
-    if (PciRelease(claimed_[i], OwnerToken()) == PciStatus::kOk) {
+  for (int i = 0; i < claimed_count_snapshot; ++i) {
+    if (PciRelease(claimed_snapshot[i], OwnerToken()) == PciStatus::kOk) {
       ++record.released_claims;
     }
   }
-  const int had_claims = claimed_count_;
-  claimed_count_ = 0;
+  const int had_claims = claimed_count_snapshot;
 
   if (had_claims > 0) {
     const IrqSpinLockGuard guard(g_release_record_lock);
     g_last_release_record = record;
   }
-  if (out_record != nullptr) {
-    *out_record = record;
-  }
+  return record;
 }
 
 #if __STDC_HOSTED__
@@ -540,6 +781,24 @@ class KernelDriverEnvironment final : public DriverEnvironment {
     return space != nullptr && space->MapOwnedFrame(user_addr, frame_phys,
                                                     UserPageAccess::kReadWrite);
   }
+
+  void SleepMicroseconds(const int64_t microseconds) override {
+    TaskScheduler* const scheduler = GetTaskScheduler();
+    CHECK(scheduler != nullptr);
+    const CpuLocal* const cpu0 = SmpGetCpuLocal(0);
+    CHECK(cpu0 != nullptr);
+    // Whole ticks of CPU 0's timer, which BlockUntil() counts, plus one: the
+    // current tick may be nearly over.
+    constexpr int64_t kTickMicroseconds = 1000000 / kApicTimerTargetHz;
+    const int64_t deadline =
+        cpu0->timer_ticks.load(std::memory_order_acquire) +
+        (microseconds + kTickMicroseconds - 1) / kTickMicroseconds + 1;
+    while (cpu0->timer_ticks.load(std::memory_order_acquire) < deadline) {
+      scheduler->BlockUntil(deadline);
+    }
+  }
+
+  void Log(const char* const text) override { ConsoleWrite(text); }
 };
 
 }  // namespace

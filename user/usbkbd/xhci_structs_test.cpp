@@ -1,7 +1,7 @@
-// Unit tests for user/xhci_ring.h, user/xhci_context.h, and
-// user/usb_descriptors.h: TRB builders, ProducerRing and EventRing wrap and
-// cycle-bit invariants, CSZ=32/64 context layout and parameter encoders, and
-// defensive USB configuration descriptor parsing.
+// Unit tests for user/usbkbd/xhci_ring.h, user/usbkbd/xhci_context.h, and
+// user/usbkbd/usb_descriptors.h: TRB builders, ProducerRing and EventRing wrap
+// and cycle-bit invariants, CSZ=32/64 context layout and parameter encoders,
+// and defensive USB configuration descriptor parsing.
 
 #include <gmock/gmock.h>
 #include <gtest/gtest.h>
@@ -9,10 +9,10 @@
 #include <cstdint>
 #include <vector>
 
-#include "user/usb_descriptors.h"
-#include "user/xhci_context.h"
-#include "user/xhci_regs.h"
-#include "user/xhci_ring.h"
+#include "user/usbkbd/usb_descriptors.h"
+#include "user/usbkbd/xhci_context.h"
+#include "user/usbkbd/xhci_regs.h"
+#include "user/usbkbd/xhci_ring.h"
 
 namespace protos::usb {
 namespace {
@@ -87,6 +87,10 @@ TEST(XhciRingTest, TrbBuildersEncodeExpectedFieldsWithoutCycleBit) {
   EXPECT_THAT(TrbPointer(normal), t::Eq(0x5000'0000ULL));
   EXPECT_THAT(normal.dw2, t::Eq(8u));
   EXPECT_THAT(normal.dw3 & (kTrbIoc | kTrbIsp), t::Eq(kTrbIoc | kTrbIsp));
+
+  const Trb noop = MakeNoOpCommandTrb();
+  EXPECT_THAT(TrbType(noop), t::Eq(kTrbNoOpCmd));
+  EXPECT_THAT(noop.dw3 & kTrbCycle, t::Eq(0u));
 }
 
 TEST(XhciRingTest, ProducerRingWrapsAndTogglesCycleAcrossMultipleLaps) {
@@ -133,6 +137,11 @@ TEST(XhciRingTest, ProducerRingWrapsAndTogglesCycleAcrossMultipleLaps) {
   EXPECT_THAT(storage[15].dw3 & kTrbCycle, t::Eq(0u));
   EXPECT_THAT(ring.enqueue_index(), t::Eq(0));
   EXPECT_THAT(ring.cycle(), t::Eq(1u));
+
+  // Rewrite replaces an existing TRB in-place while preserving its cycle bit.
+  ring.Rewrite(kRingPhys + 3 * 16, MakeNoOpCommandTrb());
+  EXPECT_THAT(TrbType(storage[3]), t::Eq(kTrbNoOpCmd));
+  EXPECT_THAT(storage[3].dw3 & kTrbCycle, t::Eq(0u));
 }
 
 TEST(XhciRingTest, EnqueueTdCommitsAcrossLinkTrbWithCorrectCycles) {
@@ -197,10 +206,10 @@ TEST(XhciRingTest, EventRingPopsEventsAndTogglesCycleOnWrap) {
   }
   for (int i = 0; i < 16; ++i) {
     ASSERT_TRUE(ring.HasEvent());
-    Trb ev;
-    ASSERT_TRUE(ring.Pop(&ev));
-    EXPECT_THAT(ev.dw0, t::Eq(static_cast<uint32_t>(i)));
-    EXPECT_THAT(TrbCompletionCode(ev), t::Eq(kCcSuccess));
+    const StatusOr<Trb> ev = ring.Pop();
+    ASSERT_TRUE(ev.ok());
+    EXPECT_THAT(ev->dw0, t::Eq(static_cast<uint32_t>(i)));
+    EXPECT_THAT(TrbCompletionCode(*ev), t::Eq(kCcSuccess));
   }
   // Now wrapped to index 0 with consumer cycle 0; seg[0] still has cycle 1
   // from lap 0, so HasEvent() is false!
@@ -212,9 +221,9 @@ TEST(XhciRingTest, EventRingPopsEventsAndTogglesCycleOnWrap) {
   seg[0] = Trb{0x99u, 0, static_cast<uint32_t>(kCcSuccess) << 24,
                static_cast<uint32_t>(kTrbPortStatusChange) << kTrbTypeShift};
   EXPECT_TRUE(ring.HasEvent());
-  Trb ev;
-  ASSERT_TRUE(ring.Pop(&ev));
-  EXPECT_THAT(ev.dw0, t::Eq(0x99u));
+  const StatusOr<Trb> ev = ring.Pop();
+  ASSERT_TRUE(ev.ok());
+  EXPECT_THAT(ev->dw0, t::Eq(0x99u));
   EXPECT_THAT(ring.dequeue_index(), t::Eq(1));
   EXPECT_THAT(ring.dequeue_phys(), t::Eq(kSegPhys + 16));
 }
@@ -257,6 +266,18 @@ TEST(XhciContextTest, ContextOffsetsAndBuildersRespectCsz32AndCsz64) {
     // DCI 3 (EP1 IN).
     *OutputSlotCtx(out_buf.data(), csz) = *slot;
     *OutputEpCtx(out_buf.data(), csz, 1) = *ep0;
+    // Simulate hardware-populated Slot State, USB Device Address, and EP0
+    // Running state in Output Device Context, and verify Evaluate Context
+    // clears RsvdZ output fields in Input Context (xHCI 6.2.2 / 6.2.3).
+    OutputSlotCtx(out_buf.data(), csz)->dw3 = (2u << 27) | 5u;
+    OutputEpCtx(out_buf.data(), csz, 1)->dw0 |= kEpStateRunning;
+
+    FormatEvaluateEp0MpsInputContext(in_buf.data(), csz, out_buf.data(), 64);
+    EXPECT_THAT(icc->drop_flags, t::Eq(0u));
+    EXPECT_THAT(icc->add_flags, t::Eq(0x2u));
+    EXPECT_THAT(slot->dw3, t::Eq(0u));
+    EXPECT_THAT(EpContextState(*ep0), t::Eq(0u));
+    EXPECT_THAT(EpContextMaxPacketSize(*ep0), t::Eq(64u));
 
     FormatConfigureInterruptEndpointInputContext(
         in_buf.data(), csz, out_buf.data(), 3, kPortSpeedFull, 8, 0, 10,
@@ -396,16 +417,16 @@ TEST(UsbDescriptorsTest, FindsSingleAndCompositeBootKeyboardsAndSsCompanion) {
       8,
       0,
   };
-  BootKeyboardMatch match;
-  ASSERT_TRUE(
-      FindBootKeyboard(composite, static_cast<int>(sizeof(composite)), &match));
-  EXPECT_THAT(match.config_value, t::Eq(1u));
-  EXPECT_THAT(match.interface_number, t::Eq(1u));
-  EXPECT_THAT(match.ep_address, t::Eq(0x82u));
-  EXPECT_THAT(match.ep_dci, t::Eq(5u));
-  EXPECT_THAT(match.max_packet_size, t::Eq(8u));
-  EXPECT_THAT(match.max_burst, t::Eq(2u));
-  EXPECT_THAT(match.b_interval, t::Eq(4u));
+  const StatusOr<BootKeyboardMatch> match =
+      FindBootKeyboard(composite, static_cast<int>(sizeof(composite)));
+  ASSERT_TRUE(match.ok());
+  EXPECT_THAT(match->config_value, t::Eq(1u));
+  EXPECT_THAT(match->interface_number, t::Eq(1u));
+  EXPECT_THAT(match->ep_address, t::Eq(0x82u));
+  EXPECT_THAT(match->ep_dci, t::Eq(5u));
+  EXPECT_THAT(match->max_packet_size, t::Eq(8u));
+  EXPECT_THAT(match->max_burst, t::Eq(2u));
+  EXPECT_THAT(match->b_interval, t::Eq(4u));
 }
 
 TEST(UsbDescriptorsTest, RejectsNonKeyboardsAndMalformedDescriptorsSafely) {
@@ -415,9 +436,8 @@ TEST(UsbDescriptorsTest, RejectsNonKeyboardsAndMalformedDescriptorsSafely) {
       9, kUsbDescInterface,     0,    0,    1, 3, 1,  2,    0,
       7, kUsbDescEndpoint,      0x81, 0x03, 4, 0, 10,
   };
-  BootKeyboardMatch match;
-  EXPECT_FALSE(FindBootKeyboard(mouse_only,
-                                static_cast<int>(sizeof(mouse_only)), &match));
+  EXPECT_FALSE(
+      FindBootKeyboard(mouse_only, static_cast<int>(sizeof(mouse_only))).ok());
 
   // Alternate setting 1 keyboard without alt 0 keyboard.
   const uint8_t alt1_only[] = {
@@ -426,7 +446,7 @@ TEST(UsbDescriptorsTest, RejectsNonKeyboardsAndMalformedDescriptorsSafely) {
       7, kUsbDescEndpoint,      0x81, 0x03, 8, 0, 10,
   };
   EXPECT_FALSE(
-      FindBootKeyboard(alt1_only, static_cast<int>(sizeof(alt1_only)), &match));
+      FindBootKeyboard(alt1_only, static_cast<int>(sizeof(alt1_only))).ok());
 
   // Zero-length sub-descriptor (bLength = 0) before the endpoint: terminates
   // the walk without infinite-looping.
@@ -459,8 +479,9 @@ TEST(UsbDescriptorsTest, RejectsNonKeyboardsAndMalformedDescriptorsSafely) {
       0,
       10,
   };
-  EXPECT_FALSE(FindBootKeyboard(
-      zero_length_sub, static_cast<int>(sizeof(zero_length_sub)), &match));
+  EXPECT_FALSE(FindBootKeyboard(zero_length_sub,
+                                static_cast<int>(sizeof(zero_length_sub)))
+                   .ok());
 
   // Sub-descriptor with bLength = 1: rejected cleanly.
   const uint8_t one_length_sub[] = {
@@ -491,8 +512,9 @@ TEST(UsbDescriptorsTest, RejectsNonKeyboardsAndMalformedDescriptorsSafely) {
       0,
       10,
   };
-  EXPECT_FALSE(FindBootKeyboard(
-      one_length_sub, static_cast<int>(sizeof(one_length_sub)), &match));
+  EXPECT_FALSE(
+      FindBootKeyboard(one_length_sub, static_cast<int>(sizeof(one_length_sub)))
+          .ok());
 
   // Endpoint descriptor truncated past buffer end.
   const uint8_t truncated_ep[] = {
@@ -500,8 +522,307 @@ TEST(UsbDescriptorsTest, RejectsNonKeyboardsAndMalformedDescriptorsSafely) {
       9, kUsbDescInterface,     0,    0,    1, 3, 1, 1,    0,
       7, kUsbDescEndpoint,      0x81, 0x03,
   };
-  EXPECT_FALSE(FindBootKeyboard(
-      truncated_ep, static_cast<int>(sizeof(truncated_ep)), &match));
+  EXPECT_FALSE(
+      FindBootKeyboard(truncated_ep, static_cast<int>(sizeof(truncated_ep)))
+          .ok());
+}
+
+TEST(XhciContextTest,
+     EncodesRouteStringTtFieldsAndHubSlotContextAcrossCsz32And64) {
+  // Multi-tier Route String calculation across tiers 0..4 and clamping to 15.
+  uint32_t route = 0;
+  route = AppendRouteStringPort(route, 0, 1);
+  EXPECT_THAT(route, t::Eq(0x00001u));
+  route = AppendRouteStringPort(route, 1, 2);
+  EXPECT_THAT(route, t::Eq(0x00021u));
+  route = AppendRouteStringPort(route, 2, 3);
+  EXPECT_THAT(route, t::Eq(0x00321u));
+  route = AppendRouteStringPort(route, 3, 4);
+  EXPECT_THAT(route, t::Eq(0x04321u));
+  route = AppendRouteStringPort(route, 4, 20);  // Clamped to 15 (0xF).
+  EXPECT_THAT(route, t::Eq(0xF4321u));
+  // Out-of-bounds tiers (< 0 or >= 5) or non-positive ports are no-ops.
+  EXPECT_THAT(AppendRouteStringPort(route, 5, 1), t::Eq(0xF4321u));
+  EXPECT_THAT(AppendRouteStringPort(route, 0, 0), t::Eq(0xF4321u));
+
+  for (const int csz : {32, 64}) {
+    alignas(64) uint8_t buf[33 * 64] = {};
+    FormatAddressDeviceInputContext(buf, csz, /*port_number=*/7,
+                                    /*port_speed=*/2,
+                                    /*ep0_ring_phys=*/0x100000u,
+                                    /*ep0_cycle=*/1u,
+                                    /*route_string=*/0x54321u,
+                                    /*parent_hub_slot_id=*/2,
+                                    /*parent_port_number=*/3, /*mtt=*/true);
+    const SlotContext* const slot = InputSlotCtx(buf, csz);
+    EXPECT_THAT(SlotContextRouteString(*slot), t::Eq(0x54321u));
+    EXPECT_THAT(SlotContextSpeed(*slot), t::Eq(2));
+    EXPECT_THAT(SlotContextEntries(*slot), t::Eq(1));
+    EXPECT_TRUE(SlotContextMtt(*slot));
+    EXPECT_FALSE(SlotContextIsHub(*slot));
+    EXPECT_THAT(SlotContextRootHubPort(*slot), t::Eq(7));
+    EXPECT_THAT(SlotContextParentHubSlotId(*slot), t::Eq(2));
+    EXPECT_THAT(SlotContextParentPortNumber(*slot), t::Eq(3));
+
+    alignas(64) uint8_t dev_ctx[32 * 64] = {};
+    *OutputSlotCtx(dev_ctx, csz) = *slot;
+    FormatConfigureInterruptEndpointInputContext(
+        buf, csz, dev_ctx, /*dci=*/3, /*port_speed=*/3, /*max_packet_size=*/1,
+        /*max_burst=*/0, /*b_interval=*/12, /*intr_ring_phys=*/0x200000u,
+        /*intr_cycle=*/1u, /*is_hub=*/true, /*num_ports=*/7, /*ttt=*/2,
+        /*mtt=*/true);
+    EXPECT_THAT(SlotContextEntries(*slot), t::Eq(3));
+    EXPECT_THAT(SlotContextRouteString(*slot), t::Eq(0x54321u));
+    EXPECT_TRUE(SlotContextIsHub(*slot));
+    EXPECT_TRUE(SlotContextMtt(*slot));
+    EXPECT_THAT(SlotContextNumPorts(*slot), t::Eq(7));
+    EXPECT_THAT(SlotContextTtt(*slot), t::Eq(2));
+  }
+}
+
+TEST(UsbDescriptorsTest, FindsUsb2AndUsb3HubInterfacesAndEndpoints) {
+  // USB 2.0 High-Speed Multi-TT Hub Configuration Descriptor (25 bytes).
+  const uint8_t usb2_hub_cfg[] = {
+      9,
+      kUsbDescConfiguration,
+      25,
+      0,
+      1,
+      1,
+      0,
+      0xE0,
+      0,
+      9,
+      kUsbDescInterface,
+      0,
+      0,
+      1,
+      kUsbClassHub,
+      0,
+      kHubProtocolHighSpeedMultiTt,
+      0,
+      7,
+      kUsbDescEndpoint,
+      0x81,
+      0x03,
+      1,
+      0,
+      12,
+  };
+  const StatusOr<HubMatch> match =
+      FindUsbHub(usb2_hub_cfg, static_cast<int>(sizeof(usb2_hub_cfg)));
+  ASSERT_TRUE(match.ok());
+  EXPECT_THAT(match->config_value, t::Eq(1));
+  EXPECT_THAT(match->interface_number, t::Eq(0));
+  EXPECT_THAT(match->interface_protocol, t::Eq(kHubProtocolHighSpeedMultiTt));
+  EXPECT_THAT(match->ep_address, t::Eq(0x81));
+  EXPECT_THAT(match->ep_dci, t::Eq(3));
+  EXPECT_THAT(match->max_packet_size, t::Eq(1));
+  EXPECT_THAT(match->b_interval, t::Eq(12));
+  EXPECT_THAT(match->max_burst, t::Eq(0));
+
+  // USB 3.0 SuperSpeed Hub Configuration Descriptor (31 bytes, with SS
+  // Endpoint Companion and Notification Interrupt IN bmAttributes = 0x13).
+  const uint8_t usb3_hub_cfg[] = {
+      9,
+      kUsbDescConfiguration,
+      31,
+      0,
+      1,
+      1,
+      0,
+      0xE0,
+      0,
+      9,
+      kUsbDescInterface,
+      0,
+      0,
+      1,
+      kUsbClassHub,
+      0,
+      0,
+      0,
+      7,
+      kUsbDescEndpoint,
+      0x81,
+      0x13,
+      2,
+      0,
+      8,
+      6,
+      kUsbDescSsEpCompanion,
+      1,
+      0,
+      4,
+      0,
+  };
+  const StatusOr<HubMatch> ss_match =
+      FindUsbHub(usb3_hub_cfg, static_cast<int>(sizeof(usb3_hub_cfg)));
+  ASSERT_TRUE(ss_match.ok());
+  EXPECT_THAT(ss_match->ep_dci, t::Eq(3));
+  EXPECT_THAT(ss_match->max_packet_size, t::Eq(2));
+  EXPECT_THAT(ss_match->b_interval, t::Eq(8));
+  EXPECT_THAT(ss_match->max_burst, t::Eq(1));
+
+  // HID keyboard configuration descriptor is rejected by FindUsbHub.
+  const uint8_t kbd_cfg[] = {
+      9, kUsbDescConfiguration, 25,   0,    1, 1, 0,  0xA0, 50,
+      9, kUsbDescInterface,     0,    0,    1, 3, 1,  1,    0,
+      7, kUsbDescEndpoint,      0x81, 0x03, 8, 0, 10,
+  };
+  EXPECT_FALSE(FindUsbHub(kbd_cfg, static_cast<int>(sizeof(kbd_cfg))).ok());
+}
+
+TEST(UsbDescriptorsTest, ParsesUsb2AndUsb3HubDescriptorsAndRejectsMalformed) {
+  // 9-byte USB 2.0 Hub Descriptor (0x29): 4 ports, TTT = 2 (0x0049), 50 * 2ms.
+  const uint8_t usb2_desc[] = {9, kUsbDescHub, 4, 0x49, 0x00, 50, 100, 0, 0xFF};
+  const StatusOr<HubDescriptorInfo> info = ParseHubDescriptor(
+      usb2_desc, static_cast<int>(sizeof(usb2_desc)), kUsbDescHub);
+  ASSERT_TRUE(info.ok());
+  EXPECT_THAT(info->num_ports, t::Eq(4));
+  EXPECT_THAT(info->ttt, t::Eq(2));
+  EXPECT_THAT(info->pwr_on_to_pwr_good, t::Eq(50));
+
+  // 12-byte USB 3.0 SuperSpeed Hub Descriptor (0x2A): 4 ports, 25 * 2ms.
+  const uint8_t usb3_desc[] = {12, kUsbDescSsHub, 4,    0x09, 0x00, 25, 100,
+                               4,  0x90,          0x01, 0x00, 0x00};
+  const StatusOr<HubDescriptorInfo> ss_info = ParseHubDescriptor(
+      usb3_desc, static_cast<int>(sizeof(usb3_desc)), kUsbDescSsHub);
+  ASSERT_TRUE(ss_info.ok());
+  EXPECT_THAT(ss_info->num_ports, t::Eq(4));
+  EXPECT_THAT(ss_info->ttt, t::Eq(0));
+  EXPECT_THAT(ss_info->pwr_on_to_pwr_good, t::Eq(25));
+
+  // Reject wrong descriptor type, truncated length, or bNbrPorts == 0.
+  EXPECT_FALSE(ParseHubDescriptor(usb2_desc,
+                                  static_cast<int>(sizeof(usb2_desc)),
+                                  kUsbDescSsHub)
+                   .ok());
+  EXPECT_FALSE(ParseHubDescriptor(usb2_desc, 6, kUsbDescHub).ok());
+  EXPECT_FALSE(ParseHubDescriptor(usb3_desc, 10, kUsbDescSsHub).ok());
+  const uint8_t zero_ports[] = {9,  kUsbDescHub, 0, 0x09, 0x00,
+                                10, 100,         0, 0xFF};
+  EXPECT_FALSE(ParseHubDescriptor(zero_ports,
+                                  static_cast<int>(sizeof(zero_ports)),
+                                  kUsbDescHub)
+                   .ok());
+}
+
+TEST(UsbDescriptorsTest, HubDescriptorParserEnforcesPortCountAndLengthBounds) {
+  // bNbrPorts 16 is the most a hub may have (USB 2.0 11.23.2.1).
+  const uint8_t d16[] = {13, kUsbDescHub, 16, 0x09, 0x00, 10,  100,
+                         0,  0,           0,  0xFF, 0xFF, 0xFF};
+  const StatusOr<HubDescriptorInfo> info16 =
+      ParseHubDescriptor(d16, static_cast<int>(sizeof(d16)), kUsbDescHub);
+  ASSERT_TRUE(info16.ok());
+  EXPECT_THAT(info16->num_ports, t::Eq(16));
+  const uint8_t d17[] = {13, kUsbDescHub, 17, 0x09, 0x00, 10,  100,
+                         0,  0,           0,  0xFF, 0xFF, 0xFF};
+  EXPECT_FALSE(
+      ParseHubDescriptor(d17, static_cast<int>(sizeof(d17)), kUsbDescHub).ok());
+  const uint8_t d255[39] = {39, kUsbDescHub, 255, 0x09, 0x00, 10, 100};
+  EXPECT_FALSE(
+      ParseHubDescriptor(d255, static_cast<int>(sizeof(d255)), kUsbDescHub)
+          .ok());
+  // bLength below the minimum while the buffer itself is long enough.
+  const uint8_t short_len[] = {6, kUsbDescHub, 4, 0x09, 0x00, 10, 100, 0, 0xFF};
+  EXPECT_FALSE(ParseHubDescriptor(
+                   short_len, static_cast<int>(sizeof(short_len)), kUsbDescHub)
+                   .ok());
+  const uint8_t ss_short_len[] = {11, kUsbDescSsHub, 4,    0x09, 0x00, 10, 100,
+                                  4,  0x90,          0x01, 0,    0};
+  EXPECT_FALSE(ParseHubDescriptor(ss_short_len,
+                                  static_cast<int>(sizeof(ss_short_len)),
+                                  kUsbDescSsHub)
+                   .ok());
+  // expected_type 0 accepts only the hub descriptor types 0x29 and 0x2A.
+  const uint8_t other[] = {9, 0x24, 4, 0x09, 0x00, 10, 100, 0, 0xFF};
+  EXPECT_FALSE(
+      ParseHubDescriptor(other, static_cast<int>(sizeof(other)), 0).ok());
+  const uint8_t ok29[] = {9, kUsbDescHub, 4, 0x09, 0x00, 10, 100, 0, 0xFF};
+  EXPECT_TRUE(ParseHubDescriptor(ok29, static_cast<int>(sizeof(ok29)), 0).ok());
+  EXPECT_FALSE(ParseHubDescriptor(nullptr, 9, kUsbDescHub).ok());
+
+  // A truncated hub configuration descriptor (endpoint cut off) has no hub
+  // interrupt endpoint.
+  const uint8_t trunc_cfg[] = {
+      9,
+      kUsbDescConfiguration,
+      25,
+      0,
+      1,
+      1,
+      0,
+      0xE0,
+      0,
+      9,
+      kUsbDescInterface,
+      0,
+      0,
+      1,
+      kUsbClassHub,
+      0,
+      0,
+      0,
+      7,
+      kUsbDescEndpoint,
+      0x81,
+  };
+  EXPECT_FALSE(FindUsbHub(trunc_cfg, static_cast<int>(sizeof(trunc_cfg))).ok());
+
+  // A compliant multi-TT hub (USB 2.0 11.23.1): alternate setting 0 is
+  // single-TT and alternate setting 1 multi-TT; the driver uses setting 0.
+  constexpr uint8_t kStt = kHubProtocolHighSpeedSingleTt;
+  constexpr uint8_t kMtt = kHubProtocolHighSpeedMultiTt;
+  const uint8_t mtt_cfg[] = {
+      9,
+      kUsbDescConfiguration,
+      41,
+      0,
+      1,
+      1,
+      0,
+      0xE0,
+      0,
+      9,
+      kUsbDescInterface,
+      0,
+      0,
+      1,
+      kUsbClassHub,
+      0,
+      kStt,
+      0,
+      7,
+      kUsbDescEndpoint,
+      0x81,
+      0x03,
+      1,
+      0,
+      12,
+      9,
+      kUsbDescInterface,
+      0,
+      1,
+      1,
+      kUsbClassHub,
+      0,
+      kMtt,
+      0,
+      7,
+      kUsbDescEndpoint,
+      0x81,
+      0x03,
+      1,
+      0,
+      11,
+  };
+  const StatusOr<HubMatch> mtt_match =
+      FindUsbHub(mtt_cfg, static_cast<int>(sizeof(mtt_cfg)));
+  ASSERT_TRUE(mtt_match.ok());
+  EXPECT_THAT(mtt_match->interface_protocol,
+              t::Eq(kHubProtocolHighSpeedSingleTt));
+  EXPECT_THAT(mtt_match->b_interval, t::Eq(12));
 }
 
 }  // namespace

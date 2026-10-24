@@ -1,5 +1,5 @@
-#ifndef PROTOS_USER_XHCI_CONTEXT_H_
-#define PROTOS_USER_XHCI_CONTEXT_H_
+#ifndef PROTOS_USER_USBKBD_XHCI_CONTEXT_H_
+#define PROTOS_USER_USBKBD_XHCI_CONTEXT_H_
 
 // Freestanding xHCI Slot, Endpoint, and Input Control Context structures and
 // CSZ-aware (32-byte vs 64-byte) accessors and parameter encoders (xHCI 1.2
@@ -45,6 +45,59 @@ struct SlotContext {
   uint32_t dw2 = 0;
   uint32_t dw3 = 0;
   uint32_t rsvd[4] = {};
+
+  constexpr uint32_t route_string() const { return dw0 & 0xFFFFFu; }
+  constexpr void SetRouteString(const uint32_t route) {
+    dw0 = (dw0 & ~0xFFFFFu) | (route & 0xFFFFFu);
+  }
+  constexpr int speed() const { return static_cast<int>((dw0 >> 20) & 0xFu); }
+  constexpr bool mtt() const { return ((dw0 >> 25) & 1u) != 0; }
+  constexpr void SetMtt(const bool enabled) {
+    if (enabled) {
+      dw0 |= (1u << 25);
+    } else {
+      dw0 &= ~(1u << 25);
+    }
+  }
+  constexpr bool is_hub() const { return ((dw0 >> 26) & 1u) != 0; }
+  constexpr void SetHub(const bool hub) {
+    if (hub) {
+      dw0 |= (1u << 26);
+    } else {
+      dw0 &= ~(1u << 26);
+    }
+  }
+  constexpr int context_entries() const {
+    return static_cast<int>((dw0 >> 27) & 0x1Fu);
+  }
+  constexpr int root_hub_port() const {
+    return static_cast<int>((dw1 >> 16) & 0xFFu);
+  }
+  constexpr int num_ports() const {
+    return static_cast<int>((dw1 >> 24) & 0xFFu);
+  }
+  constexpr void SetNumPorts(const int count) {
+    dw1 =
+        (dw1 & ~(0xFFu << 24)) | ((static_cast<uint32_t>(count) & 0xFFu) << 24);
+  }
+  constexpr uint8_t parent_hub_slot_id() const {
+    return static_cast<uint8_t>(dw2 & 0xFFu);
+  }
+  constexpr uint8_t parent_port_number() const {
+    return static_cast<uint8_t>((dw2 >> 8) & 0xFFu);
+  }
+  constexpr void SetTtInfo(const uint8_t hub_slot_id,
+                           const uint8_t port_number) {
+    dw2 = (dw2 & ~0xFFFFu) | static_cast<uint32_t>(hub_slot_id) |
+          (static_cast<uint32_t>(port_number) << 8);
+  }
+  constexpr uint8_t ttt() const {
+    return static_cast<uint8_t>((dw2 >> 16) & 0x3u);
+  }
+  constexpr void SetTtThinkTime(const uint8_t think_time) {
+    dw2 = (dw2 & ~(0x3u << 16)) |
+          ((static_cast<uint32_t>(think_time) & 0x3u) << 16);
+  }
 };
 static_assert(sizeof(SlotContext) == 32);
 
@@ -143,6 +196,47 @@ constexpr int SlotContextSpeed(const SlotContext& slot) {
 
 constexpr int SlotContextRootHubPort(const SlotContext& slot) {
   return static_cast<int>((slot.dw1 >> 16) & 0xFFu);
+}
+
+constexpr uint32_t SlotContextRouteString(const SlotContext& slot) {
+  return slot.route_string();
+}
+
+constexpr bool SlotContextMtt(const SlotContext& slot) { return slot.mtt(); }
+
+constexpr bool SlotContextHub(const SlotContext& slot) { return slot.is_hub(); }
+
+constexpr bool SlotContextIsHub(const SlotContext& slot) {
+  return slot.is_hub();
+}
+
+constexpr int SlotContextNumPorts(const SlotContext& slot) {
+  return slot.num_ports();
+}
+
+constexpr uint8_t SlotContextParentHubSlotId(const SlotContext& slot) {
+  return slot.parent_hub_slot_id();
+}
+
+constexpr uint8_t SlotContextParentPortNumber(const SlotContext& slot) {
+  return slot.parent_port_number();
+}
+
+constexpr uint8_t SlotContextTtt(const SlotContext& slot) { return slot.ttt(); }
+
+// Appends a 1-based downstream port number (clamped to 15 per xHCI 6.2.2)
+// at tier `hub_depth` (0..4) to a 20-bit xHCI Route String.
+constexpr uint32_t AppendRouteStringPort(const uint32_t parent_route_string,
+                                         const int hub_depth,
+                                         const int downstream_port) {
+  if (hub_depth < 0 || hub_depth >= 5 || downstream_port <= 0) {
+    return parent_route_string & 0xFFFFFu;
+  }
+  const uint32_t nibble =
+      static_cast<uint32_t>(downstream_port > 15 ? 15 : downstream_port);
+  const uint32_t shift = static_cast<uint32_t>(hub_depth * 4);
+  return ((parent_route_string & 0xFFFFFu) & ~(0xFu << shift)) |
+         (nibble << shift);
 }
 
 // Endpoint Context field extractors.
@@ -251,20 +345,28 @@ constexpr uint8_t EncodeInterruptInterval(const int port_speed,
 }
 
 // Formats InputSlotCtx and InputEpCtx(1) for Address Device (ICC Add = 0x3).
-inline void FormatAddressDeviceInputContext(uint8_t* const input_ctx,      //
-                                            const int context_size,        //
-                                            const int port_number,         //
-                                            const int port_speed,          //
-                                            const uint64_t ep0_ring_phys,  //
-                                            const uint32_t ep0_cycle = 1u) {
+inline void FormatAddressDeviceInputContext(
+    uint8_t* const input_ctx,               //
+    const int context_size,                 //
+    const int port_number,                  //
+    const int port_speed,                   //
+    const uint64_t ep0_ring_phys,           //
+    const uint32_t ep0_cycle = 1u,          //
+    const uint32_t route_string = 0u,       //
+    const uint8_t parent_hub_slot_id = 0u,  //
+    const uint8_t parent_port_number = 0u,  //
+    const bool mtt = false) {
   ZeroContextBuffer(input_ctx, 33 * context_size);
   InputControlContext* const icc = InputCtrlCtx(input_ctx);
   icc->drop_flags = 0u;
   icc->add_flags = 0x3u;  // A0 (Slot) | A1 (EP0)
 
   SlotContext* const slot = InputSlotCtx(input_ctx, context_size);
-  slot->dw0 = (1u << 27) | ((static_cast<uint32_t>(port_speed) & 0xFu) << 20);
+  slot->dw0 = (route_string & 0xFFFFFu) |
+              ((static_cast<uint32_t>(port_speed) & 0xFu) << 20) |
+              (mtt ? (1u << 25) : 0u) | (1u << 27);
   slot->dw1 = (static_cast<uint32_t>(port_number) & 0xFFu) << 16;
+  slot->SetTtInfo(parent_hub_slot_id, parent_port_number);
 
   EndpointContext* const ep0 = InputEpCtx(input_ctx, context_size, 1);
   const uint16_t mps = InitialEp0MaxPacketSize(port_speed);
@@ -289,13 +391,17 @@ inline void FormatEvaluateEp0MpsInputContext(uint8_t* const input_ctx,      //
 
   *InputSlotCtx(input_ctx, context_size) =
       *OutputSlotCtx(dev_ctx, context_size);
+  // Output-only fields are cleared in an Input Context: Slot State and USB
+  // Device Address (xHCI 6.2.2) and the Endpoint State (6.2.3).
+  InputSlotCtx(input_ctx, context_size)->dw3 = 0u;
   EndpointContext* const ep0 = InputEpCtx(input_ctx, context_size, 1);
   *ep0 = *OutputEpCtx(dev_ctx, context_size, 1);
+  ep0->dw0 &= ~0x7u;
   ep0->dw1 = (ep0->dw1 & 0x0000FFFFu) | (static_cast<uint32_t>(new_mps) << 16);
 }
 
-// Formats InputContext for Configure Endpoint of a Boot Keyboard Interrupt IN
-// endpoint (ICC Add = (1 << 0) | (1 << dci)).
+// Formats InputContext for Configure Endpoint of a Boot Keyboard or USB Hub
+// Interrupt IN endpoint (ICC Add = (1 << 0) | (1 << dci)).
 inline void FormatConfigureInterruptEndpointInputContext(
     uint8_t* const input_ctx,        //
     const int context_size,          //
@@ -306,7 +412,11 @@ inline void FormatConfigureInterruptEndpointInputContext(
     const uint8_t max_burst,         //
     const uint8_t b_interval,        //
     const uint64_t intr_ring_phys,   //
-    const uint32_t intr_cycle = 1u) {
+    const uint32_t intr_cycle = 1u,  //
+    const bool is_hub = false,       //
+    const int num_ports = 0,         //
+    const uint8_t ttt = 0u,          //
+    const bool mtt = false) {
   ZeroContextBuffer(input_ctx, 33 * context_size);
   InputControlContext* const icc = InputCtrlCtx(input_ctx);
   icc->drop_flags = 0u;
@@ -316,6 +426,12 @@ inline void FormatConfigureInterruptEndpointInputContext(
   *slot = *OutputSlotCtx(dev_ctx, context_size);
   slot->dw0 =
       (slot->dw0 & ~(0x1Fu << 27)) | (static_cast<uint32_t>(dci & 0x1F) << 27);
+  if (is_hub) {
+    slot->SetHub(true);
+    slot->SetMtt(slot->mtt() || mtt);
+    slot->SetNumPorts(num_ports);
+    slot->SetTtThinkTime(ttt);
+  }
   slot->dw3 = 0u;  // Output-only fields cleared in Input Slot Context
 
   EndpointContext* const ep = InputEpCtx(input_ctx, context_size, dci);
@@ -335,4 +451,4 @@ inline void FormatConfigureInterruptEndpointInputContext(
 
 }  // namespace protos::usb
 
-#endif  // PROTOS_USER_XHCI_CONTEXT_H_
+#endif  // PROTOS_USER_USBKBD_XHCI_CONTEXT_H_

@@ -211,7 +211,7 @@ class UserProcess {
   // Intended for boot self-tests that inspect mapped pages while the process is
   // alive (`space_ != nullptr`).
   uintptr_t LookupUserPage(uintptr_t user_addr) const;
-  bool QueryUserPage(uintptr_t user_addr, UserPageInfo* info) const;
+  StatusOr<UserPageInfo> QueryUserPage(uintptr_t user_addr) const;
   bool BindVectorsForSelftest(int device_index, int count);
 
   // Returns what the kernel has observed of the process so far. Each field is
@@ -287,9 +287,17 @@ class UserProcess {
   const UserProgram program_;
   const uint64_t arg_;
   const uint64_t capabilities_;
+  // The process's task. Start() stores it once CreateTask() has returned, but
+  // the task may start running, on another CPU, before that: only the creator,
+  // and tasks to which it hands the process after Start(), may read it. Code
+  // that runs on the task itself (`Run()` and the system call and interrupt
+  // handlers) must not; it gets its task from `TaskScheduler::CurrentTask()`.
   Task* task_ = nullptr;
   bool waited_ = false;
-  // The address space while the program runs, else nullptr.
+  // The address space while the program runs, else nullptr. `space_lock_`
+  // synchronizes publication and teardown of `space_` in `Run()` with external
+  // callers of `LookupUserPage()` and `QueryUserPage()`.
+  mutable IrqSpinLock space_lock_;
   AddressSpace* space_ = nullptr;
   DriverContext driver_;
   // Written by the task (and its interrupt handlers); read after `Join()`.

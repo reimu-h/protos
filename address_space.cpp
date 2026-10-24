@@ -70,9 +70,9 @@ bool AddressSpace::MapOwnedFrame(const uintptr_t user_addr,   //
   return PagingMapUserPage(root_, user_addr, frame_phys, access);
 }
 
-bool AddressSpace::QueryPage(const uintptr_t user_addr,
-                             UserPageInfo* const info) const {
-  return PagingQueryUserPage(root_, user_addr, info);
+StatusOr<UserPageInfo> AddressSpace::QueryPage(
+    const uintptr_t user_addr) const {
+  return PagingQueryUserPage(root_, user_addr);
 }
 
 void ActivateAddressSpace(const AddressSpace* const address_space) {

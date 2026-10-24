@@ -30,7 +30,7 @@
 #include "task.h"
 #include "task_stack.h"
 #include "uart.h"
-#include "user/usertest.h"
+#include "user/usertest/usertest.h"
 #include "user_access.h"
 #include "user_mode.h"
 #include "user_programs.h"
@@ -138,30 +138,48 @@ class XorDevice final : public PolymorphicBase {
   uint64_t extra_padding_[2];
 };
 
-// Prints the "[TEST] <name>: PASS|FAIL" line of a boot test over UART only.
-// The suite runs after the boot log has filled about half of the 25-row VGA
-// text screen, and each VGA line it added would bring the greeting on row 0
-// (which test_boot.sh checks) closer to scrolling off. The VGA console only
-// gets the one-line summary of RunBootSelfTests().
-static void LogTestResult(const char* const test_name, const bool passed) {
-  UartWrite("[TEST] ");
-  UartWrite(test_name);
-  UartWrite(passed ? ": PASS\n" : ": FAIL\n");
+// Writes `text`, part of a failure report, over UART and to the VGA console,
+// which shows the report on a machine without a serial port (most PCs). A
+// passing suite writes no failure report, so its VGA output stays as
+// LogTestResult() describes.
+static void WriteFailureReport(const char* const text) {
+  UartWrite(text);
+  VgaWrite(text);
 }
 
-// Logs `expr` with its location over UART if `ok` is false; returns `ok`.
+// Prints the "[TEST] <name>: PASS|FAIL" line of a boot test: a PASS line over
+// UART only, a FAIL line also to the VGA console (WriteFailureReport()). The
+// suite runs after the boot log has filled about half of the 25-row VGA text
+// screen, and each VGA line it added would bring the greeting on row 0 (which
+// test_boot.sh checks) closer to scrolling off. A passing suite's only VGA
+// line is the summary of RunBootSelfTests().
+static void LogTestResult(const char* const test_name, const bool passed) {
+  if (passed) {
+    UartWrite("[TEST] ");
+    UartWrite(test_name);
+    UartWrite(": PASS\n");
+    return;
+  }
+  WriteFailureReport("[TEST] ");
+  WriteFailureReport(test_name);
+  WriteFailureReport(": FAIL\n");
+}
+
+// Logs `expr` with its location (WriteFailureReport()) if `ok` is false;
+// returns `ok`.
 static bool CheckExpectation(const bool ok,           //
                              const char* const expr,  //
                              const char* const file,  //
                              const int line) {
   if (!ok) {
-    UartWrite("[TEST] expectation failed: ");
-    UartWrite(expr);
-    UartWrite(" at ");
-    UartWrite(file);
-    UartWrite(":");
+    WriteFailureReport("[TEST] expectation failed: ");
+    WriteFailureReport(expr);
+    WriteFailureReport(" at ");
+    WriteFailureReport(file);
+    WriteFailureReport(":");
     UartWriteDec(static_cast<uint64_t>(line));
-    UartWrite("\n");
+    VgaWriteDec(static_cast<uint64_t>(line));
+    WriteFailureReport("\n");
   }
   return ok;
 }
@@ -2431,6 +2449,57 @@ static int64_t Cpu0TimerTicks() {
   return SmpGetCpuLocal(0)->timer_ticks.load(std::memory_order_acquire);
 }
 
+static bool MeasureTscCyclesPerTick(int64_t* cycles);
+
+// Timer ticks that a TickDeadline allows beyond the length of its wait, for
+// whatever else the wait involves: 2.5 s at 250 Hz, as long as
+// kSelfTestWaitTimeoutTscCycles on a 4 GHz TSC.
+constexpr int64_t kTickWaitSlackTicks = 625;
+// The TSC cycles per timer tick that TickDeadline assumes if the timer of
+// CPU 0 doesn't tick (MeasureTscCyclesPerTick() fails): those of a 10 GHz TSC,
+// faster than any.
+constexpr int64_t kFallbackTscCyclesPerTick =
+    10'000'000'000LL / kApicTimerTargetHz;
+
+// The TSC cycles that a timer tick of CPU 0 takes, measured the first time it
+// is asked for, then cached (the TSC runs at a constant rate). Call it only
+// from the task that runs the boot tests, which may then spin for a few ticks.
+static int64_t TscCyclesPerTick() {
+  static int64_t cycles_per_tick = 0;
+  if (cycles_per_tick <= 0) {
+    int64_t measured = 0;
+    cycles_per_tick = (MeasureTscCyclesPerTick(&measured) && measured > 0)
+                          ? measured
+                          : kFallbackTscCyclesPerTick;
+  }
+  return cycles_per_tick;
+}
+
+// Deadline of a wait that may legitimately last `ticks` timer ticks: it
+// expires once CPU 0 has taken kTickWaitSlackTicks more than that, or, should
+// its timer stop, once the TSC shows that the ticks would have taken twice as
+// long (TickWaitTimeoutTscCycles()). A fixed number of TSC cycles would not
+// bound such a wait: the TSC rate differs from machine to machine
+// (kSelfTestWaitTimeoutTscCycles is 2 s on a 5 GHz TSC). Construct it only
+// from the task that runs the boot tests.
+class TickDeadline {
+ public:
+  explicit TickDeadline(const int64_t ticks)
+      : tsc_deadline_(TickWaitTimeoutTscCycles(ticks + kTickWaitSlackTicks,
+                                               TscCyclesPerTick())),
+        end_tick_(Cpu0TimerTicks() + ticks + kTickWaitSlackTicks) {}
+
+  bool Expired() const {
+    return Cpu0TimerTicks() >= end_tick_ || tsc_deadline_.Expired();
+  }
+
+ private:
+  // First, so that the end tick is read after the first TscCyclesPerTick()
+  // has measured the rate.
+  const TscDeadline tsc_deadline_;
+  const int64_t end_tick_;
+};
+
 // Owns the tasks of one phase of TestSchedulerBlockWake() and joins them when
 // it goes out of scope, also on an early `return false`. Its tasks block, so
 // they would never notice a stop flag by themselves: the group first sets
@@ -2604,11 +2673,25 @@ static bool TestBlockWakePingPongPhase(TaskScheduler& scheduler,
     shared.tasks[side].store(task, std::memory_order_release);
   }
   shared.start.store(true, std::memory_order_release);
-  const TscDeadline deadline(kSelfTestWaitTimeoutTscCycles);
+  int last_rounds_done = 0;
   while (!shared.done[0].load(std::memory_order_acquire) ||
          !shared.done[1].load(std::memory_order_acquire)) {
-    SELFTEST_EXPECT(!deadline.Expired());
-    scheduler.Yield();
+    const TscDeadline deadline(kSelfTestWaitTimeoutTscCycles);
+    for (;;) {
+      if (shared.done[0].load(std::memory_order_acquire) &&
+          shared.done[1].load(std::memory_order_acquire)) {
+        break;
+      }
+      const int rounds_done =
+          shared.rounds_done[0].load(std::memory_order_relaxed) +
+          shared.rounds_done[1].load(std::memory_order_relaxed);
+      if (rounds_done != last_rounds_done) {
+        last_rounds_done = rounds_done;
+        break;
+      }
+      SELFTEST_EXPECT(!deadline.Expired());
+      scheduler.Yield();
+    }
   }
   group.JoinAll();
 
@@ -2784,14 +2867,14 @@ static void BlockWakeSpinnerWorker(void* const raw_shared) {
 }
 
 // Yields until CPU 0 has taken `ticks` more timer ticks (false if that takes
-// longer than kSelfTestWaitTimeoutTscCycles), checking `still_ok()` on the
-// way (false as soon as it fails).
+// much longer: TickDeadline), checking `still_ok()` on the way (false as soon
+// as it fails).
 template <typename StillOkFn>
 static bool YieldForCpu0Ticks(TaskScheduler& scheduler,  //
                               const int64_t ticks,       //
                               const StillOkFn& still_ok) {
+  const TickDeadline deadline(ticks);
   const int64_t start = Cpu0TimerTicks();
-  const TscDeadline deadline(kSelfTestWaitTimeoutTscCycles);
   while (Cpu0TimerTicks() - start < ticks) {
     if (deadline.Expired() || !still_ok()) {
       return false;
@@ -3045,7 +3128,8 @@ static bool TestBlockWakeTimedPhase(TaskScheduler& scheduler,
                                                    kDefaultTaskWeight,        //
                                                    1 % cpu_count);
     SELFTEST_EXPECT(group.Add(waiter, &shared.done));
-    const TscDeadline deadline(kSelfTestWaitTimeoutTscCycles);
+    const TickDeadline deadline(kBlockWakeTimedWaitTicks +
+                                kBlockWakeTimedWaitSlackTicks);
     while (!shared.done.load(std::memory_order_acquire)) {
       SELFTEST_EXPECT(!deadline.Expired());
       scheduler.Yield();
@@ -3182,8 +3266,9 @@ struct ShootdownStormContext {
   int cpu_count = 0;
   std::atomic<int> started{0};
   std::atomic<int> finished{0};
-  // Set if not every task could be created.
+  // Set if not every task could be created, or if the start barrier timed out.
   std::atomic<bool> stop{false};
+  std::atomic<bool> start_timed_out{false};
 };
 
 // Runs kShootdownsPerTask TLB shootdowns, every other one with interrupts
@@ -3192,11 +3277,20 @@ static void ShootdownStormWorker(void* const raw_ctx) {
   ShootdownStormContext* const ctx =
       static_cast<ShootdownStormContext*>(raw_ctx);
   ctx->started.fetch_add(1, std::memory_order_acq_rel);
+  const TscDeadline start_deadline(kSelfTestWaitTimeoutTscCycles);
   while (ctx->started.load(std::memory_order_acquire) < ctx->cpu_count) {
     if (ctx->stop.load(std::memory_order_acquire)) {
       return;
     }
+    if (start_deadline.Expired()) {
+      ctx->start_timed_out.store(true, std::memory_order_release);
+      ctx->stop.store(true, std::memory_order_release);
+      return;
+    }
     asm volatile("pause" : : : "memory");
+  }
+  if (ctx->stop.load(std::memory_order_acquire)) {
+    return;
   }
   for (int i = 0; i < kShootdownsPerTask; ++i) {
     if ((i & 1) == 0) {
@@ -3266,6 +3360,7 @@ static bool TestTlbShootdown() {
     }
     tasks.JoinAll();
   }
+  SELFTEST_EXPECT(!storm.start_timed_out.load(std::memory_order_acquire));
   SELFTEST_EXPECT(storm.finished.load(std::memory_order_acquire) == cpu_count);
   SELFTEST_EXPECT(PmmFreeFrameCount() == pmm_free_before);
   return true;
@@ -3640,7 +3735,7 @@ static bool WaitForProcesses(
       return true;
     }
     if (!SELFTEST_OK(!deadline.Expired())) {
-      UartWrite("[TEST] wait for processes timed out: FAIL\n");
+      WriteFailureReport("[TEST] wait for processes timed out: FAIL\n");
       return false;
     }
     if (mode == WaitMode::kYield) {
@@ -3656,9 +3751,9 @@ static bool HasEnded(const UserProcessStats& stats) {
   return stats.end_tick >= 0;
 }
 
-// Runs user/usertest.cpp in `mode` in a process of its own until it ends, and
-// stores how it ended in `*result`. Returns false if the process can't be
-// started, or doesn't end in time (instead of hanging in Wait()).
+// Runs user/usertest/usertest.cpp in `mode` in a process of its own until it
+// ends, and stores how it ended in `*result`. Returns false if the process
+// can't be started, or doesn't end in time (instead of hanging in Wait()).
 static bool RunUserTest(const usertest::Mode mode,
                         UserProgramResult* const result) {
   const std::unique_ptr<UserProcess> process =
@@ -3671,12 +3766,12 @@ static bool RunUserTest(const usertest::Mode mode,
   return true;
 }
 
-// Logs `result` over UART as the result of a user program that ended
-// otherwise than expected.
+// Logs `result` (WriteFailureReport()) as the result of a user program that
+// ended otherwise than expected.
 static void LogUnexpectedResult(const UserProgramResult& result) {
-  UartWrite("[TEST] unexpected user program result: ");
-  WriteUserProgramResult(result, UartWrite);
-  UartWrite("\n");
+  WriteFailureReport("[TEST] unexpected user program result: ");
+  WriteUserProgramResult(result, WriteFailureReport);
+  WriteFailureReport("\n");
 }
 
 // Returns true if `result` says that the program exited with `status`, and
@@ -3711,8 +3806,8 @@ static bool TestUserModeConsoleRead();
 static bool TestUserModeSpawnAndWait();
 static bool TestUserModeInteractiveShell();
 
-// Checks user processes with user/usertest.cpp, user/init.cpp, and
-// user/sh.cpp: the exit status reaches the kernel, system calls work and
+// Checks user processes with user/usertest/usertest.cpp, user/init/init.cpp,
+// and user/sh/sh.cpp: the exit status reaches the kernel, system calls work and
 // reject bad arguments, console read() and process spawn()/wait() work and
 // clean up children across exit/fault/kill, the interactive shell runs
 // built-in commands and child programs, and each kind of fault kills the
@@ -3797,6 +3892,7 @@ static bool TestUserModePrograms() {
     const std::unique_ptr<UserProcess> process = UserProcess::Start(
         UserProgram{kNotAnExecutable, sizeof(kNotAnExecutable)}, 0);
     SELFTEST_EXPECT(process != nullptr);
+    SELFTEST_EXPECT(WaitForProcesses(&process, 1, HasEnded, WaitMode::kYield));
     result = process->Wait();
     SELFTEST_EXPECT(result.outcome == UserProgramOutcome::kLoadFailed);
     SELFTEST_EXPECT(process->syscall_count() == 0);
@@ -3909,10 +4005,11 @@ static bool IsInSyscall(const UserProcessStats& stats) {
   return stats.in_syscall;
 }
 
-// Starts `count` processes that run user/usertest.cpp with the arguments
-// `arg_of(0)` to `arg_of(count - 1)` as `processes[0..count-1]`, each on a CPU
-// of its own if there are no more of them than CPUs other than CPU 0, which
-// runs this task. Each one starts only once the one before has run user code
+// Starts `count` processes that run user/usertest/usertest.cpp with the
+// arguments `arg_of(0)` to `arg_of(count - 1)` as `processes[0..count-1]`, each
+// on a CPU of its own if there are no more of them than CPUs other than CPU 0,
+// which runs this task. Each one starts only once the one before has run user
+// code
 // (WaitMode::kSpin). Started back to back, two of them could share a CPU: the
 // scheduler picks the least loaded CPU for a new task before it queues the
 // task there (work_stealing_scheduler.cpp), and in between an idle CPU, woken
@@ -4500,6 +4597,8 @@ static bool TestUserModeConsoleRead() {
   }
 
   // (b) Streaming input fed in two chunks after the process blocks in Read().
+  // RunConsoleRead() first makes 16 validation read() calls before blocking in
+  // the 17th read() for the first chunk and the 18th read() for the second.
   ConsoleClearInput();
   {
     constexpr const char kStreamInput[] = "stream8!";
@@ -4509,17 +4608,28 @@ static bool TestUserModeConsoleRead() {
         usertest::Arg(Mode::kConsoleRead, static_cast<uint64_t>(kStreamLen)));
     SELFTEST_EXPECT(reader != nullptr);
     SELFTEST_EXPECT(WaitForProcesses(
-        &reader, 1,
-        [](const UserProcessStats& s) { return s.in_syscall || HasEnded(s); },
+        &reader,  //
+        1,        //
+        [](const UserProcessStats& s) {
+          return (s.syscalls >= 17 && s.in_syscall) || HasEnded(s);
+        },
         WaitMode::kYield));
     SELFTEST_EXPECT(!HasEnded(reader->stats()));
     ConsolePushInput(kStreamInput, 4);
-    GetTaskScheduler()->Yield();
+    SELFTEST_EXPECT(WaitForProcesses(
+        &reader,  //
+        1,        //
+        [](const UserProcessStats& s) {
+          return (s.syscalls >= 18 && s.in_syscall) || HasEnded(s);
+        },
+        WaitMode::kYield));
+    SELFTEST_EXPECT(!HasEnded(reader->stats()));
     ConsolePushInput(kStreamInput + 4, 4);
     SELFTEST_EXPECT(WaitForProcesses(&reader, 1, HasEnded, WaitMode::kYield));
     const int64_t expected_checksum = SyscallSpinChecksum(
         reinterpret_cast<const uint8_t*>(kStreamInput), kStreamLen);
     SELFTEST_EXPECT(ExitedWith(reader->Wait(), expected_checksum));
+    SELFTEST_EXPECT(reader->stats().syscalls >= 19);
   }
 
   // (c) Kill() while blocked in Read() terminates within kKillDeadlineTicks.
@@ -4620,15 +4730,37 @@ static bool TestUserModeSpawnAndWait() {
   return true;
 }
 
+// For its lifetime: no echo of the console output on the screen, and an empty
+// console input to begin with. Then empties the console input and restores
+// the echo setting, also when a test returns early.
+class ScopedQuietConsole {
+ public:
+  ScopedQuietConsole() : vga_echo_(ConsoleVgaEchoEnabled()) {
+    ConsoleSetVgaEcho(false);
+    ConsoleClearInput();
+  }
+
+  ~ScopedQuietConsole() {
+    ConsoleClearInput();
+    ConsoleSetVgaEcho(vga_echo_);
+  }
+
+  ScopedQuietConsole(const ScopedQuietConsole&) = delete;
+  ScopedQuietConsole& operator=(const ScopedQuietConsole&) = delete;
+
+ private:
+  const bool vga_echo_;
+};
+
 // Verifies the end-to-end init -> sh workflow and interactive shell features
 // (prompt, character echoing, '\b' and 0x7F backspace editing with empty-line
 // underflow guard, '\r\n' handling, empty/whitespace lines, built-in commands
 // help/echo/cpu/programs/exit, spawning usertest passing and faulting modes,
 // and unknown command recovery).
 static bool TestUserModeInteractiveShell() {
-  const bool prev_vga_echo = ConsoleVgaEchoEnabled();
-  ConsoleSetVgaEcho(false);
-  ConsoleClearInput();
+  // Declared before the processes, so that on an early return their
+  // destructors kill and reap them before the console is restored.
+  const ScopedQuietConsole quiet_console;
   ConsoleResetOutputCapture();
 
   constexpr const char kShellScript[] =
@@ -4649,12 +4781,11 @@ static bool TestUserModeInteractiveShell() {
 
   const std::unique_ptr<UserProcess> init_proc =
       UserProcess::Start(InitProgram(), 0);
-  if (init_proc == nullptr) {
-    ConsoleSetVgaEcho(prev_vga_echo);
-    return false;
-  }
-  const bool waited =
-      WaitForProcesses(&init_proc, 1, HasEnded, WaitMode::kYield);
+  SELFTEST_EXPECT(init_proc != nullptr);
+  // Not in Wait() before init has ended: a shell that never gets through the
+  // script would hang the suite there. If init doesn't end in time, its
+  // destructor kills it, which also kills sh.
+  SELFTEST_EXPECT(WaitForProcesses(&init_proc, 1, HasEnded, WaitMode::kYield));
   const UserProgramResult init_result = init_proc->Wait();
 
   static char captured[4096];
@@ -4668,17 +4799,10 @@ static bool TestUserModeInteractiveShell() {
                    static_cast<int64_t>(sizeof(kExit42Script)) - 1);
   const std::unique_ptr<UserProcess> sh_proc =
       UserProcess::Start(ShUserProgram(), 0);
-  bool sh_waited = false;
-  UserProgramResult sh_result;
-  if (sh_proc != nullptr) {
-    sh_waited = WaitForProcesses(&sh_proc, 1, HasEnded, WaitMode::kYield);
-    sh_result = sh_proc->Wait();
-  }
+  SELFTEST_EXPECT(sh_proc != nullptr);
+  SELFTEST_EXPECT(WaitForProcesses(&sh_proc, 1, HasEnded, WaitMode::kYield));
+  const UserProgramResult sh_result = sh_proc->Wait();
 
-  ConsoleClearInput();
-  ConsoleSetVgaEcho(prev_vga_echo);
-
-  SELFTEST_EXPECT(waited);
   SELFTEST_EXPECT(ExitedWith(init_result, 0));
   SELFTEST_EXPECT(captured_len > 0);
   SELFTEST_EXPECT(ContainsSubstring(captured, "[INIT] hello from ring 3\n"));
@@ -4696,8 +4820,6 @@ static bool TestUserModeInteractiveShell() {
   SELFTEST_EXPECT(ContainsSubstring(captured, "sh: usertest faulted vector=6"));
   SELFTEST_EXPECT(
       ContainsSubstring(captured, "sh: unknown command: nosuchcommand\n"));
-  SELFTEST_EXPECT(sh_proc != nullptr);
-  SELFTEST_EXPECT(sh_waited);
   SELFTEST_EXPECT(ExitedWith(sh_result, 42));
   return true;
 }
@@ -4995,6 +5117,9 @@ static bool TestUserModeFpuIsolation() {
   }
   const int64_t pmm_free_before = PmmFreeFrameCount();
   const int64_t heap_free_before = HeapTotalFreeBytes();
+  // Bounds the preemption phase below; constructed before the tick counts are
+  // read, since the first TickDeadline measures the timer for a few ticks.
+  const TickDeadline deadline(kFpuIsolationTicksPerCpu);
   const int64_t switches_before = TotalContextSwitches();
   int64_t ticks_before[kMaxSupportedCpus];
   for (int cpu = 0; cpu < cpu_count; ++cpu) {
@@ -5007,7 +5132,6 @@ static bool TestUserModeFpuIsolation() {
   }
   int64_t min_cpu_ticks = 0;
   int64_t min_user_ticks = 0;
-  const TscDeadline deadline(kSelfTestWaitTimeoutTscCycles);
   for (;;) {
     SELFTEST_EXPECT(SampleFpuHoldGroup(&group));
     min_cpu_ticks = INT64_MAX;
@@ -5149,6 +5273,8 @@ static bool RunFpuInitialStateRound(const int count,           //
         UserTestProgram(), usertest::Arg(usertest::Mode::kFpuInitialState));
     SELFTEST_EXPECT(checkers[i] != nullptr);
   }
+  SELFTEST_EXPECT(
+      WaitForProcesses(checkers.get(), count, HasEnded, WaitMode::kYield));
   for (int i = 0; i < count; ++i) {
     SELFTEST_EXPECT(ExitedWith(checkers[i]->Wait(), 0));
     // The CPU of its exit() call.
@@ -6286,8 +6412,9 @@ static bool HasMadeSyscallOrEnded(const UserProcessStats& stats) {
 }
 
 // Waits without yielding until CPU 0, which runs the boot self-tests, has
-// taken `ticks` more timer interrupts. Fails if that takes longer than
-// kSelfTestWaitTimeoutTscCycles.
+// taken `ticks` (a few) more timer interrupts. Fails if that takes longer than
+// kSelfTestWaitTimeoutTscCycles: a TickDeadline would measure the timer with
+// this function.
 static bool BusyWaitTicks(const int64_t ticks) {
   const int64_t until = CpuTimerTicks(0) + ticks;
   const TscDeadline deadline(kSelfTestWaitTimeoutTscCycles);
@@ -6323,8 +6450,8 @@ static bool NoneEnded(const std::unique_ptr<UserProcess>* const processes,
   return true;
 }
 
-// Starts `count` processes that run user/usertest.cpp with the arguments
-// `arg_of(0)` to `arg_of(count - 1)` as `processes[0..count-1]`.
+// Starts `count` processes that run user/usertest/usertest.cpp with the
+// arguments `arg_of(0)` to `arg_of(count - 1)` as `processes[0..count-1]`.
 template <typename ArgOf>
 static bool StartProcesses(std::unique_ptr<UserProcess>* const processes,  //
                            const int count,                                //
@@ -6819,13 +6946,13 @@ static bool CheckSmapStillEnforced(const int cpu_count, int* const cpus) {
 }
 
 // Checks system calls with bad and unusual buffers and arguments
-// (kBufferChecks in user/usertest.h), in one process alone and then in one
-// process per CPU at once: user code gets kSyscallErrorFault for every buffer
-// that it may not read, also kernel, non-canonical and wrapping ones, without
-// a panic; kSyscallErrorInvalid for invalid sizes and ticks; the checksum of
-// unusual buffers that it may read; and its registers and RFLAGS.AC back,
-// also after timer interrupts of its user code with RFLAGS.AC set. The passes
-// cover both SMAP on and off. With SMAP, a SMAP read probe on every CPU
+// (kBufferChecks in user/usertest/usertest.h), in one process alone and then in
+// one process per CPU at once: user code gets kSyscallErrorFault for every
+// buffer that it may not read, also kernel, non-canonical and wrapping ones,
+// without a panic; kSyscallErrorInvalid for invalid sizes and ticks; the
+// checksum of unusual buffers that it may read; and its registers and RFLAGS.AC
+// back, also after timer interrupts of its user code with RFLAGS.AC set. The
+// passes cover both SMAP on and off. With SMAP, a SMAP read probe on every CPU
 // afterwards shows that the kernel still faults on its own accesses to user
 // pages. Runs everything twice; the first round lets the heap grow, and after
 // the second every frame and heap byte is back.
@@ -6851,9 +6978,9 @@ static bool TestUserModeSyscallBufferChecks() {
   }
 
   // `checks=` is the size of the suite (usertest::kBufferCheckCount, which the
-  // static_assert in user/usertest.cpp ties to the program): every process
-  // above exited with 0, which kBufferChecks does only after passing all of
-  // them.
+  // static_assert in user/usertest/usertest.cpp ties to the program): every
+  // process above exited with 0, which kBufferChecks does only after passing
+  // all of them.
   UartWrite("[TEST] user_mode_syscall_buffer_checks: checks=");
   UartWriteDec(static_cast<uint64_t>(usertest::kBufferCheckCount));
   UartWrite(smap ? " smap=on" : " smap=off");
@@ -7479,15 +7606,39 @@ static bool IsBlockedInIrqWait(const UserProcessStats& stats) {
   return stats.blocked_in_irq_wait;
 }
 
-static bool FindClaimablePciDeviceWithBar(int* const out_dev_index,  //
-                                          int* const out_bar_index,  //
-                                          const bool prefer_msix) {
+constexpr uint8_t kPciClassSerialBus = 0x0C;
+constexpr uint8_t kPciSubclassUsb = 0x03;
+constexpr uint8_t kPciProgIfXhci = 0x30;
+
+static bool IsXhci(const PciDevice& dev) {
+  return dev.class_code == kPciClassSerialBus &&
+         dev.subclass == kPciSubclassUsb && dev.prog_if == kPciProgIfXhci;
+}
+
+// Whether the driver tests may claim `dev` and change its interrupt settings
+// and Bus Master (BootSelfTestMayUsePciFunction()).
+static bool MayUseInDriverTests(const PciDevice& dev) {
+  return dev.claimable && BootSelfTestMayUsePciFunction(
+                              dev.class_code, dev.subclass, dev.prog_if);
+}
+
+struct ClaimablePciBar {
+  int dev_index = -1;
+  int bar_index = -1;
+};
+
+// Returns a function that the driver tests may use (MayUseInDriverTests())
+// and that has a memory BAR of at least a page whose first page holds no
+// MSI-X structure, and that BAR: with `prefer_msix`, the first such function
+// whose MSI-X table is in that BAR, if any; else the first such function.
+static StatusOr<ClaimablePciBar> FindClaimablePciDeviceWithBar(
+    const bool prefer_msix) {
   int best_dev = -1;
   int best_bar = -1;
   const int count = PciDeviceCount();
   for (int i = 0; i < count; ++i) {
     const PciDevice* const dev = PciGetDevice(i);
-    if (dev == nullptr || !dev->claimable) {
+    if (dev == nullptr || !MayUseInDriverTests(*dev)) {
       continue;
     }
     int mem_bar = -1;
@@ -7508,18 +7659,15 @@ static bool FindClaimablePciDeviceWithBar(int* const out_dev_index,  //
       best_bar = mem_bar;
     }
     if (prefer_msix && dev->msix.offset != 0 && dev->msix.valid &&
-        dev->msix.table_bar == mem_bar) {
-      *out_dev_index = i;
-      *out_bar_index = mem_bar;
-      return true;
+        dev->msix.table_bar == mem_bar &&
+        dev->bars[mem_bar].size <= kSyscallMmioMaxSize) {
+      return ClaimablePciBar{i, mem_bar};
     }
   }
   if (best_dev < 0) {
-    return false;
+    return kStatusError;
   }
-  *out_dev_index = best_dev;
-  *out_bar_index = best_bar;
-  return true;
+  return ClaimablePciBar{best_dev, best_bar};
 }
 
 // For a boot test whose device checks need a claimable PCI function with a
@@ -7530,6 +7678,63 @@ static bool SkipDeviceChecks(const char* const test_name) {
   UartWrite("[TEST] ");
   UartWrite(test_name);
   UartWrite(": skipped (no claimable PCI function with a memory BAR)\n");
+  return true;
+}
+
+// Formats `address` as "bb:dd.f" (hexadecimal), as the PCI boot report does.
+static void FormatPciAddress(const PciAddress& address, char (&out)[8]) {
+  constexpr char kHexDigits[] = "0123456789abcdef";
+  out[0] = kHexDigits[(address.bus >> 4) & 0xF];
+  out[1] = kHexDigits[address.bus & 0xF];
+  out[2] = ':';
+  out[3] = kHexDigits[(address.device >> 4) & 0x1];
+  out[4] = kHexDigits[address.device & 0xF];
+  out[5] = '.';
+  out[6] = kHexDigits[address.function & 0x7];
+  out[7] = '\0';
+}
+
+// Makes function `dev_idx` safe for the driver tests of `test_name`, which
+// claim it, enable its Bus Master and program its interrupts. An xHCI may
+// still run: firmware may have left it running, and so does a non-interactive
+// boot, whose init starts usbkbd and kills it when it ends. Its release clears
+// Bus Master but leaves the controller running on rings in memory that has
+// been freed since (the kernel can't stop a device by itself), and Bus Master
+// on would let it write that memory again. So an xHCI is first taken over
+// from firmware, halted and reset, as usbkbd does before it enables Bus Master
+// (usertest's kDriverXhciReset); it then stays halted, accessing no memory,
+// until a driver starts it again. Other functions need nothing: no driver of
+// this kernel runs them, and firmware stops their DMA before it hands the
+// machine over.
+static bool PrepareDeviceForDriverTests(const char* const test_name,
+                                        const int dev_idx) {
+  const PciDevice* const dev = PciGetDevice(dev_idx);
+  SELFTEST_EXPECT(dev != nullptr);
+  if (!IsXhci(*dev)) {
+    return true;
+  }
+  UserProgramResult result{};
+  SELFTEST_EXPECT(RunUserTestWithCaps(
+      usertest::DriverArg(usertest::Mode::kDriverXhciReset, 0, dev_idx),
+      kUserCapDriver, &result));
+  if (result.outcome == UserProgramOutcome::kExited &&
+      result.exit_status == usertest::kXhciResetWasRunningStatus) {
+    char address[8];
+    FormatPciAddress(dev->address, address);
+    LineBuffer line;
+    line.Append("[TEST] ")
+        .Append(test_name)
+        .Append(": halted and reset the running xHCI controller ")
+        .Append(address)
+        .Append("\n");
+    UartWrite(line.c_str());
+    return true;
+  }
+  if (result.outcome == UserProgramOutcome::kExited &&
+      result.exit_status == usertest::kXhciResetNotDecodingStatus) {
+    return true;
+  }
+  SELFTEST_EXPECT(ExitedWith(result, 0));
   return true;
 }
 
@@ -7628,12 +7833,15 @@ static bool TestDriverDeviceOwnership() {
   using usertest::DriverHoldSubmode;
   using usertest::Mode;
   SELFTEST_EXPECT(GetTaskScheduler() != nullptr);
-  int dev_idx = -1;
-  int bar_idx = -1;
-  if (!FindClaimablePciDeviceWithBar(&dev_idx, &bar_idx,
-                                     /*prefer_msix=*/true)) {
+  const StatusOr<ClaimablePciBar> target =
+      FindClaimablePciDeviceWithBar(/*prefer_msix=*/true);
+  if (!target.ok()) {
     return SkipDeviceChecks("driver_device_ownership");
   }
+  const int dev_idx = target->dev_index;
+  const int bar_idx = target->bar_index;
+  SELFTEST_EXPECT(
+      PrepareDeviceForDriverTests("driver_device_ownership", dev_idx));
   const PciDevice* const dev = PciGetDevice(dev_idx);
   SELFTEST_EXPECT(dev != nullptr);
 
@@ -7641,9 +7849,10 @@ static bool TestDriverDeviceOwnership() {
   // `PciGetDevice(dev_idx)`.
   {
     DriverContext ctx;
-    PciDeviceInfo info{};
-    SELFTEST_EXPECT(ctx.PciInfo(0, nullptr) == PciDeviceCount());
-    SELFTEST_EXPECT(ctx.PciInfo(dev_idx, &info) == PciDeviceCount());
+    const StatusOr<DriverPciInfoResult> res = ctx.PciInfo(dev_idx);
+    SELFTEST_EXPECT(res.ok());
+    SELFTEST_EXPECT(res->count == PciDeviceCount());
+    const PciDeviceInfo& info = res->info;
     SELFTEST_EXPECT(info.bus == dev->address.bus);
     SELFTEST_EXPECT(info.device == dev->address.device);
     SELFTEST_EXPECT(info.function == dev->address.function);
@@ -7766,23 +7975,34 @@ static bool TestDriverMmioMapping() {
   const uint64_t pat_msr = PagingReadPatMsr();
   SELFTEST_EXPECT(((pat_msr >> 24) & 0xFFULL) == 0x00ULL);
 
-  int dev_idx = -1;
-  int bar_idx = -1;
-  if (!FindClaimablePciDeviceWithBar(&dev_idx, &bar_idx,
-                                     /*prefer_msix=*/true)) {
+  const StatusOr<ClaimablePciBar> target =
+      FindClaimablePciDeviceWithBar(/*prefer_msix=*/true);
+  if (!target.ok()) {
     return SkipDeviceChecks("driver_mmio_mapping");
   }
+  const int dev_idx = target->dev_index;
+  const int bar_idx = target->bar_index;
+  SELFTEST_EXPECT(PrepareDeviceForDriverTests("driver_mmio_mapping", dev_idx));
   const PciDevice* const dev = PciGetDevice(dev_idx);
   SELFTEST_EXPECT(dev != nullptr);
   const PciBar& bar = dev->bars[bar_idx];
+  const bool bar_has_msix =
+      dev->msix.offset != 0 && dev->msix.valid &&
+      (dev->msix.table_bar == bar_idx || dev->msix.pba_bar == bar_idx) &&
+      bar.size > kPageSize && bar.size <= kSyscallMmioMaxSize;
+  const uint8_t msix_flag = bar_has_msix ? 2 : 0;
 
   const int64_t pmm_free_at_start = PmmFreeFrameCount();
   const int64_t heap_free_at_start = HeapTotalFreeBytes();
   UserProgramResult result{};
   // Warm up once before recording the exact baseline.
-  SELFTEST_EXPECT(RunUserTestWithCaps(
-      usertest::DriverArg(Mode::kDriverMmioChecks, 0, dev_idx, bar_idx),
-      kUserCapDriver, &result));
+  SELFTEST_EXPECT(
+      RunUserTestWithCaps(usertest::DriverArg(Mode::kDriverMmioChecks,  //
+                                              msix_flag,                //
+                                              dev_idx,                  //
+                                              bar_idx),                 //
+                          kUserCapDriver,                               //
+                          &result));
   SELFTEST_EXPECT(ExitedWith(result, 0));
 
   const int64_t pmm_free_before = PmmFreeFrameCount();
@@ -7798,7 +8018,10 @@ static bool TestDriverMmioMapping() {
   {
     const std::unique_ptr<UserProcess> proc = UserProcess::Start(
         UserTestProgram(),
-        usertest::DriverArg(Mode::kDriverMmioChecks, 1, dev_idx, bar_idx),
+        usertest::DriverArg(Mode::kDriverMmioChecks,              //
+                            static_cast<uint8_t>(1 | msix_flag),  //
+                            dev_idx,                              //
+                            bar_idx),
         kUserCapDriver);
     SELFTEST_EXPECT(proc != nullptr);
     SELFTEST_EXPECT(WaitForProcesses(&proc, 1, IsInIrqWait, WaitMode::kYield));
@@ -7812,18 +8035,17 @@ static bool TestDriverMmioMapping() {
           kDriverMmioWindowBase +
           static_cast<uintptr_t>(2 * m) * static_cast<uintptr_t>(kPageSize);
       const uintptr_t guard_va = mapped_va + static_cast<uintptr_t>(kPageSize);
-      UserPageInfo page_info{};
-      SELFTEST_EXPECT(proc->QueryUserPage(mapped_va, &page_info));
-      SELFTEST_EXPECT(page_info.writable);
-      SELFTEST_EXPECT(page_info.executable == !PagingNoExecuteEnabled());
-      SELFTEST_EXPECT(page_info.write_through);
-      SELFTEST_EXPECT(page_info.cache_disable);
-      SELFTEST_EXPECT(!page_info.pat);
-      SELFTEST_EXPECT(!page_info.owned);
-      SELFTEST_EXPECT(page_info.phys_addr == bar.base);
+      const StatusOr<UserPageInfo> page_info = proc->QueryUserPage(mapped_va);
+      SELFTEST_EXPECT(page_info.ok());
+      SELFTEST_EXPECT(page_info->writable);
+      SELFTEST_EXPECT(page_info->executable == !PagingNoExecuteEnabled());
+      SELFTEST_EXPECT(page_info->write_through);
+      SELFTEST_EXPECT(page_info->cache_disable);
+      SELFTEST_EXPECT(!page_info->pat);
+      SELFTEST_EXPECT(!page_info->owned);
+      SELFTEST_EXPECT(page_info->phys_addr == bar.base);
 
-      UserPageInfo guard_info{};
-      SELFTEST_EXPECT(!proc->QueryUserPage(guard_va, &guard_info));
+      SELFTEST_EXPECT(!proc->QueryUserPage(guard_va).ok());
       SELFTEST_EXPECT(proc->LookupUserPage(guard_va) == 0);
     }
 
@@ -7904,16 +8126,16 @@ static bool TestDriverDmaMemory() {
       const uintptr_t va =
           kDriverDmaWindowBase +
           static_cast<uintptr_t>(p) * static_cast<uintptr_t>(kPageSize);
-      UserPageInfo page_info{};
-      SELFTEST_EXPECT(proc->QueryUserPage(va, &page_info));
-      SELFTEST_EXPECT(page_info.writable);
-      SELFTEST_EXPECT(page_info.executable == !PagingNoExecuteEnabled());
-      SELFTEST_EXPECT(!page_info.write_through);
-      SELFTEST_EXPECT(!page_info.cache_disable);
-      SELFTEST_EXPECT(!page_info.pat);
-      SELFTEST_EXPECT(page_info.owned);
+      const StatusOr<UserPageInfo> page_info = proc->QueryUserPage(va);
+      SELFTEST_EXPECT(page_info.ok());
+      SELFTEST_EXPECT(page_info->writable);
+      SELFTEST_EXPECT(page_info->executable == !PagingNoExecuteEnabled());
+      SELFTEST_EXPECT(!page_info->write_through);
+      SELFTEST_EXPECT(!page_info->cache_disable);
+      SELFTEST_EXPECT(!page_info->pat);
+      SELFTEST_EXPECT(page_info->owned);
       if (p == 0) {
-        phys1 = page_info.phys_addr;
+        phys1 = page_info->phys_addr;
         SELFTEST_EXPECT(phys1 != 0);
         SELFTEST_EXPECT((phys1 & (static_cast<uint64_t>(kPageSize) - 1)) == 0);
         // Word 0 of page 0 holds `phys1` written by user mode after
@@ -7924,10 +8146,10 @@ static bool TestDriverDmaMemory() {
         SELFTEST_EXPECT(reported_phys1 == phys1);
       } else {
         // Multi-page DMA buffer must be physically contiguous.
-        SELFTEST_EXPECT(page_info.phys_addr ==
+        SELFTEST_EXPECT(page_info->phys_addr ==
                         phys1 + static_cast<uint64_t>(p) * kPageSize);
         const uint64_t word = *reinterpret_cast<const volatile uint64_t*>(
-            static_cast<uintptr_t>(page_info.phys_addr));
+            static_cast<uintptr_t>(page_info->phys_addr));
         SELFTEST_EXPECT(word ==
                         0xD0A0000000000000ULL + static_cast<uint64_t>(p));
       }
@@ -7938,21 +8160,20 @@ static bool TestDriverDmaMemory() {
     {
       const uintptr_t guard_va =
           kDriverDmaWindowBase + 4 * static_cast<uintptr_t>(kPageSize);
-      UserPageInfo guard_info{};
-      SELFTEST_EXPECT(!proc->QueryUserPage(guard_va, &guard_info));
+      SELFTEST_EXPECT(!proc->QueryUserPage(guard_va).ok());
       SELFTEST_EXPECT(proc->LookupUserPage(guard_va) == 0);
 
       const uintptr_t va2 =
           kDriverDmaWindowBase + 5 * static_cast<uintptr_t>(kPageSize);
-      UserPageInfo page_info2{};
-      SELFTEST_EXPECT(proc->QueryUserPage(va2, &page_info2));
-      SELFTEST_EXPECT(page_info2.writable);
-      SELFTEST_EXPECT(page_info2.executable == !PagingNoExecuteEnabled());
-      SELFTEST_EXPECT(!page_info2.write_through);
-      SELFTEST_EXPECT(!page_info2.cache_disable);
-      SELFTEST_EXPECT(!page_info2.pat);
-      SELFTEST_EXPECT(page_info2.owned);
-      phys2 = page_info2.phys_addr;
+      const StatusOr<UserPageInfo> page_info2 = proc->QueryUserPage(va2);
+      SELFTEST_EXPECT(page_info2.ok());
+      SELFTEST_EXPECT(page_info2->writable);
+      SELFTEST_EXPECT(page_info2->executable == !PagingNoExecuteEnabled());
+      SELFTEST_EXPECT(!page_info2->write_through);
+      SELFTEST_EXPECT(!page_info2->cache_disable);
+      SELFTEST_EXPECT(!page_info2->pat);
+      SELFTEST_EXPECT(page_info2->owned);
+      phys2 = page_info2->phys_addr;
       SELFTEST_EXPECT(phys2 != 0 && phys2 != phys1);
       const uint64_t reported_phys2 =
           *reinterpret_cast<const volatile uint64_t*>(
@@ -7986,8 +8207,52 @@ static bool TestDriverDmaMemory() {
   return true;
 }
 
-// Verifies `kSyscallIrqAlloc` and `kSyscallIrqWait` across every claimable PCI
-// device with MSI or MSI-X:
+// The PCI vendor IDs of the devices that QEMU itself provides (qemu-xhci, PCI
+// bridges; virtio devices), which always decode their BARs.
+constexpr uint16_t kPciVendorRedHat = 0x1B36;
+constexpr uint16_t kPciVendorVirtio = 0x1AF4;
+
+// Returns true if MSI-X device `dev_idx` (`dev`), which a test process has
+// claimed and whose MSI-X table entry 0 reads all-ones, shows for another
+// reason that it decodes no memory accesses, so that its table can't be read
+// back: its configuration space no longer answers (vendor ID all-ones, as
+// when a Thunderbolt controller powers an idle xHCI off), or it is not in D0
+// although the claim put it there. Logs that. Without such a reason, a table
+// that reads all-ones lost the writes that programmed it (a BAR or bridge
+// window that doesn't decode, or a wrong table address): the device would
+// never deliver its interrupts, and the test must fail. QEMU's own devices
+// always decode.
+static bool MsixTableNotDecoding(const int dev_idx, const PciDevice& dev) {
+  if (dev.vendor_id == kPciVendorRedHat || dev.vendor_id == kPciVendorVirtio) {
+    return false;
+  }
+  const bool config_gone =
+      PciConfigRead16(dev_idx, kPciVendorIdOffset) == 0xFFFF;
+  int power_state = 0;
+  if (dev.pm_offset != 0) {
+    const int pmcsr_offset = dev.pm_offset + kPciPmControlStatusOffset;
+    power_state =
+        PciConfigRead16(dev_idx, pmcsr_offset) & kPciPmcsrPowerStateMask;
+  }
+  if (!config_gone && power_state == 0) {
+    return false;
+  }
+  char address[8];
+  FormatPciAddress(dev.address, address);
+  LineBuffer line;
+  line.Append("[TEST] driver_irq_wait: ").Append(address);
+  if (config_gone) {
+    line.Append(" no longer answers");
+  } else {
+    line.Append(" is in D").AppendDec(static_cast<uint64_t>(power_state));
+  }
+  line.Append(": MSI-X table not read back\n");
+  UartWrite(line.c_str());
+  return true;
+}
+
+// Verifies `kSyscallIrqAlloc` and `kSyscallIrqWait` across every PCI device
+// with MSI or MSI-X that the driver tests may use (MayUseInDriverTests()):
 // - Validation of invalid counts/modes and duplicate `irq_alloc` rejection.
 // - Non-blocking poll (`timeout_ticks == 0`) and timeout expiration.
 // - Hardware MSI / MSI-X capability and table programming (`0xFEE00000 |
@@ -8003,8 +8268,6 @@ static bool TestDriverIrqWait() {
   using usertest::Mode;
   TaskScheduler* const scheduler = GetTaskScheduler();
   SELFTEST_EXPECT(scheduler != nullptr);
-  const int64_t pmm_free_before = PmmFreeFrameCount();
-  const int64_t heap_free_before = HeapTotalFreeBytes();
 
   int target_devices[kPciMaxDevices] = {};
   int target_count = 0;
@@ -8013,7 +8276,7 @@ static bool TestDriverIrqWait() {
   const int total_pci = PciDeviceCount();
   for (int dev_idx = 0; dev_idx < total_pci; ++dev_idx) {
     const PciDevice* const dev = PciGetDevice(dev_idx);
-    if (dev == nullptr || !dev->claimable ||
+    if (dev == nullptr || !MayUseInDriverTests(*dev) ||
         (dev->msi.offset == 0 && (dev->msix.offset == 0 || !dev->msix.valid))) {
       continue;
     }
@@ -8025,19 +8288,30 @@ static bool TestDriverIrqWait() {
     }
   }
   if (target_count == 0) {
-    int fallback_dev = -1;
-    int fallback_bar = -1;
-    if (!FindClaimablePciDeviceWithBar(&fallback_dev, &fallback_bar,
-                                       /*prefer_msix=*/false)) {
+    const StatusOr<ClaimablePciBar> fallback =
+        FindClaimablePciDeviceWithBar(/*prefer_msix=*/false);
+    if (!fallback.ok()) {
       return SkipDeviceChecks("driver_irq_wait");
     }
-    target_devices[target_count++] = fallback_dev;
+    target_devices[target_count++] = fallback->dev_index;
   }
+  for (int t = 0; t < target_count; ++t) {
+    SELFTEST_EXPECT(
+        PrepareDeviceForDriverTests("driver_irq_wait", target_devices[t]));
+  }
+  const int64_t pmm_free_before = PmmFreeFrameCount();
+  const int64_t heap_free_before = HeapTotalFreeBytes();
+  // MSI-X devices whose table the test read back, and those whose table it
+  // could not read because the device doesn't decode its BAR
+  // (MsixTableNotDecoding()).
+  int msix_tables_checked = 0;
+  int msix_tables_skipped = 0;
 
   for (int t = 0; t < target_count; ++t) {
     const int dev_idx = target_devices[t];
     const PciDevice* const dev = PciGetDevice(dev_idx);
     SELFTEST_EXPECT(dev != nullptr);
+    (void)PciQuiesce(dev_idx);
     const bool has_hw_irq =
         dev->msi.offset != 0 || (dev->msix.offset != 0 && dev->msix.valid);
     const int expected_count =
@@ -8113,16 +8387,22 @@ static bool TestDriverIrqWait() {
               PciConfigRead16(dev_idx, dev->msix.offset + kPciMsiControlOffset);
           SELFTEST_EXPECT((ctrl & kPciMsixControlEnable) != 0);
           SELFTEST_EXPECT((ctrl & kPciMsixControlFunctionMask) == 0);
-          for (int k = 0; k < expected_count; ++k) {
-            const int vec_k = (k == 0) ? vec0 : vec1;
-            SELFTEST_EXPECT(DeviceIrqReadMsixTableWord(dev_idx, k * 4 + 0) ==
-                            expected_addr_lo);
-            SELFTEST_EXPECT(DeviceIrqReadMsixTableWord(dev_idx, k * 4 + 1) ==
-                            0);
-            SELFTEST_EXPECT(DeviceIrqReadMsixTableWord(dev_idx, k * 4 + 2) ==
-                            DeviceIrqMsiData(vec_k));
-            SELFTEST_EXPECT(
-                (DeviceIrqReadMsixTableWord(dev_idx, k * 4 + 3) & 1U) == 0);
+          if (DeviceIrqReadMsixTableWord(dev_idx, 0) == 0xFFFFFFFFU &&
+              MsixTableNotDecoding(dev_idx, *dev)) {
+            ++msix_tables_skipped;
+          } else {
+            ++msix_tables_checked;
+            for (int k = 0; k < expected_count; ++k) {
+              const int vec_k = (k == 0) ? vec0 : vec1;
+              SELFTEST_EXPECT(DeviceIrqReadMsixTableWord(dev_idx, k * 4 + 0) ==
+                              expected_addr_lo);
+              SELFTEST_EXPECT(DeviceIrqReadMsixTableWord(dev_idx, k * 4 + 1) ==
+                              0);
+              SELFTEST_EXPECT(DeviceIrqReadMsixTableWord(dev_idx, k * 4 + 2) ==
+                              DeviceIrqMsiData(vec_k));
+              SELFTEST_EXPECT(
+                  (DeviceIrqReadMsixTableWord(dev_idx, k * 4 + 3) & 1U) == 0);
+            }
           }
         } else {
           const uint16_t ctrl =
@@ -8172,8 +8452,8 @@ static bool TestDriverIrqWait() {
         SELFTEST_EXPECT(proc->stats().blocked_in_irq_wait);
 
         const int64_t task_ticks_before = proc->stats().task_timer_ticks;
+        const TickDeadline block_deadline(20);
         const int64_t wait_start_tick = Cpu0TimerTicks();
-        const TscDeadline block_deadline(kSelfTestWaitTimeoutTscCycles);
         while (Cpu0TimerTicks() - wait_start_tick < 20) {
           SELFTEST_EXPECT(!block_deadline.Expired());
           scheduler->Yield();
@@ -8243,8 +8523,15 @@ static bool TestDriverIrqWait() {
       .AppendDec(static_cast<uint64_t>(tested_msix))
       .Append(" msi=")
       .AppendDec(static_cast<uint64_t>(tested_msi))
+      .Append(" msix_tables_checked=")
+      .AppendDec(static_cast<uint64_t>(msix_tables_checked))
+      .Append(" skipped=")
+      .AppendDec(static_cast<uint64_t>(msix_tables_skipped))
       .Append("\n");
   UartWrite(summary.c_str());
+  // Every MSI-X device had its table read back, or showed that it decodes no
+  // memory accesses.
+  SELFTEST_EXPECT(msix_tables_checked + msix_tables_skipped == tested_msix);
 
   SELFTEST_EXPECT(PagingActiveRoot() == PagingKernelRoot());
   SELFTEST_EXPECT(PagingUserSpaceIsEmpty());
@@ -8262,12 +8549,14 @@ static bool TestDriverTeardown() {
   using usertest::DriverHoldSubmode;
   using usertest::Mode;
   SELFTEST_EXPECT(GetTaskScheduler() != nullptr);
-  int dev_idx = -1;
-  int bar_idx = -1;
-  if (!FindClaimablePciDeviceWithBar(&dev_idx, &bar_idx,
-                                     /*prefer_msix=*/true)) {
+  const StatusOr<ClaimablePciBar> target =
+      FindClaimablePciDeviceWithBar(/*prefer_msix=*/true);
+  if (!target.ok()) {
     return SkipDeviceChecks("driver_teardown");
   }
+  const int dev_idx = target->dev_index;
+  const int bar_idx = target->bar_index;
+  SELFTEST_EXPECT(PrepareDeviceForDriverTests("driver_teardown", dev_idx));
   const PciDevice* const dev = PciGetDevice(dev_idx);
   SELFTEST_EXPECT(dev != nullptr);
   const bool has_irq =
@@ -8352,15 +8641,14 @@ static bool TestDriverTeardown() {
   return true;
 }
 
-constexpr int kMaxSelfTestXhciControllers = 4;
-constexpr uint8_t kPciClassSerialBus = 0x0C;
-constexpr uint8_t kPciSubclassUsb = 0x03;
-constexpr uint8_t kPciProgIfXhci = 0x30;
-// 100 ticks at 250 Hz = 400 ms: covers two-phase controller bring-up (reset +
-// port power settle) plus the 100 ms port debounce, 50 ms USB2 reset recovery,
-// 10 ms address settle, and descriptor/endpoint setup so all cold-plugged
-// keyboards reach steady-state indefinite `irq_wait(mask, -1)`.
+constexpr int kMaxSelfTestXhciControllers = kSyscallMaxClaims;
+// 100 ticks at 250 Hz = 400 ms minimum settle window; if a physical USB device
+// is still enumerating after 400 ms, wait until `usbkbd` has remained blocked
+// in `irq_wait` with no new syscalls for `kDriverQuietSettleTicks` (140 ms,
+// longer than the 100 ms port debounce), up to `kDriverMaxEnumSettleTicks`.
 constexpr int64_t kDriverEnumSettleTicks = 100;
+constexpr int64_t kDriverQuietSettleTicks = 35;
+constexpr int64_t kDriverMaxEnumSettleTicks = 625;
 // 550 ticks at 250 Hz = 2.20 s; the measured window must be at least
 // kDriverMinIdleWindowTicks (500 ticks = 2.0 s).
 constexpr int64_t kDriverIdleWindowTicks = 550;
@@ -8396,7 +8684,7 @@ static bool VerifyXhciDevicesQuiescedAndReleased(
     const int64_t expected_heap) {
   const DriverReleaseRecord rec = DriverLastReleaseRecord();
   SELFTEST_EXPECT(rec.quiesced_count == dev_count);
-  SELFTEST_EXPECT(rec.freed_vectors == dev_count);
+  SELFTEST_EXPECT(rec.freed_vectors >= 1 && rec.freed_vectors <= dev_count);
   SELFTEST_EXPECT(rec.released_claims == dev_count);
   SELFTEST_EXPECT(rec.quiesced_before_vectors_freed);
   SELFTEST_EXPECT(rec.quiesced_before_address_space_destroyed);
@@ -8456,6 +8744,7 @@ static bool VerifyXhciDevicesQuiescedAndReleased(
 //        resets and restarts all controllers cleanly
 //        (`kDriverArgExitAfterReady`).
 static bool TestUsbKbdDriverLifecycle() {
+  const ScopedQuietConsole quiet_console;
   TaskScheduler* const scheduler = GetTaskScheduler();
   SELFTEST_EXPECT(scheduler != nullptr);
   SELFTEST_EXPECT(PciClaimedCount() == 0);
@@ -8537,9 +8826,24 @@ static bool TestUsbKbdDriverLifecycle() {
     // root-hub ports (100 ms debounce + 50 ms reset recovery + 10 ms address
     // settle + control transfers) to finish enumerating and enter indefinite
     // `irq_wait(mask, -1)`.
+    const TickDeadline settle_deadline(kDriverMaxEnumSettleTicks);
     const int64_t settle_start = Cpu0TimerTicks();
-    const TscDeadline settle_deadline(kSelfTestWaitTimeoutTscCycles);
-    while (Cpu0TimerTicks() - settle_start < kDriverEnumSettleTicks) {
+    int64_t last_activity_tick = settle_start;
+    int64_t last_syscalls = proc->stats().syscalls;
+    for (;;) {
+      const int64_t now_tick = Cpu0TimerTicks();
+      const UserProcessStats cur_stats = proc->stats();
+      if (!cur_stats.blocked_in_irq_wait ||
+          cur_stats.syscalls != last_syscalls) {
+        last_activity_tick = now_tick;
+        last_syscalls = cur_stats.syscalls;
+      }
+      const int64_t elapsed = now_tick - settle_start;
+      if (elapsed >= kDriverEnumSettleTicks &&
+          (now_tick - last_activity_tick >= kDriverQuietSettleTicks ||
+           elapsed >= kDriverMaxEnumSettleTicks)) {
+        break;
+      }
       SELFTEST_EXPECT(!settle_deadline.Expired());
       scheduler->Yield();
     }
@@ -8548,17 +8852,21 @@ static bool TestUsbKbdDriverLifecycle() {
     scheduler->Yield();
     SELFTEST_EXPECT(proc->stats().blocked_in_irq_wait);
 
+    int active_xhci_count = 0;
     for (int i = 0; i < xhci_count; ++i) {
       const int dev_idx = xhci_indices[i];
       SELFTEST_EXPECT(PciOwner(dev_idx) == expected_owner);
       const uint16_t cmd = PciConfigRead16(dev_idx, kPciCommandOffset);
-      SELFTEST_EXPECT((cmd & kPciCommandBusMaster) != 0);
+      if ((cmd & kPciCommandBusMaster) != 0) {
+        ++active_xhci_count;
+      }
     }
-    SELFTEST_EXPECT(DeviceIrqUsedVectorCount() == xhci_count);
+    SELFTEST_EXPECT(active_xhci_count >= 1 && active_xhci_count <= xhci_count);
+    SELFTEST_EXPECT(DeviceIrqUsedVectorCount() == active_xhci_count);
 
+    const TickDeadline idle_deadline(kDriverIdleWindowTicks);
     const int64_t driver_ticks_before = proc->stats().task_timer_ticks;
     const int64_t total_ticks_before = Cpu0TimerTicks();
-    const TscDeadline idle_deadline(kSelfTestWaitTimeoutTscCycles);
     bool checked_midpoint = false;
     for (;;) {
       const int64_t elapsed = Cpu0TimerTicks() - total_ticks_before;

@@ -1,6 +1,6 @@
-// Tests of the HID boot-keyboard translation (user/usb_hid.h). The expected
-// characters are written out by hand here (US layout, HID Usage Tables page
-// 0x07), not taken from the code under test.
+// Tests of the HID boot-keyboard translation (user/usbkbd/usb_hid.h). The
+// expected characters are written out by hand here (US layout, HID Usage Tables
+// page 0x07), not taken from the code under test.
 
 #include <gmock/gmock.h>
 #include <gtest/gtest.h>
@@ -11,8 +11,8 @@
 #include <string>
 #include <vector>
 
-#include "user/sh_lib.h"
-#include "user/usb_hid.h"
+#include "user/sh/sh_lib.h"
+#include "user/usbkbd/usb_hid.h"
 
 namespace protos::usb {
 namespace {

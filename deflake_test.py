@@ -3,7 +3,10 @@
 
 from __future__ import annotations
 
+import ast
+import dataclasses
 import fcntl
+import io
 import json
 import os
 from pathlib import Path
@@ -11,16 +14,106 @@ import random
 import re
 import shlex
 import shutil
+import signal
 import stat
 import subprocess
+import sys
 import tempfile
 import textwrap
+import threading
 import time
+import tokenize
 import unittest
+from unittest import mock
 
 import deflake
 
 REPO_ROOT = Path(__file__).resolve().parent
+
+
+def process_gone(pid: int, timeout_s: float = 10.0) -> bool:
+  """Waits up to `timeout_s` for process `pid` to end (a zombie counts)."""
+  deadline = time.monotonic() + timeout_s
+  while True:
+    try:
+      with open(f"/proc/{pid}/stat", encoding="latin-1") as f:
+        if f.read().rsplit(")", 1)[1].split()[0] == "Z":
+          return True
+    except OSError:
+      try:
+        os.kill(pid, 0)
+      except ProcessLookupError:
+        return True
+      except PermissionError:
+        pass
+    if time.monotonic() >= deadline:
+      return False
+    time.sleep(0.05)
+
+
+def wait_for_file(path: Path, timeout_s: float = 30.0) -> bool:
+  """Waits up to `timeout_s` for `path` to exist."""
+  deadline = time.monotonic() + timeout_s
+  while not path.exists():
+    if time.monotonic() >= deadline:
+      return False
+    time.sleep(0.05)
+  return True
+
+
+def make_run_record(**fields: object) -> deflake.RunRecord:
+  """A RunRecord of a failed host:bios run, with `fields` replaced."""
+  record = deflake.RunRecord(
+      config="host:bios",
+      index=1,
+      build="b1",
+      status="FAIL",
+      reasons=("test_failed:rbtree_edge_cases",),
+      outcomes={},
+      failed_tests=["rbtree_edge_cases"],
+      phase="after suite (failed)",
+      seeds=[],
+      seed_lines=[],
+      failure_lines=[],
+      expectations=[],
+      diagnostics=[],
+      duration_s=1.0,
+      start_utc="2026-10-20T18:00:00Z",
+      lock_wait_s=0.0,
+      loadavg_before=[0.0, 0.0, 0.0],
+      qemu_argv=(),
+      qemu_cwd="/repo",
+      harness_argv=(),
+      env_recorded={},
+      nondefault_harness_env={},
+      iso_snapshot="/store/abc.iso",
+      mb1_iso_snapshot=None,
+      exit_code=1,
+      t_pass=None,
+      t_fail=1.0,
+  )
+  return dataclasses.replace(record, **fields)
+
+
+def make_test_boot_repo(tmp_path: Path, fake_qemu: str) -> dict[str, str]:
+  """Sets up `tmp_path` as a repository with a copy of test_boot.sh, fake
+  ISOs and OVMF images, and `fake_qemu` (a script) as qemu-system-x86_64 in
+  tmp_path/fakebin. Returns the environment to run the copy in."""
+  shutil.copy2(REPO_ROOT / "test_boot.sh", tmp_path / "test_boot.sh")
+  (tmp_path / "test_boot.sh").chmod(0o755)
+  for name in ("kernel.iso", "kernel-mb1.iso", "OVMF.fd", "OVMF_CODE.fd",
+               "OVMF_VARS.fd"):
+    (tmp_path / name).write_bytes(b"fake " + name.encode())
+  (tmp_path / "fakebin").mkdir()
+  qemu = tmp_path / "fakebin" / "qemu-system-x86_64"
+  qemu.write_text(textwrap.dedent(fake_qemu), encoding="utf-8")
+  qemu.chmod(0o755)
+  env = os.environ.copy()
+  env["PATH"] = f"{tmp_path / 'fakebin'}:{env.get('PATH', '')}"
+  for var in (*deflake.BOOT_TEST_ENV_VARS, "USE_DOCKER", "KVM", "MAKEFLAGS",
+              "MAKELEVEL", "MFLAGS", "MAKEOVERRIDES"):
+    env.pop(var, None)
+  return env
 
 
 def make_serial_log(
@@ -104,8 +197,10 @@ def make_serial_log(
 # editor; the serial console socket drops unread input when the client hangs
 # up (like QEMU). FAKE_BOOT_LINES names a file of lines to print before the
 # self-tests end; FAKE_BUG injects one bug: "noninteractive" (the kernel
-# ignores the fw_cfg opt-in) or "symbols_unshifted" (Shift does not change
-# digits and symbols).
+# ignores the fw_cfg opt-in), "symbols_unshifted" (Shift does not change
+# digits and symbols) or "late_failure" (the stress test fails while the
+# harness dumps the VGA text buffer or framebuffer, after its last serial log
+# check before that dump).
 FAKE_GUEST_QEMU = r'''#!/usr/bin/env python3
 import json, os, queue, select, socket, sys, threading, time
 
@@ -139,7 +234,13 @@ monitor_path = values("-monitor")[0][len("unix:"):].split(",")[0]
 interactive = ("name=opt/protos/boot_session,string=interactive" in
                values("-fw_cfg") and BUG != "noninteractive")
 uefi = "-bios" in argv
-controllers, cold, slot = {}, [], 4
+def xhci_port(port_spec):
+    parts = str(port_spec).split(".")
+    parts[0] = str(int(parts[0]) + 4)
+    return ".".join(parts)
+
+
+controllers, cold, hubs, slot = {}, [], {}, 4
 for spec in values("-device"):
     driver, o = opts(spec)
     if driver in ("qemu-xhci", "nec-usb-xhci"):
@@ -150,10 +251,15 @@ for spec in values("-device"):
         controllers[o["id"]] = (bdf, "msi" if o.get("msix") == "off" else "msix")
     elif driver == "pci-bridge":
         controllers[o["id"]], slot = ("00:%02x.0" % slot, None), slot + 1
+    elif driver == "usb-hub":
+        hubs[o["id"]] = {"id": o["id"], "ctrl": o["bus"].split(".")[0],
+                         "port": str(o["port"])}
     elif driver == "usb-kbd":
+        port_str = str(o["port"])
+        is_fs = o.get("usb_version") == "1" or "." in port_str
         cold.append({"id": o["id"], "ctrl": o["bus"].split(".")[0],
-                     "port": int(o["port"]),
-                     "speed": "fs" if o.get("usb_version") == "1" else "hs"})
+                     "port": port_str,
+                     "speed": "fs" if is_fs else "hs"})
 
 log_lock = threading.Lock()
 log_file = open(log_path, "ab", buffering=0)
@@ -212,14 +318,14 @@ def driver():
 def attach(kb):
     time.sleep(0.05)
     kb["armed"] = True
-    log("[USBKBD] keyboard attached: %s port %d (%s)\n" % (
-        controllers[kb["ctrl"]][0], kb["port"] + 4, kb["speed"]))
+    log("[USBKBD] keyboard attached: %s port %s (%s)\n" % (
+        controllers[kb["ctrl"]][0], xhci_port(kb["port"]), kb["speed"]))
 
 
 def detach(kb):
     time.sleep(0.02)
-    log("[USBKBD] keyboard detached: %s port %d\n" % (
-        controllers[kb["ctrl"]][0], kb["port"] + 4))
+    log("[USBKBD] keyboard detached: %s port %s\n" % (
+        controllers[kb["ctrl"]][0], xhci_port(kb["port"])))
 
 
 def shell():
@@ -356,20 +462,51 @@ def qmp_server():
                         target["events"].append((e["data"]["key"]["data"],
                                                  e["data"]["down"]))
             elif command == "device_add":
-                kb = new_keyboard({"id": args["id"], "port": int(args["port"]),
-                                   "ctrl": args["bus"].split(".")[0],
-                                   "speed": "fs" if args.get("usb_version") == 1
-                                   else "hs"})
-                with lock:
-                    keyboards.append(kb)
-                threading.Thread(target=attach, args=(kb,), daemon=True).start()
+                ctrl = args["bus"].split(".")[0]
+                port_str = str(args["port"])
+                if args.get("driver") == "usb-hub":
+                    with lock:
+                        hubs[args["id"]] = {"id": args["id"], "ctrl": ctrl,
+                                            "port": port_str}
+                else:
+                    is_fs = args.get("usb_version") == 1 or "." in port_str
+                    kb = new_keyboard({"id": args["id"], "port": port_str,
+                                       "ctrl": ctrl,
+                                       "speed": "fs" if is_fs else "hs"})
+                    with lock:
+                        keyboards.append(kb)
+                    threading.Thread(target=attach, args=(kb,),
+                                     daemon=True).start()
             elif command == "device_del":
+                target_id = args["id"]
+                detached_kbs = []
                 with lock:
-                    kb = [k for k in keyboards if k["id"] == args["id"]][0]
-                    keyboards.remove(kb)
-                events.append({"event": "DEVICE_DELETED",
-                               "data": {"device": kb["id"]}})
-                threading.Thread(target=detach, args=(kb,), daemon=True).start()
+                    if target_id in hubs:
+                        h = hubs.pop(target_id)
+                        prefix = h["port"] + "."
+                        sub_ids = [hid for hid, sub in list(hubs.items())
+                                   if sub["ctrl"] == h["ctrl"] and
+                                   sub["port"].startswith(prefix)]
+                        for hid in sub_ids:
+                            hubs.pop(hid)
+                        detached_kbs = [k for k in keyboards
+                                        if k["ctrl"] == h["ctrl"] and
+                                        k["port"].startswith(prefix)]
+                        for k in detached_kbs:
+                            keyboards.remove(k)
+                        for dev_id in [target_id] + sub_ids + [
+                                k["id"] for k in detached_kbs]:
+                            events.append({"event": "DEVICE_DELETED",
+                                           "data": {"device": dev_id}})
+                    else:
+                        kb = [k for k in keyboards if k["id"] == target_id][0]
+                        keyboards.remove(kb)
+                        detached_kbs = [kb]
+                        events.append({"event": "DEVICE_DELETED",
+                                       "data": {"device": kb["id"]}})
+                for k in detached_kbs:
+                    threading.Thread(target=detach, args=(k,),
+                                     daemon=True).start()
             reply["id"] = request.get("id")
             send(reply)
             for event in events:
@@ -385,6 +522,8 @@ def monitor_server():
         conn, _ = server.accept()
         words = conn.makefile("rb").readline().decode().split()
         if words[:1] == ["pmemsave"]:
+            if BUG == "late_failure":
+                log("[STRESS] random_multicpu_stress: FAIL (late) seed=0x1\n")
             size = int(words[2])
             if int(words[1], 0) == 0xB8000:
                 data = b"".join(bytes([ord(c), 0x0F])
@@ -1422,12 +1561,21 @@ class LockAndRunnersTest(unittest.TestCase):
       # The bios pass (USB scenarios by default) has the USB devices of
       # `make run`, the fw_cfg opt-in and a serial console socket that logs to
       # the usual file; the max pass keeps its file serial and no USB device.
+      # Their files are in the run's own directory under build/, which
+      # test_boot.sh deletes at its end.
+      run_dir = (art_dir / "bios" / "qemu_run_dir").read_text(
+          encoding="utf-8").strip()
+      self.assertRegex(run_dir, r"^build/test_boot\.[A-Za-z0-9]+$")
+      self.assertEqual(
+          (art_dir / "max" / "qemu_run_dir").read_text(encoding="utf-8").strip(),
+          run_dir,
+      )
       bios_argv = argvs["bios"]
       chardev = bios_argv[bios_argv.index("-chardev") + 1]
       self.assertEqual(
           chardev,
-          "socket,id=ser0,path=build/qemu_bios_serial.sock,server=on,"
-          "wait=off,logfile=build/serial_bios_output.log",
+          f"socket,id=ser0,path={run_dir}/qemu_bios_serial.sock,server=on,"
+          f"wait=off,logfile={run_dir}/serial_bios_output.log",
       )
       self.assertEqual(
           bios_argv[bios_argv.index("-serial") + 1], "chardev:ser0"
@@ -1441,10 +1589,14 @@ class LockAndRunnersTest(unittest.TestCase):
       self.assertEqual(bios_argv[start:start + len(usb_args)], usb_args)
       self.assertEqual(
           argvs["max"][argvs["max"].index("-serial") + 1],
-          "file:build/serial_max_output.log",
+          f"file:{run_dir}/serial_max_output.log",
       )
       for absent in ("-chardev", "-device", "-fw_cfg"):
         self.assertNotIn(absent, argvs["max"])
+      for p in ("bios", "max"):
+        self.assertEqual(
+            (art_dir / p / "qemu_stderr.log").read_text(encoding="utf-8"), ""
+        )
       self.assertEqual(sorted(os.listdir(tmp_path / "build")), [])
 
       # 3. BOOT_TEST_USB=0 runs bios and uefi exactly as without the USB
@@ -1475,17 +1627,483 @@ class LockAndRunnersTest(unittest.TestCase):
           ("uefi", ["-bios", str(tmp_path / "OVMF.fd"), "-cpu",
                     "qemu64,+x2apic", "-m", "4G"]),
       ):
+        run_dir = (art_off / p / "qemu_run_dir").read_text(
+            encoding="utf-8").strip()
         self.assertEqual(
             (art_off / p / "qemu_argv").read_bytes().decode().split("\0"),
             common + [
-                "-serial", f"file:build/serial_{p}_output.log",
-                "-monitor", f"unix:build/qemu_{p}_monitor.sock,server,nowait",
-                "-qmp", f"unix:build/qemu_{p}_qmp.sock,server,nowait",
+                "-serial", f"file:{run_dir}/serial_{p}_output.log",
+                "-monitor", f"unix:{run_dir}/qemu_{p}_monitor.sock,server,nowait",
+                "-qmp", f"unix:{run_dir}/qemu_{p}_qmp.sock,server,nowait",
                 "-no-reboot",
             ] + rest + ["-cdrom", str(tmp_path / "kernel.iso"), ""],
         )
         output_txt = (art_off / p / "output.log").read_text(encoding="utf-8")
         self.assertNotIn("USB", output_txt)
+
+  def test_concurrent_test_boot_runs_keep_their_files_apart(self) -> None:
+    # Each fake QEMU logs the token of its run a while after it starts, so
+    # that the second run starts while the first one waits for it.
+    fake_qemu = """\
+        #!/usr/bin/env python3
+        import os, sys, time
+        argv = sys.argv[1:]
+        serial_path = argv[argv.index("-serial") + 1][len("file:"):]
+        with open(serial_path, "ab") as f:
+            f.write(b"Hello, x86-64 Kernel World!\\r\\n")
+            f.flush()
+            time.sleep(1.5)
+            f.write(b"[TEST] run_%s: FAIL\\r\\n" % os.environ["FAKE_TOKEN"].encode())
+            f.flush()
+        time.sleep(30)
+        """
+    with tempfile.TemporaryDirectory() as tmp:
+      tmp_path = Path(tmp)
+      env = make_test_boot_repo(tmp_path, fake_qemu)
+      procs = {}
+      for token in ("first", "second"):
+        procs[token] = subprocess.Popen(
+            [str(tmp_path / "test_boot.sh"), "--passes=max",
+             f"--artifact-dir={tmp_path / ('art_' + token)}", "kernel.iso",
+             "kernel-mb1.iso"],
+            cwd=tmp_path,
+            env={**env, "FAKE_TOKEN": token},
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+        )
+        time.sleep(0.5)
+      for token, proc in procs.items():
+        out, _ = proc.communicate(timeout=120)
+        other = "second" if token == "first" else "first"
+        self.assertEqual(proc.returncode, 1, out)
+        serial = (tmp_path / f"art_{token}" / "max" / "serial.log").read_text(
+            encoding="utf-8")
+        self.assertEqual(serial.count("Hello, x86-64 Kernel World!"), 1, out)
+        self.assertIn(f"[TEST] run_{token}: FAIL", serial)
+        self.assertNotIn(f"run_{other}", serial + out)
+      self.assertEqual(sorted(os.listdir(tmp_path / "build")), [])
+
+  def test_test_boot_sh_reports_qemu_errors(self) -> None:
+    fake_qemu = """\
+        #!/usr/bin/env python3
+        import os, sys
+        sys.stderr.write(os.environ["FAKE_QEMU_ERROR"] + "\\n")
+        sys.exit(1)
+        """
+    error = ("qemu-system-x86_64: -device nec-usb-xhci: 'nec-usb-xhci' is not "
+             "a valid device model name")
+    with tempfile.TemporaryDirectory() as tmp:
+      tmp_path = Path(tmp)
+      env = make_test_boot_repo(tmp_path, fake_qemu)
+      env["FAKE_QEMU_ERROR"] = error
+
+      def run(passes: str, art: str, **extra_env: str) -> str:
+        proc = subprocess.run(
+            [str(tmp_path / "test_boot.sh"), f"--passes={passes}",
+             f"--artifact-dir={tmp_path / art}", "kernel.iso",
+             "kernel-mb1.iso"],
+            cwd=tmp_path,
+            env={**env, **extra_env},
+            capture_output=True,
+            text=True,
+            check=False,
+            timeout=120,
+        )
+        self.assertEqual(proc.returncode, 1, proc.stdout + proc.stderr)
+        return proc.stdout + proc.stderr
+
+      # A QEMU that exits at once: its error is reported (and saved), and the
+      # failure is that QEMU exited, not a timeout.
+      out = run("max", "art_max")
+      output = (tmp_path / "art_max" / "max" / "output.log").read_text(
+          encoding="utf-8")
+      first = deflake.first_harness_failure(output) or ""
+      self.assertIn("QEMU exited unexpectedly before the boot completed", first)
+      self.assertIn(error, out)
+      self.assertEqual(
+          (tmp_path / "art_max" / "max" / "qemu_stderr.log").read_text(
+              encoding="utf-8"),
+          error + "\n",
+      )
+      verdict = deflake.judge_test_boot(
+          "FAIL", 1, "FAIL", output_log=output,
+          report=deflake.parse_serial(b""))
+      self.assertEqual(verdict.reasons, ("qemu_exited",))
+
+      # Split OVMF images: QEMU boots the VARS template itself with
+      # snapshot=on, which keeps it unchanged (no copy that rerun.sh misses).
+      code, vars_ = tmp_path / "OVMF_CODE.fd", tmp_path / "OVMF_VARS.fd"
+      run("uefi", "art_uefi", OVMF=str(code), OVMF_VARS=str(vars_),
+          BOOT_TEST_USB="0")
+      argv = (tmp_path / "art_uefi" / "uefi" / "qemu_argv").read_bytes()
+      argv_items = argv.decode().split("\0")
+      self.assertIn(f"if=pflash,format=raw,unit=0,readonly=on,file={code}",
+                    argv_items)
+      self.assertIn(f"if=pflash,format=raw,unit=1,snapshot=on,file={vars_}",
+                    argv_items)
+      # A VARS template that QEMU can't read fails the pass before QEMU runs.
+      out = run("uefi", "art_novars", OVMF=str(code),
+                OVMF_VARS=str(tmp_path / "missing_vars.fd"), BOOT_TEST_USB="0")
+      self.assertIn("FAIL: The OVMF_VARS template", out)
+      self.assertFalse((tmp_path / "art_novars" / "uefi" / "qemu_argv").exists())
+      self.assertEqual(sorted(os.listdir(tmp_path / "build")), [])
+
+  def test_test_boot_sh_docker_fallback_passes_arguments_on(self) -> None:
+    if os.path.exists("/.dockerenv") or os.path.exists("/run/.containerenv"):
+      self.skipTest("test_boot.sh has no Docker fallback in a container")
+    if shutil.which("make") is None:
+      self.skipTest("make not found")
+    with tempfile.TemporaryDirectory() as tmp, \
+        tempfile.TemporaryDirectory() as outside:
+      tmp_path = Path(tmp)
+      env = make_test_boot_repo(tmp_path, "#!/bin/sh\nexit 1\n")
+      env["USE_DOCKER"] = "1"
+      # Prints the words that make passes to the shell, like the recipe of
+      # the Makefile's run-boot-test.
+      (tmp_path / "Makefile").write_text(
+          "run-boot-test:\n"
+          "\t@printf '%s\\n' USE_DOCKER=$(USE_DOCKER) $(BOOT_TEST_OPTS) "
+          "ISOS: $(BOOT_TEST_ISOS) >make_args.txt\n",
+          encoding="utf-8",
+      )
+      make_args = tmp_path / "make_args.txt"
+
+      def run(*args: str) -> subprocess.CompletedProcess[str]:
+        if make_args.exists():
+          make_args.unlink()
+        return subprocess.run(
+            [str(tmp_path / "test_boot.sh"), *args],
+            cwd=tmp_path,
+            env=env,
+            capture_output=True,
+            text=True,
+            check=False,
+            timeout=60,
+        )
+
+      art = tmp_path / "art $dir 'q'"
+      proc = run("--passes", "bios uefi", f"--artifact-dir={art}",
+                 "--drain-on-fail", str(tmp_path / "kernel.iso"),
+                 "missing-mb1.iso")
+      self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+      self.assertEqual(
+          make_args.read_text(encoding="utf-8").splitlines(),
+          ["USE_DOCKER=1", "--passes=bios uefi", "--artifact-dir=art $dir 'q'",
+           "--drain-on-fail", "ISOS:", "kernel.iso", "missing-mb1.iso"],
+      )
+      self.assertTrue(art.is_dir())
+      # Without options and ISO files, make boots (and builds) its own ISOs.
+      proc = run()
+      self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+      self.assertEqual(make_args.read_text(encoding="utf-8").splitlines(),
+                       ["USE_DOCKER=1", "ISOS:"])
+      # The container sees only the repository.
+      outside_iso = Path(outside) / "kernel.iso"
+      outside_iso.write_bytes(b"iso")
+      for args in ((str(outside_iso),),
+                   (f"--artifact-dir={outside}/art", "kernel.iso")):
+        proc = run(*args)
+        self.assertEqual(proc.returncode, 1, args)
+        self.assertIn("sees only the repository", proc.stderr)
+        self.assertFalse(make_args.exists())
+
+  def test_run_test_boot_pass_stops_the_harness_on_interrupt(self) -> None:
+    with tempfile.TemporaryDirectory() as tmp:
+      tmp_path = Path(tmp)
+      pids = tmp_path / "pids"
+      fake_tb = tmp_path / "fake_test_boot.sh"
+      # Like test_boot.sh: a process group with a VM process in it.
+      fake_tb.write_text(
+          textwrap.dedent(f"""\
+          #!/usr/bin/env python3
+          import os, subprocess, time
+          vm = subprocess.Popen(["sleep", "60"])
+          with open({str(pids)!r} + ".tmp", "w") as f:
+              f.write("%d %d" % (os.getpid(), vm.pid))
+          os.rename({str(pids)!r} + ".tmp", {str(pids)!r})
+          time.sleep(60)
+          """),
+          encoding="utf-8",
+      )
+      fake_tb.chmod(0o755)
+      iso = tmp_path / "kernel.iso"
+      iso.write_bytes(b"fake-iso")
+      cfg = deflake._make_builtin_config("host:max")
+
+      def interrupt_once_started() -> None:
+        if wait_for_file(pids):
+          os.kill(os.getpid(), signal.SIGINT)
+
+      old_handler = signal.signal(signal.SIGINT, signal.default_int_handler)
+      try:
+        threading.Thread(target=interrupt_once_started, daemon=True).start()
+        with self.assertRaises(KeyboardInterrupt):
+          deflake.run_test_boot_pass(
+              cfg,
+              tmp_path / "run",
+              iso,
+              None,
+              tmp_path,
+              self.names,
+              index=1,
+              build_id="b1",
+              session_id="s1",
+              test_boot_script=fake_tb,
+          )
+      finally:
+        signal.signal(signal.SIGINT, old_handler)
+      for pid in map(int, pids.read_text(encoding="utf-8").split()):
+        self.assertTrue(process_gone(pid), pid)
+
+  def test_main_stops_the_run_on_sigterm_and_sighup(self) -> None:
+    with tempfile.TemporaryDirectory() as tmp:
+      tmp_path = Path(tmp)
+      iso = tmp_path / "kernel.iso"
+      iso.write_bytes(b"fake-iso")
+      fake_qemu = tmp_path / "qemu-system-x86_64"
+      fake_qemu.write_text(
+          textwrap.dedent("""\
+          #!/usr/bin/env python3
+          import os, sys, time
+          pid_file = os.environ["FAKE_QEMU_PID_FILE"]
+          with open(pid_file + ".tmp", "w") as f:
+              f.write(str(os.getpid()))
+          os.rename(pid_file + ".tmp", pid_file)
+          sys.stdout.write("Hello, x86-64 Kernel World!\\r\\n")
+          sys.stdout.flush()
+          time.sleep(120)
+          """),
+          encoding="utf-8",
+      )
+      fake_qemu.chmod(0o755)
+      lock = tmp_path / "host.lock"
+      # deflake.py as a command, with the default handlers of the signals.
+      child_code = (
+          "import signal, sys\n"
+          "signal.signal(signal.SIGTERM, signal.SIG_DFL)\n"
+          "signal.signal(signal.SIGHUP, signal.SIG_DFL)\n"
+          "import deflake\n"
+          "sys.exit(deflake.main(sys.argv[1:]))\n"
+      )
+      for sig in (signal.SIGTERM, signal.SIGHUP):
+        out_dir = tmp_path / f"out_{sig.name}"
+        pid_file = tmp_path / f"qemu_{sig.name}.pid"
+        child = subprocess.Popen(
+            [sys.executable, "-B", "-c", child_code, "--qemu-cmd",
+             f"{shlex.quote(str(fake_qemu))} -smp 4 -serial mon:stdio"
+             f" -cdrom {shlex.quote(str(iso))}",
+             "--runs", "1", "--lock", str(lock), "--out", str(out_dir),
+             "--quiet"],
+            cwd=REPO_ROOT,
+            env={**os.environ, "FAKE_QEMU_PID_FILE": str(pid_file)},
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+        )
+        try:
+          self.assertTrue(wait_for_file(pid_file), sig.name)
+          child.send_signal(sig)
+          out, _ = child.communicate(timeout=60)
+        finally:
+          if child.poll() is None:
+            child.kill()
+            child.wait()
+        # The VM is gone and the host lock free before deflake exits, which
+        # writes the session's summary.
+        self.assertEqual(child.returncode, 128 + sig, out)
+        self.assertTrue(process_gone(int(pid_file.read_text())), sig.name)
+        session = json.loads(
+            (out_dir / "session.json").read_text(encoding="utf-8"))
+        self.assertEqual(session["stop_reason"], "interrupted")
+        fd = os.open(lock, os.O_RDWR)
+        try:
+          fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        finally:
+          os.close(fd)
+
+  def test_docker_session_runs_and_records_the_image(self) -> None:
+    image_id = "sha256:" + "ab" * 32
+    with tempfile.TemporaryDirectory() as tmp:
+      tmp_path = Path(tmp)
+      repo = tmp_path / "repo"
+      (repo / "selftest").mkdir(parents=True)
+      shutil.copy2(REPO_ROOT / "selftest" / "boot_selftest.cpp",
+                   repo / "selftest" / "boot_selftest.cpp")
+      iso = tmp_path / "kernel.iso"
+      iso.write_bytes(b"fake-iso")
+      mb1 = tmp_path / "kernel-mb1.iso"
+      mb1.write_bytes(b"fake-mb1-iso")
+      docker_log = tmp_path / "docker_run.json"
+      fakebin = tmp_path / "fakebin"
+      fakebin.mkdir()
+      # A docker whose container runs test_boot.sh's failing pass.
+      (fakebin / "docker").write_text(
+          textwrap.dedent(f"""\
+          #!/usr/bin/env python3
+          import json, pathlib, sys
+          args = sys.argv[1:]
+          if args[:2] == ["image", "inspect"]:
+              print({image_id!r})
+          elif args[:1] == ["info"]:
+              print("{{}}")
+          elif args[:1] == ["run"]:
+              pathlib.Path({str(docker_log)!r}).write_text(json.dumps(args))
+              opts = dict(a.split("=", 1) for a in args if a.startswith("--")
+                          and "=" in a)
+              d = pathlib.Path(opts["--artifact-dir"]) / opts["--passes"]
+              d.mkdir(parents=True)
+              (d / "result").write_text("FAIL\\n")
+              (d / "serial.log").write_text(
+                  "Hello, x86-64 Kernel World!\\n[TEST] rbtree_edge_cases: FAIL\\n")
+              (d / "output.log").write_text("FAIL: boot printed a failure.\\n")
+              (d / "qemu_argv").write_bytes(
+                  b"qemu-system-x86_64\\0-cdrom\\0/workspace/k.iso\\0")
+              (d / "qemu_cwd").write_text("/workspace\\n")
+              (d / "qemu_run_dir").write_text("build/test_boot.abc123\\n")
+              print("FAILURE: boot verification failed (max: FAIL).")
+              sys.exit(1)
+          else:
+              sys.exit(2)
+          """),
+          encoding="utf-8",
+      )
+      (fakebin / "docker").chmod(0o755)
+      out_dir = tmp_path / "out"
+      args = deflake.build_arg_parser().parse_args([
+          "--config", "docker:max", "--runs", "1", "--no-lock", "--out",
+          str(out_dir), "--iso", str(iso), "--mb1-iso", str(mb1), "--quiet",
+      ])
+      env = {"PATH": f"{fakebin}:{os.environ.get('PATH', '')}",
+             "HOST_UID": "1234", "HOST_GID": "5678"}
+      with mock.patch.dict(os.environ, env):
+        self.assertEqual(deflake.run_session(args, repo=repo), 1)
+      docker_args = json.loads(docker_log.read_text(encoding="utf-8"))
+      self.assertIn(image_id, docker_args)
+      self.assertEqual(docker_args[docker_args.index("--user") + 1],
+                       "1234:5678")
+      run_dir = out_dir / "runs" / "docker-max" / "0001"
+      command = json.loads(
+          (run_dir / "command.json").read_text(encoding="utf-8"))
+      self.assertEqual(command["docker_image_id"], image_id)
+      rerun = (run_dir / "rerun.sh").read_text(encoding="utf-8")
+      self.assertIn(f"mkdir -p {repo / 'build' / 'test_boot.abc123'}\n", rerun)
+      exec_words = shlex.split(rerun.splitlines()[-1])
+      self.assertEqual(exec_words[exec_words.index("--user") + 1], "1234:5678")
+      self.assertEqual(exec_words[-4:], [image_id, "qemu-system-x86_64",
+                                         "-cdrom", "/workspace/k.iso"])
+
+  def test_docker_run_identity(self) -> None:
+    host = f"{os.getuid()}:{os.getgid()}"
+
+    def identity(env: dict[str, str], rootless: bool,
+                 selinux: bool) -> tuple[str, str]:
+      return deflake.docker_run_identity(
+          env, rootless=lambda _: rootless, selinux=lambda: selinux)
+
+    self.assertEqual(identity({}, False, False), (host, ""))
+    # Rootless Docker and Podman map container root to the host user.
+    self.assertEqual(identity({}, True, True), ("0:0", ":z"))
+    self.assertEqual(
+        identity({"HOST_UID": "7", "HOST_GID": "8", "DOCKER_VOLUME_OPTS": ""},
+                 True, True),
+        ("7:8", ""),
+    )
+    self.assertEqual(identity({"HOST_UID": "7"}, True, False),
+                     (f"7:{os.getgid()}", ""))
+    argv = deflake.build_docker_test_boot_argv(
+        Path("/repo"), "max", "art", "k.iso", "mb1.iso", user="0:0",
+        volume_opts=":z")
+    self.assertEqual(argv[argv.index("--user") + 1], "0:0")
+    self.assertIn("/repo:/workspace:z", argv)
+    with tempfile.TemporaryDirectory() as tmp:
+      for name, info, rootless in (
+          ("docker", '{"SecurityOptions":["name=seccomp","name=rootless"]}', True),
+          ("podman", '{"host":{"security":{"rootless":true}}}', True),
+          ("rootful", '{"SecurityOptions":["name=seccomp"]}', False),
+      ):
+        fake = Path(tmp) / name
+        fake.write_text(f"#!/bin/sh\necho '{info}'\n", encoding="utf-8")
+        fake.chmod(0o755)
+        self.assertEqual(deflake.docker_is_rootless(str(fake)), rootless, name)
+      self.assertFalse(deflake.docker_is_rootless(str(Path(tmp) / "missing")))
+
+  def test_rerun_and_reproduce_scripts_rerun_the_archived_run(self) -> None:
+    repo = Path("/repo")
+    tool = REPO_ROOT / "deflake.py"
+    # reproduce.sh of a --qemu-cmd run boots the archived ISO, not the file
+    # at the -cdrom path of the command.
+    cmd = ("qemu-system-x86_64 -enable-kvm -cpu host -smp 4 -serial mon:stdio"
+           " -cdrom build/kernel.iso")
+    cfg = deflake.expand_configs(qemu_cmd_list=[cmd])[0]
+    rec = make_run_record(config=cfg.name, harness_argv=())
+    script = deflake.render_reproduce_script(rec, cfg, repo, tool)
+    words = shlex.split(script.splitlines()[-1])
+    qemu_cmd = words[words.index("--qemu-cmd") + 1]
+    self.assertNotIn("build/kernel.iso", script)
+    reproduced = deflake.expand_configs(qemu_cmd_list=[qemu_cmd])[0]
+    self.assertEqual(reproduced.custom_iso, Path(rec.iso_snapshot))
+    self.assertEqual(reproduced.qemu_argv, cfg.qemu_argv)
+
+    # rerun.sh of a test_boot.sh USB pass recreates the run's directory and
+    # leaves out the interactive boot session, which would wait forever
+    # without the harness.
+    qemu_argv = ("qemu-system-x86_64", "-serial",
+                 "file:build/test_boot.abc123/serial_bios_output.log",
+                 *deflake.INTERACTIVE_SESSION_ARGS, "-cdrom", rec.iso_snapshot)
+    rec = make_run_record(qemu_argv=qemu_argv, qemu_run_dir="build/test_boot.abc123",
+                          harness_argv=("./test_boot.sh", "--passes=bios"))
+    script = deflake.render_rerun_script(
+        rec, deflake._make_builtin_config("host:bios"), repo)
+    lines = script.splitlines()
+    self.assertIn("mkdir -p build/test_boot.abc123", lines)
+    self.assertEqual(shlex.split(lines[-1])[1:],
+                     [a for a in qemu_argv if a not in
+                      deflake.INTERACTIVE_SESSION_ARGS])
+    self.assertIn(f"# {shlex.join(qemu_argv)}", lines)
+    # In Docker: the harness's user and bind mount options, and the image.
+    rec = dataclasses.replace(
+        rec,
+        config="docker:bios",
+        harness_argv=deflake.build_docker_test_boot_argv(
+            repo, "bios", "art", "k.iso", "mb1.iso", user="0:0",
+            volume_opts=":z"),
+    )
+    script = deflake.render_rerun_script(
+        rec, deflake._make_builtin_config("docker:bios"), repo,
+        docker_image_id="sha256:1234")
+    lines = script.splitlines()
+    self.assertIn("mkdir -p /repo/build/test_boot.abc123", lines)
+    words = shlex.split(lines[-1])
+    self.assertEqual(words[words.index("--user") + 1], "0:0")
+    self.assertIn("/repo:/workspace:z", words)
+    self.assertIn("/store:/store:ro,z", words)
+    self.assertEqual(words[words.index("sha256:1234") + 1:],
+                     [a for a in qemu_argv if a not in
+                      deflake.INTERACTIVE_SESSION_ARGS])
+
+  def test_sources_parse_as_python_3_8(self) -> None:
+    for name in ("deflake.py", "deflake_test.py"):
+      source = (REPO_ROOT / name).read_text(encoding="utf-8")
+      ast.parse(source, feature_version=(3, 8))
+      # Newer parsers accept a parenthesized with statement (Python 3.9+)
+      # also for feature_version=(3, 8).
+      tokens = list(tokenize.generate_tokens(io.StringIO(source).readline))
+      for i, tok in enumerate(tokens[:-1]):
+        if not (tok.type == tokenize.NAME and tok.string == "with" and
+                tokens[i + 1].type == tokenize.OP and
+                tokens[i + 1].string == "("):
+          continue
+        depth = 0
+        for t in tokens[i + 1:]:
+          if t.type == tokenize.OP and t.string in ("(", "[", "{"):
+            depth += 1
+          elif t.type == tokenize.OP and t.string in (")", "]", "}"):
+            depth -= 1
+            if depth == 0:
+              break
+          elif depth == 1 and t.type == tokenize.NAME and t.string == "as":
+            self.fail(f"{name}:{tok.start[0]}: parenthesized with statement")
 
   def test_end_to_end_session_writes_artifacts_and_rerun_script(self) -> None:
     with tempfile.TemporaryDirectory() as tmp:
@@ -1600,6 +2218,7 @@ class LockAndRunnersTest(unittest.TestCase):
           (pdir / "output.log").write_text("Running pass...\\n")
           (pdir / "qemu_argv").write_bytes(b"qemu-system-x86_64\\0-cpu\\0max\\0")
           (pdir / "qemu_cwd").write_text(str(pathlib.Path.cwd()) + "\\n")
+          (pdir / "qemu_run_dir").write_text("build/test_boot.Ab12Cd\\n")
           print(f"SUCCESS: boot verification passed ({{passes}}: PASS): greeting")
           sys.exit(0)
           """),
@@ -1627,6 +2246,7 @@ class LockAndRunnersTest(unittest.TestCase):
       )
       self.assertEqual(rec.status, "PASS")
       self.assertEqual(rec.qemu_argv, ("qemu-system-x86_64", "-cpu", "max"))
+      self.assertEqual(rec.qemu_run_dir, "build/test_boot.Ab12Cd")
       self.assertEqual(rec.outcomes["@harness"], "PASS")
 
       docker_cfg = deflake.Config(
@@ -1645,8 +2265,25 @@ class LockAndRunnersTest(unittest.TestCase):
 class UsbHarnessTest(unittest.TestCase):
   """test_boot.sh's USB keyboard scenarios against FAKE_GUEST_QEMU."""
 
+  def setup_fake_guest(self, tmp_path: Path) -> None:
+    """Copies test_boot.sh into tmp_path, with fake ISOs and FAKE_GUEST_QEMU."""
+    script = (REPO_ROOT / "test_boot.sh").read_text(encoding="utf-8")
+    (tmp_path / "test_boot.sh").write_text(script, encoding="utf-8")
+    (tmp_path / "test_boot.sh").chmod(0o755)
+    for name in ("kernel.iso", "kernel-mb1.iso", "OVMF.fd"):
+      (tmp_path / name).write_bytes(b"fake")
+    (tmp_path / "boot_lines.txt").write_text(
+        "".join(line + "\n" for line in qemu64_boot_lines(script)),
+        encoding="utf-8",
+    )
+    (tmp_path / "fakebin").mkdir()
+    fake_qemu = tmp_path / "fakebin" / "qemu-system-x86_64"
+    fake_qemu.write_text(FAKE_GUEST_QEMU, encoding="utf-8")
+    fake_qemu.chmod(0o755)
+
   def run_test_boot(
-      self, tmp_path: Path, passes: str, bug: str = ""
+      self, tmp_path: Path, passes: str, bug: str = "",
+      extra_env: dict[str, str] | None = None,
   ) -> tuple[subprocess.CompletedProcess[str], Path, float]:
     art_dir = tmp_path / f"artifacts_{passes.replace(',', '_')}_{bug}"
     env = os.environ.copy()
@@ -1659,6 +2296,7 @@ class UsbHarnessTest(unittest.TestCase):
         "BOOT_TEST_JOBS": "2",
         "FAKE_BOOT_LINES": str(tmp_path / "boot_lines.txt"),
         "FAKE_BUG": bug,
+        **(extra_env or {}),
     })
     started = time.monotonic()
     proc = subprocess.run(
@@ -1672,22 +2310,37 @@ class UsbHarnessTest(unittest.TestCase):
     )
     return proc, art_dir, time.monotonic() - started
 
+  def test_test_boot_sh_fails_on_failure_during_the_last_checks(self) -> None:
+    with tempfile.TemporaryDirectory() as tmp:
+      tmp_path = Path(tmp)
+      self.setup_fake_guest(tmp_path)
+      # Without the bug, the bios pass passes (without the USB scenarios).
+      proc, art_dir, _ = self.run_test_boot(
+          tmp_path, "bios", extra_env={"BOOT_TEST_USB": "0"})
+      self.assertEqual(proc.returncode, 0, (proc.stdout + proc.stderr)[-3000:])
+      # The stress test fails while test_boot.sh dumps the VGA text buffer,
+      # after verify_serial_log: the saved serial log shows the failure, so
+      # the pass fails.
+      proc, art_dir, _ = self.run_test_boot(
+          tmp_path, "bios", "late_failure", extra_env={"BOOT_TEST_USB": "0"})
+      self.assertEqual(proc.returncode, 1, (proc.stdout + proc.stderr)[-3000:])
+      self.assertEqual(
+          (art_dir / "bios" / "result").read_text(encoding="utf-8").strip(),
+          "FAIL",
+      )
+      self.assertIn(
+          "random_multicpu_stress: FAIL (late)",
+          (art_dir / "bios" / "serial.log").read_text(encoding="latin-1"),
+      )
+      output = (art_dir / "bios" / "output.log").read_text(encoding="utf-8")
+      self.assertIn("Verified VGA text buffer", output)
+      self.assertEqual(deflake.first_harness_failure(output),
+                       "FAIL: Found a failure line in serial output:")
+
   def test_test_boot_sh_usb_scenarios_with_fake_guest(self) -> None:
     with tempfile.TemporaryDirectory() as tmp:
       tmp_path = Path(tmp)
-      script = (REPO_ROOT / "test_boot.sh").read_text(encoding="utf-8")
-      (tmp_path / "test_boot.sh").write_text(script, encoding="utf-8")
-      (tmp_path / "test_boot.sh").chmod(0o755)
-      for name in ("kernel.iso", "kernel-mb1.iso", "OVMF.fd"):
-        (tmp_path / name).write_bytes(b"fake")
-      (tmp_path / "boot_lines.txt").write_text(
-          "".join(line + "\n" for line in qemu64_boot_lines(script)),
-          encoding="utf-8",
-      )
-      (tmp_path / "fakebin").mkdir()
-      fake_qemu = tmp_path / "fakebin" / "qemu-system-x86_64"
-      fake_qemu.write_text(FAKE_GUEST_QEMU, encoding="utf-8")
-      fake_qemu.chmod(0o755)
+      self.setup_fake_guest(tmp_path)
 
       # 1. With an ideal driver every scenario of both passes passes, and so
       # do the usual checks after the session.
@@ -1699,11 +2352,14 @@ class UsbHarnessTest(unittest.TestCase):
           "bios": ("usb_serial_sync", "usb_token", "usb_shift_backspace",
                    "usb_editing_edges", "usb_serial_mixed", "usb_unplug",
                    "usb_no_keyboard", "usb_hotplug_add", "usb_replug",
-                   "usb_second_keyboard", "usb_long_line", "usb_commands"),
+                   "usb_second_keyboard", "usb_long_line", "usb_hub_single",
+                   "usb_hub_chained", "usb_hub_hotplug", "usb_hub_replug",
+                   "usb_commands"),
           "uefi": ("usb_serial_sync", "usb_token", "usb_shift_backspace",
-                   "usb_unplug", "usb_root_controller", "usb_editing_edges",
-                   "usb_serial_after_usb", "usb_replug",
+                   "usb_unplug", "usb_hub_single", "usb_root_controller",
+                   "usb_editing_edges", "usb_serial_after_usb", "usb_replug",
                    "usb_bridged_controller", "usb_hotplug_add",
+                   "usb_hub_chained", "usb_hub_hotplug", "usb_hub_replug",
                    "usb_commands"),
       }
       for p, names in scenarios.items():

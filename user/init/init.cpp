@@ -32,14 +32,14 @@ int64_t Main(const uint64_t arg) {
   if (sh_pid < 0) {
     return 3;
   }
-  UserProgramResult sh_result;
-  if (Wait(sh_pid, &sh_result) != 0) {
+  const StatusOr<UserProgramResult> sh_result = Wait(sh_pid);
+  if (!sh_result.ok()) {
     return 4;
   }
-  if (sh_result.outcome != UserProgramOutcome::kExited) {
+  if (sh_result->outcome != UserProgramOutcome::kExited) {
     return 5;
   }
-  if (sh_result.exit_status != 0) {
+  if (sh_result->exit_status != 0) {
     return 6;
   }
   return 0;

@@ -20,6 +20,7 @@ QEMU command line, kernel build identity, logged seeds, and an executable
 from __future__ import annotations
 
 import argparse
+import contextlib
 import dataclasses
 from datetime import datetime, timezone
 import fcntl
@@ -35,7 +36,7 @@ import signal
 import subprocess
 import sys
 import time
-from typing import Any, Callable, Mapping, Sequence
+from typing import Any, Callable, Iterator, Mapping, Sequence
 
 SCHEMA = "protos-deflake/1"
 PASS_NAMES: tuple[str, ...] = ("bios", "uefi", "mb1", "max", "smep")
@@ -82,6 +83,14 @@ BOOT_TEST_ENV_VARS: tuple[str, ...] = (
 # the pass timeout.
 USB_PASS_NAMES: tuple[str, ...] = ("bios", "uefi")
 DEFAULT_USB_SESSION_TIMEOUT_S = 60.0
+# The QEMU arguments with which test_boot.sh asks the kernel for its
+# interactive boot session in the USB passes.
+INTERACTIVE_SESSION_ARGS: tuple[str, ...] = (
+    "-fw_cfg",
+    "name=opt/protos/boot_session,string=interactive",
+)
+# The tag of the Docker image (the Makefile's DOCKER_IMAGE).
+DEFAULT_DOCKER_IMAGE = "x86-64-kernel-build"
 # How much longer than test_boot.sh's own bound for a pass (its timeout plus
 # the USB scenarios) a test_boot run may take before deflake stops it (the
 # post-boot checks, draining after a failure, and a loaded host).
@@ -1346,6 +1355,59 @@ def build_identity(
     }
 
 
+class Interrupted(KeyboardInterrupt):
+    """A signal that stops the session, raised by `stop_signals_raise`."""
+
+    def __init__(self, signum: int) -> None:
+        super().__init__(signal.Signals(signum).name)
+        self.signum = signum
+
+
+STOP_SIGNALS: tuple[signal.Signals, ...] = (
+    signal.SIGINT,
+    signal.SIGTERM,
+    signal.SIGHUP,
+)
+
+
+@contextlib.contextmanager
+def stop_signals_raise() -> Iterator[None]:
+    """Makes SIGINT, SIGTERM and SIGHUP raise `Interrupted` while active.
+
+    By default, SIGTERM and SIGHUP (a closed SSH session, for example) end
+    Python without running `finally` blocks, which would leave the VM or
+    test_boot.sh of the current run running (in a session of its own, which a
+    terminal's signals don't reach) after deflake released the host lock. As
+    an exception, they stop the run like Ctrl-C: the runners stop its process
+    group (and container), then the session writes its summary. Only the
+    first signal raises, so that later ones can't cut that cleanup short.
+    Signals that were ignored (nohup) stay ignored.
+    """
+    stopping = False
+
+    def handler(signum: int, frame: Any) -> None:
+        nonlocal stopping
+        if not stopping:
+            stopping = True
+            raise Interrupted(signum)
+
+    previous: dict[int, Any] = {}
+    for signum in STOP_SIGNALS:
+        old = signal.getsignal(signum)
+        if old is signal.SIG_IGN:
+            continue
+        try:
+            signal.signal(signum, handler)
+        except ValueError:  # Not the main thread.
+            continue
+        previous[signum] = signal.SIG_DFL if old is None else old
+    try:
+        yield
+    finally:
+        for signum, old in previous.items():
+            signal.signal(signum, old)
+
+
 class HostLock:
     """Context manager that acquires an exclusive flock on a lock file."""
 
@@ -1455,6 +1517,9 @@ class RunRecord:
     t_pass: float | None
     t_fail: float | None
     artifact_dir: str | None = None
+    # The directory of test_boot.sh's run whose files (serial log, sockets)
+    # qemu_argv names, relative to qemu_cwd; test_boot.sh deletes it at its end.
+    qemu_run_dir: str | None = None
 
 
 def _current_loadavg() -> list[float]:
@@ -1515,10 +1580,7 @@ def run_qemu_boot(
 
     t0 = time.monotonic()
     try:
-        with (
-            serial_path.open("wb") as out_f,
-            stderr_path.open("wb") as err_f,
-        ):
+        with serial_path.open("wb") as out_f, stderr_path.open("wb") as err_f:
             proc = subprocess.Popen(
                 argv,
                 cwd=repo,
@@ -1697,6 +1759,78 @@ def run_qemu_boot(
     )
 
 
+def docker_image_id(
+    image: str = DEFAULT_DOCKER_IMAGE, docker_bin: str = "docker"
+) -> str | None:
+    """Returns the ID of the Docker image that `image` names, or None."""
+    try:
+        res = subprocess.run(
+            [docker_bin, "image", "inspect", "--format", "{{.Id}}", image],
+            capture_output=True,
+            text=True,
+            timeout=60,
+            check=False,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    image_id = res.stdout.strip()
+    return image_id if res.returncode == 0 and image_id else None
+
+
+def docker_is_rootless(docker_bin: str = "docker") -> bool:
+    """Returns whether the Docker engine is rootless Docker or Podman."""
+    try:
+        res = subprocess.run(
+            [docker_bin, "info", "--format", "{{json .}}"],
+            capture_output=True,
+            text=True,
+            timeout=60,
+            check=False,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return False
+    return re.search(r'"name=rootless"|"rootless": ?true', res.stdout) is not None
+
+
+def selinux_enforcing() -> bool:
+    """Returns whether SELinux is enforcing on this host."""
+    try:
+        return Path("/sys/fs/selinux/enforce").read_text().strip() == "1"
+    except OSError:
+        return False
+
+
+def docker_run_identity(
+    env: Mapping[str, str],
+    *,
+    docker_bin: str = "docker",
+    rootless: Callable[[str], bool] = docker_is_rootless,
+    selinux: Callable[[], bool] = selinux_enforcing,
+) -> tuple[str, str]:
+    """Returns the --user value and the bind mount options of docker runs.
+
+    Like the Makefile's DOCKER_RUN_ARGS: the container runs as the host user,
+    so that the files it writes in the bind-mounted checkout are the user's,
+    but as root with rootless Docker or Podman, which map container root to
+    the host user (and the other container users to subordinate IDs, which
+    can't write the checkout); HOST_UID and HOST_GID override the choice. On
+    SELinux hosts, ':z' gives the checkout the container label without which
+    containers may not use it; DOCKER_VOLUME_OPTS overrides it.
+    """
+    uid = env.get("HOST_UID") or None
+    gid = env.get("HOST_GID") or None
+    if uid is None and gid is None and rootless(docker_bin):
+        uid = gid = "0"
+    if uid is None:
+        uid = str(os.getuid())
+    if gid is None:
+        gid = str(os.getgid())
+    volume_opts = env.get("DOCKER_VOLUME_OPTS")
+    if volume_opts is None:
+        volume_opts = ":z" if selinux() else ""
+    return f"{uid}:{gid}", volume_opts
+
+
 def build_docker_test_boot_argv(
     repo: Path,
     pass_name: str,
@@ -1706,11 +1840,17 @@ def build_docker_test_boot_argv(
     *,
     container_name: str | None = None,
     docker_bin: str = "docker",
-    docker_image: str = "x86-64-kernel-build",
+    docker_image: str = DEFAULT_DOCKER_IMAGE,
     uid: int | None = None,
     gid: int | None = None,
+    user: str | None = None,
+    volume_opts: str = "",
 ) -> tuple[str, ...]:
-    """Builds the exact docker run command mirroring Makefile's DOCKER_RUN."""
+    """Builds the exact docker run command mirroring Makefile's DOCKER_RUN.
+
+    `user` (see `docker_run_identity`) replaces `uid`:`gid`, which default
+    to the host user's.
+    """
     host_uid = os.getuid() if uid is None else uid
     host_gid = os.getgid() if gid is None else gid
     cmd: list[str] = [docker_bin, "run", "--rm"]
@@ -1719,7 +1859,7 @@ def build_docker_test_boot_argv(
     cmd.extend([
         "--platform=linux/amd64",
         "--user",
-        f"{host_uid}:{host_gid}",
+        user or f"{host_uid}:{host_gid}",
         "-e",
         "HOME=/tmp",
     ])
@@ -1727,7 +1867,7 @@ def build_docker_test_boot_argv(
         cmd.extend(["-e", var])
     cmd.extend([
         "-v",
-        f"{repo}:/workspace",
+        f"{repo}:/workspace{volume_opts}",
         "-w",
         "/workspace",
         docker_image,
@@ -1755,7 +1895,9 @@ def run_test_boot_pass(
     lock_wait_s: float = 0.0,
     test_boot_script: Path | None = None,
     docker_bin: str = "docker",
-    docker_image: str = "x86-64-kernel-build",
+    docker_image: str = DEFAULT_DOCKER_IMAGE,
+    docker_user: str | None = None,
+    docker_volume_opts: str = "",
 ) -> RunRecord:
     """Executes one pass of test_boot.sh (host or docker) and reads its verdict."""
     run_dir.mkdir(parents=True, exist_ok=True)
@@ -1810,6 +1952,8 @@ def run_test_boot_pass(
             container_name=container_name,
             docker_bin=docker_bin,
             docker_image=docker_image,
+            user=docker_user,
+            volume_opts=docker_volume_opts,
         )
     else:
         container_name = None
@@ -1851,6 +1995,12 @@ def run_test_boot_pass(
                 watchdog_fired = True
                 stop_process_group(proc, docker_name=container_name)
                 exit_code = proc.returncode
+            except BaseException:
+                # Ctrl-C, SIGTERM or SIGHUP (see stop_signals_raise), which
+                # don't reach test_boot.sh's session: stop it, its QEMU and
+                # its container before the caller releases the host lock.
+                stop_process_group(proc, docker_name=container_name)
+                raise
     except OSError as e:
         test_boot_log_path.write_text(f"Spawn error: {e}\n", encoding="utf-8")
         verdict = Verdict("ERROR", (f"spawn_failed:{e}",))
@@ -1937,6 +2087,14 @@ def run_test_boot_pass(
             encoding="utf-8", errors="replace"
         ).strip()
 
+    qemu_run_dir: str | None = None
+    qemu_run_dir_file = pass_art_dir / "qemu_run_dir"
+    if qemu_run_dir_file.is_file():
+        qemu_run_dir = (
+            qemu_run_dir_file.read_text(encoding="utf-8", errors="replace").strip()
+            or None
+        )
+
     test_boot_log_text = (
         test_boot_log_path.read_text(encoding="latin-1", errors="replace")
         if test_boot_log_path.is_file()
@@ -1989,7 +2147,32 @@ def run_test_boot_pass(
         exit_code=exit_code,
         t_pass=duration_s if verdict.status == "PASS" else None,
         t_fail=duration_s if verdict.status == "FAIL" else None,
+        qemu_run_dir=qemu_run_dir,
     )
+
+
+def without_interactive_session(argv: Sequence[str]) -> tuple[str, ...]:
+    """Returns QEMU argv `argv` without INTERACTIVE_SESSION_ARGS."""
+    n = len(INTERACTIVE_SESSION_ARGS)
+    result: list[str] = []
+    i = 0
+    while i < len(argv):
+        if tuple(argv[i : i + n]) == INTERACTIVE_SESSION_ARGS:
+            i += n
+            continue
+        result.append(argv[i])
+        i += 1
+    return tuple(result)
+
+
+def _docker_run_option(
+    argv: Sequence[str], option: str, prefix: str = ""
+) -> str | None:
+    """Returns the value of the first `option` in `argv` starting with `prefix`."""
+    for i in range(len(argv) - 1):
+        if argv[i] == option and argv[i + 1].startswith(prefix):
+            return argv[i + 1]
+    return None
 
 
 def render_rerun_script(
@@ -2008,7 +2191,25 @@ def render_rerun_script(
         argv = record.qemu_argv
         lines.append(f"cd {shlex.quote(record.qemu_cwd)} || exit 1")
         lines.append(f"exec {shlex.join(argv)}")
-    elif config.mode == "docker":
+        return "\n".join(lines) + "\n"
+
+    # Without test_boot.sh, which types 'exit 0' after its USB keyboard
+    # scenarios, the kernel's interactive boot session would wait forever
+    # before the stress test.
+    qemu_argv = without_interactive_session(record.qemu_argv)
+    notes: list[str] = []
+    if qemu_argv != tuple(record.qemu_argv):
+        notes = [
+            "# This boot leaves out test_boot.sh's request for the kernel's",
+            f"# interactive boot session ({shlex.join(INTERACTIVE_SESSION_ARGS)}),",
+            "# which waits for test_boot.sh's USB keyboard scenarios (reproduce.sh",
+            "# runs them) before the stress test. The exact QEMU command was:",
+            f"# {shlex.join(record.qemu_argv)}",
+        ]
+    # The serial log and the QEMU sockets go in test_boot.sh's directory for
+    # the run, which it deleted at its end.
+    qemu_run_dir = record.qemu_run_dir or "build"
+    if config.mode == "docker":
         repo_iso_store = repo / "build" / "deflake" / "isos"
         lines.append(f"mkdir -p {shlex.quote(str(repo_iso_store))}")
         for snap in (record.iso_snapshot, record.mb1_iso_snapshot):
@@ -2020,10 +2221,17 @@ def render_rerun_script(
                         f"[ -f {shlex.quote(str(staged))} ] || cp -p"
                         f" {shlex.quote(str(snap_path))} {shlex.quote(str(staged))}"
                     )
-        if record.qemu_argv:
-            uid = os.getuid()
-            gid = os.getgid()
-            image = docker_image_id or "x86-64-kernel-build"
+        if qemu_argv:
+            # The user and the bind mount options of the harness's container.
+            user = _docker_run_option(record.harness_argv, "--user") or (
+                f"{os.getuid()}:{os.getgid()}"
+            )
+            workspace = f"{repo}:/workspace"
+            workspace_mount = (
+                _docker_run_option(record.harness_argv, "-v", workspace) or workspace
+            )
+            volume_opts = workspace_mount[len(workspace) :].replace(":", ",", 1)
+            image = docker_image_id or DEFAULT_DOCKER_IMAGE
             iso_store = str(Path(record.iso_snapshot).parent)
             docker_cmd = [
                 "docker",
@@ -2031,28 +2239,31 @@ def render_rerun_script(
                 "--rm",
                 "--platform=linux/amd64",
                 "--user",
-                f"{uid}:{gid}",
+                user,
                 "-e",
                 "HOME=/tmp",
                 "-v",
-                f"{repo}:/workspace",
+                workspace_mount,
                 "-v",
-                f"{iso_store}:{iso_store}:ro",
+                f"{iso_store}:{iso_store}:ro{volume_opts}",
                 "-w",
                 "/workspace",
                 image,
-                *record.qemu_argv,
+                *qemu_argv,
             ]
+            lines.append(f"mkdir -p {shlex.quote(str(repo / qemu_run_dir))}")
             lines.append(f"# Harness command: {shlex.join(record.harness_argv)}")
+            lines.extend(notes)
             lines.append(f"exec {shlex.join(docker_cmd)}")
         else:
             lines.append(f"cd {shlex.quote(str(repo))} || exit 1")
             lines.append(f"exec {shlex.join(record.harness_argv)}")
-    elif record.qemu_argv:
+    elif qemu_argv:
         lines.append(f"cd {shlex.quote(record.qemu_cwd)} || exit 1")
-        lines.append("mkdir -p build")
+        lines.append(f"mkdir -p {shlex.quote(qemu_run_dir)}")
         lines.append(f"# Harness command: {shlex.join(record.harness_argv)}")
-        lines.append(f"exec {shlex.join(record.qemu_argv)}")
+        lines.extend(notes)
+        lines.append(f"exec {shlex.join(qemu_argv)}")
     else:
         lines.append(f"cd {shlex.quote(str(repo))} || exit 1")
         lines.append(f"exec {shlex.join(record.harness_argv)}")
@@ -2071,12 +2282,19 @@ def render_reproduce_script(
         if config.timeout_s != 60.0:
             cmd.extend(["--timeout", f"custom1={config.timeout_s:g}"])
     elif config.description.startswith("cmd: "):
-        cmd.extend(["--qemu-cmd", config.description[len("cmd: ") :]])
+        # The command with the archived ISO as its -cdrom file, which may have
+        # changed since the run (or be gone).
+        argv = [
+            record.iso_snapshot if tok == ISO_PLACEHOLDER else tok
+            for tok in config.qemu_argv
+        ]
+        cmd.extend(["--qemu-cmd", shlex.join(argv)])
         if config.timeout_s != 60.0:
             cmd.extend(["--timeout", f"custom1={config.timeout_s:g}"])
-    cmd.extend(["--iso", record.iso_snapshot])
-    if record.mb1_iso_snapshot:
-        cmd.extend(["--mb1-iso", record.mb1_iso_snapshot])
+    if config.custom_iso is None:
+        cmd.extend(["--iso", record.iso_snapshot])
+        if record.mb1_iso_snapshot:
+            cmd.extend(["--mb1-iso", record.mb1_iso_snapshot])
     return (
         "#!/bin/sh\n"
         f"cd {shlex.quote(str(repo))} || exit 1\n"
@@ -2631,6 +2849,12 @@ def run_session(
             print(f"{c.name:<16} engine={c.engine:<10} timeout={c.timeout_s:g}s  {c.description}")
         return 0
 
+    uses_docker = any(c.engine == "test_boot" and c.mode == "docker" for c in configs)
+    docker_user: str | None = None
+    docker_volume_opts = ""
+    if uses_docker:
+        docker_user, docker_volume_opts = docker_run_identity(os.environ)
+
     if args.dry_run:
         iso_preview = args.iso or str(repo_root / "build" / "kernel.iso")
         mb1_preview = args.mb1_iso or str(repo_root / "build" / "kernel-mb1.iso")
@@ -2648,6 +2872,8 @@ def run_session(
                     f"build/deflake/dry/{c.pass_name}",
                     iso_preview,
                     mb1_preview,
+                    user=docker_user,
+                    volume_opts=docker_volume_opts,
                 )
                 print(f"[{c.name}] {shlex.join(d_argv)}")
             else:
@@ -2738,12 +2964,18 @@ def run_session(
     if not args.no_lock and args.lock and args.lock.lower() != "none":
         lock_path = Path(args.lock).resolve()
 
+    # The docker:<pass> runs use (and record) the image that the tag names now,
+    # also if the tag moves on during the session (when make rebuilds the
+    # image from another checkout's Dockerfile, for example).
+    image_id = docker_image_id(DEFAULT_DOCKER_IMAGE) if uses_docker else None
+
     records: list[RunRecord] = []
     per_cfg_count: dict[str, int] = {c.name: 0 for c in configs}
     failed_runs_total = 0
     total_lock_wait = 0.0
     stop_reason = "runs"
     interrupted = False
+    interrupt_signum = int(signal.SIGINT)
 
     start_utc = datetime.now(timezone.utc).isoformat()
     t_session_start = time.monotonic()
@@ -2751,6 +2983,7 @@ def run_session(
 
     def execute_one(cfg: Config) -> bool:
         nonlocal failed_runs_total, total_lock_wait, stop_reason, interrupted
+        nonlocal interrupt_signum
         if duration_s is not None and (time.monotonic() - t_session_start) >= duration_s:
             stop_reason = "duration"
             return False
@@ -2799,9 +3032,13 @@ def run_session(
                         build_id=b_id,
                         session_id=session_id,
                         lock_wait_s=lk.wait_s,
+                        docker_image=image_id or DEFAULT_DOCKER_IMAGE,
+                        docker_user=docker_user,
+                        docker_volume_opts=docker_volume_opts,
                     )
-        except KeyboardInterrupt:
+        except KeyboardInterrupt as e:
             interrupted = True
+            interrupt_signum = getattr(e, "signum", signal.SIGINT)
             stop_reason = "interrupted"
             if run_dir.exists():
                 shutil.rmtree(run_dir, ignore_errors=True)
@@ -2821,6 +3058,7 @@ def run_session(
                 builds[b_id],
                 repo_root,
                 tool_path,
+                docker_image_id=image_id,
             )
         else:
             shutil.rmtree(run_dir, ignore_errors=True)
@@ -2860,27 +3098,33 @@ def run_session(
             )
         return True
 
-    if args.order == "grouped" and runs_per_cfg is not None:
-        for cfg in configs:
-            for _ in range(runs_per_cfg):
-                if not execute_one(cfg):
-                    break
-            if interrupted or stop_reason in ("duration", "max_failures"):
-                break
-    else:
-        round_idx = 0
-        while True:
-            if runs_per_cfg is not None and round_idx >= runs_per_cfg:
-                stop_reason = "runs"
-                break
-            round_idx += 1
-            kept_going = True
+    try:
+        if args.order == "grouped" and runs_per_cfg is not None:
             for cfg in configs:
-                if not execute_one(cfg):
-                    kept_going = False
+                for _ in range(runs_per_cfg):
+                    if not execute_one(cfg):
+                        break
+                if interrupted or stop_reason in ("duration", "max_failures"):
                     break
-            if not kept_going:
-                break
+        else:
+            round_idx = 0
+            while True:
+                if runs_per_cfg is not None and round_idx >= runs_per_cfg:
+                    stop_reason = "runs"
+                    break
+                round_idx += 1
+                kept_going = True
+                for cfg in configs:
+                    if not execute_one(cfg):
+                        kept_going = False
+                        break
+                if not kept_going:
+                    break
+    except KeyboardInterrupt as e:
+        # Stopped between runs (execute_one handles a stop during a run).
+        interrupted = True
+        interrupt_signum = getattr(e, "signum", signal.SIGINT)
+        stop_reason = "interrupted"
 
     elapsed_s = round(time.monotonic() - t_session_start, 3)
     session_meta = {
@@ -2906,10 +3150,13 @@ def run_session(
     )
     summary_text = render_text(summary, registry)
     (out_dir / "summary.txt").write_text(summary_text, encoding="utf-8")
-    print(summary_text, end="", flush=True)
+    try:
+        print(summary_text, end="", flush=True)
+    except OSError:  # For example, after SIGHUP from a closed terminal.
+        pass
 
     if interrupted:
-        return 130
+        return 128 + interrupt_signum
     if any(r.status == "FAIL" for r in records):
         return 1
     if any(r.status == "ERROR" for r in records):
@@ -2929,17 +3176,21 @@ def main(argv: Sequence[str] | None = None) -> int:
             trailing_custom.append(shlex.join(trailing_tokens))
 
     parser = build_arg_parser()
-    try:
-        args = parser.parse_args(raw)
-        for tc in trailing_custom:
-            if tc.startswith("qemu-system-"):
-                args.qemu_cmd.append(tc)
-            else:
-                args.qemu_args.append(tc)
-        return run_session(args, raw_argv=["deflake.py", *raw])
-    except ConfigError as e:
-        print(f"ERROR: {e}", file=sys.stderr)
-        return 2
+    with stop_signals_raise():
+        try:
+            args = parser.parse_args(raw)
+            for tc in trailing_custom:
+                if tc.startswith("qemu-system-"):
+                    args.qemu_cmd.append(tc)
+                else:
+                    args.qemu_args.append(tc)
+            return run_session(args, raw_argv=["deflake.py", *raw])
+        except ConfigError as e:
+            print(f"ERROR: {e}", file=sys.stderr)
+            return 2
+        except KeyboardInterrupt as e:
+            # Stopped before the runs, or while the summary was written.
+            return 128 + getattr(e, "signum", signal.SIGINT)
 
 
 if __name__ == "__main__":

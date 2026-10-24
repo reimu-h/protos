@@ -113,27 +113,32 @@ inline int64_t ReadKvmStealNs(const KvmStealTime& st) {
 }
 
 // Returns a conservative upper bound (in nanoseconds) on the duration of one
-// `GlobalTimerTicks()` tick (`P_conv = 16 * count + floor(16 * count / 1024) +
-// 1` ns) so `StealNsToTicks` never over-subtracts steal time. Returns 0 if
-// `initial_count == 0`.
-inline constexpr int64_t TimerTickNsUpperBound(const uint32_t initial_count) {
-  if (initial_count == 0) {
+// `GlobalTimerTicks()` tick that lasts at most `max_tick_ns`
+// (`P_conv = max_tick_ns + floor(max_tick_ns / 1024) + 1` ns, saturating), so
+// `StealNsToTicks` never over-subtracts steal time. Returns 0 if
+// `max_tick_ns <= 0`. `SmpTimerTickNsUpperBound()` (smp.h) passes the longest
+// tick that the Local APIC timer's calibration admits.
+inline constexpr int64_t TickNsUpperBound(const int64_t max_tick_ns) {
+  if (max_tick_ns <= 0) {
     return 0;
   }
-  const int64_t base_ns = 16LL * static_cast<int64_t>(initial_count);
-  return base_ns + (base_ns / 1024LL) + 1LL;
+  const int64_t margin_ns = (max_tick_ns / 1024LL) + 1LL;
+  return (max_tick_ns > INT64_MAX - margin_ns) ? INT64_MAX
+                                               : max_tick_ns + margin_ns;
 }
 
 // Returns a conservative lower bound (in nanoseconds) on the duration of one
-// `GlobalTimerTicks()` tick (`P_low = 16 * count - floor(16 * count / 1024)`
-// ns), used by `BusyWaitKillMeasureTicks` so injected delays are never cut
-// short by steal-time subtraction. Returns 0 if `initial_count == 0`.
-inline constexpr int64_t TimerTickNsLowerBound(const uint32_t initial_count) {
-  if (initial_count == 0) {
+// `GlobalTimerTicks()` tick that lasts at least `min_tick_ns`
+// (`P_low = min_tick_ns - floor(min_tick_ns / 1024)` ns), used by
+// `BusyWaitKillMeasureTicks` so injected delays are never cut short by
+// steal-time subtraction. Returns 0 if `min_tick_ns <= 0`.
+// `SmpTimerTickNsLowerBound()` (smp.h) passes the shortest tick that the Local
+// APIC timer's calibration admits.
+inline constexpr int64_t TickNsLowerBound(const int64_t min_tick_ns) {
+  if (min_tick_ns <= 0) {
     return 0;
   }
-  const int64_t base_ns = 16LL * static_cast<int64_t>(initial_count);
-  return base_ns - (base_ns / 1024LL);
+  return min_tick_ns - (min_tick_ns / 1024LL);
 }
 
 // Converts `steal_ns` nanoseconds of excluded steal time to whole timer ticks

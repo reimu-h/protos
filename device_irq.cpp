@@ -99,6 +99,114 @@ static DeviceIrqStatus SelectEffectiveMode(const PciDevice& device,  //
   return DeviceIrqStatus::kOk;
 }
 
+// The bits of the MSI Mask Bits register that belong to the vectors that the
+// function implements (Multiple Message Capable); the others are reserved.
+static uint32_t MsiImplementedMaskBits(const PciMsi& msi) {
+  return (msi.vectors_log2 >= 5) ? 0xFFFFFFFFU
+                                 : (uint32_t{1} << (1 << msi.vectors_log2)) - 1;
+}
+
+// Masks or unmasks entry `entry` of the MSI-X table that `table` maps through
+// bit 0 of its Vector Control word alone: bits 31:1 are reserved, and software
+// must preserve them [PCI Local Bus 3.0 §6.8.2.9] (TLP Processing Hints keep
+// Steering Tags there).
+static void SetMsixEntryMasked(volatile uint32_t* const table,  //
+                               const int entry,                 //
+                               const bool masked) {
+  volatile uint32_t& vector_control = table[entry * 4 + 3];
+  const uint32_t old_value = vector_control;
+  const uint32_t new_value = masked ? (old_value | kMsixVectorControlMaskBit)
+                                    : (old_value & ~kMsixVectorControlMaskBit);
+  if (new_value != old_value) {
+    vector_control = new_value;
+  }
+}
+
+// Programs MSI on `device` (index `device_index`) for one vector
+// (DeviceIrqProgramDevice()).
+static void ProgramMsi(const int device_index,      //
+                       const PciDevice& device,     //
+                       const uint32_t address_low,  //
+                       const int vector) {
+  const PciMsi& msi = device.msi;
+  const int control = msi.offset + kPciMsiControlOffset;
+  // 1. Turn MSI-X off (with its Function Mask set, as PciQuiesce() does): a
+  //    function must not have MSI and MSI-X on at once [PCI Local Bus 3.0
+  //    §6.8].
+  if (device.msix.offset != 0) {
+    PciConfigUpdate16(device_index,                               //
+                      device.msix.offset + kPciMsiControlOffset,  //
+                      kPciMsixControlFunctionMask,                //
+                      kPciMsixControlEnable);
+  }
+  // 2. Disable MSI and clear Multiple Message Enable before programming.
+  PciConfigUpdate16(device_index, control, 0,
+                    kPciMsiControlEnable | kMsiControlMmeMask);
+  // 3. Write Message Address (and Upper Address = 0 if 64-bit).
+  PciConfigWrite32(device_index, msi.offset + 4, address_low);
+  if (msi.is_64bit) {
+    PciConfigWrite32(device_index, msi.offset + 8, 0);
+  }
+  // 4. Write Message Data.
+  PciConfigWrite16(device_index, msi.data_offset, DeviceIrqMsiData(vector));
+  // 5. If per-vector masking is present, unmask vector 0 and mask the other
+  //    implemented vectors, leaving the reserved bits as they are.
+  if (msi.per_vector_masking) {
+    const uint32_t implemented = MsiImplementedMaskBits(msi);
+    const uint32_t mask_bits = PciConfigRead32(device_index, msi.mask_offset);
+    PciConfigWrite32(device_index, msi.mask_offset,
+                     (mask_bits & ~implemented) | (implemented & ~uint32_t{1}));
+  }
+  // 6. Disable legacy INTx and enable MSI with MME = 0 (1 vector).
+  PciUpdateCommand(device_index, kPciCommandInterruptDisable, 0);
+  PciConfigUpdate16(device_index, control, kPciMsiControlEnable,
+                    kMsiControlMmeMask);
+}
+
+// Programs MSI-X entries 0..count - 1 of `device` (index `device_index`),
+// whose table `table` maps, with `vectors` (DeviceIrqProgramDevice()).
+static void ProgramMsix(const int device_index,          //
+                        const PciDevice& device,         //
+                        volatile uint32_t* const table,  //
+                        const uint32_t address_low,      //
+                        const int count,                 //
+                        const int* const vectors) {
+  const PciMsix& msix = device.msix;
+  const int control = msix.offset + kPciMsiControlOffset;
+  // 1. Turn MSI off: a function must not have MSI and MSI-X on at once [PCI
+  //    Local Bus 3.0 §6.8].
+  if (device.msi.offset != 0) {
+    PciConfigUpdate16(device_index,                              //
+                      device.msi.offset + kPciMsiControlOffset,  //
+                      0,                                         //
+                      kPciMsiControlEnable);
+  }
+  // 2. Ensure BAR Memory Space decoding is enabled and legacy INTx is disabled.
+  PciUpdateCommand(device_index,
+                   kPciCommandMemorySpace | kPciCommandInterruptDisable, 0);
+  // 3. Set Enable and Function Mask in one write before touching the table:
+  //    some devices ignore table accesses while MSI-X Enable is 0 (Linux's
+  //    msix_capability_init() does the same), and the Function Mask keeps
+  //    every vector from being signaled until step 6.
+  PciConfigUpdate16(device_index, control,
+                    kPciMsixControlEnable | kPciMsixControlFunctionMask, 0);
+  // 4. Mask all MSI-X table entries.
+  for (int e = 0; e < msix.table_size; ++e) {
+    SetMsixEntryMasked(table, e, /*masked=*/true);
+  }
+  // 5. Program entries 0..count - 1 and unmask them.
+  for (int i = 0; i < count; ++i) {
+    table[i * 4 + 0] = address_low;
+    table[i * 4 + 1] = 0;
+    table[i * 4 + 2] = DeviceIrqMsiData(vectors[i]);
+    SetMsixEntryMasked(table, i, /*masked=*/false);
+  }
+  // 6. Read back entry 0's Vector Control word to flush posted MMIO writes,
+  //    then clear Function Mask.
+  (void)table[3];
+  PciConfigUpdate16(device_index, control, 0, kPciMsixControlFunctionMask);
+}
+
 }  // namespace
 
 void DeviceIrqInit(std::shared_ptr<DeviceIrqEnvironment> env) {
@@ -113,6 +221,11 @@ void DeviceIrqInit(std::shared_ptr<DeviceIrqEnvironment> env) {
     g_device_configured[i] = false;
     g_msix_tables[i] = nullptr;
   }
+}
+
+int DeviceIrqMsiDestinationApicId() {
+  CHECK(g_env != nullptr);
+  return g_env->MsiDestinationApicId();
 }
 
 DeviceIrqStatus DeviceIrqAllocateVectors(
@@ -190,6 +303,11 @@ DeviceIrqStatus DeviceIrqProgramDevice(const int device_index,  //
       return DeviceIrqStatus::kInvalid;
     }
   }
+  const int destination = g_env->MsiDestinationApicId();
+  if (destination < 0 ||
+      !DeviceIrqMsiCanTarget(static_cast<uint32_t>(destination))) {
+    return DeviceIrqStatus::kInvalid;
+  }
 
   {
     const IrqSpinLockGuard guard(g_device_irq_lock);
@@ -199,32 +317,13 @@ DeviceIrqStatus DeviceIrqProgramDevice(const int device_index,  //
     g_device_configured[device_index] = true;
   }
 
-  const uint32_t addr_lo = DeviceIrqMsiAddressLow(g_env->BspApicId());
+  const uint32_t address_low =
+      DeviceIrqMsiAddressLow(static_cast<uint8_t>(destination));
   if (effective_mode == kSyscallIrqModeMsi) {
-    const PciMsi& msi = device->msi;
-    // 1. Disable MSI and clear Multiple Message Enable before programming.
-    PciConfigUpdate16(device_index, msi.offset + kPciMsiControlOffset, 0,
-                      kPciMsiControlEnable | kMsiControlMmeMask);
-    // 2. Write Message Address (and Upper Address = 0 if 64-bit).
-    PciConfigWrite32(device_index, msi.offset + 4, addr_lo);
-    if (msi.is_64bit) {
-      PciConfigWrite32(device_index, msi.offset + 8, 0);
-    }
-    // 3. Write Message Data.
-    PciConfigWrite16(device_index, msi.data_offset,
-                     DeviceIrqMsiData(vectors[0]));
-    // 4. If per-vector masking is present, unmask vector 0 and mask bits 1..31.
-    if (msi.per_vector_masking) {
-      PciConfigWrite32(device_index, msi.mask_offset, ~uint32_t{1});
-    }
-    // 5. Disable legacy INTx and enable MSI with MME = 0 (1 vector).
-    PciUpdateCommand(device_index, kPciCommandInterruptDisable, 0);
-    PciConfigUpdate16(device_index, msi.offset + kPciMsiControlOffset,
-                      kPciMsiControlEnable, kMsiControlMmeMask);
+    ProgramMsi(device_index, *device, address_low, vectors[0]);
     return DeviceIrqStatus::kOk;
   }
 
-  const PciMsix& msix = device->msix;
   volatile uint32_t* const table =
       g_env->MapMsixTable(device_index, device->msix);
   if (table == nullptr) {
@@ -236,29 +335,7 @@ DeviceIrqStatus DeviceIrqProgramDevice(const int device_index,  //
     const IrqSpinLockGuard guard(g_device_irq_lock);
     g_msix_tables[device_index] = table;
   }
-
-  // 1. Set Function Mask = 1 and Enable = 0 while programming the table.
-  PciConfigUpdate16(device_index, msix.offset + kPciMsiControlOffset,
-                    kPciMsixControlFunctionMask, kPciMsixControlEnable);
-  // 2. Ensure BAR Memory Space decoding is enabled and legacy INTx is disabled.
-  PciUpdateCommand(device_index,
-                   kPciCommandMemorySpace | kPciCommandInterruptDisable, 0);
-  // 3. Mask all MSI-X table entries.
-  for (int e = 0; e < msix.table_size; ++e) {
-    table[e * 4 + 3] = kMsixVectorControlMaskBit;
-  }
-  // 4. Program entries 0..count - 1 and unmask them.
-  for (int i = 0; i < count; ++i) {
-    table[i * 4 + 0] = addr_lo;
-    table[i * 4 + 1] = 0;
-    table[i * 4 + 2] = DeviceIrqMsiData(vectors[i]);
-    table[i * 4 + 3] = 0;
-  }
-  // 5. Read back entry 0's Vector Control word to flush posted MMIO writes.
-  (void)table[3];
-  // 6. Enable MSI-X and clear Function Mask.
-  PciConfigUpdate16(device_index, msix.offset + kPciMsiControlOffset,
-                    kPciMsixControlEnable, kPciMsixControlFunctionMask);
+  ProgramMsix(device_index, *device, table, address_low, count, vectors);
   return DeviceIrqStatus::kOk;
 }
 
@@ -281,16 +358,33 @@ void DeviceIrqReleaseDevice(const int device_index) {
   }
 
   if (table != nullptr && device->msix.offset != 0 && device->msix.valid) {
+    // PciQuiesce() has cleared MSI-X Enable. As when programming the table,
+    // set it with the Function Mask (which, like the cleared Bus Master, keeps
+    // the function from signaling any vector) while the entries are masked,
+    // for the devices that ignore table accesses otherwise; then put Message
+    // Control back.
+    constexpr uint16_t kEnableAndMask =
+        kPciMsixControlEnable | kPciMsixControlFunctionMask;
+    const int control = device->msix.offset + kPciMsiControlOffset;
+    const uint16_t old_control = PciConfigRead16(device_index, control);
+    PciConfigUpdate16(device_index, control, kEnableAndMask, 0);
     for (int e = 0; e < device->msix.table_size; ++e) {
-      table[e * 4 + 3] = kMsixVectorControlMaskBit;
+      SetMsixEntryMasked(table, e, /*masked=*/true);
     }
     (void)table[3];
+    PciConfigUpdate16(device_index,                                         //
+                      control,                                              //
+                      static_cast<uint16_t>(old_control & kEnableAndMask),  //
+                      static_cast<uint16_t>(~old_control & kEnableAndMask));
     if (g_env != nullptr) {
       g_env->UnmapMsixTable(device_index);
     }
   }
   if (device->msi.offset != 0 && device->msi.per_vector_masking) {
-    PciConfigWrite32(device_index, device->msi.mask_offset, 0xFFFFFFFFU);
+    const uint32_t mask_bits =
+        PciConfigRead32(device_index, device->msi.mask_offset);
+    PciConfigWrite32(device_index, device->msi.mask_offset,
+                     mask_bits | MsiImplementedMaskBits(device->msi));
   }
 }
 
@@ -372,6 +466,10 @@ int DeviceIrqVectorForBit(const uintptr_t owner, const int bit_index) {
 uint32_t DeviceIrqReadMsixTableWord(const int device_index,
                                     const int word_index) {
   if (device_index < 0 || device_index >= kPciMaxDevices || word_index < 0) {
+    return 0;
+  }
+  const PciDevice* const device = PciGetDevice(device_index);
+  if (device == nullptr || word_index >= device->msix.table_size * 4) {
     return 0;
   }
   const IrqSpinLockGuard guard(g_device_irq_lock);
@@ -483,6 +581,20 @@ IrqSpinLock g_kernel_msix_map_lock;
 bool g_window_page_used[kDeviceIrqMmioWindowPages] = {};
 KernelMsixMapping g_kernel_msix_mappings[kPciMaxDevices] = {};
 
+// Marks window pages `first .. first + count - 1` free once no CPU can still
+// hold a translation of them: after a TLB shootdown that starts after they
+// were unmapped (`PagingUnmapKernelPage` in paging.h). Until then they stay
+// marked used, so that `MapMsixTable` can't map them to another table yet.
+// Called without `g_kernel_msix_map_lock`: a shootdown must not run under an
+// `IrqSpinLock`.
+static void FreeWindowPagesAfterShootdown(const int first, const int count) {
+  SmpTlbShootdown();
+  const IrqSpinLockGuard guard(g_kernel_msix_map_lock);
+  for (int j = 0; j < count; ++j) {
+    g_window_page_used[first + j] = false;
+  }
+}
+
 class KernelDeviceIrqEnvironment final : public DeviceIrqEnvironment {
  public:
   KernelDeviceIrqEnvironment() {
@@ -500,9 +612,16 @@ class KernelDeviceIrqEnvironment final : public DeviceIrqEnvironment {
     IdtUnregisterHandler(vector);
   }
 
-  uint8_t BspApicId() override {
-    const CpuInfo* const bsp = SmpGetCpuInfo(0);
-    return bsp != nullptr ? static_cast<uint8_t>(bsp->apic_id & 0xFFU) : 0;
+  int MsiDestinationApicId() override {
+    // CPU 0 is the BSP (smp.h).
+    const int cpu_count = SmpCpuCount();
+    for (int cpu = 0; cpu < cpu_count; ++cpu) {
+      const uint32_t apic_id = SmpGetCpuInfo(cpu)->apic_id;
+      if (IsCpuOnline(cpu, cpu_count) && DeviceIrqMsiCanTarget(apic_id)) {
+        return static_cast<int>(apic_id);
+      }
+    }
+    return -1;
   }
 
   volatile uint32_t* MapMsixTable(const int device_index,
@@ -511,11 +630,6 @@ class KernelDeviceIrqEnvironment final : public DeviceIrqEnvironment {
         msix.table_phys == 0 || msix.table_bytes <= 0) {
       return nullptr;
     }
-    const IrqSpinLockGuard guard(g_kernel_msix_map_lock);
-    if (g_kernel_msix_mappings[device_index].table != nullptr) {
-      return g_kernel_msix_mappings[device_index].table;
-    }
-
     constexpr uint64_t kPageMask = static_cast<uint64_t>(kPageSize) - 1;
     const uint64_t first_phys = msix.table_phys & ~kPageMask;
     const uint64_t last_phys =
@@ -528,51 +642,64 @@ class KernelDeviceIrqEnvironment final : public DeviceIrqEnvironment {
     }
 
     int start_page = -1;
-    for (int i = 0; i <= kDeviceIrqMmioWindowPages - pages; ++i) {
-      bool ok = true;
-      for (int j = 0; j < pages; ++j) {
-        if (g_window_page_used[i + j]) {
-          ok = false;
+    {
+      const IrqSpinLockGuard guard(g_kernel_msix_map_lock);
+      if (g_kernel_msix_mappings[device_index].table != nullptr) {
+        return g_kernel_msix_mappings[device_index].table;
+      }
+      for (int i = 0; i <= kDeviceIrqMmioWindowPages - pages; ++i) {
+        bool ok = true;
+        for (int j = 0; j < pages; ++j) {
+          if (g_window_page_used[i + j]) {
+            ok = false;
+            break;
+          }
+        }
+        if (ok) {
+          start_page = i;
           break;
         }
       }
-      if (ok) {
-        start_page = i;
-        break;
-      }
-    }
-    if (start_page < 0) {
-      return nullptr;
-    }
-
-    const uintptr_t virt_base = kDeviceIrqMmioWindowBase +
-                                static_cast<uintptr_t>(start_page) * kPageSize;
-    for (int j = 0; j < pages; ++j) {
-      const uintptr_t va = virt_base + static_cast<uintptr_t>(j) * kPageSize;
-      const uintptr_t pa = static_cast<uintptr_t>(first_phys) +
-                           static_cast<uintptr_t>(j) * kPageSize;
-      if (!PagingMapKernelMmioPage(va, pa)) {
-        for (int k = 0; k < j; ++k) {
-          PagingUnmapKernelPage(virt_base +
-                                static_cast<uintptr_t>(k) * kPageSize);
-        }
+      if (start_page < 0) {
         return nullptr;
       }
+      // Reserved before they are mapped: if a mapping fails, the pages mapped
+      // so far may only be reused after a TLB shootdown.
+      for (int j = 0; j < pages; ++j) {
+        g_window_page_used[start_page + j] = true;
+      }
+
+      const uintptr_t virt_base =
+          kDeviceIrqMmioWindowBase +
+          static_cast<uintptr_t>(start_page) * kPageSize;
+      int mapped = 0;
+      while (mapped < pages &&
+             PagingMapKernelMmioPage(
+                 virt_base + static_cast<uintptr_t>(mapped) * kPageSize,
+                 static_cast<uintptr_t>(first_phys) +
+                     static_cast<uintptr_t>(mapped) * kPageSize)) {
+        ++mapped;
+      }
+      if (mapped == pages) {
+        const uintptr_t offset_in_page =
+            static_cast<uintptr_t>(msix.table_phys - first_phys);
+        volatile uint32_t* const table =
+            reinterpret_cast<volatile uint32_t*>(virt_base + offset_in_page);
+        g_kernel_msix_mappings[device_index] = KernelMsixMapping{
+            .virt_base = virt_base,
+            .first_window_page = start_page,
+            .page_count = pages,
+            .table = table,
+        };
+        return table;
+      }
+      for (int k = 0; k < mapped; ++k) {
+        PagingUnmapKernelPage(virt_base +
+                              static_cast<uintptr_t>(k) * kPageSize);
+      }
     }
-    for (int j = 0; j < pages; ++j) {
-      g_window_page_used[start_page + j] = true;
-    }
-    const uintptr_t offset_in_page =
-        static_cast<uintptr_t>(msix.table_phys - first_phys);
-    volatile uint32_t* const table =
-        reinterpret_cast<volatile uint32_t*>(virt_base + offset_in_page);
-    g_kernel_msix_mappings[device_index] = KernelMsixMapping{
-        .virt_base = virt_base,
-        .first_window_page = start_page,
-        .page_count = pages,
-        .table = table,
-    };
-    return table;
+    FreeWindowPagesAfterShootdown(start_page, pages);
+    return nullptr;
   }
 
   void UnmapMsixTable(const int device_index) override {
@@ -589,12 +716,11 @@ class KernelDeviceIrqEnvironment final : public DeviceIrqEnvironment {
       for (int j = 0; j < mapping.page_count; ++j) {
         PagingUnmapKernelPage(mapping.virt_base +
                               static_cast<uintptr_t>(j) * kPageSize);
-        g_window_page_used[mapping.first_window_page + j] = false;
       }
       g_kernel_msix_mappings[device_index] = KernelMsixMapping{};
     }
-    // Flush TLBs across all CPUs before those virtual pages can be reused.
-    SmpTlbShootdown();
+    FreeWindowPagesAfterShootdown(mapping.first_window_page,
+                                  mapping.page_count);
   }
 
   int64_t NowTicks() override {

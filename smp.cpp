@@ -59,6 +59,9 @@ constexpr uint32_t kMsrX2ApicBase = 0x00000800;
 constexpr uint32_t kCpuidEcxX2ApicBit = 1u << 21;
 constexpr uint64_t kApicBaseX2ApicEnable = 1ULL << 10;
 constexpr uint64_t kApicBaseGlobalEnable = 1ULL << 11;
+// IA32_APIC_BASE bits 12 up to MAXPHYADDR - 1 (at most bit 51): the physical
+// address of the Local APIC's xAPIC MMIO page.
+constexpr uint64_t kApicBaseAddressMask = 0x000FFFFFFFFFF000ULL;
 
 constexpr int kLapicRegId = 0x020;
 constexpr int kLapicRegTpr = 0x080;
@@ -85,11 +88,10 @@ constexpr uint32_t kIcrDeliveryStartup = 0x00000600u;
 constexpr uint32_t kIcrDeliveryPending = 1u << 12;
 constexpr uint32_t kIcrLevelAssert = 1u << 14;
 constexpr uint32_t kIcrTriggerLevel = 1u << 15;
-constexpr uint32_t kIcrDestAllExcludingSelf = 3u << 18;
 constexpr int kIcrIdlePollLimit = 1000000;
-// ICR value of the NMI that stops the other CPUs when one CPU panics.
-constexpr uint32_t kPanicStopIcr =
-    kIcrDeliveryNmi | kIcrLevelAssert | kIcrDestAllExcludingSelf;
+// ICR bits 0-31 of the NMI that stops another CPU when one CPU panics (sent to
+// each CPU by its APIC ID, see SmpStopOtherCpusForPanic()).
+constexpr uint32_t kPanicStopIcr = kIcrDeliveryNmi | kIcrLevelAssert;
 
 constexpr uint32_t kMsrIa32Efer = 0xC0000080;
 constexpr uint64_t kEferLongModeActive = 1ULL << 10;
@@ -112,14 +114,49 @@ constexpr int64_t kSipiDelayUs = 200;
 // Time an AP gets, after its last SIPI, to report in from ApKernelEntry() (the
 // same limit as Linux).
 constexpr int64_t kApStartupTimeoutMs = 10000;
-// TSC rate assumed until CalibrateLocalApicTimer() measures it, and if the PIT
-// does not respond. It is deliberately high (8 GHz), so that delays err on the
-// long side.
+// TSC rate assumed until CalibrateLocalApicTimer() measures it, and if neither
+// the PIT nor Hyper-V or CPUID provides it. It is deliberately high (8 GHz), so
+// that delays err on the long side.
 constexpr uint64_t kFallbackTscTicksPerMs = 8000000;
 // TSC rates that a calibration may report: 100 MHz to 20 GHz. A rate below
 // would shorten every delay and timeout.
 constexpr uint64_t kMinPlausibleTscTicksPerMs = 100000;
 constexpr uint64_t kMaxPlausibleTscTicksPerMs = 20000000;
+// Time the PIT calibration countdown (~10 ms) gets to run out, timed with the
+// TSC at kFallbackTscTicksPerMs: at least 50 ms for any TSC up to 8 GHz, and
+// far less than kPitCalibrationPollLimit port reads take where each read
+// exits to a hypervisor.
+constexpr int64_t kPitCalibrationTimeoutMs = 50;
+
+// CPUID leaves that report clock frequencies (Intel SDM, "CPUID"): 15H, the
+// TSC/core crystal clock ratio EBX/EAX (EBX is 0 if it is not enumerated) and
+// the crystal clock in Hz (ECX, 0 if not enumerated), and 16H, the processor
+// base and bus (reference) frequencies in MHz (EAX[15:0] and ECX[15:0]).
+constexpr uint32_t kCpuidTscCrystalLeaf = 0x15;
+constexpr uint32_t kCpuidFrequencyLeaf = 0x16;
+
+// Length of one Local APIC timer tick at kApicTimerTargetHz.
+constexpr int64_t kNominalTimerTickNs = 1000000000 / kApicTimerTargetHz;
+// A calibrated Local APIC timer clock may be off by this fraction (1/128): a
+// rate measured against the PIT by the latency of the accesses around the
+// ~10 ms countdown (78 us of it; each access may exit to a hypervisor), and
+// the CPUID frequencies by the rounding of leaf 16H to whole MHz and by
+// spread-spectrum bus clocks.
+constexpr int64_t kCalibratedTimerClockErrorDivisor = 128;
+// The input clocks that the Local APIC timer may run at when nothing reports
+// or measures it (kFallbackApicTimerInitialCount): up to the 1 GHz that QEMU
+// and KVM emulate, and down to 10 MHz, below the 19.2 to 100 MHz crystal and
+// bus clocks of hardware.
+constexpr int64_t kMinUncalibratedTimerClockHz = 10000000;
+constexpr int64_t kMaxUncalibratedTimerClockHz = 1000000000;
+// The length of one tick of kFallbackApicTimerInitialCount at those clocks
+// (divided by 16, see kLapicTimerDivBy16): 4 ms to 400 ms.
+constexpr int64_t kFallbackTimerTickNsMin =
+    16LL * kFallbackApicTimerInitialCount * 1000000000 /
+    kMaxUncalibratedTimerClockHz;
+constexpr int64_t kFallbackTimerTickNsMax =
+    16LL * kFallbackApicTimerInitialCount * 1000000000 /
+    kMinUncalibratedTimerClockHz;
 
 // Hyper-V (Microsoft's Hypervisor Top Level Functional Specification), whose
 // generation 2 VMs have no PIT: CPUID.01H:ECX[31] (a hypervisor is present),
@@ -214,6 +251,10 @@ SmpTopology g_topology = {};
 std::unique_ptr<CpuLocal[]> g_cpu_locals;
 // Calibrated periodic Local APIC timer initial count computed on the BSP.
 uint32_t g_calibrated_timer_initial_count = 0;
+// The range in which the length of one Local APIC timer tick lies, as far as
+// SmpInit() knows the timer's clock (see ChooseApicTimerInitialCount()).
+int64_t g_timer_tick_ns_min = kFallbackTimerTickNsMin;
+int64_t g_timer_tick_ns_max = kFallbackTimerTickNsMax;
 // Number of CPUs (BSP + APs) that have completed initialization and come
 // online.
 std::atomic<int> g_online_cpu_count{0};
@@ -239,9 +280,13 @@ bool g_steal_time = false;
 // True once the BSP's Local APIC is enabled, so that the panic path can send
 // IPIs.
 std::atomic<bool> g_panic_ipi_ready{false};
-// Set before the stop NMI is sent; makes the NMI handler and starting APs park.
+// The CpuLocal of the panicking CPU (nullptr if it has none), which an NMI
+// must not park. Set before the stop request.
+std::atomic<const CpuLocal*> g_panic_stopping_cpu{nullptr};
+// Set before the stop NMIs are sent; makes the NMI handler and starting APs
+// park.
 std::atomic<bool> g_panic_stop_requested{false};
-// Number of CPUs parked by ParkCpuForPanic().
+// Number of CPUs that the stop NMI parked (ParkCpuForPanic()).
 std::atomic<int> g_panic_parked_cpu_count{0};
 
 // State for synchronous multi-CPU work dispatch in SmpRunOnAllCpus():
@@ -319,14 +364,11 @@ static bool VerifyChecksum(const void* const data, const int64_t length) {
   return sum == 0;
 }
 
-static bool ValidateRsdpV1Bounded(const uintptr_t rsdp_addr,
-                                  const uintptr_t rsdp_max_end_addr,
-                                  const uintptr_t max_physical_addr,
-                                  uintptr_t* const out_rsdt_addr) {
+static StatusOr<uintptr_t> ValidateRsdpV1Bounded(
+    const uintptr_t rsdp_addr, const uintptr_t rsdp_max_end_addr,
+    const uintptr_t max_physical_addr) {
   DCHECK(rsdp_addr != 0);
   DCHECK(max_physical_addr > 0);
-  DCHECK(out_rsdt_addr != nullptr);
-  *out_rsdt_addr = 0;
 
   constexpr int64_t kV1Size = sizeof(AcpiRsdpV1);
   const uintptr_t structure_limit = (rsdp_max_end_addr < max_physical_addr)
@@ -334,32 +376,25 @@ static bool ValidateRsdpV1Bounded(const uintptr_t rsdp_addr,
                                         : max_physical_addr;
   if (rsdp_addr >= structure_limit ||
       (structure_limit - rsdp_addr) < static_cast<uintptr_t>(kV1Size)) {
-    return false;
+    return kStatusError;
   }
   const AcpiRsdpV1* const rsdp = MapPhysical<AcpiRsdpV1>(rsdp_addr, kV1Size);
   if (rsdp == nullptr || !BytesMatch(rsdp->signature, "RSD PTR ", 8) ||
       !VerifyChecksum(rsdp, kV1Size)) {
-    return false;
+    return kStatusError;
   }
   const uintptr_t rsdt_addr = rsdp->rsdt_address;
   if (rsdt_addr == 0 || rsdt_addr >= max_physical_addr) {
-    return false;
+    return kStatusError;
   }
-  *out_rsdt_addr = rsdt_addr;
-  return true;
+  return rsdt_addr;
 }
 
-static bool ParseRsdpBounded(const uintptr_t rsdp_addr,
-                             const uintptr_t rsdp_max_end_addr,
-                             const uintptr_t max_physical_addr,
-                             uintptr_t* const out_rsdt_addr,
-                             uintptr_t* const out_xsdt_addr) {
+static StatusOr<RsdpTables> ParseRsdpBounded(
+    const uintptr_t rsdp_addr, const uintptr_t rsdp_max_end_addr,
+    const uintptr_t max_physical_addr) {
   DCHECK(rsdp_addr != 0);
   DCHECK(max_physical_addr > 0);
-  DCHECK(out_rsdt_addr != nullptr);
-  DCHECK(out_xsdt_addr != nullptr);
-  *out_rsdt_addr = 0;
-  *out_xsdt_addr = 0;
 
   constexpr int64_t kV1Size = sizeof(AcpiRsdpV1);
   constexpr int64_t kV2Size = sizeof(AcpiRsdpV2);
@@ -368,18 +403,19 @@ static bool ParseRsdpBounded(const uintptr_t rsdp_addr,
                                         : max_physical_addr;
   if (rsdp_addr >= structure_limit ||
       (structure_limit - rsdp_addr) < static_cast<uintptr_t>(kV1Size)) {
-    return false;
+    return kStatusError;
   }
 
   const AcpiRsdpV1* const rsdp_v1 = MapPhysical<AcpiRsdpV1>(rsdp_addr, kV1Size);
   if (rsdp_v1 == nullptr || !BytesMatch(rsdp_v1->signature, "RSD PTR ", 8) ||
       !VerifyChecksum(rsdp_v1, kV1Size)) {
-    return false;
+    return kStatusError;
   }
 
+  RsdpTables tables{};
   const uintptr_t rsdt_addr = rsdp_v1->rsdt_address;
   if (rsdt_addr != 0 && rsdt_addr < max_physical_addr) {
-    *out_rsdt_addr = rsdt_addr;
+    tables.rsdt_addr = rsdt_addr;
   }
 
   if (rsdp_v1->revision >= 2) {
@@ -388,8 +424,7 @@ static bool ParseRsdpBounded(const uintptr_t rsdp_addr,
             ? nullptr
             : MapPhysical<AcpiRsdpV2>(rsdp_addr, kV2Size);
     if (rsdp_v2 == nullptr) {
-      *out_rsdt_addr = 0;
-      return false;
+      return kStatusError;
     }
     const int64_t v2_len = rsdp_v2->length;
     const AcpiRsdpV2* const full_rsdp_v2 =
@@ -398,84 +433,80 @@ static bool ParseRsdpBounded(const uintptr_t rsdp_addr,
             ? nullptr
             : MapPhysical<AcpiRsdpV2>(rsdp_addr, v2_len);
     if (full_rsdp_v2 == nullptr || !VerifyChecksum(full_rsdp_v2, v2_len)) {
-      *out_rsdt_addr = 0;
-      return false;
+      return kStatusError;
     }
     const uintptr_t xsdt_addr = full_rsdp_v2->xsdt_address;
     if (xsdt_addr != 0 && xsdt_addr < max_physical_addr) {
-      *out_xsdt_addr = xsdt_addr;
+      tables.xsdt_addr = xsdt_addr;
     }
   }
 
-  return *out_rsdt_addr != 0 || *out_xsdt_addr != 0;
+  if (tables.rsdt_addr == 0 && tables.xsdt_addr == 0) {
+    return kStatusError;
+  }
+  return tables;
 }
 
-static bool FindRsdpTagsInMultiboot2(const uintptr_t multiboot_info_addr,
-                                     const uintptr_t max_physical_addr,
-                                     uintptr_t* const out_new_addr,
-                                     uintptr_t* const out_new_end_addr,
-                                     uintptr_t* const out_old_addr,
-                                     uintptr_t* const out_old_end_addr) {
+struct Multiboot2RsdpTags {
+  uintptr_t new_addr = 0;
+  uintptr_t new_end_addr = 0;
+  uintptr_t old_addr = 0;
+  uintptr_t old_end_addr = 0;
+};
+
+static StatusOr<Multiboot2RsdpTags> FindRsdpTagsInMultiboot2(
+    const uintptr_t multiboot_info_addr, const uintptr_t max_physical_addr) {
   DCHECK(multiboot_info_addr != 0);
   DCHECK(max_physical_addr > 0);
-  DCHECK(out_new_addr != nullptr);
-  DCHECK(out_new_end_addr != nullptr);
-  DCHECK(out_old_addr != nullptr);
-  DCHECK(out_old_end_addr != nullptr);
-  *out_new_addr = 0;
-  *out_new_end_addr = 0;
-  *out_old_addr = 0;
-  *out_old_end_addr = 0;
 
-  int64_t total_size = 0;
-  const uint8_t* const info = Multiboot2MapInfo(
-      multiboot_info_addr, max_physical_addr, &MapPhysicalMemory, &total_size);
-  if (info == nullptr) {
-    return false;
+  const StatusOr<Multiboot2MappedInfo> mapped = Multiboot2MapInfo(
+      multiboot_info_addr, max_physical_addr, &MapPhysicalMemory);
+  if (!mapped.ok()) {
+    return kStatusError;
   }
 
+  Multiboot2RsdpTags tags{};
   constexpr int64_t kTagHeaderSize = sizeof(Multiboot2Tag);
   constexpr int64_t kMinOldTagSize = kTagHeaderSize + sizeof(AcpiRsdpV1);
   constexpr int64_t kMinNewTagSize = kTagHeaderSize + sizeof(AcpiRsdpV2);
-  for (Multiboot2TagIterator it(info, total_size); !it.Done(); it.Next()) {
+  for (Multiboot2TagIterator it(mapped->data, mapped->total_size); !it.Done();
+       it.Next()) {
     const Multiboot2Tag& tag = it.tag();
     const int64_t tag_size = tag.size;
     const uintptr_t tag_addr = multiboot_info_addr + it.offset();
     const uintptr_t payload_addr = tag_addr + kTagHeaderSize;
     const uintptr_t tag_end_addr = tag_addr + tag_size;
     if (tag.type == kMultiboot2TagAcpiNew && tag_size >= kMinNewTagSize &&
-        *out_new_addr == 0) {
-      uintptr_t rsdt = 0;
-      uintptr_t xsdt = 0;
-      if (ParseRsdpBounded(payload_addr,       //
-                           tag_end_addr,       //
-                           max_physical_addr,  //
-                           &rsdt,              //
-                           &xsdt)) {
-        *out_new_addr = payload_addr;
-        *out_new_end_addr = tag_end_addr;
-      } else if (*out_old_addr == 0 &&
-                 ValidateRsdpV1Bounded(payload_addr,       //
-                                       tag_end_addr,       //
-                                       max_physical_addr,  //
-                                       &rsdt)) {
-        *out_old_addr = payload_addr;
-        *out_old_end_addr = tag_end_addr;
+        tags.new_addr == 0) {
+      if (ParseRsdpBounded(payload_addr,  //
+                           tag_end_addr,  //
+                           max_physical_addr)
+              .ok()) {
+        tags.new_addr = payload_addr;
+        tags.new_end_addr = tag_end_addr;
+      } else if (tags.old_addr == 0 && ValidateRsdpV1Bounded(payload_addr,  //
+                                                             tag_end_addr,  //
+                                                             max_physical_addr)
+                                           .ok()) {
+        tags.old_addr = payload_addr;
+        tags.old_end_addr = tag_end_addr;
       }
     } else if (tag.type == kMultiboot2TagAcpiOld &&
-               tag_size >= kMinOldTagSize && *out_old_addr == 0) {
-      uintptr_t rsdt = 0;
-      if (ValidateRsdpV1Bounded(payload_addr,       //
-                                tag_end_addr,       //
-                                max_physical_addr,  //
-                                &rsdt)) {
-        *out_old_addr = payload_addr;
-        *out_old_end_addr = tag_end_addr;
+               tag_size >= kMinOldTagSize && tags.old_addr == 0) {
+      if (ValidateRsdpV1Bounded(payload_addr,  //
+                                tag_end_addr,  //
+                                max_physical_addr)
+              .ok()) {
+        tags.old_addr = payload_addr;
+        tags.old_end_addr = tag_end_addr;
       }
     }
   }
 
-  return *out_new_addr != 0 || *out_old_addr != 0;
+  if (tags.new_addr == 0 && tags.old_addr == 0) {
+    return kStatusError;
+  }
+  return tags;
 }
 
 static const AcpiSdtHeader* MapAndValidateSdt(
@@ -551,38 +582,43 @@ static void AddDiscoveredCpu(SmpTopology* const topology,       //
   ++topology->cpu_count;
 }
 
-static bool TryDiscoverFromRsdp(const uintptr_t rsdp_addr,
-                                const uintptr_t rsdp_max_end_addr,
-                                const uintptr_t max_physical_addr,
-                                const uint32_t bsp_apic_id,
-                                const bool force_v1_only,
-                                SmpTopology* const out_topology) {
+static StatusOr<SmpTopology> TryDiscoverFromRsdp(
+    const uintptr_t rsdp_addr, const uintptr_t rsdp_max_end_addr,
+    const uintptr_t max_physical_addr, const uint32_t bsp_apic_id,
+    const bool force_v1_only) {
   DCHECK(rsdp_addr != 0);
   DCHECK(max_physical_addr > 0);
   DCHECK(bsp_apic_id != kInvalidX2ApicId);
-  DCHECK(out_topology != nullptr);
   uintptr_t rsdt_addr = 0;
   uintptr_t xsdt_addr = 0;
   if (force_v1_only) {
-    if (!ValidateRsdpV1Bounded(rsdp_addr,          //
-                               rsdp_max_end_addr,  //
-                               max_physical_addr,  //
-                               &rsdt_addr)) {
-      return false;
+    const StatusOr<uintptr_t> rsdt =
+        ValidateRsdpV1Bounded(rsdp_addr,          //
+                              rsdp_max_end_addr,  //
+                              max_physical_addr);
+    if (!rsdt.ok()) {
+      return kStatusError;
     }
-  } else if (!ParseRsdpBounded(rsdp_addr,          //
-                               rsdp_max_end_addr,  //
-                               max_physical_addr,  //
-                               &rsdt_addr,         //
-                               &xsdt_addr)) {
-    return false;
+    rsdt_addr = *rsdt;
+  } else {
+    const StatusOr<RsdpTables> tables = ParseRsdpBounded(rsdp_addr,          //
+                                                         rsdp_max_end_addr,  //
+                                                         max_physical_addr);
+    if (!tables.ok()) {
+      return kStatusError;
+    }
+    rsdt_addr = tables->rsdt_addr;
+    xsdt_addr = tables->xsdt_addr;
   }
 
   const uintptr_t madt_addr =
       SmpFindMadtInSdt(rsdt_addr, xsdt_addr, max_physical_addr);
-  if (madt_addr != 0 &&
-      SmpParseMadt(madt_addr, max_physical_addr, bsp_apic_id, out_topology)) {
-    return true;
+  if (madt_addr != 0) {
+    StatusOr<SmpTopology> topology =
+        SmpParseMadt(madt_addr, max_physical_addr, bsp_apic_id);
+    if (topology.ok()) {
+      return topology;
+    }
   }
 
   if (xsdt_addr != 0 && rsdt_addr != 0) {
@@ -591,27 +627,23 @@ static bool TryDiscoverFromRsdp(const uintptr_t rsdp_addr,
     if (rsdt_madt_addr != 0 && rsdt_madt_addr != madt_addr) {
       return SmpParseMadt(rsdt_madt_addr,     //
                           max_physical_addr,  //
-                          bsp_apic_id,        //
-                          out_topology);
+                          bsp_apic_id);
     }
   }
-  return false;
+  return kStatusError;
 }
 
-static bool TryDiscoverFromMemoryRange(const uintptr_t range_start,
-                                       const int64_t range_length,
-                                       const uintptr_t max_physical_addr,
-                                       const uint32_t bsp_apic_id,
-                                       SmpTopology* const out_topology) {
+static StatusOr<SmpTopology> TryDiscoverFromMemoryRange(
+    const uintptr_t range_start, const int64_t range_length,
+    const uintptr_t max_physical_addr, const uint32_t bsp_apic_id) {
   DCHECK(range_start != 0);
   DCHECK(range_length > 0);
   DCHECK(max_physical_addr > 0);
   DCHECK(bsp_apic_id != kInvalidX2ApicId);
-  DCHECK(out_topology != nullptr);
   if (range_start >= max_physical_addr ||
       (max_physical_addr - range_start) <
           static_cast<uintptr_t>(range_length)) {
-    return false;
+    return kStatusError;
   }
   const uintptr_t range_end = range_start + range_length;
   uintptr_t cursor = AlignUp(range_start, kRsdpScanAlignment);
@@ -621,17 +653,17 @@ static bool TryDiscoverFromMemoryRange(const uintptr_t range_start,
     if (rsdp_addr == 0) {
       break;
     }
-    if (TryDiscoverFromRsdp(rsdp_addr,          //
-                            range_end,          //
-                            max_physical_addr,  //
-                            bsp_apic_id,        //
-                            false,              //
-                            out_topology)) {
-      return true;
+    StatusOr<SmpTopology> topology = TryDiscoverFromRsdp(rsdp_addr,          //
+                                                         range_end,          //
+                                                         max_physical_addr,  //
+                                                         bsp_apic_id,        //
+                                                         false);
+    if (topology.ok()) {
+      return topology;
     }
     cursor = rsdp_addr + kRsdpScanAlignment;
   }
-  return false;
+  return kStatusError;
 }
 
 static void InitCpuLocalSlot(const int cpu_index,              //
@@ -702,11 +734,14 @@ static void ResetSmpState() {
   g_steal_time = false;
   g_x2apic_mode = false;
   g_panic_ipi_ready.store(false, std::memory_order_seq_cst);
+  g_panic_stopping_cpu.store(nullptr, std::memory_order_seq_cst);
   g_panic_stop_requested.store(false, std::memory_order_seq_cst);
   g_panic_parked_cpu_count.store(0, std::memory_order_seq_cst);
   g_topology = {};
   g_cpu_locals.reset();
   g_calibrated_timer_initial_count = 0;
+  g_timer_tick_ns_min = kFallbackTimerTickNsMin;
+  g_timer_tick_ns_max = kFallbackTimerTickNsMax;
   g_online_cpu_count.store(0, std::memory_order_seq_cst);
   g_ap_boot_done.store(0, std::memory_order_seq_cst);
   g_ap_boot_started.store(0, std::memory_order_seq_cst);
@@ -761,25 +796,58 @@ static uint32_t ReadCpuidInitialApicId() {
   return xapic_id;
 }
 
-// Returns the Local APIC timer's input clock in Hz as reported by CPUID, or 0
-// if CPUID does not report it (as on AMD CPUs and most hypervisors). Per the
-// Intel SDM ("APIC Timer"), the timer runs at the core crystal clock when leaf
-// 0x15 enumerates the TSC/crystal ratio (leaf 0x15 ECX holds the crystal
-// frequency, or 0 if that is not enumerated), and at the bus clock otherwise
-// (leaf 0x16 ECX[15:0], in MHz).
-static int64_t ApicTimerClockHzFromCpuid() {
+// Returns `a * b / c` for `a >= 0` and `c > 0`, or 0 if `a * b` overflows.
+static int64_t MulDivOrZero(const int64_t a, const int64_t b, const int64_t c) {
+  int64_t product = 0;
+  if (__builtin_mul_overflow(a, b, &product)) {
+    return 0;
+  }
+  return product / c;
+}
+
+// The frequencies in Hz that CPUID reports, each 0 if CPUID does not report
+// it (as on AMD CPUs and most hypervisors).
+struct CpuidFrequencies {
+  int64_t tsc_hz = 0;
+  int64_t apic_timer_clock_hz = 0;
+};
+
+// Reads the frequencies the way Linux does (native_calibrate_tsc() and
+// cpu_khz_from_cpuid()). Per the Intel SDM ("APIC Timer"), the Local APIC
+// timer runs at the core crystal clock when leaf 15H enumerates the
+// TSC/crystal ratio, and at the bus clock of leaf 16H otherwise. The TSC runs
+// at the crystal clock times that ratio, or else at the processor base
+// frequency of leaf 16H.
+static CpuidFrequencies ReadCpuidFrequencies() {
   SmpHardware& hw = Hardware();
   const uint32_t max_leaf = hw.Cpuid(0, 0).eax;
-  if (max_leaf >= 0x15u) {
-    const CpuidResult leaf15 = hw.Cpuid(0x15u, 0);
-    if (leaf15.ebx != 0) {
-      return leaf15.ecx;
+  const CpuidResult leaf15 = (max_leaf >= kCpuidTscCrystalLeaf)
+                                 ? hw.Cpuid(kCpuidTscCrystalLeaf, 0)
+                                 : CpuidResult{};
+  const CpuidResult leaf16 = (max_leaf >= kCpuidFrequencyLeaf)
+                                 ? hw.Cpuid(kCpuidFrequencyLeaf, 0)
+                                 : CpuidResult{};
+  const int64_t base_hz = static_cast<int64_t>(leaf16.eax & 0xFFFFu) * 1000000;
+  const int64_t bus_hz = static_cast<int64_t>(leaf16.ecx & 0xFFFFu) * 1000000;
+  CpuidFrequencies frequencies;
+  if (leaf15.ebx != 0) {
+    int64_t crystal_hz = leaf15.ecx;
+    if (crystal_hz == 0) {
+      // Skylake to Coffee Lake client CPUs do not enumerate the crystal clock,
+      // but it is the base frequency over the ratio.
+      crystal_hz = MulDivOrZero(base_hz, leaf15.eax, leaf15.ebx);
     }
+    frequencies.apic_timer_clock_hz = crystal_hz;
+    if (leaf15.eax != 0) {
+      frequencies.tsc_hz = MulDivOrZero(crystal_hz, leaf15.ebx, leaf15.eax);
+    }
+  } else {
+    frequencies.apic_timer_clock_hz = bus_hz;
   }
-  if (max_leaf >= 0x16u) {
-    return static_cast<int64_t>(hw.Cpuid(0x16u, 0).ecx & 0xFFFFu) * 1000000;
+  if (frequencies.tsc_hz == 0) {
+    frequencies.tsc_hz = base_hz;
   }
-  return 0;
+  return frequencies;
 }
 
 // The TSC and Local APIC timer frequencies in Hz that Hyper-V reports, each 0
@@ -821,24 +889,50 @@ static bool IsPlausibleTscRate(const uint64_t tsc_ticks_per_ms) {
          tsc_ticks_per_ms <= kMaxPlausibleTscTicksPerMs;
 }
 
+// Records the range of the tick length of the calibrated Local APIC timer
+// initial count `initial_count` (> 0), floor(f / (16 * kApicTimerTargetHz))
+// for the timer clock f that the calibration measured or that was reported.
+// At f, a tick lasts 16 * initial_count / f: from kNominalTimerTickNs *
+// initial_count / (initial_count + 1) (as the count was rounded down) to
+// kNominalTimerTickNs. The real clock may differ from f by
+// 1 / kCalibratedTimerClockErrorDivisor.
+static void SetCalibratedTimerTickNsRange(const uint32_t initial_count) {
+  DCHECK(initial_count > 0);
+  const int64_t min_ns = kNominalTimerTickNs * initial_count /
+                         (static_cast<int64_t>(initial_count) + 1);
+  g_timer_tick_ns_min = min_ns - min_ns / kCalibratedTimerClockErrorDivisor;
+  g_timer_tick_ns_max = kNominalTimerTickNs +
+                        kNominalTimerTickNs / kCalibratedTimerClockErrorDivisor;
+}
+
 // Returns the periodic Local APIC timer initial count for kApicTimerTargetHz:
 // `pit_calibrated_count` if PIT calibration produced one (non-zero), else the
 // count for the timer clock that Hyper-V or else CPUID reports, else
 // kFallbackApicTimerInitialCount, with a warning since the resulting timer
-// rate is unknown. Without PIT calibration, it also takes the TSC rate from
-// Hyper-V if Hyper-V reports one.
+// rate is unknown. Records the range of the length of its ticks. Without PIT
+// calibration, it also takes the TSC rate from Hyper-V or else CPUID if they
+// report one.
 static uint32_t ChooseApicTimerInitialCount(
     const uint32_t pit_calibrated_count) {
   if (pit_calibrated_count > 0) {
+    SetCalibratedTimerTickNsRange(pit_calibrated_count);
     return pit_calibrated_count;
   }
   const HypervFrequencies hyperv = ReadHypervFrequencies();
+  const CpuidFrequencies cpuid = ReadCpuidFrequencies();
   const uint64_t hyperv_tsc_ticks_per_ms =
       static_cast<uint64_t>(hyperv.tsc_hz) / 1000;
+  const uint64_t cpuid_tsc_ticks_per_ms =
+      static_cast<uint64_t>(cpuid.tsc_hz) / 1000;
   if (IsPlausibleTscRate(hyperv_tsc_ticks_per_ms)) {
     g_tsc_ticks_per_ms = hyperv_tsc_ticks_per_ms;
     UartWrite("[SMP] No PIT calibration; TSC rate from Hyper-V: ");
     UartWriteDec(static_cast<uint64_t>(hyperv.tsc_hz));
+    UartWrite(" Hz\n");
+  } else if (IsPlausibleTscRate(cpuid_tsc_ticks_per_ms)) {
+    g_tsc_ticks_per_ms = cpuid_tsc_ticks_per_ms;
+    UartWrite("[SMP] No PIT calibration; TSC rate from CPUID: ");
+    UartWriteDec(static_cast<uint64_t>(cpuid.tsc_hz));
     UartWrite(" Hz\n");
   }
   // The timer divides its input clock by 16 (kLapicTimerDivBy16).
@@ -848,19 +942,23 @@ static uint32_t ChooseApicTimerInitialCount(
         "[SMP] No PIT calibration; Local APIC timer clock from Hyper-V: ");
     UartWriteDec(static_cast<uint64_t>(hyperv.apic_timer_hz));
     UartWrite(" Hz\n");
+    SetCalibratedTimerTickNsRange(static_cast<uint32_t>(hyperv_count));
     return static_cast<uint32_t>(hyperv_count);
   }
-  const int64_t clock_hz = ApicTimerClockHzFromCpuid();
+  const int64_t clock_hz = cpuid.apic_timer_clock_hz;
   const int64_t count = clock_hz / (16 * kApicTimerTargetHz);
   if (count > 0 && count <= static_cast<int64_t>(UINT32_MAX)) {
     UartWrite("[SMP] No PIT calibration; Local APIC timer clock from CPUID: ");
     UartWriteDec(static_cast<uint64_t>(clock_hz));
     UartWrite(" Hz\n");
+    SetCalibratedTimerTickNsRange(static_cast<uint32_t>(count));
     return static_cast<uint32_t>(count);
   }
   ConsoleWrite(
       "[SMP] WARNING: no PIT or CPUID timer frequency; LAPIC timer rate is "
       "uncalibrated\n");
+  g_timer_tick_ns_min = kFallbackTimerTickNsMin;
+  g_timer_tick_ns_max = kFallbackTimerTickNsMax;
   return kFallbackApicTimerInitialCount;
 }
 
@@ -989,9 +1087,9 @@ static uint32_t ReadLapicTimerCurrentCount(const uintptr_t lapic_base) {
 
 // Measures the Local APIC timer, and the TSC rate for ReadClockTicks(), against
 // a one-shot ~10 ms countdown of PIT channel 2. Returns the periodic initial
-// count for kApicTimerTargetHz, or 0 if there is no PIT, it did not respond, or
-// the TSC rate it measured is implausible (the TSC rate then stays at
-// kFallbackTscTicksPerMs).
+// count for kApicTimerTargetHz, or 0 if there is no PIT, its countdown did not
+// run out within kPitCalibrationTimeoutMs, or the TSC rate it measured is
+// implausible (the TSC rate then stays at kFallbackTscTicksPerMs).
 static uint32_t CalibrateLocalApicTimer(const uintptr_t lapic_base) {
   DCHECK(g_x2apic_mode || lapic_base != 0);
   SmpHardware& hw = Hardware();
@@ -1024,11 +1122,13 @@ static uint32_t CalibrateLocalApicTimer(const uintptr_t lapic_base) {
   const uint64_t tsc_start = ReadClockTicks();
   LapicWrite(lapic_base, kLapicRegTimerInitCount, 0xFFFFFFFFu);
 
-  const uint32_t initial_count =
-      CalibrateApicTimerCount(lapic_base,                //
-                              kPitCalibrationPollLimit,  //
-                              ReadPitSpeakerPort,        //
-                              ReadLapicTimerCurrentCount);
+  const uint32_t initial_count = CalibrateApicTimerCount(
+      lapic_base,                                            //
+      kPitCalibrationPollLimit,                              //
+      ClockTicksForMicros(kPitCalibrationTimeoutMs * 1000),  //
+      ReadPitSpeakerPort,                                    //
+      ReadClockTicks,                                        //
+      ReadLapicTimerCurrentCount);
   const uint64_t tsc_elapsed = ReadClockTicks() - tsc_start;
 
   LapicWrite(lapic_base, kLapicRegTimerInitCount, 0);
@@ -1151,22 +1251,46 @@ static bool WakeApplicationProcessor(const uintptr_t lapic_base,
   return false;
 }
 
-// Parks the calling CPU for good once another CPU has started a panic: counts
-// it in g_panic_parked_cpu_count, so that the panicking CPU knows it stopped,
-// and halts with interrupts disabled.
-[[noreturn]] static void ParkCpuForPanic() {
-  g_panic_parked_cpu_count.fetch_add(1, std::memory_order_acq_rel);
+// Parks the calling CPU for good once another CPU has started a panic, and
+// halts with interrupts disabled. A CPU that parks for the stop NMI
+// (`stopped_by_nmi`) counts itself in g_panic_parked_cpu_count, so that the
+// panicking CPU knows it stopped. A CPU that parks before that NMI could reach
+// it was not sent one, or counts itself when it takes it in the halt.
+[[noreturn]] static void ParkCpuForPanic(const bool stopped_by_nmi) {
+  if (stopped_by_nmi) {
+    g_panic_parked_cpu_count.fetch_add(1, std::memory_order_acq_rel);
+  }
   for (;;) {
     Hardware().HaltForever();
   }
 }
 
 // NMI handler installed by SmpInit(): parks the CPU if another CPU requested a
-// panic stop (see SmpStopOtherCpusForPanic()), and ignores the NMI otherwise.
+// panic stop (see SmpStopOtherCpusForPanic()), and ignores the NMI otherwise,
+// also on the panicking CPU itself, which must go on to print its message.
 static void OnPanicStopNmi(InterruptFrame* const /*frame*/) {
-  if (g_panic_stop_requested.load(std::memory_order_acquire)) {
-    ParkCpuForPanic();
+  if (g_panic_stop_requested.load(std::memory_order_acquire) &&
+      CurrentCpuOrNull() !=
+          g_panic_stopping_cpu.load(std::memory_order_relaxed)) {
+    ParkCpuForPanic(/*stopped_by_nmi=*/true);
   }
+}
+
+// Sends the panic-stop NMI to the CPU with `apic_id`. Unlike
+// LapicSendIpiCommand(), it fails no CHECK, which would re-enter the panic
+// path: in xAPIC mode, it waits a bounded time for the previous IPI to go out,
+// and then sends anyway (as Linux does for NMIs).
+static void SendPanicStopNmi(const uintptr_t lapic_base,
+                             const uint32_t apic_id) {
+  if (g_x2apic_mode) {
+    asm volatile("mfence; lfence" : : : "memory");
+    WriteMsr(LapicOffsetToX2ApicMsr(kLapicRegIcrLow),
+             (static_cast<uint64_t>(apic_id) << 32) | kPanicStopIcr);
+    return;
+  }
+  (void)WaitForIcrIdle(lapic_base);
+  LapicWrite(lapic_base, kLapicRegIcrHigh, apic_id << 24);
+  LapicWrite(lapic_base, kLapicRegIcrLow, kPanicStopIcr);
 }
 
 // Flushes the TLB of the calling CPU, `cpu_index`, if a TLB shootdown was
@@ -1228,6 +1352,12 @@ static void WaitForDispatchAcks(const uintptr_t lapic_base,
   const uint64_t resend_ticks = ClockTicksForMicros(kWakeupIpiResendIntervalUs);
   uint64_t last_send = start;
   for (;;) {
+    // An AP may finish a task that waits in SmpTlbShootdown() for this CPU,
+    // which takes no IPI here, before it gets to acknowledge: handle its
+    // request here instead (as SmpTlbShootdown() does).
+    if (g_tlb_shootdown_handled != nullptr) {
+      HandleTlbShootdownRequests(0);
+    }
     bool all_acked = true;
     for (int i = 1; i < cpu_count && all_acked; ++i) {
       all_acked = g_ap_ack_epoch[i].load(std::memory_order_acquire) == epoch;
@@ -1307,6 +1437,31 @@ static uintptr_t ReadEbdaBase() {
              : 0;
 }
 
+// Returns a topology with the BSP alone, for a machine without a usable MADT:
+// APIC ID `bsp_apic_id`, and the Local APIC at the base address in
+// IA32_APIC_BASE (the architectural default if that is not a valid MMIO page).
+static StatusOr<SmpTopology> MakeBspOnlyTopology(const uint32_t bsp_apic_id) {
+  DCHECK(bsp_apic_id != kInvalidX2ApicId);
+  SmpTopology topology{};
+  topology.cpus.reset(new (std::nothrow) CpuInfo[1]());
+  if (topology.cpus == nullptr) {
+    return kStatusError;
+  }
+  const uintptr_t msr_base = ReadMsr(kMsrIa32ApicBase) & kApicBaseAddressMask;
+  topology.local_apic_phys_addr =
+      IsValidLocalApicAddress(msr_base, kIdentityMapLimit)
+          ? msr_base
+          : kDefaultLocalApicPhysAddr;
+  topology.bsp_apic_id = bsp_apic_id;
+  topology.cpu_count = 1;
+  CpuInfo& bsp = topology.cpus[0];
+  bsp.apic_id = bsp_apic_id;
+  bsp.is_bsp = true;
+  bsp.online = true;
+  bsp.observed_apic_id = bsp_apic_id;
+  return topology;
+}
+
 }  // namespace
 
 extern "C" void ApKernelEntry(const int cpu_index) {
@@ -1321,18 +1476,22 @@ extern "C" void ApKernelEntry(const int cpu_index) {
   // stacks.
   GdtLoadForCpu(cpu_index, ApStackBlockOf(cpu_index).ist_stack_tops);
   IdtLoad();
-  // A CPU that panicked while this one was in the trampoline sent its stop NMI
-  // before the kernel IDT was loaded here.
-  if (g_panic_stop_requested.load(std::memory_order_acquire)) {
-    ParkCpuForPanic();
-  }
   // Before this AP runs any task: the x87/SSE/AVX state of user processes,
   // which may move between CPUs, needs the BSP's configuration on every CPU,
   // and so do SMEP and SMAP, which must be on before the AP runs a system
   // call.
   CpuInitAp();
   RegisterStealTimeForCurrentCpu();
-  g_cpu_locals[cpu_index].online = true;
+  // Online: from here on, a panicking CPU sends this AP its stop NMI
+  // (SmpStopOtherCpusForPanic()), which the kernel IDT handles. A CPU that
+  // panicked before it saw this store sent none, so look for its stop request
+  // after the store. Both stores and both loads are seq_cst, so at least one of
+  // the two CPUs sees the other's store.
+  std::atomic_ref<bool>(g_cpu_locals[cpu_index].online)
+      .store(true, std::memory_order_seq_cst);
+  if (g_panic_stop_requested.load(std::memory_order_seq_cst)) {
+    ParkCpuForPanic(/*stopped_by_nmi=*/false);
+  }
   EnableLocalApic(lapic_base);
 
   CpuInfo& cpu = g_topology.cpus[cpu_index];
@@ -1380,9 +1539,7 @@ uintptr_t SmpFindRsdpInMemoryRange(const uintptr_t range_start,
   const uintptr_t range_end = range_start + range_length;
   for (uintptr_t addr = aligned_start; addr + kV1Size <= range_end;
        addr += kRsdpScanAlignment) {
-    uintptr_t rsdt = 0;
-    uintptr_t xsdt = 0;
-    if (ParseRsdpBounded(addr, range_end, kIdentityMapLimit, &rsdt, &xsdt)) {
+    if (ParseRsdpBounded(addr, range_end, kIdentityMapLimit).ok()) {
       return addr;
     }
   }
@@ -1446,31 +1603,29 @@ uintptr_t SmpFindMadtInSdt(const uintptr_t rsdt_addr,  //
   return 0;
 }
 
-bool SmpParseMadt(const uintptr_t madt_addr,          //
-                  const uintptr_t max_physical_addr,  //
-                  const uint32_t bsp_apic_id,         //
-                  SmpTopology* const out_topology) {
+StatusOr<SmpTopology> SmpParseMadt(const uintptr_t madt_addr,          //
+                                   const uintptr_t max_physical_addr,  //
+                                   const uint32_t bsp_apic_id) {
   DCHECK(madt_addr != 0);
   DCHECK(max_physical_addr > 0);
   DCHECK(bsp_apic_id != kInvalidX2ApicId);
-  DCHECK(out_topology != nullptr);
-  *out_topology = {};
+  SmpTopology topology{};
 
   const AcpiSdtHeader* const header =
       MapAndValidateSdt(madt_addr, max_physical_addr, "APIC");
   constexpr int64_t kMadtHeaderSize = sizeof(AcpiMadt);
   if (header == nullptr || header->length < kMadtHeaderSize) {
-    return false;
+    return kStatusError;
   }
 
   const AcpiMadt* const madt = reinterpret_cast<const AcpiMadt*>(header);
   const uint8_t* const madt_bytes = reinterpret_cast<const uint8_t*>(header);
   const int64_t madt_length = madt->header.length;
-  out_topology->local_apic_phys_addr =
+  topology.local_apic_phys_addr =
       IsValidLocalApicAddress(madt->local_apic_address, max_physical_addr)
           ? static_cast<uintptr_t>(madt->local_apic_address)
           : kDefaultLocalApicPhysAddr;
-  out_topology->bsp_apic_id = bsp_apic_id;
+  topology.bsp_apic_id = bsp_apic_id;
 
   int candidate_count = 0;
   int64_t offset = kMadtHeaderSize;
@@ -1501,7 +1656,7 @@ bool SmpParseMadt(const uintptr_t madt_addr,          //
           reinterpret_cast<const AcpiMadtLocalApicOverride*>(entry);
       if (IsValidLocalApicAddress(override_entry->local_apic_address,
                                   max_physical_addr)) {
-        out_topology->local_apic_phys_addr = override_entry->local_apic_address;
+        topology.local_apic_phys_addr = override_entry->local_apic_address;
       }
     } else if (entry->type == kMadtTypeLocalX2Apic) {
       if (entry_len < static_cast<int64_t>(sizeof(AcpiMadtLocalX2Apic))) {
@@ -1524,19 +1679,17 @@ bool SmpParseMadt(const uintptr_t madt_addr,          //
     candidate_count = kMaxSupportedCpus - 1;
   }
   if (candidate_count <= 0) {
-    *out_topology = {};
-    return false;
+    return kStatusError;
   }
 
   const int capacity = candidate_count + 1;
-  out_topology->cpus.reset(new (std::nothrow) CpuInfo[capacity]());
-  if (out_topology->cpus == nullptr) {
-    *out_topology = {};
-    return false;
+  topology.cpus.reset(new (std::nothrow) CpuInfo[capacity]());
+  if (topology.cpus == nullptr) {
+    return kStatusError;
   }
 
-  out_topology->cpus[0].apic_id = bsp_apic_id;
-  out_topology->cpu_count = 1;
+  topology.cpus[0].apic_id = bsp_apic_id;
+  topology.cpu_count = 1;
   bool bsp_listed = false;
   offset = kMadtHeaderSize;
   while (offset + kEntryHeaderSize <= madt_length) {
@@ -1555,7 +1708,7 @@ bool SmpParseMadt(const uintptr_t madt_addr,          //
           reinterpret_cast<const AcpiMadtLocalApic*>(entry);
       if ((lapic->flags & kMadtLapicFlagEnabled) != 0 &&
           lapic->apic_id != kInvalidXapicId) {
-        AddDiscoveredCpu(out_topology,              //
+        AddDiscoveredCpu(&topology,                 //
                          capacity,                  //
                          lapic->apic_id,            //
                          lapic->acpi_processor_id,  //
@@ -1573,7 +1726,7 @@ bool SmpParseMadt(const uintptr_t madt_addr,          //
           reinterpret_cast<const AcpiMadtLocalX2Apic*>(entry);
       if ((x2apic->flags & kMadtLapicFlagEnabled) != 0 &&
           x2apic->x2apic_id != kInvalidX2ApicId) {
-        AddDiscoveredCpu(out_topology,                //
+        AddDiscoveredCpu(&topology,                   //
                          capacity,                    //
                          x2apic->x2apic_id,           //
                          x2apic->acpi_processor_uid,  //
@@ -1584,50 +1737,46 @@ bool SmpParseMadt(const uintptr_t madt_addr,          //
     offset += entry_len;
   }
 
-  out_topology->cpus[0].is_bsp = true;
-  out_topology->cpus[0].online = true;
-  out_topology->cpus[0].observed_apic_id = bsp_apic_id;
-  return true;
+  topology.cpus[0].is_bsp = true;
+  topology.cpus[0].online = true;
+  topology.cpus[0].observed_apic_id = bsp_apic_id;
+  return topology;
 }
 
-bool SmpDiscoverTopology(const uint32_t multiboot_magic,
-                         const uint64_t multiboot_info_addr,
-                         const uintptr_t ebda_base,
-                         const uintptr_t bios_rom_base,
-                         const uintptr_t max_physical_addr,
-                         const uint32_t bsp_apic_id,
-                         SmpTopology* const out_topology) {
+StatusOr<SmpTopology> SmpDiscoverTopology(const uint32_t multiboot_magic,
+                                          const uint64_t multiboot_info_addr,
+                                          const uintptr_t ebda_base,
+                                          const uintptr_t bios_rom_base,
+                                          const uintptr_t max_physical_addr,
+                                          const uint32_t bsp_apic_id) {
   DCHECK(max_physical_addr > 0);
   DCHECK(bsp_apic_id != kInvalidX2ApicId);
-  DCHECK(out_topology != nullptr);
-  *out_topology = {};
 
   if (multiboot_magic == kMultiboot2Magic && multiboot_info_addr != 0) {
-    uintptr_t rsdp_new_addr = 0;
-    uintptr_t rsdp_new_end_addr = 0;
-    uintptr_t rsdp_old_addr = 0;
-    uintptr_t rsdp_old_end_addr = 0;
-    if (FindRsdpTagsInMultiboot2(multiboot_info_addr,  //
-                                 max_physical_addr,    //
-                                 &rsdp_new_addr,       //
-                                 &rsdp_new_end_addr,   //
-                                 &rsdp_old_addr,       //
-                                 &rsdp_old_end_addr)) {
-      if (rsdp_new_addr != 0 && TryDiscoverFromRsdp(rsdp_new_addr,      //
-                                                    rsdp_new_end_addr,  //
-                                                    max_physical_addr,  //
-                                                    bsp_apic_id,        //
-                                                    false,              //
-                                                    out_topology)) {
-        return true;
+    const StatusOr<Multiboot2RsdpTags> tags =
+        FindRsdpTagsInMultiboot2(multiboot_info_addr, max_physical_addr);
+    if (tags.ok()) {
+      if (tags->new_addr != 0) {
+        StatusOr<SmpTopology> topology =
+            TryDiscoverFromRsdp(tags->new_addr,      //
+                                tags->new_end_addr,  //
+                                max_physical_addr,   //
+                                bsp_apic_id,         //
+                                false);
+        if (topology.ok()) {
+          return topology;
+        }
       }
-      if (rsdp_old_addr != 0 && TryDiscoverFromRsdp(rsdp_old_addr,      //
-                                                    rsdp_old_end_addr,  //
-                                                    max_physical_addr,  //
-                                                    bsp_apic_id,        //
-                                                    true,               //
-                                                    out_topology)) {
-        return true;
+      if (tags->old_addr != 0) {
+        StatusOr<SmpTopology> topology =
+            TryDiscoverFromRsdp(tags->old_addr,      //
+                                tags->old_end_addr,  //
+                                max_physical_addr,   //
+                                bsp_apic_id,         //
+                                true);
+        if (topology.ok()) {
+          return topology;
+        }
       }
     }
   }
@@ -1640,26 +1789,28 @@ bool SmpDiscoverTopology(const uint32_t multiboot_magic,
         ebda_scan_len = max_ebda_bytes;
       }
     }
-    if (TryDiscoverFromMemoryRange(ebda_base,          //
+    StatusOr<SmpTopology> topology =
+        TryDiscoverFromMemoryRange(ebda_base,          //
                                    ebda_scan_len,      //
                                    max_physical_addr,  //
-                                   bsp_apic_id,        //
-                                   out_topology)) {
-      return true;
+                                   bsp_apic_id);
+    if (topology.ok()) {
+      return topology;
     }
   }
 
   if (bios_rom_base != 0) {
-    if (TryDiscoverFromMemoryRange(bios_rom_base,      //
+    StatusOr<SmpTopology> topology =
+        TryDiscoverFromMemoryRange(bios_rom_base,      //
                                    kBiosRomScanBytes,  //
                                    max_physical_addr,  //
-                                   bsp_apic_id,        //
-                                   out_topology)) {
-      return true;
+                                   bsp_apic_id);
+    if (topology.ok()) {
+      return topology;
     }
   }
 
-  return false;
+  return kStatusError;
 }
 
 uint32_t ComputeApicTimerInitialCount(const uint64_t elapsed_apic_ticks,
@@ -1687,16 +1838,24 @@ uint32_t ComputeApicTimerInitialCount(const uint64_t elapsed_apic_ticks,
 uint32_t CalibrateApicTimerCount(
     const uintptr_t lapic_base,               //
     const int max_polls,                      //
+    const uint64_t max_clock_ticks,           //
     const PitSpeakerReadFn read_pit_speaker,  //
+    const ClockReadFn read_clock,             //
     const ApicTimerCurrentCountReadFn read_apic_current_count) {
   DCHECK(max_polls > 0);
+  DCHECK(max_clock_ticks > 0);
   DCHECK(read_pit_speaker != nullptr);
+  DCHECK(read_clock != nullptr);
   DCHECK(read_apic_current_count != nullptr);
 
+  const uint64_t clock_start = read_clock();
   bool terminal_count_reached = false;
   for (int poll = 0; poll < max_polls; ++poll) {
     if ((read_pit_speaker() & kPitSpeakerOut2Bit) != 0) {
       terminal_count_reached = true;
+      break;
+    }
+    if (read_clock() - clock_start >= max_clock_ticks) {
       break;
     }
     asm volatile("pause" : : : "memory");
@@ -1733,13 +1892,26 @@ void SmpInit(const uint32_t multiboot_magic,
 
   // The CPUID initial APIC ID only selects a provisional BSP entry, which is
   // enough to find the Local APIC. Its ID register is authoritative.
-  CHECK(SmpDiscoverTopology(multiboot_magic,      //
-                            multiboot_info_addr,  //
-                            ebda_base,            //
-                            bios_rom_base,        //
-                            kIdentityMapLimit,    //
-                            bsp_initial_apic_id,  //
-                            &g_topology));
+  StatusOr<SmpTopology> discovered =
+      SmpDiscoverTopology(multiboot_magic,      //
+                          multiboot_info_addr,  //
+                          ebda_base,            //
+                          bios_rom_base,        //
+                          kIdentityMapLimit,    //
+                          bsp_initial_apic_id);
+  const bool madt_found = discovered.ok();
+  if (madt_found) {
+    g_topology = *std::move(discovered);
+  } else {
+    // No RSDP or no valid MADT: Multiboot1 under UEFI, whose firmware
+    // publishes the RSDP only in the EFI system table, ACPI turned off, or a
+    // table that fails its checksum. The BSP runs alone. Any other CPUs stay
+    // where firmware left them, and the kernel sends them no IPI.
+    ConsoleWrite("[SMP] WARNING: no valid ACPI MADT; using the BSP only\n");
+    StatusOr<SmpTopology> bsp_only = MakeBspOnlyTopology(bsp_initial_apic_id);
+    CHECK(bsp_only.ok());
+    g_topology = *std::move(bsp_only);
+  }
 
   g_x2apic_mode = IsX2ApicSupported();
   const uintptr_t lapic_base = g_topology.local_apic_phys_addr;
@@ -1758,13 +1930,21 @@ void SmpInit(const uint32_t multiboot_magic,
     UartWrite(" differs from its CPUID initial APIC ID ");
     UartWriteDec(g_topology.bsp_apic_id);
     UartWrite("; using the Local APIC ID\n");
-    CHECK(SmpDiscoverTopology(multiboot_magic,      //
+    if (madt_found) {
+      StatusOr<SmpTopology> rediscovered =
+          SmpDiscoverTopology(multiboot_magic,      //
                               multiboot_info_addr,  //
                               ebda_base,            //
                               bios_rom_base,        //
                               kIdentityMapLimit,    //
-                              bsp_apic_id,          //
-                              &g_topology));
+                              bsp_apic_id);
+      CHECK(rediscovered.ok());
+      g_topology = *std::move(rediscovered);
+    } else {
+      StatusOr<SmpTopology> bsp_only = MakeBspOnlyTopology(bsp_apic_id);
+      CHECK(bsp_only.ok());
+      g_topology = *std::move(bsp_only);
+    }
     DCHECK(g_topology.local_apic_phys_addr == lapic_base);
   }
   // In xAPIC mode, IPI destinations are 8-bit APIC IDs.
@@ -2021,26 +2201,39 @@ void SmpStopOtherCpusForPanic() {
   if (!g_panic_ipi_ready.load(std::memory_order_acquire)) {
     return;
   }
+  const CpuLocal* const self = CurrentCpuOrNull();
+  g_panic_stopping_cpu.store(self, std::memory_order_relaxed);
   g_panic_stop_requested.store(true, std::memory_order_seq_cst);
-  const uintptr_t lapic_base = g_topology.local_apic_phys_addr;
-  if (g_x2apic_mode) {
-    asm volatile("mfence; lfence" : : : "memory");
-    WriteMsr(LapicOffsetToX2ApicMsr(kLapicRegIcrLow), kPanicStopIcr);
-  } else {
-    // Unlike LapicSendIpiCommand(), do not CHECK that the ICR becomes idle.
-    (void)WaitForIcrIdle(lapic_base);
-    LapicWrite(lapic_base, kLapicRegIcrHigh, 0);
-    LapicWrite(lapic_base, kLapicRegIcrLow, kPanicStopIcr);
+  // One NMI to each online CPU, by APIC ID. The "all excluding self" shorthand
+  // would also reach CPUs that run no kernel code, where an NMI can
+  // triple-fault and reset the machine before the panic message goes out: APs
+  // that are not started yet, which firmware may keep in a loop whose IDT is
+  // gone, CPUs beyond kMaxSupportedCpus or unknown without an MADT, which
+  // never start, and an AP in the startup trampoline, which has no usable IDT
+  // or stack yet. (Linux, too, uses shorthands only once every present CPU has
+  // booted.) An AP that comes online later parks itself in ApKernelEntry(). A
+  // panicking CPU without a CpuLocal is the BSP before it starts any AP.
+  CpuLocal* const cpu_locals = g_cpu_locals.get();
+  int nmi_count = 0;
+  if (self != nullptr && cpu_locals != nullptr) {
+    const uintptr_t lapic_base = g_topology.local_apic_phys_addr;
+    // SmpInit() only ever shrinks cpu_count, within the CpuLocal array.
+    const int cpu_count = g_topology.cpu_count;
+    for (int i = 0; i < cpu_count; ++i) {
+      CpuLocal& cpu = cpu_locals[i];
+      if (&cpu != self &&
+          std::atomic_ref<bool>(cpu.online).load(std::memory_order_seq_cst)) {
+        SendPanicStopNmi(lapic_base, cpu.apic_id);
+        ++nmi_count;
+      }
+    }
   }
-  // Give the other CPUs a moment to park, so that they stop writing to the
+  // Give those CPUs a moment to park, so that they stop writing to the
   // consoles before the panic message goes out.
-  const int other_cpu_count =
-      g_online_cpu_count.load(std::memory_order_acquire) - 1;
   const uint64_t start = ReadClockTicks();
   const uint64_t timeout_ticks =
       ClockTicksForMicros(kPanicParkTimeoutMs * 1000);
-  while (g_panic_parked_cpu_count.load(std::memory_order_acquire) <
-             other_cpu_count &&
+  while (g_panic_parked_cpu_count.load(std::memory_order_acquire) < nmi_count &&
          ReadClockTicks() - start < timeout_ticks) {
     SpinPause();
   }
@@ -2111,17 +2304,11 @@ int64_t SmpStealNsOfCpu(const int cpu_index) {
 }
 
 int64_t SmpTimerTickNsUpperBound() {
-  const uint32_t count = (g_calibrated_timer_initial_count > 0)
-                             ? g_calibrated_timer_initial_count
-                             : kFallbackApicTimerInitialCount;
-  return TimerTickNsUpperBound(count);
+  return TickNsUpperBound(g_timer_tick_ns_max);
 }
 
 int64_t SmpTimerTickNsLowerBound() {
-  const uint32_t count = (g_calibrated_timer_initial_count > 0)
-                             ? g_calibrated_timer_initial_count
-                             : kFallbackApicTimerInitialCount;
-  return TimerTickNsLowerBound(count);
+  return TickNsLowerBound(g_timer_tick_ns_min);
 }
 
 #if __STDC_HOSTED__
@@ -2129,34 +2316,19 @@ uintptr_t SmpFindRsdpInMultiboot2ForTest(const uintptr_t multiboot_info_addr,
                                          const uintptr_t max_physical_addr) {
   DCHECK(multiboot_info_addr != 0);
   DCHECK(max_physical_addr > 0);
-  uintptr_t rsdp_new_addr = 0;
-  uintptr_t rsdp_new_end_addr = 0;
-  uintptr_t rsdp_old_addr = 0;
-  uintptr_t rsdp_old_end_addr = 0;
-  if (!FindRsdpTagsInMultiboot2(multiboot_info_addr,  //
-                                max_physical_addr,    //
-                                &rsdp_new_addr,       //
-                                &rsdp_new_end_addr,   //
-                                &rsdp_old_addr,       //
-                                &rsdp_old_end_addr)) {
+  const StatusOr<Multiboot2RsdpTags> tags =
+      FindRsdpTagsInMultiboot2(multiboot_info_addr, max_physical_addr);
+  if (!tags.ok()) {
     return 0;
   }
-  return (rsdp_new_addr != 0) ? rsdp_new_addr : rsdp_old_addr;
+  return (tags->new_addr != 0) ? tags->new_addr : tags->old_addr;
 }
 
-bool SmpParseRsdpForTest(const uintptr_t rsdp_addr,          //
-                         const uintptr_t max_physical_addr,  //
-                         uintptr_t* const out_rsdt_addr,     //
-                         uintptr_t* const out_xsdt_addr) {
+StatusOr<RsdpTables> SmpParseRsdpForTest(const uintptr_t rsdp_addr,
+                                         const uintptr_t max_physical_addr) {
   DCHECK(rsdp_addr != 0);
   DCHECK(max_physical_addr > 0);
-  DCHECK(out_rsdt_addr != nullptr);
-  DCHECK(out_xsdt_addr != nullptr);
-  return ParseRsdpBounded(rsdp_addr,          //
-                          max_physical_addr,  //
-                          max_physical_addr,  //
-                          out_rsdt_addr,      //
-                          out_xsdt_addr);
+  return ParseRsdpBounded(rsdp_addr, max_physical_addr, max_physical_addr);
 }
 
 uint32_t SmpReadCpuidInitialApicIdForTest() { return ReadCpuidInitialApicId(); }

@@ -1,4 +1,4 @@
-#include "user/xhci_platform.h"
+#include "user/usbkbd/xhci_platform.h"
 
 #include <gmock/gmock.h>
 #include <gtest/gtest.h>
@@ -7,9 +7,9 @@
 #include <string>
 #include <type_traits>
 
-#include "user/usb_hid.h"
-#include "user/xhci_controller.h"
-#include "xhci_sim.h"
+#include "user/usbkbd/usb_hid.h"
+#include "user/usbkbd/xhci_controller.h"
+#include "user/usbkbd/xhci_sim.h"
 
 namespace protos::usb {
 namespace {
@@ -214,6 +214,29 @@ TEST(XhciPlatformTest, MappedMmioWindowAccessesDwordsInsideTheWindow) {
   window.Init(nullptr, 16);
   EXPECT_THAT(window.Size(), t::Eq(0));
   EXPECT_THAT(window.Read32(0), t::Eq(kMmioAllOnes));
+}
+
+TEST(XhciPlatformTest,
+     MappedMmioWindowSupportsNonContiguousSegmentsAroundMsixHole) {
+  alignas(4) uint32_t low_regs[4] = {0x10u, 0x20u, 0x30u, 0x40u};
+  alignas(4) uint32_t high_regs[4] = {0x50u, 0x60u, 0x70u, 0x80u};
+  MappedMmioWindow window;
+  ASSERT_TRUE(
+      window.AddSegment(0, reinterpret_cast<volatile uint8_t*>(low_regs), 16));
+  ASSERT_TRUE(window.AddSegment(
+      32, reinterpret_cast<volatile uint8_t*>(high_regs), 16));
+  EXPECT_THAT(window.Size(), t::Eq(48));
+  EXPECT_THAT(window.Read32(0), t::Eq(0x10u));
+  EXPECT_THAT(window.Read32(12), t::Eq(0x40u));
+  // Unmapped MSI-X hole [16, 32) returns all-ones and ignores writes.
+  EXPECT_THAT(window.Read32(16), t::Eq(kMmioAllOnes));
+  EXPECT_THAT(window.Read32(28), t::Eq(kMmioAllOnes));
+  window.Write32(20, 0xDEADu);
+  // Segment [32, 48) maps to high_regs[0..3].
+  EXPECT_THAT(window.Read32(32), t::Eq(0x50u));
+  EXPECT_THAT(window.Read32(44), t::Eq(0x80u));
+  window.Write32(36, 0xBEEFu);
+  EXPECT_THAT(high_regs[1], t::Eq(0xBEEFu));
 }
 
 }  // namespace

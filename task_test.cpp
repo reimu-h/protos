@@ -26,6 +26,10 @@ namespace {
 
 namespace t = ::testing;
 
+// The comments give vruntime values relative to the `min_vruntime` that every
+// CPU starts with, which the core puts just below the 2^64 wrap of vruntime
+// (core_runqueue_scheduler.cpp).
+
 // Returns the frame the CPU pushes when it interrupts code that runs with
 // interrupts enabled (RFLAGS.IF set; RFLAGS bit 1 always reads as 1).
 static InterruptFrame MakeInterruptFrame(const uint8_t vector) {

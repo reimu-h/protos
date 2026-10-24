@@ -8,6 +8,7 @@
 #include <memory>
 #include <mutex>
 #include <thread>
+#include <utility>
 #include <vector>
 
 #include "idt.h"
@@ -22,6 +23,8 @@ namespace t = ::testing;
 
 constexpr uintptr_t kOwnerA = 0xA000;
 constexpr uintptr_t kOwnerB = 0xB000;
+// The Local APIC ID that FakeDeviceIrqEnvironment sends MSIs to by default.
+constexpr int kDestinationApicId = 3;
 
 class FakeDeviceIrqEnvironment final : public DeviceIrqEnvironment {
  public:
@@ -38,7 +41,7 @@ class FakeDeviceIrqEnvironment final : public DeviceIrqEnvironment {
     ++unregister_calls_;
   }
 
-  uint8_t BspApicId() override { return bsp_apic_id_; }
+  int MsiDestinationApicId() override { return msi_destination_; }
 
   volatile uint32_t* MapMsixTable(const int device_index,
                                   const PciMsix& msix) override {
@@ -46,7 +49,7 @@ class FakeDeviceIrqEnvironment final : public DeviceIrqEnvironment {
         device_index >= kPciMaxDevices) {
       return nullptr;
     }
-    msix_words_[device_index].assign(msix.table_size * 4, 0xDEADBEEFU);
+    msix_words_[device_index].assign(msix.table_size * 4, msix_fill_);
     msix_mapped_[device_index] = true;
     return msix_words_[device_index].data();
   }
@@ -87,8 +90,10 @@ class FakeDeviceIrqEnvironment final : public DeviceIrqEnvironment {
     handlers_[vector](&frame);
   }
 
-  uint8_t bsp_apic_id_ = 3;
+  int msi_destination_ = kDestinationApicId;
   bool fail_map_msix_ = false;
+  // What MapMsixTable() fills a new table with.
+  uint32_t msix_fill_ = 0xDEADBEEFU;
   InterruptHandlerFn handlers_[kIdtEntryCount] = {};
   int register_calls_ = 0;
   int unregister_calls_ = 0;
@@ -124,6 +129,60 @@ class DeviceIrqTest : public t::Test {
     DeviceIrqResetForTest();
     PciResetForTest();
   }
+
+  // Replaces the machine with one function (index 0) that has both MSI (64-bit,
+  // 4 vectors, per-vector masking) and MSI-X (4 entries in BAR0), as many NICs
+  // and NVMe controllers do.
+  void UseFunctionWithMsiAndMsix() {
+    DeviceIrqResetForTest();
+    PciResetForTest();
+    pci_ = std::make_shared<FakePciConfigSpace>();
+    pci_->AddFunction(
+        kBoth, {.vendor_id = 0x8086, .device_id = 0x1533, .class_code = 0x02});
+    pci_->SetBar(kBoth,  //
+                 0,      //
+                 {.kind = FakePciConfigSpace::BarKind::kMem64,
+                  .base = 0xFEB00000,
+                  .size = 0x4000});
+    pci_->AddMsi(
+        kBoth, kBothMsiOffset,
+        {.is_64bit = true, .per_vector_masking = true, .vectors_log2 = 2});
+    pci_->AddMsix(kBoth, kBothMsixOffset,
+                  {.table_size = 4,
+                   .table_bar = 0,
+                   .table_offset = 0x2000,
+                   .pba_bar = 0,
+                   .pba_offset = 0x3000});
+    PciInit(pci_);
+    DeviceIrqInit(env_);
+  }
+
+  // The writes to the MSI and MSI-X Message Control registers of the function
+  // at `address`, as (offset, MSI Enable or MSI-X Enable and Function Mask).
+  std::vector<std::pair<int, uint32_t>> ControlWrites(
+      const PciAddress address) const {
+    const PciDevice* const device = PciGetDevice(PciFindDevice(address));
+    const int msi_control = device->msi.offset + kPciMsiControlOffset;
+    const int msix_control = device->msix.offset + kPciMsiControlOffset;
+    std::vector<std::pair<int, uint32_t>> writes;
+    for (const FakePciConfigSpace::Access& access : pci_->Accesses()) {
+      if (!access.write || !(access.address == address)) {
+        continue;
+      }
+      if (device->msi.offset != 0 && access.offset == msi_control) {
+        writes.emplace_back(access.offset, access.value & kPciMsiControlEnable);
+      } else if (device->msix.offset != 0 && access.offset == msix_control) {
+        writes.emplace_back(access.offset,
+                            access.value & (kPciMsixControlEnable |
+                                            kPciMsixControlFunctionMask));
+      }
+    }
+    return writes;
+  }
+
+  static constexpr PciAddress kBoth = {0, 9, 0};
+  static constexpr int kBothMsiOffset = 0x70;
+  static constexpr int kBothMsixOffset = 0x90;
 
   std::shared_ptr<FakePciConfigSpace> pci_;
   std::shared_ptr<FakeDeviceIrqEnvironment> env_;
@@ -231,7 +290,7 @@ TEST_F(DeviceIrqTest, ProgramsMsi64AndRejectsMultiVectorMsi) {
               t::Eq(DeviceIrqStatus::kOk));
   const PciMsi& msi = PciGetDevice(msi_dev)->msi;
   EXPECT_THAT(pci_->Peek32({1, 1, 0}, msi.offset + 4),
-              t::Eq(DeviceIrqMsiAddressLow(env_->bsp_apic_id_)));
+              t::Eq(DeviceIrqMsiAddressLow(kDestinationApicId)));
   EXPECT_THAT(pci_->Peek32({1, 1, 0}, msi.offset + 8), t::Eq(0U));
   EXPECT_THAT(pci_->Peek16({1, 1, 0}, msi.data_offset), t::Eq(0x0050U));
   EXPECT_THAT(pci_->Peek16({1, 1, 0}, msi.offset + kPciMsiControlOffset) &
@@ -267,20 +326,24 @@ TEST_F(DeviceIrqTest, ProgramsMsiWithPerVectorMaskingAndMasksOnRelease) {
                                 .class_code = 0x0C,
                                 .subclass = 0x03,
                                 .prog_if = 0x30});
-  pci_->AddMsi({0, 9, 0}, 0x60,
-               {.is_64bit = false, .per_vector_masking = true});
+  pci_->AddMsi(
+      {0, 9, 0}, 0x60,
+      {.is_64bit = false, .per_vector_masking = true, .vectors_log2 = 2});
   PciInit(pci_);
   DeviceIrqInit(env_);
 
   ASSERT_THAT(PciClaim(0, kOwnerA), t::Eq(PciStatus::kOk));
+  const PciMsi& msi = PciGetDevice(0)->msi;
+  // Bits 31:4 don't belong to any of the 4 vectors: reserved, kept as they are.
+  pci_->SetRaw32({0, 9, 0}, msi.mask_offset, 0xA5000000U);
   const int vector = 0x55;
   ASSERT_THAT(DeviceIrqProgramDevice(0, 1, kSyscallIrqModeMsi, &vector),
               t::Eq(DeviceIrqStatus::kOk));
-  const PciMsi& msi = PciGetDevice(0)->msi;
-  EXPECT_THAT(pci_->Peek32({0, 9, 0}, msi.mask_offset), t::Eq(0xFFFFFFFEU));
+  // Vector 0 unmasked, vectors 1..3 masked.
+  EXPECT_THAT(pci_->Peek32({0, 9, 0}, msi.mask_offset), t::Eq(0xA500000EU));
 
   DeviceIrqReleaseDevice(0);
-  EXPECT_THAT(pci_->Peek32({0, 9, 0}, msi.mask_offset), t::Eq(0xFFFFFFFFU));
+  EXPECT_THAT(pci_->Peek32({0, 9, 0}, msi.mask_offset), t::Eq(0xA500000FU));
 }
 
 TEST_F(DeviceIrqTest, ProgramsMsixTableAndMasksAndUnmapsOnRelease) {
@@ -288,6 +351,9 @@ TEST_F(DeviceIrqTest, ProgramsMsixTableAndMasksAndUnmapsOnRelease) {
   ASSERT_THAT(msix_dev, t::Ge(0));
   ASSERT_THAT(PciClaim(msix_dev, kOwnerA), t::Eq(PciStatus::kOk));
 
+  // Vector Control bits 31:1 are reserved (Steering Tags with TPH): only the
+  // Mask bit may change.
+  env_->msix_fill_ = 0xABCD0000U;
   const int vectors[4] = {0x50, 0x51, 0x52, 0x53};
   // Count exceeding msix.table_size (16) is rejected.
   int many[17] = {};
@@ -306,25 +372,27 @@ TEST_F(DeviceIrqTest, ProgramsMsixTableAndMasksAndUnmapsOnRelease) {
   ASSERT_THAT(table.size(), t::Eq(16U * 4U));
   for (int i = 0; i < 4; ++i) {
     EXPECT_THAT(table[i * 4 + 0],
-                t::Eq(DeviceIrqMsiAddressLow(env_->bsp_apic_id_)));
+                t::Eq(DeviceIrqMsiAddressLow(kDestinationApicId)));
     EXPECT_THAT(table[i * 4 + 1], t::Eq(0U));
     EXPECT_THAT(table[i * 4 + 2], t::Eq(static_cast<uint32_t>(vectors[i])))
         << "entry " << i;
-    EXPECT_THAT(table[i * 4 + 3], t::Eq(0U)) << "entry " << i;
+    EXPECT_THAT(table[i * 4 + 3], t::Eq(0xABCD0000U)) << "entry " << i;
   }
   for (int i = 4; i < 16; ++i) {
-    EXPECT_THAT(table[i * 4 + 3], t::Eq(1U)) << "entry " << i;
+    EXPECT_THAT(table[i * 4 + 3], t::Eq(0xABCD0001U)) << "entry " << i;
   }
-  const uint16_t msix_ctl =
-      pci_->Peek16({0, 4, 0}, PciGetDevice(msix_dev)->msix.offset + 2);
+  const int msix_control = PciGetDevice(msix_dev)->msix.offset + 2;
+  const uint16_t msix_ctl = pci_->Peek16({0, 4, 0}, msix_control);
   EXPECT_THAT(msix_ctl & kPciMsixControlEnable, t::Ne(0U));
   EXPECT_THAT(msix_ctl & kPciMsixControlFunctionMask, t::Eq(0U));
 
-  // Release masks all 16 entries and unmaps the kernel MSI-X table mapping.
+  // Release masks all 16 entries and unmaps the kernel MSI-X table mapping,
+  // and leaves Message Control as it found it.
   DeviceIrqReleaseDevice(msix_dev);
   for (int i = 0; i < 16; ++i) {
-    EXPECT_THAT(table[i * 4 + 3], t::Eq(1U)) << "entry " << i;
+    EXPECT_THAT(table[i * 4 + 3], t::Eq(0xABCD0001U)) << "entry " << i;
   }
+  EXPECT_THAT(pci_->Peek16({0, 4, 0}, msix_control), t::Eq(msix_ctl));
   EXPECT_FALSE(env_->msix_mapped_[msix_dev]);
   EXPECT_THAT(env_->unmap_calls_, t::Eq(1));
 }
@@ -492,6 +560,10 @@ TEST_F(DeviceIrqTest,
   EXPECT_THAT(DeviceIrqReadMsixTableWord(msi_dev, 0), t::Eq(0U));
   EXPECT_THAT(DeviceIrqReadMsixTableWord(msix_dev, 2),
               t::Eq(static_cast<uint32_t>(vectors[0])));
+  // Words beyond the 16-entry table read as 0 rather than past its end.
+  EXPECT_THAT(DeviceIrqReadMsixTableWord(msix_dev, 16 * 4 - 1),
+              t::Eq(env_->msix_fill_ | 1U));
+  EXPECT_THAT(DeviceIrqReadMsixTableWord(msix_dev, 16 * 4), t::Eq(0U));
 
   // DeviceIrqFreeDeviceVectors frees only msix_dev's 2 vectors, keeping
   // msi_dev's vector intact.
@@ -541,6 +613,126 @@ TEST_F(DeviceIrqTest,
   };
   EXPECT_THAT(DeviceIrqWait(&pending, 0x1, 50, stop_after_block, &checks),
               t::Eq(0));
+}
+
+TEST_F(DeviceIrqTest, MsiCanTargetOnlyApicIdsBelowTheBroadcastId) {
+  EXPECT_TRUE(DeviceIrqMsiCanTarget(0));
+  EXPECT_TRUE(DeviceIrqMsiCanTarget(0xFE));
+  EXPECT_FALSE(DeviceIrqMsiCanTarget(0xFF));
+  EXPECT_FALSE(DeviceIrqMsiCanTarget(0x100));
+  EXPECT_FALSE(DeviceIrqMsiCanTarget(0xFFFFFFFFU));
+}
+
+TEST_F(DeviceIrqTest, MsisGoToTheEnvironmentsDestinationOrAreRefused) {
+  const int msix_dev = PciFindDevice({0, 4, 0});
+  const int msi_dev = PciFindDevice({1, 1, 0});
+  ASSERT_THAT(PciClaim(msix_dev, kOwnerA), t::Eq(PciStatus::kOk));
+  ASSERT_THAT(PciClaim(msi_dev, kOwnerA), t::Eq(PciStatus::kOk));
+  const int vector = 0x60;
+
+  // No online CPU that a compatibility-format MSI can address (e.g. only
+  // x2APIC IDs of 0x100 and up): refused before the device is touched. An
+  // environment that returned the broadcast ID or a wider one is refused too.
+  for (const int destination : {-1, 0xFF, 0x100}) {
+    SCOPED_TRACE(destination);
+    env_->msi_destination_ = destination;
+    pci_->ClearAccesses();
+    EXPECT_THAT(
+        DeviceIrqProgramDevice(msix_dev, 1, kSyscallIrqModeMsix, &vector),
+        t::Eq(DeviceIrqStatus::kInvalid));
+    EXPECT_THAT(DeviceIrqProgramDevice(msi_dev, 1, kSyscallIrqModeMsi, &vector),
+                t::Eq(DeviceIrqStatus::kInvalid));
+    EXPECT_THAT(pci_->Accesses(), t::IsEmpty());
+    EXPECT_FALSE(env_->msix_mapped_[msix_dev]);
+  }
+
+  // Another CPU than the BSP (whose ID didn't fit): both use its ID, and the
+  // refusals above left nothing configured.
+  env_->msi_destination_ = 0x2A;
+  EXPECT_THAT(DeviceIrqMsiDestinationApicId(), t::Eq(0x2A));
+  ASSERT_THAT(DeviceIrqProgramDevice(msix_dev, 1, kSyscallIrqModeMsix, &vector),
+              t::Eq(DeviceIrqStatus::kOk));
+  ASSERT_THAT(DeviceIrqProgramDevice(msi_dev, 1, kSyscallIrqModeMsi, &vector),
+              t::Eq(DeviceIrqStatus::kOk));
+  EXPECT_THAT(env_->msix_words_[msix_dev][0], t::Eq(0xFEE2A000U));
+  EXPECT_THAT(pci_->Peek32({1, 1, 0}, PciGetDevice(msi_dev)->msi.offset + 4),
+              t::Eq(0xFEE2A000U));
+}
+
+TEST_F(DeviceIrqTest, MsixTurnsMsiOffAndIsProgrammedEnabledAndMasked) {
+  UseFunctionWithMsiAndMsix();
+  ASSERT_THAT(PciClaim(0, kOwnerA), t::Eq(PciStatus::kOk));
+  // Something left MSI on: MSI and MSI-X must never be on at once.
+  pci_->SetRaw16(kBoth, kBothMsiOffset + kPciMsiControlOffset,
+                 pci_->Peek16(kBoth, kBothMsiOffset + kPciMsiControlOffset) |
+                     kPciMsiControlEnable);
+  pci_->ClearAccesses();
+  const int vectors[2] = {0x58, 0x59};
+  ASSERT_THAT(DeviceIrqProgramDevice(0, 2, kSyscallIrqModeMsix, vectors),
+              t::Eq(DeviceIrqStatus::kOk));
+  // MSI off first; then MSI-X on with the Function Mask in one write, before
+  // the table entries are programmed (some devices ignore table writes while
+  // MSI-X is off); the Function Mask cleared last.
+  EXPECT_THAT(ControlWrites(kBoth),
+              t::ElementsAre(
+                  t::Pair(kBothMsiOffset + kPciMsiControlOffset, 0U),
+                  t::Pair(kBothMsixOffset + kPciMsiControlOffset,
+                          kPciMsixControlEnable | kPciMsixControlFunctionMask),
+                  t::Pair(kBothMsixOffset + kPciMsiControlOffset,
+                          kPciMsixControlEnable)));
+  const std::vector<uint32_t>& table = env_->msix_words_[0];
+  EXPECT_THAT(table[1 * 4 + 2], t::Eq(0x59U));
+  EXPECT_THAT(table[1 * 4 + 3], t::Eq(0xDEADBEEEU));
+  EXPECT_THAT(table[2 * 4 + 3], t::Eq(0xDEADBEEFU));
+}
+
+TEST_F(DeviceIrqTest, MsiTurnsMsixOffFirst) {
+  UseFunctionWithMsiAndMsix();
+  ASSERT_THAT(PciClaim(0, kOwnerA), t::Eq(PciStatus::kOk));
+  pci_->SetRaw16(kBoth, kBothMsixOffset + kPciMsiControlOffset,
+                 pci_->Peek16(kBoth, kBothMsixOffset + kPciMsiControlOffset) |
+                     kPciMsixControlEnable);
+  pci_->ClearAccesses();
+  const int vector = 0x5A;
+  ASSERT_THAT(DeviceIrqProgramDevice(0, 1, kSyscallIrqModeMsi, &vector),
+              t::Eq(DeviceIrqStatus::kOk));
+  // MSI-X off (Function Mask set, as PciQuiesce() leaves it), then MSI on.
+  EXPECT_THAT(ControlWrites(kBoth),
+              t::ElementsAre(t::Pair(kBothMsixOffset + kPciMsiControlOffset,
+                                     kPciMsixControlFunctionMask),
+                             t::Pair(kBothMsiOffset + kPciMsiControlOffset,
+                                     kPciMsiControlEnable)));
+  EXPECT_THAT(pci_->Peek32(kBoth, kBothMsiOffset + 4),
+              t::Eq(DeviceIrqMsiAddressLow(kDestinationApicId)));
+}
+
+TEST_F(DeviceIrqTest, ReleaseMasksTheTableWithMsixEnabledAndMasked) {
+  const int msix_dev = PciFindDevice({0, 4, 0});
+  ASSERT_THAT(PciClaim(msix_dev, kOwnerA), t::Eq(PciStatus::kOk));
+  env_->msix_fill_ = 0x12340000U;
+  const int vectors[2] = {0x50, 0x51};
+  ASSERT_THAT(DeviceIrqProgramDevice(msix_dev, 2, kSyscallIrqModeMsix, vectors),
+              t::Eq(DeviceIrqStatus::kOk));
+  // As DriverContext::Release() does: quiesce first, which turns MSI-X off.
+  PciQuiesce(msix_dev);
+  const int msix_control = PciGetDevice(msix_dev)->msix.offset + 2;
+  const uint16_t quiesced = pci_->Peek16({0, 4, 0}, msix_control);
+  ASSERT_THAT(quiesced & kPciMsixControlEnable, t::Eq(0U));
+  pci_->ClearAccesses();
+
+  DeviceIrqReleaseDevice(msix_dev);
+  // MSI-X on with the Function Mask while the entries are masked, then back.
+  EXPECT_THAT(
+      ControlWrites({0, 4, 0}),
+      t::ElementsAre(t::Pair(msix_control, kPciMsixControlEnable |
+                                               kPciMsixControlFunctionMask),
+                     t::Pair(msix_control, kPciMsixControlFunctionMask)));
+  EXPECT_THAT(pci_->Peek16({0, 4, 0}, msix_control), t::Eq(quiesced));
+  const std::vector<uint32_t>& table = env_->msix_words_[msix_dev];
+  for (int i = 0; i < 16; ++i) {
+    EXPECT_THAT(table[i * 4 + 3], t::Eq(0x12340001U)) << "entry " << i;
+  }
+  EXPECT_FALSE(env_->msix_mapped_[msix_dev]);
 }
 
 }  // namespace

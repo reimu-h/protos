@@ -10,6 +10,7 @@
 #include "check.h"
 #include "gdt.h"
 #include "interrupts.h"
+#include "status_or.h"
 #include "steal_time.h"
 
 namespace protos {
@@ -76,6 +77,9 @@ struct alignas(64) CpuLocal {
   CpuLocal* self = nullptr;
   int cpu_id = 0;
   uint32_t apic_id = 0;
+  // Set by the CPU itself once it runs the kernel with the kernel IDT loaded
+  // (an AP in ApKernelEntry()). Only online CPUs get the panic-stop NMI
+  // (SmpStopOtherCpusForPanic()).
   bool online = false;
   uintptr_t stack_base = 0;
   uintptr_t stack_top = 0;
@@ -238,33 +242,29 @@ uintptr_t SmpFindMadtInSdt(uintptr_t rsdt_addr,  //
                            uintptr_t max_physical_addr);
 
 // Parses the ACPI MADT at non-zero `madt_addr` (below non-zero
-// `max_physical_addr`) into non-null `*out_topology`: the Local APIC MMIO base
-// address (including any Type 5 64-bit override) and the processors whose
-// Type 0 (Local APIC) or Type 9 (Local x2APIC) entry has the Enabled flag set.
-// Entries that are only Online Capable describe hot-pluggable processors that
-// are not present, and are ignored. The BSP (`bsp_apic_id`,
-// `!= kInvalidX2ApicId`) is placed at index 0, followed by the other
-// processors in table order, at most `kMaxSupportedCpus` CPUs in total; the
-// number of enabled entries left out is stored in `ignored_cpu_count`.
-// Validates preconditions with `DCHECK`. Returns true if the MADT is valid and
-// lists at least one enabled processor.
-bool SmpParseMadt(uintptr_t madt_addr,          //
-                  uintptr_t max_physical_addr,  //
-                  uint32_t bsp_apic_id,         //
-                  SmpTopology* out_topology);
+// `max_physical_addr`): the Local APIC MMIO base address (including any Type 5
+// 64-bit override) and the processors whose Type 0 (Local APIC) or Type 9
+// (Local x2APIC) entry has the Enabled flag set. Entries that are only Online
+// Capable describe hot-pluggable processors that are not present, and are
+// ignored. The BSP (`bsp_apic_id`, `!= kInvalidX2ApicId`) is placed at index 0,
+// followed by the other processors in table order, at most `kMaxSupportedCpus`
+// CPUs in total; the number of enabled entries left out is stored in
+// `ignored_cpu_count`. Validates preconditions with `DCHECK`. Returns the
+// topology if the MADT is valid and lists at least one enabled processor.
+StatusOr<SmpTopology> SmpParseMadt(uintptr_t madt_addr,          //
+                                   uintptr_t max_physical_addr,  //
+                                   uint32_t bsp_apic_id);
 
 // Discovers the system CPU topology from Multiboot2 ACPI tags (if
 // `multiboot_magic` is Multiboot2) or legacy BIOS memory ranges (`ebda_base`
-// and `bios_rom_base`), populating non-null `*out_topology`. Validates
-// preconditions with `DCHECK`. Returns true if a valid MADT was found and
-// parsed.
-bool SmpDiscoverTopology(uint32_t multiboot_magic,      //
-                         uint64_t multiboot_info_addr,  //
-                         uintptr_t ebda_base,           //
-                         uintptr_t bios_rom_base,       //
-                         uintptr_t max_physical_addr,   //
-                         uint32_t bsp_apic_id,          //
-                         SmpTopology* out_topology);
+// and `bios_rom_base`). Validates preconditions with `DCHECK`. Returns the
+// discovered topology if a valid MADT was found and parsed.
+StatusOr<SmpTopology> SmpDiscoverTopology(uint32_t multiboot_magic,      //
+                                          uint64_t multiboot_info_addr,  //
+                                          uintptr_t ebda_base,           //
+                                          uintptr_t bios_rom_base,       //
+                                          uintptr_t max_physical_addr,   //
+                                          uint32_t bsp_apic_id);
 
 // Computes the periodic Local APIC timer initial count for `target_hz`
 // (`0 < target_hz <= 1193182`) given `elapsed_apic_ticks` measured over
@@ -284,36 +284,43 @@ constexpr int kPitCalibrationPollLimit = 1000000;
 constexpr uint32_t kFallbackApicTimerInitialCount = 250000;
 
 using PitSpeakerReadFn = uint8_t (*)();
+using ClockReadFn = uint64_t (*)();
 using ApicTimerCurrentCountReadFn = uint32_t (*)(uintptr_t lapic_base);
 
-// Polls `read_pit_speaker()` (bit 5, `0x20`, is PIT channel 2's OUT2) for at
-// most `max_polls` iterations (`max_polls > 0`) until the PIT reaches terminal
-// count, then reads `read_apic_current_count(lapic_base)` and returns the
-// periodic Local APIC timer initial count for `kApicTimerTargetHz`. Returns 0,
-// instead of hanging, if the PIT does not reach terminal count within
-// `max_polls` iterations or no APIC timer ticks elapsed.
+// Polls `read_pit_speaker()` (bit 5, `0x20`, is PIT channel 2's OUT2) until
+// the PIT reaches terminal count, for at most `max_polls` iterations
+// (`max_polls > 0`) and until `read_clock()` has advanced by at most
+// `max_clock_ticks` (`> 0`), then reads `read_apic_current_count(lapic_base)`
+// and returns the periodic Local APIC timer initial count for
+// `kApicTimerTargetHz`. Returns 0, instead of hanging, if the PIT does not
+// reach terminal count within these limits or no APIC timer ticks elapsed.
 uint32_t CalibrateApicTimerCount(
     uintptr_t lapic_base,               //
     int max_polls,                      //
+    uint64_t max_clock_ticks,           //
     PitSpeakerReadFn read_pit_speaker,  //
+    ClockReadFn read_clock,             //
     ApicTimerCurrentCountReadFn read_apic_current_count);
 
 // Discovers all CPUs, initializes the BSP Local APIC (in x2APIC mode when the
 // CPU supports it, otherwise in xAPIC mode) and `CpuLocal` state, and
 // calibrates the Local APIC timer and the TSC against PIT channel 2 (or,
-// failing that, takes the timer clock that CPUID reports, or
-// `kFallbackApicTimerInitialCount` with a warning). The BSP's Local APIC ID
-// register, not CPUID, identifies its MADT entry. Then allocates each AP's
-// stacks from the PMM (`kApStackBlockFrames`), unmaps their guard pages, and
-// starts the APs one by one with INIT-SIPI-SIPI through the real-mode
-// trampoline at 0x8000. Each AP enters 64-bit Long Mode, binds its `CpuLocal`
-// via `IA32_GS_BASE`, loads the kernel GDT and its TSS (`GdtLoadForCpu()`) and
-// then the 256-entry IDT, starts its periodic Local APIC timer, and parks in a
-// maskable `sti; hlt` idle loop. An AP that does not report in within the
-// startup timeout, or whose APIC ID is not addressable in xAPIC mode, is left
-// out of the topology (and of `SmpCpuCount()`). Finally enables interrupts on
-// the BSP (`sti`). Requires `SmpSetHardware()`. Panics via `CHECK` if topology
-// discovery, MMIO mapping, stack allocation, or unmapping a guard page fails.
+// failing that, takes the timer clock and TSC rate that Hyper-V or CPUID
+// report, or `kFallbackApicTimerInitialCount` with a warning). The BSP's Local
+// APIC ID register, not CPUID, identifies its MADT entry. Without a valid MADT
+// (no RSDP, as under UEFI with Multiboot1, or ACPI turned off), prints a
+// warning and runs on the BSP alone, with its Local APIC at the base address
+// in IA32_APIC_BASE. Then allocates each AP's stacks from the PMM
+// (`kApStackBlockFrames`), unmaps their guard pages, and starts the APs one by
+// one with INIT-SIPI-SIPI through the real-mode trampoline at 0x8000. Each AP
+// enters 64-bit Long Mode, binds its `CpuLocal` via `IA32_GS_BASE`, loads the
+// kernel GDT and its TSS (`GdtLoadForCpu()`) and then the 256-entry IDT,
+// starts its periodic Local APIC timer, and parks in a maskable `sti; hlt`
+// idle loop. An AP that does not report in within the startup timeout, or
+// whose APIC ID is not addressable in xAPIC mode, is left out of the topology
+// (and of `SmpCpuCount()`). Finally enables interrupts on the BSP (`sti`).
+// Requires `SmpSetHardware()`. Panics via `CHECK` if MMIO mapping, stack
+// allocation, or unmapping a guard page fails.
 void SmpInit(uint32_t multiboot_magic, uint64_t multiboot_info_addr);
 
 // Returns the total number of CPUs discovered during `SmpInit`. Validates with
@@ -432,11 +439,15 @@ using SmpWorkFn = void (*)(int cpu_index, void* context);
 // The wait for the calls to return has no timeout.
 void SmpRunOnAllCpus(SmpWorkFn work_fn, void* context);
 
-// Stops the other CPUs for a kernel panic: sends them an NMI, which parks them
-// for good in the NMI handler that `SmpInit` installs, and waits up to 100 ms
-// for them to park. Called by the panic path (idt.cpp) on the panicking CPU
-// with interrupts disabled. Does nothing until `SmpInit` has enabled the BSP's
-// Local APIC. Never fails a `CHECK`, which would re-enter the panic path.
+// Stops the other CPUs for a kernel panic: sends an NMI to each other CPU that
+// is online, which parks it for good in the NMI handler that `SmpInit`
+// installs, and waits up to 100 ms for them to park. CPUs that run no kernel
+// code (not started yet, left out, or in the AP startup trampoline) get no
+// NMI, and an AP that comes online afterwards parks itself. Called by the
+// panic path (idt.cpp) on the panicking CPU with interrupts disabled, which
+// no NMI parks from then on. Does nothing until `SmpInit` has enabled the
+// BSP's Local APIC. Never fails a `CHECK`, which would re-enter the panic
+// path.
 void SmpStopOtherCpusForPanic();
 
 // TLB shootdown: flushes the TLB of every online CPU and returns once all of
@@ -476,22 +487,31 @@ int64_t SmpOwnStealNsIrqsOff();
 int64_t SmpStealNsOfCpu(int cpu_index);
 
 // Returns a conservative upper bound (in nanoseconds) on the duration of one
-// `GlobalTimerTicks()` tick (`kApicTimerTargetHz = 250 Hz`, ~4 ms).
+// `GlobalTimerTicks()` tick (`kApicTimerTargetHz = 250 Hz`, ~4 ms), from the
+// Local APIC timer clock that `SmpInit()` measured or that was reported to
+// it, or, with the uncalibrated `kFallbackApicTimerInitialCount` (and before
+// `SmpInit()`), from the slowest plausible timer clock (10 MHz).
 int64_t SmpTimerTickNsUpperBound();
 
 // Returns a conservative lower bound (in nanoseconds) on the duration of one
-// `GlobalTimerTicks()` tick (`kApicTimerTargetHz = 250 Hz`, ~4 ms).
+// `GlobalTimerTicks()` tick (`kApicTimerTargetHz = 250 Hz`, ~4 ms), from the
+// Local APIC timer clock that `SmpInit()` measured or that was reported to
+// it, or, with the uncalibrated `kFallbackApicTimerInitialCount` (and before
+// `SmpInit()`), from the fastest plausible timer clock (1 GHz).
 int64_t SmpTimerTickNsLowerBound();
+
+struct RsdpTables {
+  uintptr_t rsdt_addr = 0;
+  uintptr_t xsdt_addr = 0;
+};
 
 #if __STDC_HOSTED__
 // Host unit-test wrappers around internal helpers of `SmpDiscoverTopology` and
 // `SmpInit`; they read through the installed `SmpHardware`.
 uintptr_t SmpFindRsdpInMultiboot2ForTest(uintptr_t multiboot_info_addr,
                                          uintptr_t max_physical_addr);
-bool SmpParseRsdpForTest(uintptr_t rsdp_addr,          //
-                         uintptr_t max_physical_addr,  //
-                         uintptr_t* out_rsdt_addr,     //
-                         uintptr_t* out_xsdt_addr);
+StatusOr<RsdpTables> SmpParseRsdpForTest(uintptr_t rsdp_addr,
+                                         uintptr_t max_physical_addr);
 uint32_t SmpReadCpuidInitialApicIdForTest();
 #endif
 

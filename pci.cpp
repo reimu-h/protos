@@ -70,6 +70,56 @@ constexpr int kPciMsixBytes = 12;
 constexpr uint32_t kPciMsixBirMask = 0x7;
 constexpr int64_t kPciMsixPbaEntryBytes = 8;
 
+// The PCI Express Capabilities register (pci.h), and the Device/Port Types
+// that decide which other registers exist [PCIe Base 6.0 §7.5.3.2].
+constexpr uint16_t kPciExpressVersionMask = 0x000F;
+constexpr int kPciExpressTypeShift = 4;
+constexpr uint16_t kPciExpressTypeMask = 0x000F;
+constexpr uint16_t kPciExpressSlotImplemented = 1u << 8;
+constexpr int kPcieTypeEndpoint = 0x0;
+constexpr int kPcieTypeLegacyEndpoint = 0x1;
+constexpr int kPcieTypeRootPort = 0x4;
+constexpr int kPcieTypeUpstreamPort = 0x5;
+constexpr int kPcieTypeDownstreamPort = 0x6;
+constexpr int kPcieTypePcieToPciBridge = 0x7;
+constexpr int kPcieTypePciToPcieBridge = 0x8;
+constexpr int kPcieTypeRootComplexEventCollector = 0xA;
+
+// The registers of a PCI-to-PCI bridge that tell it which bus numbers and
+// address ranges lie behind it [PCI-to-PCI Bridge 1.2 §3.2], in
+// configuration-space order: the primary, secondary and subordinate bus
+// numbers with the secondary latency timer; I/O base and limit (16 bits: the
+// Secondary Status register above them has write-1-to-clear bits); memory
+// base and limit; prefetchable base and limit; the upper halves of the
+// prefetchable base and limit; the upper halves of I/O base and limit. Then
+// Bridge Control, whose Secondary Bus Reset bit is never written back.
+struct RegisterSpec {
+  int offset = 0;
+  int width = 0;
+};
+constexpr RegisterSpec kPciBridgeRoutingRegisters[] = {
+    {0x18, 4}, {0x1C, 2}, {0x20, 4}, {0x24, 4}, {0x28, 4}, {0x2C, 4}, {0x30, 4},
+};
+constexpr int kPciBridgeRoutingStart = 0x18;
+constexpr int kPciBridgeRoutingEnd = 0x34;
+constexpr int kPciBridgeControlOffset = 0x3E;
+constexpr uint16_t kPciBridgeControlSecondaryBusReset = 1u << 6;
+
+// USB host controllers (class 0Ch, subclass 03h) by programming interface, and
+// the port routing registers of the xHCI of Intel 7/8/9-series PCHs, as
+// Linux's drivers/usb/host/pci-quirks.c names them.
+constexpr uint8_t kPciClassSerialBus = 0x0C;
+constexpr uint8_t kPciSubclassUsb = 0x03;
+constexpr uint8_t kPciProgIfEhci = 0x20;
+constexpr uint8_t kPciProgIfXhci = 0x30;
+constexpr uint16_t kPciVendorIntel = 0x8086;
+constexpr uint16_t kPciVendorSony = 0x104D;
+constexpr uint16_t kSonyVaioTSeriesSubsystemId = 0x90A8;
+constexpr int kIntelXusb2prOffset = 0xD0;    // USB 2.0 port routing
+constexpr int kIntelXusb2prmOffset = 0xD4;   // ... which ports may switch
+constexpr int kIntelUsb3PssenOffset = 0xD8;  // SuperSpeed enable
+constexpr int kIntelUsb3prmOffset = 0xDC;    // ... which ports may switch
+
 // Room for the longest line of the boot report (about 380 characters).
 constexpr int kPciReportLineCapacity = 512;
 
@@ -90,6 +140,11 @@ int g_unrecorded_count = 0;
 // have one. Guarded by g_pci_lock.
 uintptr_t g_owners[kPciMaxDevices] = {};
 int g_claimed_count = 0;
+// Whether PciInit() sized the BARs of each device while the device was in a
+// low-power state, until PciRestoreAfterPowerUp() has sized them again in D0.
+// Written by PciInit() before it publishes the device, then guarded by
+// g_pci_lock.
+bool g_sized_in_low_power[kPciMaxDevices] = {};
 
 // A bus waiting to be scanned, and the index of the bridge that leads to it.
 struct PendingBus {
@@ -147,6 +202,39 @@ static void Write32Locked(const PciAddress address,  //
                           const uint32_t value) {
   DcheckAccessLocked(offset, 4);
   g_config->Write32(address, offset, value);
+}
+
+// A read or write of a register of `width` bytes (1, 2 or 4).
+static uint32_t ReadWidthLocked(const PciAddress address,  //
+                                const int offset,          //
+                                const int width) {
+  switch (width) {
+    case 1:
+      return Read8Locked(address, offset);
+    case 2:
+      return Read16Locked(address, offset);
+    default:
+      DCHECK(width == 4);
+      return Read32Locked(address, offset);
+  }
+}
+
+static void WriteWidthLocked(const PciAddress address,  //
+                             const int offset,          //
+                             const int width,           //
+                             const uint32_t value) {
+  switch (width) {
+    case 1:
+      Write8Locked(address, offset, static_cast<uint8_t>(value));
+      break;
+    case 2:
+      Write16Locked(address, offset, static_cast<uint16_t>(value));
+      break;
+    default:
+      DCHECK(width == 4);
+      Write32Locked(address, offset, value);
+      break;
+  }
 }
 
 // Sets `set` and clears `clear` in the 16-bit register at `offset` with one
@@ -322,6 +410,53 @@ static void DecodeBarsLocked(const PciAddress address,  //
   }
 }
 
+// Whether every BAR of `device` that has a recorded base still holds it.
+// Called with the PCI lock held.
+static bool BarsIntactLocked(const PciDevice& device) {
+  for (int i = 0; i < kPciMaxBars; ++i) {
+    const PciBar& bar = device.bars[i];
+    if (bar.type == PciBarType::kNone || bar.base == 0) {
+      continue;
+    }
+    const uint32_t low = Read32Locked(device.address, BarOffset(i));
+    uint64_t base = 0;
+    if (bar.type == PciBarType::kIo) {
+      base = low & kPciBarIoAddressMask;
+    } else {
+      base = low & kPciBarMemoryAddressMask;
+      if (bar.type == PciBarType::kMem64) {
+        base |= static_cast<uint64_t>(
+                    Read32Locked(device.address, BarOffset(i + 1)))
+                << 32;
+      }
+    }
+    if (base != bar.base) {
+      return false;
+    }
+  }
+  return true;
+}
+
+// Writes the recorded base of every BAR of `device` that has one back to its
+// register(s); the flag bits are read-only. Called with the PCI lock held and
+// the device's decoding off.
+static void RestoreBarsLocked(const PciDevice& device) {
+  for (int i = 0; i < kPciMaxBars; ++i) {
+    const PciBar& bar = device.bars[i];
+    if (bar.type == PciBarType::kNone || bar.base == 0) {
+      continue;
+    }
+    Write32Locked(device.address,  //
+                  BarOffset(i),    //
+                  static_cast<uint32_t>(bar.base));
+    if (bar.type == PciBarType::kMem64) {
+      Write32Locked(device.address,    //
+                    BarOffset(i + 1),  //
+                    static_cast<uint32_t>(bar.base >> 32));
+    }
+  }
+}
+
 // Decodes the MSI capability at `offset`, unless it does not fit in the
 // configuration space.
 static void DecodeMsiLocked(const PciAddress address,  //
@@ -372,9 +507,9 @@ static void DecodeMsixLocked(const PciAddress address,  //
 }
 
 // Walks the capability list of the function at `address` (header types 0 and
-// 1) for its first MSI and MSI-X capabilities. The list comes from the device,
-// so the walk stops at a pointer into the header and after
-// kPciMaxCapabilities entries.
+// 1) for its first MSI, MSI-X, Power Management and PCI Express capabilities.
+// The list comes from the device, so the walk stops at a pointer into the
+// header and after kPciMaxCapabilities entries.
 static void ParseCapabilitiesLocked(const PciAddress address,
                                     PciDevice* const device) {
   if ((Read16Locked(address, kPciStatusOffset) & kPciStatusCapabilitiesList) ==
@@ -391,6 +526,13 @@ static void ParseCapabilitiesLocked(const PciAddress address,
       DecodeMsiLocked(address, pointer, &device->msi);
     } else if (id == kPciCapabilityMsix && device->msix.offset == 0) {
       DecodeMsixLocked(address, pointer, &device->msix);
+    } else if (id == kPciCapabilityPowerManagement && device->pm_offset == 0 &&
+               pointer + kPciPmCapabilityBytes <= kPciConfigSpaceSize) {
+      device->pm_offset = pointer;
+    } else if (id == kPciCapabilityExpress && device->pcie_offset == 0 &&
+               pointer + kPciExpressDeviceControlOffset + 2 <=
+                   kPciConfigSpaceSize) {
+      device->pcie_offset = pointer;
     }
     pointer = (header >> 8) & kPciCapabilityPointerMask;
   }
@@ -419,9 +561,14 @@ static bool OffsetRangeInBar(const PciBar& bar,      //
 
 // Marks the MSI-X capability of `device` valid, with the physical ranges of its
 // table and PBA, if both lie inside usable memory BARs of the function and do
-// not overlap.
+// not overlap; otherwise invalid, without them.
 static void ValidateMsix(PciDevice* const device) {
   PciMsix& msix = device->msix;
+  msix.valid = false;
+  msix.table_phys = 0;
+  msix.table_bytes = 0;
+  msix.pba_phys = 0;
+  msix.pba_bytes = 0;
   if (msix.offset == 0) {
     return;
   }
@@ -450,6 +597,193 @@ static void ValidateMsix(PciDevice* const device) {
   msix.pba_bytes = pba_bytes;
 }
 
+// Whether `owner` may change the power state of function `index`: it owns it,
+// or `index` is a bridge between a function that it owns and that function's
+// root bus. Called with the PCI lock held.
+static bool MayManagePowerLocked(const int index, const uintptr_t owner) {
+  if (g_owners[index] == owner) {
+    return true;
+  }
+  if (g_devices[index].header_type != kPciHeaderTypeBridge) {
+    return false;
+  }
+  // A function behind a bridge always has a larger index than the bridge.
+  const int count = g_device_count.load(std::memory_order_relaxed);
+  for (int i = index + 1; i < count; ++i) {
+    if (g_owners[i] != owner) {
+      continue;
+    }
+    for (int bridge = g_devices[i].parent_index; bridge != kPciNoParent;
+         bridge = g_devices[bridge].parent_index) {
+      if (bridge == index) {
+        return true;
+      }
+    }
+  }
+  return false;
+}
+
+// Which PCI Express registers a function of Device/Port Type `type` has
+// [PCIe Base 6.0 §7.5.3], as Linux's pcie_capability_reg_implemented() decides:
+// the link registers belong to the functions at either end of a link (not to
+// Root Complex Integrated Endpoints and Event Collectors), the slot registers
+// to downstream ports with a slot, the root registers to Root Ports and Root
+// Complex Event Collectors.
+static bool PcieHasLinkRegisters(const int type) {
+  return type == kPcieTypeEndpoint || type == kPcieTypeLegacyEndpoint ||
+         type == kPcieTypeRootPort || type == kPcieTypeUpstreamPort ||
+         type == kPcieTypeDownstreamPort || type == kPcieTypePcieToPciBridge ||
+         type == kPcieTypePciToPcieBridge;
+}
+
+static bool PcieHasSlotRegisters(const int type, const uint16_t capabilities) {
+  return (type == kPcieTypeRootPort || type == kPcieTypeDownstreamPort ||
+          type == kPcieTypePcieToPciBridge) &&
+         (capabilities & kPciExpressSlotImplemented) != 0;
+}
+
+static bool PcieHasRootRegisters(const int type) {
+  return type == kPcieTypeRootPort ||
+         type == kPcieTypeRootComplexEventCollector;
+}
+
+// Whether the register at `offset` of `device` is one of a bridge's routing
+// registers (kPciBridgeRoutingRegisters).
+static bool IsBridgeRoutingRegister(const PciDevice& device, const int offset) {
+  return device.header_type == kPciHeaderTypeBridge &&
+         offset >= kPciBridgeRoutingStart && offset < kPciBridgeRoutingEnd;
+}
+
+// Saves the configuration of `device` that PciRestoreAfterPowerUp() writes
+// back after a reset (PciPowerUpContext), in ascending order of offset. Called
+// with the PCI lock held.
+static PciPowerUpContext SaveContextLocked(const PciDevice& device) {
+  const PciAddress address = device.address;
+  PciPowerUpContext context{};
+  context.saved = true;
+  context.command = Read16Locked(address, kPciCommandOffset);
+  const auto save = [&](const int offset, const int width) {
+    DCHECK(context.register_count < PciPowerUpContext::kMaxRegisters);
+    context.registers[context.register_count++] = {
+        .offset = offset,
+        .width = width,
+        .value = ReadWidthLocked(address, offset, width),
+    };
+  };
+  save(kPciCacheLineSizeOffset, 1);
+  save(kPciLatencyTimerOffset, 1);
+  if (device.header_type == kPciHeaderTypeBridge) {
+    for (const RegisterSpec& reg : kPciBridgeRoutingRegisters) {
+      save(reg.offset, reg.width);
+    }
+    save(kPciBridgeControlOffset, 2);
+    context.registers[context.register_count - 1].value &=
+        ~uint32_t{kPciBridgeControlSecondaryBusReset};
+  }
+  if (device.pcie_offset != 0) {
+    const int pcie = device.pcie_offset;
+    const uint16_t capabilities =
+        Read16Locked(address, pcie + kPciExpressCapabilitiesOffset);
+    const int version = capabilities & kPciExpressVersionMask;
+    const int type =
+        (capabilities >> kPciExpressTypeShift) & kPciExpressTypeMask;
+    const auto save_if_fits = [&](const int offset) {
+      if (pcie + offset + 2 <= kPciConfigSpaceSize) {
+        save(pcie + offset, 2);
+      }
+    };
+    save_if_fits(kPciExpressDeviceControlOffset);
+    if (PcieHasLinkRegisters(type)) {
+      save_if_fits(kPciExpressLinkControlOffset);
+    }
+    if (PcieHasSlotRegisters(type, capabilities)) {
+      save_if_fits(kPciExpressSlotControlOffset);
+    }
+    if (PcieHasRootRegisters(type)) {
+      save_if_fits(kPciExpressRootControlOffset);
+    }
+    if (version >= 2) {
+      save_if_fits(kPciExpressDeviceControl2Offset);
+    }
+  }
+  return context;
+}
+
+// Writes `reg` back to the function at `address` unless it holds that value.
+static void RestoreRegisterLocked(const PciAddress address,
+                                  const PciPowerUpContext::Register& reg) {
+  if (ReadWidthLocked(address, reg.offset, reg.width) != reg.value) {
+    WriteWidthLocked(address, reg.offset, reg.width, reg.value);
+  }
+}
+
+static bool SameBar(const PciBar& a, const PciBar& b) {
+  return a.type == b.type && a.prefetchable == b.prefetchable &&
+         a.base == b.base && a.size == b.size;
+}
+
+// Sizes the BARs of `device`, an endpoint in D0, again, and if they differ
+// from its record, corrects the record's BARs and MSI-X geometry. Returns
+// whether it did. Called with the PCI lock held.
+static bool ResizeBarsLocked(PciDevice* const device) {
+  PciBar bars[kPciMaxBars];
+  DecodeBarsLocked(device->address,         //
+                   kPciEndpointBarCount,    //
+                   /*size_assigned=*/true,  //
+                   bars);
+  bool same = true;
+  for (int i = 0; i < kPciMaxBars; ++i) {
+    same = same && SameBar(bars[i], device->bars[i]);
+  }
+  if (same) {
+    return false;
+  }
+  PciDevice corrected = *device;
+  for (int i = 0; i < kPciMaxBars; ++i) {
+    corrected.bars[i] = bars[i];
+  }
+  ValidateMsix(&corrected);
+  *device = corrected;
+  return true;
+}
+
+static bool IsUsbHostController(const PciDevice& device,
+                                const uint8_t prog_if) {
+  return device.class_code == kPciClassSerialBus &&
+         device.subclass == kPciSubclassUsb && device.prog_if == prog_if;
+}
+
+// Whether the device table holds an Intel EHCI controller.
+static bool IntelEhciExists() {
+  const int count = g_device_count.load(std::memory_order_acquire);
+  for (int i = 0; i < count; ++i) {
+    if (g_devices[i].vendor_id == kPciVendorIntel &&
+        IsUsbHostController(g_devices[i], kPciProgIfEhci)) {
+      return true;
+    }
+  }
+  return false;
+}
+
+// usb_enable_intel_xhci_ports() of Linux for the Intel xHCI `device`: routes
+// every switchable port to it, the SuperSpeed terminations first so that USB
+// 3.0 devices connect at SuperSpeed rather than at USB 2.0 speed, and returns
+// the routing as read back. Called with the PCI lock held.
+static PciClaimQuirks RouteIntelUsbPortsToXhciLocked(const PciDevice& device) {
+  const PciAddress address = device.address;
+  PciClaimQuirks result{};
+  Write32Locked(address,                //
+                kIntelUsb3PssenOffset,  //
+                Read32Locked(address, kIntelUsb3prmOffset));
+  result.usb3_ports = Read32Locked(address, kIntelUsb3PssenOffset);
+  Write32Locked(address,              //
+                kIntelXusb2prOffset,  //
+                Read32Locked(address, kIntelXusb2prmOffset));
+  result.usb2_ports = Read32Locked(address, kIntelXusb2prOffset);
+  result.intel_usb_ports_routed = true;
+  return result;
+}
+
 static bool IsPresent(const uint16_t vendor_id) {
   return vendor_id != kPciVendorIdAbsent && vendor_id != kPciVendorIdZero &&
          vendor_id != kPciVendorIdRetry;
@@ -463,6 +797,53 @@ static uint8_t ReadConfig8(const PciAddress address, const int offset) {
 static uint16_t ReadVendorId(const PciAddress address) {
   const IrqSpinLockGuard guard(g_pci_lock);
   return Read16Locked(address, kPciVendorIdOffset);
+}
+
+// Whether `device` has a Power Management capability whose power state is not
+// D0 (and the function answers). Called with the PCI lock held.
+static bool InLowPowerStateLocked(const PciDevice& device) {
+  if (device.pm_offset == 0) {
+    return false;
+  }
+  const uint16_t pmcsr = Read16Locked(
+      device.address, device.pm_offset + kPciPmControlStatusOffset);
+  return pmcsr != 0xFFFF && (pmcsr & kPciPmcsrPowerStateMask) != 0;
+}
+
+// Whether `device` or any bridge between it and its root bus is in D1, D2 or
+// D3hot. The highest sleeping bridge on the path is on a reachable bus, so
+// walking up `parent_index` finds it even when functions below it read 0xFFFF.
+// Called with the PCI lock held.
+static bool PathInLowPowerLocked(const PciDevice& device) {
+  if (InLowPowerStateLocked(device)) {
+    return true;
+  }
+  for (int bridge = device.parent_index; bridge != kPciNoParent;
+       bridge = g_devices[bridge].parent_index) {
+    if (InLowPowerStateLocked(g_devices[bridge])) {
+      return true;
+    }
+  }
+  return false;
+}
+
+// Turns off MSI and MSI-X on `device` if either is on: the new owner's
+// irq_alloc enables MSI or MSI-X, never both, because with both on the
+// function's behavior is undefined [PCI Local Bus 3.0 §6.8]. Called with the
+// PCI lock held.
+static void DisableMsiAndMsixLocked(const PciDevice& device) {
+  if (device.msix.offset != 0) {
+    Update16Locked(device.address,                             //
+                   device.msix.offset + kPciMsiControlOffset,  //
+                   0,                                          //
+                   kPciMsixControlEnable);
+  }
+  if (device.msi.offset != 0) {
+    Update16Locked(device.address,                            //
+                   device.msi.offset + kPciMsiControlOffset,  //
+                   0,                                         //
+                   kPciMsiControlEnable);
+  }
 }
 
 // Records the present function at `address`, on a bus that the bridge with
@@ -481,6 +862,7 @@ static int RecordFunction(const PciAddress address,  //
   device.address = address;
   device.parent_index = parent_index;
   device.multi_function = multi_function;
+  bool sized_in_low_power = false;
   {
     const IrqSpinLockGuard guard(g_pci_lock);
     const uint32_t ids = Read32Locked(address, kPciVendorIdOffset);
@@ -503,6 +885,7 @@ static int RecordFunction(const PciAddress address,  //
                        device.claimable,      //
                        device.bars);
       ParseCapabilitiesLocked(address, &device);
+      sized_in_low_power = device.claimable && InLowPowerStateLocked(device);
     } else if (device.header_type == kPciHeaderTypeBridge) {
       DecodeBarsLocked(address,                  //
                        kPciBridgeBarCount,       //
@@ -515,6 +898,7 @@ static int RecordFunction(const PciAddress address,  //
   }
   ValidateMsix(&device);
   g_devices[index] = device;
+  g_sized_in_low_power[index] = sized_in_low_power;
   g_device_count.store(index + 1, std::memory_order_release);
   return index;
 }
@@ -736,6 +1120,14 @@ const PciDevice* PciGetDevice(const int index) {
   return IsValidIndex(index) ? &g_devices[index] : nullptr;
 }
 
+StatusOr<PciDevice> PciCopyDevice(const int index) {
+  if (!IsValidIndex(index)) {
+    return kStatusError;
+  }
+  const IrqSpinLockGuard guard(g_pci_lock);
+  return g_devices[index];
+}
+
 int PciFindDevice(const PciAddress address) {
   const int count = PciDeviceCount();
   for (int index = 0; index < count; ++index) {
@@ -845,11 +1237,20 @@ PciStatus PciClaim(const int index, const uintptr_t owner) {
   }
   g_owners[index] = owner;
   ++g_claimed_count;
-  SetUpstreamBridgeCommandLocked(device, kPciCommandMemorySpace);
-  Update16Locked(device.address,                                        //
-                 kPciCommandOffset,                                     //
-                 kPciCommandMemorySpace | kPciCommandInterruptDisable,  //
-                 0);
+  // If the function or a bridge above it is in D1, D2 or D3hot, leave the
+  // configuration writes to PciRestoreAfterPowerUp() once the path is in D0.
+  if (!PathInLowPowerLocked(device)) {
+    // Enable Bus Master as well as Memory Space on upstream bridges (as Linux's
+    // pci_enable_bridge() does) so USB4/Thunderbolt tunnels forward BAR read
+    // completions before the driver enables Bus Master on the endpoint itself.
+    SetUpstreamBridgeCommandLocked(
+        device, kPciCommandMemorySpace | kPciCommandBusMaster);
+    Update16Locked(device.address,                                        //
+                   kPciCommandOffset,                                     //
+                   kPciCommandMemorySpace | kPciCommandInterruptDisable,  //
+                   0);
+    DisableMsiAndMsixLocked(device);
+  }
   return PciStatus::kOk;
 }
 
@@ -915,6 +1316,166 @@ PciStatus PciSetBusMaster(const int index,        //
   return PciStatus::kOk;
 }
 
+StatusOr<PciPowerTransition, PciStatus> PciSetPowerStateD0(
+    const int index, const uintptr_t owner, const bool save_context) {
+  CHECK(owner != kPciNoOwner);
+  if (!IsValidIndex(index)) {
+    return PciStatus::kNoDevice;
+  }
+  const PciDevice& device = g_devices[index];
+  const IrqSpinLockGuard guard(g_pci_lock);
+  if (!MayManagePowerLocked(index, owner)) {
+    return PciStatus::kNotOwner;
+  }
+  PciPowerTransition transition{};
+  if (device.pm_offset == 0) {
+    return transition;
+  }
+  const int offset = device.pm_offset + kPciPmControlStatusOffset;
+  const uint16_t pmcsr = Read16Locked(device.address, offset);
+  const uint16_t state = pmcsr & kPciPmcsrPowerStateMask;
+  // All ones: the function doesn't answer at all.
+  if (state == 0 || pmcsr == 0xFFFF) {
+    return transition;
+  }
+  // A function keeps its configuration in D1, D2 and D3hot; the transition to
+  // D0 may reset it.
+  if (save_context) {
+    transition.context = SaveContextLocked(device);
+  }
+  // PME_Status is write-1-to-clear: writing it as 0 leaves it as it is.
+  Write16Locked(device.address,  //
+                offset,          //
+                static_cast<uint16_t>(
+                    pmcsr & ~(kPciPmcsrPowerStateMask | kPciPmcsrPmeStatus)));
+  transition.from = static_cast<PciPowerState>(state);
+  return transition;
+}
+
+int64_t PciPowerUpDelayMicroseconds(const PciPowerState from) {
+  switch (from) {
+    case PciPowerState::kD3hot:
+      return 10000;
+    case PciPowerState::kD2:
+      return 200;
+    case PciPowerState::kD0:
+    case PciPowerState::kD1:
+      break;
+  }
+  return 0;
+}
+
+bool PciFunctionResponds(const int index) {
+  const PciAddress address = CheckedAddress(index);
+  const IrqSpinLockGuard guard(g_pci_lock);
+  return Read32Locked(address, kPciCommandOffset) != 0xFFFFFFFFu;
+}
+
+StatusOr<bool, PciStatus> PciRestoreAfterPowerUp(
+    const int index, const uintptr_t owner,
+    const PciPowerUpContext* const context) {
+  CHECK(owner != kPciNoOwner);
+  if (!IsValidIndex(index)) {
+    return PciStatus::kNoDevice;
+  }
+  PciDevice& device = g_devices[index];
+  const PciAddress address = device.address;
+  const bool saved = context != nullptr && context->saved;
+  const int saved_count = saved ? context->register_count : 0;
+  DCHECK(saved_count >= 0 && saved_count <= PciPowerUpContext::kMaxRegisters);
+  const IrqSpinLockGuard guard(g_pci_lock);
+  if (!MayManagePowerLocked(index, owner)) {
+    return PciStatus::kNotOwner;
+  }
+  // From the top of the configuration space down, as Linux's
+  // pci_restore_state() does, and Command last: first the PCI Express
+  // registers and Bridge Control.
+  for (int i = saved_count - 1; i >= 0; --i) {
+    if (context->registers[i].offset >= kPciBridgeRoutingEnd) {
+      RestoreRegisterLocked(address, context->registers[i]);
+    }
+  }
+  // Then the BARs and a bridge's routing registers, with the function's
+  // decoding (and Bus Master) off while any of them is written, so that no
+  // half-written address range is ever decoded.
+  bool routing_intact = true;
+  for (int i = 0; i < saved_count; ++i) {
+    const PciPowerUpContext::Register& reg = context->registers[i];
+    if (IsBridgeRoutingRegister(device, reg.offset) &&
+        ReadWidthLocked(address, reg.offset, reg.width) != reg.value) {
+      routing_intact = false;
+    }
+  }
+  if (!routing_intact || !BarsIntactLocked(device)) {
+    Update16Locked(address,            //
+                   kPciCommandOffset,  //
+                   0,                  //
+                   kPciCommandDecode | kPciCommandBusMaster);
+    for (int i = saved_count - 1; i >= 0; --i) {
+      if (IsBridgeRoutingRegister(device, context->registers[i].offset)) {
+        RestoreRegisterLocked(address, context->registers[i]);
+      }
+    }
+    RestoreBarsLocked(device);
+  }
+  bool resized = false;
+  const bool owned = g_owners[index] == owner;
+  if (owned && g_sized_in_low_power[index] &&
+      Read32Locked(address, kPciCommandOffset) != 0xFFFFFFFFu) {
+    g_sized_in_low_power[index] = false;
+    resized = ResizeBarsLocked(&device);
+  }
+  // Cache Line Size and Latency Timer.
+  for (int i = saved_count - 1; i >= 0; --i) {
+    if (context->registers[i].offset < kPciBar0Offset) {
+      RestoreRegisterLocked(address, context->registers[i]);
+    }
+  }
+  if (owned) {
+    SetUpstreamBridgeCommandLocked(
+        device, kPciCommandMemorySpace | kPciCommandBusMaster);
+    DisableMsiAndMsixLocked(device);
+    const uint16_t saved_command =
+        saved ? static_cast<uint16_t>(context->command & ~kPciCommandBusMaster)
+              : 0;
+    Update16Locked(
+        address,            //
+        kPciCommandOffset,  //
+        static_cast<uint16_t>(saved_command | kPciCommandMemorySpace |
+                              kPciCommandInterruptDisable),
+        0);
+  } else if (saved) {
+    Update16Locked(address, kPciCommandOffset, context->command, 0);
+  }
+  return resized;
+}
+
+StatusOr<PciClaimQuirks, PciStatus> PciApplyClaimQuirks(const int index,
+                                                        const uintptr_t owner) {
+  CHECK(owner != kPciNoOwner);
+  if (!IsValidIndex(index)) {
+    return PciStatus::kNoDevice;
+  }
+  const PciDevice& device = g_devices[index];
+  const IrqSpinLockGuard guard(g_pci_lock);
+  if (g_owners[index] != owner) {
+    return PciStatus::kNotOwner;
+  }
+  PciClaimQuirks result{};
+  if (device.vendor_id == kPciVendorIntel &&
+      IsUsbHostController(device, kPciProgIfXhci) && IntelEhciExists()) {
+    const bool sony_vaio_t_series =
+        Read16Locked(device.address, kPciSubsystemVendorIdOffset) ==
+            kPciVendorSony &&
+        Read16Locked(device.address, kPciSubsystemIdOffset) ==
+            kSonyVaioTSeriesSubsystemId;
+    if (!sony_vaio_t_series) {
+      result = RouteIntelUsbPortsToXhciLocked(device);
+    }
+  }
+  return result;
+}
+
 PciQuiesceResult PciQuiesce(const int index) {
   CHECK(IsValidIndex(index));
   const IrqSpinLockGuard guard(g_pci_lock);
@@ -939,6 +1500,9 @@ void PciResetForTest() {
     const IrqSpinLockGuard guard(g_pci_lock);
     for (uintptr_t& owner : g_owners) {
       owner = kPciNoOwner;
+    }
+    for (bool& sized_in_low_power : g_sized_in_low_power) {
+      sized_in_low_power = false;
     }
     g_claimed_count = 0;
     g_device_count.store(0, std::memory_order_release);

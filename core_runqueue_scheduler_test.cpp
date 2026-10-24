@@ -28,6 +28,10 @@ namespace {
 
 namespace t = ::testing;
 
+// The comments give vruntime values relative to the `min_vruntime` that every
+// CPU starts with, which the core puts just below the 2^64 wrap of vruntime
+// (see VruntimeOrderHoldsAcrossTheWrapAround).
+
 // Returns the length of the longest run of consecutive `id` entries in `trace`.
 static int MaxConsecutiveRun(const std::vector<int>& trace, const int id) {
   int longest = 0;
@@ -538,6 +542,60 @@ TEST(CoreRunqueueSchedulerTest,
   }
   EXPECT_THAT(high_finish_pos, t::Lt(med_finish_pos));
   EXPECT_THAT(med_finish_pos, t::Lt(low_finish_pos));
+
+  EXPECT_THAT(PmmFreeFrameCount(), t::Eq(pmm_before));
+  EXPECT_THAT(HeapTotalFreeBytes(), t::Eq(heap_before));
+}
+
+struct WrapAroundCtx {
+  TaskScheduler* sched = nullptr;
+  std::vector<int> dispatch_order;
+};
+
+struct WrapAroundTaskArg {
+  WrapAroundCtx* ctx = nullptr;
+  int id = 0;
+  int slices = 0;
+};
+
+static void WrapAroundWorker(void* const raw_arg) {
+  const WrapAroundTaskArg* const arg =
+      static_cast<const WrapAroundTaskArg*>(raw_arg);
+  for (int i = 0; i < arg->slices; ++i) {
+    arg->ctx->dispatch_order.push_back(arg->id);
+    arg->ctx->sched->Yield();
+  }
+}
+
+// The core keeps vruntime modulo 2^64 and starts every CPU a few
+// default-weight charges below the wrap, so a weight-1 task's first slice
+// (2^20) takes it past the wrap at once, and a default-weight one (1024 per
+// slice) follows a few slices later. Tasks must still run in the order of how
+// far they got, not of the wrapped values: after one slice each, the
+// default-weight task is 2^20 - 1024 behind, so it runs all its 8 slices
+// before the weight-1 task runs again.
+TEST(CoreRunqueueSchedulerTest, VruntimeOrderHoldsAcrossTheWrapAround) {
+  SetupEnv(1);
+  const int64_t pmm_before = PmmFreeFrameCount();
+  const int64_t heap_before = HeapTotalFreeBytes();
+
+  const std::shared_ptr<TaskScheduler> core = CreateCoreRunqueueScheduler();
+  TaskSchedulerInternals::Init(*core);
+
+  WrapAroundCtx ctx;
+  ctx.sched = core.get();
+  WrapAroundTaskArg light_arg{&ctx, /*id=*/1, /*slices=*/2};
+  WrapAroundTaskArg normal_arg{&ctx, /*id=*/2, /*slices=*/8};
+  Task* const light =
+      core->CreateTask(WrapAroundWorker, &light_arg, kMinTaskWeight);
+  Task* const normal =
+      core->CreateTask(WrapAroundWorker, &normal_arg, kDefaultTaskWeight);
+  ASSERT_THAT(light, t::NotNull());
+  ASSERT_THAT(normal, t::NotNull());
+  core->Join(light);
+  core->Join(normal);
+
+  EXPECT_THAT(ctx.dispatch_order, t::ElementsAre(1, 2, 2, 2, 2, 2, 2, 2, 2, 1));
 
   EXPECT_THAT(PmmFreeFrameCount(), t::Eq(pmm_before));
   EXPECT_THAT(HeapTotalFreeBytes(), t::Eq(heap_before));

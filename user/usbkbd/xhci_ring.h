@@ -1,11 +1,13 @@
-#ifndef PROTOS_USER_XHCI_RING_H_
-#define PROTOS_USER_XHCI_RING_H_
+#ifndef PROTOS_USER_USBKBD_XHCI_RING_H_
+#define PROTOS_USER_USBKBD_XHCI_RING_H_
 
 // Freestanding xHCI Transfer Request Block (TRB) definitions, single-segment
 // ProducerRing (Command, EP0, Interrupt IN), and single-segment EventRing
 // consumer (xHCI 1.2 sections 4.9 and 6.4).
 
 #include <cstdint>
+
+#include "status_or.h"
 
 namespace protos::usb {
 
@@ -214,6 +216,11 @@ constexpr Trb MakeSetTrDequeueTrb(const uint64_t new_deq_phys_with_dcs,  //
   };
 }
 
+// No Op Command (xHCI 6.4.3.1): completes with Success and does nothing.
+constexpr Trb MakeNoOpCommandTrb() {
+  return Trb{0, 0, 0, static_cast<uint32_t>(kTrbNoOpCmd) << kTrbTypeShift};
+}
+
 // Transfer TRB builders (xHCI 6.4.1.1 - 6.4.1.2).
 constexpr Trb MakeSetupStageTrb(const uint8_t bm_request_type,  //
                                 const uint8_t b_request,        //
@@ -369,6 +376,22 @@ class ProducerRing {
     DmaBarrier();
   }
 
+  // Replaces the enqueued TRB at `trb_phys`, keeping its cycle bit, with
+  // `trb`: e.g. an aborted command with a No Op once the Command Ring has
+  // stopped (xHCI 4.6.1.2), so that the consumer never acts on it. Returns
+  // false if `trb_phys` is not a TRB slot of this ring (or is its Link TRB).
+  bool Rewrite(const uint64_t trb_phys, const Trb& trb) {
+    if (base_ == nullptr || trb_phys < phys_ ||
+        ((trb_phys - phys_) & 0xF) != 0 ||
+        trb_phys - phys_ >= static_cast<uint64_t>(Capacity - 1) * sizeof(Trb)) {
+      return false;
+    }
+    Trb* const dst = &base_[(trb_phys - phys_) / sizeof(Trb)];
+    const uint32_t cycle = ring_internal::ReadVolatile32(&dst->dw3) & kTrbCycle;
+    ring_internal::WriteTrbWithCycle(dst, trb, cycle);
+    return true;
+  }
+
   uint64_t phys() const { return phys_; }
   int enqueue_index() const { return enqueue_; }
   uint32_t cycle() const { return cycle_; }
@@ -438,23 +461,24 @@ class EventRing {
     return (dw3 & kTrbCycle) == cycle_;
   }
 
-  bool Pop(Trb* const out) {
+  StatusOr<Trb> Pop() {
     const Trb& slot = base_[dequeue_];
     const uint32_t dw3 = ring_internal::ReadVolatile32(&slot.dw3);
     if ((dw3 & kTrbCycle) != cycle_) {
-      return false;
+      return kStatusError;
     }
     DmaBarrier();
-    out->dw0 = ring_internal::ReadVolatile32(&slot.dw0);
-    out->dw1 = ring_internal::ReadVolatile32(&slot.dw1);
-    out->dw2 = ring_internal::ReadVolatile32(&slot.dw2);
-    out->dw3 = dw3;
+    Trb out{};
+    out.dw0 = ring_internal::ReadVolatile32(&slot.dw0);
+    out.dw1 = ring_internal::ReadVolatile32(&slot.dw1);
+    out.dw2 = ring_internal::ReadVolatile32(&slot.dw2);
+    out.dw3 = dw3;
     ++dequeue_;
     if (dequeue_ == Capacity) {
       dequeue_ = 0;
       cycle_ ^= 1u;
     }
-    return true;
+    return out;
   }
 
   uint64_t seg_phys() const { return seg_phys_; }
@@ -476,4 +500,4 @@ class EventRing {
 
 }  // namespace protos::usb
 
-#endif  // PROTOS_USER_XHCI_RING_H_
+#endif  // PROTOS_USER_USBKBD_XHCI_RING_H_

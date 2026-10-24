@@ -1,12 +1,13 @@
-#ifndef PROTOS_USER_SH_LIB_H_
-#define PROTOS_USER_SH_LIB_H_
+#ifndef PROTOS_USER_SH_SH_LIB_H_
+#define PROTOS_USER_SH_SH_LIB_H_
 
 #include <cstdint>
 
+#include "status_or.h"
 #include "syscall_abi.h"
 
 // Freestanding line editor, command parser, and command dispatcher for the
-// user-space shell (user/sh.cpp). Parameterized over a callback environment
+// user-space shell (user/sh/sh.cpp). Parameterized over a callback environment
 // (`ShellEnv`) so host unit tests (syscall_abi_test.cpp) can exercise the
 // exact shell implementation directly.
 
@@ -111,12 +112,11 @@ inline bool TokenEquals(const ShellToken& token, const char* const literal) {
   return i == token.length && literal[i] == '\0';
 }
 
-inline int TokenizeLine(const char* const line,  //
-                        const int line_length,   //
-                        ShellCommand* const out) {
-  out->token_count = 0;
+inline ShellCommand TokenizeLine(const char* const line,
+                                 const int line_length) {
+  ShellCommand out{};
   if (line == nullptr || line_length <= 0) {
-    return 0;
+    return out;
   }
   int i = 0;
   while (i < line_length) {
@@ -130,20 +130,20 @@ inline int TokenizeLine(const char* const line,  //
     while (i < line_length && line[i] != ' ' && line[i] != '\t') {
       ++i;
     }
-    if (out->token_count < kShellMaxTokens) {
-      out->tokens[out->token_count].ptr = line + start;
-      out->tokens[out->token_count].length = i - start;
-      ++out->token_count;
+    if (out.token_count < kShellMaxTokens) {
+      out.tokens[out.token_count].ptr = line + start;
+      out.tokens[out.token_count].length = i - start;
+      ++out.token_count;
     }
   }
-  return out->token_count;
+  return out;
 }
 
 // Parses a signed 64-bit integer in decimal or 0x-prefixed hexadecimal from
 // `token` without signed overflow undefined behavior.
-inline bool ParseInt64(const ShellToken& token, int64_t* const out) {
-  if (token.ptr == nullptr || token.length <= 0 || out == nullptr) {
-    return false;
+inline StatusOr<int64_t> ParseInt64(const ShellToken& token) {
+  if (token.ptr == nullptr || token.length <= 0) {
+    return kStatusError;
   }
   int index = 0;
   bool negative = false;
@@ -154,7 +154,7 @@ inline bool ParseInt64(const ShellToken& token, int64_t* const out) {
     index = 1;
   }
   if (index >= token.length) {
-    return false;
+    return kStatusError;
   }
   uint64_t base = 10;
   if (index + 2 <= token.length && token.ptr[index] == '0' &&
@@ -162,7 +162,7 @@ inline bool ParseInt64(const ShellToken& token, int64_t* const out) {
     base = 16;
     index += 2;
     if (index >= token.length) {
-      return false;
+      return kStatusError;
     }
   }
   uint64_t value = 0;
@@ -176,10 +176,10 @@ inline bool ParseInt64(const ShellToken& token, int64_t* const out) {
     } else if (base == 16 && ch >= 'A' && ch <= 'F') {
       digit = static_cast<uint64_t>(10 + (ch - 'A'));
     } else {
-      return false;
+      return kStatusError;
     }
     if (value > (UINT64_MAX - digit) / base) {
-      return false;
+      return kStatusError;
     }
     value = value * base + digit;
   }
@@ -187,45 +187,38 @@ inline bool ParseInt64(const ShellToken& token, int64_t* const out) {
     constexpr uint64_t kMaxNegativeMagnitude =
         static_cast<uint64_t>(INT64_MAX) + 1ULL;
     if (value > kMaxNegativeMagnitude) {
-      return false;
+      return kStatusError;
     }
-    *out = (value == kMaxNegativeMagnitude) ? INT64_MIN
+    return (value == kMaxNegativeMagnitude) ? INT64_MIN
                                             : -static_cast<int64_t>(value);
-  } else {
-    if (value > static_cast<uint64_t>(INT64_MAX)) {
-      return false;
-    }
-    *out = static_cast<int64_t>(value);
   }
-  return true;
+  if (value > static_cast<uint64_t>(INT64_MAX)) {
+    return kStatusError;
+  }
+  return static_cast<int64_t>(value);
 }
 
 // Parses a program argument token: either an integer or a named `usertest`
 // mode alias ("exit" -> 0, "syscalls" -> 1, "fault" / "ud2" -> 6,
 // "buffers" -> 16).
-inline bool ParseProgramArg(const ShellToken& token, uint64_t* const out) {
-  int64_t parsed = 0;
-  if (ParseInt64(token, &parsed)) {
-    *out = static_cast<uint64_t>(parsed);
-    return true;
+inline StatusOr<uint64_t> ParseProgramArg(const ShellToken& token) {
+  const StatusOr<int64_t> parsed = ParseInt64(token);
+  if (parsed.ok()) {
+    return static_cast<uint64_t>(*parsed);
   }
   if (TokenEquals(token, "exit")) {
-    *out = 0;
-    return true;
+    return uint64_t{0};
   }
   if (TokenEquals(token, "syscalls")) {
-    *out = 1;
-    return true;
+    return uint64_t{1};
   }
   if (TokenEquals(token, "fault") || TokenEquals(token, "ud2")) {
-    *out = 6;
-    return true;
+    return uint64_t{6};
   }
   if (TokenEquals(token, "buffers")) {
-    *out = 16;
-    return true;
+    return uint64_t{16};
   }
-  return false;
+  return kStatusError;
 }
 
 inline bool IsKnownUserProgram(const ShellToken& token) {
@@ -303,7 +296,7 @@ struct ShellEnv {
   int (*get_cpu)(void* ctx) = nullptr;
   int64_t (*spawn)(void* ctx, const char* name, int64_t name_len,
                    uint64_t arg) = nullptr;
-  int64_t (*wait)(void* ctx, int64_t pid, UserProgramResult* result) = nullptr;
+  StatusOr<UserProgramResult> (*wait)(void* ctx, int64_t pid) = nullptr;
 };
 
 inline void WriteStr(const ShellEnv& env, const char* const text) {
@@ -319,15 +312,14 @@ inline void WriteBuf(const ShellEnv& env, const ShellOutBuffer& buf) {
   }
 }
 
-// Executes a single parsed command line. Returns true if the shell should exit
-// with `*exit_status`, or false to continue the REPL loop.
-inline bool ExecuteLine(const ShellEnv& env,     //
-                        const char* const line,  //
-                        const int line_length,   //
-                        int64_t* const exit_status) {
-  ShellCommand cmd;
-  if (TokenizeLine(line, line_length, &cmd) == 0) {
-    return false;
+// Executes a single parsed command line. Returns the exit status if the shell
+// should exit, or `kStatusError` to continue the REPL loop.
+inline StatusOr<int64_t> ExecuteLine(const ShellEnv& env,     //
+                                     const char* const line,  //
+                                     const int line_length) {
+  const ShellCommand cmd = TokenizeLine(line, line_length);
+  if (cmd.token_count == 0) {
+    return kStatusError;
   }
   const ShellToken& first = cmd.tokens[0];
 
@@ -335,7 +327,7 @@ inline bool ExecuteLine(const ShellEnv& env,     //
     WriteStr(env,
              "built-in commands: help echo cpu programs run exit\n"
              "user programs: init sh usertest\n");
-    return false;
+    return kStatusError;
   }
 
   if (TokenEquals(first, "echo")) {
@@ -348,7 +340,7 @@ inline bool ExecuteLine(const ShellEnv& env,     //
     }
     out.AppendChar('\n');
     WriteBuf(env, out);
-    return false;
+    return kStatusError;
   }
 
   if (TokenEquals(first, "cpu")) {
@@ -358,26 +350,26 @@ inline bool ExecuteLine(const ShellEnv& env,     //
     out.AppendInt64Dec(cpu);
     out.AppendChar('\n');
     WriteBuf(env, out);
-    return false;
+    return kStatusError;
   }
 
   if (TokenEquals(first, "programs")) {
     WriteStr(env, "programs: init sh usertest\n");
-    return false;
+    return kStatusError;
   }
 
   if (TokenEquals(first, "exit")) {
     if (cmd.token_count == 1) {
-      *exit_status = 0;
-      return true;
+      return int64_t{0};
     }
-    int64_t parsed_status = 0;
-    if (cmd.token_count == 2 && ParseInt64(cmd.tokens[1], &parsed_status)) {
-      *exit_status = parsed_status;
-      return true;
+    if (cmd.token_count == 2) {
+      const StatusOr<int64_t> parsed_status = ParseInt64(cmd.tokens[1]);
+      if (parsed_status.ok()) {
+        return *parsed_status;
+      }
     }
     WriteStr(env, "sh: invalid exit status\n");
-    return false;
+    return kStatusError;
   }
 
   ShellToken prog_token;
@@ -385,34 +377,42 @@ inline bool ExecuteLine(const ShellEnv& env,     //
   if (TokenEquals(first, "run")) {
     if (cmd.token_count < 2) {
       WriteStr(env, "sh: usage: run <program> [arg]\n");
-      return false;
+      return kStatusError;
     }
     if (cmd.token_count > 3) {
       WriteStr(env, "sh: too many arguments\n");
-      return false;
+      return kStatusError;
     }
     prog_token = cmd.tokens[1];
-    if (cmd.token_count == 3 && !ParseProgramArg(cmd.tokens[2], &prog_arg)) {
-      ShellOutBuffer err;
-      err.AppendStr("sh: invalid argument: ");
-      err.AppendBytes(cmd.tokens[2].ptr, cmd.tokens[2].length);
-      err.AppendChar('\n');
-      WriteBuf(env, err);
-      return false;
+    if (cmd.token_count == 3) {
+      const StatusOr<uint64_t> parsed_arg = ParseProgramArg(cmd.tokens[2]);
+      if (!parsed_arg.ok()) {
+        ShellOutBuffer err;
+        err.AppendStr("sh: invalid argument: ");
+        err.AppendBytes(cmd.tokens[2].ptr, cmd.tokens[2].length);
+        err.AppendChar('\n');
+        WriteBuf(env, err);
+        return kStatusError;
+      }
+      prog_arg = *parsed_arg;
     }
   } else if (IsKnownUserProgram(first)) {
     if (cmd.token_count > 2) {
       WriteStr(env, "sh: too many arguments\n");
-      return false;
+      return kStatusError;
     }
     prog_token = first;
-    if (cmd.token_count == 2 && !ParseProgramArg(cmd.tokens[1], &prog_arg)) {
-      ShellOutBuffer err;
-      err.AppendStr("sh: invalid argument: ");
-      err.AppendBytes(cmd.tokens[1].ptr, cmd.tokens[1].length);
-      err.AppendChar('\n');
-      WriteBuf(env, err);
-      return false;
+    if (cmd.token_count == 2) {
+      const StatusOr<uint64_t> parsed_arg = ParseProgramArg(cmd.tokens[1]);
+      if (!parsed_arg.ok()) {
+        ShellOutBuffer err;
+        err.AppendStr("sh: invalid argument: ");
+        err.AppendBytes(cmd.tokens[1].ptr, cmd.tokens[1].length);
+        err.AppendChar('\n');
+        WriteBuf(env, err);
+        return kStatusError;
+      }
+      prog_arg = *parsed_arg;
     }
   } else {
     ShellOutBuffer err;
@@ -420,12 +420,12 @@ inline bool ExecuteLine(const ShellEnv& env,     //
     err.AppendBytes(first.ptr, first.length);
     err.AppendChar('\n');
     WriteBuf(env, err);
-    return false;
+    return kStatusError;
   }
 
   if (env.spawn == nullptr || env.wait == nullptr) {
     WriteStr(env, "sh: spawn unavailable\n");
-    return false;
+    return kStatusError;
   }
   const int64_t pid =
       env.spawn(env.ctx, prog_token.ptr, prog_token.length, prog_arg);
@@ -435,29 +435,28 @@ inline bool ExecuteLine(const ShellEnv& env,     //
     err.AppendBytes(prog_token.ptr, prog_token.length);
     err.AppendChar('\n');
     WriteBuf(env, err);
-    return false;
+    return kStatusError;
   }
 
-  UserProgramResult result;
-  const int64_t wait_rc = env.wait(env.ctx, pid, &result);
-  if (wait_rc < 0) {
+  const StatusOr<UserProgramResult> result = env.wait(env.ctx, pid);
+  if (!result.ok()) {
     WriteStr(env, "sh: wait error\n");
-    return false;
+    return kStatusError;
   }
 
   ShellOutBuffer report;
   report.AppendStr("sh: ");
   report.AppendBytes(prog_token.ptr, prog_token.length);
-  switch (result.outcome) {
+  switch (result->outcome) {
     case UserProgramOutcome::kExited:
       report.AppendStr(" exited with status ");
-      report.AppendInt64Dec(result.exit_status);
+      report.AppendInt64Dec(result->exit_status);
       break;
     case UserProgramOutcome::kFaulted:
       report.AppendStr(" faulted vector=");
-      report.AppendInt64Dec(result.fault_vector);
+      report.AppendInt64Dec(result->fault_vector);
       report.AppendStr(" error=");
-      report.AppendHex64(result.fault_error_code);
+      report.AppendHex64(result->fault_error_code);
       break;
     case UserProgramOutcome::kKilled:
       report.AppendStr(" killed");
@@ -468,14 +467,13 @@ inline bool ExecuteLine(const ShellEnv& env,     //
   }
   report.AppendChar('\n');
   WriteBuf(env, report);
-  return false;
+  return kStatusError;
 }
 
 // Runs the interactive Read-Eval-Print Loop until `exit` is executed or `read`
 // returns <= 0 (EOF).
 inline int64_t RunShell(const ShellEnv& env) {
   ShellLineEditor editor;
-  int64_t exit_status = 0;
   WriteStr(env, kShellPrompt);
 
   for (;;) {
@@ -484,9 +482,13 @@ inline int64_t RunShell(const ShellEnv& env) {
     if (n <= 0) {
       if (editor.length > 0) {
         WriteStr(env, "\n");
-        (void)ExecuteLine(env, editor.buffer, editor.length, &exit_status);
+        const StatusOr<int64_t> exit_status =
+            ExecuteLine(env, editor.buffer, editor.length);
+        if (exit_status.ok()) {
+          return *exit_status;
+        }
       }
-      return exit_status;
+      return 0;
     }
 
     const ShellCharAction action = editor.FeedChar(&ch);
@@ -504,11 +506,11 @@ inline int64_t RunShell(const ShellEnv& env) {
         break;
       case ShellCharAction::kSubmitLine: {
         WriteStr(env, "\n");
-        const bool should_exit =
-            ExecuteLine(env, editor.buffer, editor.length, &exit_status);
+        const StatusOr<int64_t> exit_status =
+            ExecuteLine(env, editor.buffer, editor.length);
         editor.ResetLine();
-        if (should_exit) {
-          return exit_status;
+        if (exit_status.ok()) {
+          return *exit_status;
         }
         WriteStr(env, kShellPrompt);
         break;
@@ -519,4 +521,4 @@ inline int64_t RunShell(const ShellEnv& env) {
 
 }  // namespace protos::sh
 
-#endif  // PROTOS_USER_SH_LIB_H_
+#endif  // PROTOS_USER_SH_SH_LIB_H_

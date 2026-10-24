@@ -80,6 +80,136 @@ static bool TryMergeRegions(MemoryRegion* const dst, const MemoryRegion& src) {
   return true;
 }
 
+// Maps the fixed part of the Multiboot1 boot information at `info_phys`
+// (below `max_physical_addr`) and returns it, or nullptr if it reaches past
+// `max_physical_addr` or cannot be mapped.
+static const Multiboot1Info* MapMultiboot1Info(
+    const uintptr_t info_phys, const uintptr_t max_physical_addr) {
+  constexpr int64_t kInfoSize = sizeof(Multiboot1Info);
+  if ((max_physical_addr - info_phys) < kInfoSize ||
+      !PagingMapBootstrapRange(info_phys, kInfoSize)) {
+    return nullptr;
+  }
+  return reinterpret_cast<const Multiboot1Info*>(info_phys);
+}
+
+// Size of the Multiboot1 boot information up to the end of its framebuffer
+// fields, its last fields.
+constexpr int64_t kMultiboot1InfoWithFramebufferSize =
+    kMultiboot1FramebufferInfoOffset + sizeof(Multiboot1FramebufferInfo);
+
+// Maps the Multiboot1 boot information at `info_phys` (below
+// `max_physical_addr`) up to the end of its framebuffer fields and returns
+// those, or nullptr if they reach past `max_physical_addr` or cannot be mapped.
+static const Multiboot1FramebufferInfo* MapMultiboot1FramebufferInfo(
+    const uintptr_t info_phys, const uintptr_t max_physical_addr) {
+  if ((max_physical_addr - info_phys) <
+          static_cast<uintptr_t>(kMultiboot1InfoWithFramebufferSize) ||
+      !PagingMapBootstrapRange(info_phys, kMultiboot1InfoWithFramebufferSize)) {
+    return nullptr;
+  }
+  return reinterpret_cast<const Multiboot1FramebufferInfo*>(
+      info_phys + kMultiboot1FramebufferInfoOffset);
+}
+
+// A framebuffer as a Multiboot2 framebuffer tag or the Multiboot1 framebuffer
+// fields describe it.
+struct FramebufferFields {
+  uint64_t addr;
+  uint32_t pitch;
+  uint32_t width;
+  uint32_t height;
+  uint8_t bpp;
+  uint8_t type;
+  // Whether the description is long enough to hold `rgb`, the color
+  // information of an RGB framebuffer.
+  bool has_color_info;
+  MultibootRgbColorInfo rgb;
+};
+
+// Returns the fields of a Multiboot2 framebuffer tag of at least
+// `sizeof(Multiboot2TagFramebuffer)` bytes.
+static FramebufferFields Multiboot2FramebufferFields(const Multiboot2Tag& tag) {
+  const Multiboot2TagFramebuffer* const fb =
+      reinterpret_cast<const Multiboot2TagFramebuffer*>(&tag);
+  FramebufferFields fields = {};
+  fields.addr = fb->framebuffer_addr;
+  fields.pitch = fb->framebuffer_pitch;
+  fields.width = fb->framebuffer_width;
+  fields.height = fb->framebuffer_height;
+  fields.bpp = fb->framebuffer_bpp;
+  fields.type = fb->framebuffer_type;
+  fields.has_color_info = tag.size >= sizeof(Multiboot2TagFramebufferRgb);
+  if (fields.has_color_info) {
+    fields.rgb =
+        reinterpret_cast<const Multiboot2TagFramebufferRgb*>(&tag)->rgb;
+  }
+  return fields;
+}
+
+static FramebufferFields Multiboot1FramebufferFields(
+    const Multiboot1FramebufferInfo& fb) {
+  FramebufferFields fields = {};
+  fields.addr = fb.framebuffer_addr;
+  fields.pitch = fb.framebuffer_pitch;
+  fields.width = fb.framebuffer_width;
+  fields.height = fb.framebuffer_height;
+  fields.bpp = fb.framebuffer_bpp;
+  fields.type = fb.framebuffer_type;
+  fields.has_color_info = true;
+  fields.rgb = fb.rgb;
+  return fields;
+}
+
+// Records `fb` in `*out_map` if it is an RGB framebuffer that the console
+// could draw on: with color information, 24 or 32 bits per pixel, and an
+// address, dimensions and pitch that are consistent and fit the identity map
+// and `int`. Whether the console supports its color channels is left to
+// `VgaInitFramebuffer`.
+static void RecordFramebuffer(const FramebufferFields& fb,
+                              MultibootMemoryMap* const out_map) {
+  if (fb.type != kMultiboot2FramebufferTypeRgb || !fb.has_color_info ||
+      fb.addr == 0 || fb.addr >= kIdentityMapLimit || fb.width == 0 ||
+      fb.height == 0 || fb.pitch > static_cast<uint32_t>(INT32_MAX) ||
+      fb.width > static_cast<uint32_t>(INT32_MAX) ||
+      fb.height > static_cast<uint32_t>(INT32_MAX) ||
+      (fb.bpp != 24 && fb.bpp != 32) ||
+      static_cast<int64_t>(fb.pitch) <
+          static_cast<int64_t>(fb.width) * (fb.bpp / 8)) {
+    return;
+  }
+  out_map->fb_addr = fb.addr;
+  out_map->fb_pitch = static_cast<int>(fb.pitch);
+  out_map->fb_width = static_cast<int>(fb.width);
+  out_map->fb_height = static_cast<int>(fb.height);
+  out_map->fb_bpp = fb.bpp;
+  out_map->fb_type = fb.type;
+  out_map->fb_red_position = fb.rgb.red_field_position;
+  out_map->fb_red_size = fb.rgb.red_mask_size;
+  out_map->fb_green_position = fb.rgb.green_field_position;
+  out_map->fb_green_size = fb.rgb.green_mask_size;
+  out_map->fb_blue_position = fb.rgb.blue_field_position;
+  out_map->fb_blue_size = fb.rgb.blue_mask_size;
+}
+
+// Returns true if `fb` is the VGA text buffer in text mode: the EGA text
+// framebuffer at 0xB8000 that GRUB reports for it (and not, for example, the
+// monochrome text buffer at 0xB0000, whose CRT controller is at 0x3B4).
+static bool IsVgaTextFramebuffer(const FramebufferFields& fb) {
+  constexpr uint64_t kVgaTextBufferAddr = 0xB8000;
+  return fb.type == kMultiboot2FramebufferTypeEgaText &&
+         fb.addr == kVgaTextBufferAddr;
+}
+
+// Returns true for the Multiboot2 tag types that only UEFI boot loaders pass.
+static bool IsEfiTag(const uint32_t type) {
+  return type == kMultiboot2TagEfi32 || type == kMultiboot2TagEfi64 ||
+         type == kMultiboot2TagEfiMmap ||
+         type == kMultiboot2TagEfiBootServices ||
+         type == kMultiboot2TagEfi32ImageHandle ||
+         type == kMultiboot2TagEfi64ImageHandle;
+}
+
 }  // namespace
 
 static bool RecordMmapEntryImpl(MultibootMemoryMap* const out_map,  //
@@ -212,6 +342,12 @@ static bool ParseMemoryMapImpl(const uint32_t multiboot_magic,
   out_map->fb_height = 0;
   out_map->fb_bpp = 0;
   out_map->fb_type = 0;
+  out_map->fb_red_position = 0;
+  out_map->fb_red_size = 0;
+  out_map->fb_green_position = 0;
+  out_map->fb_green_size = 0;
+  out_map->fb_blue_position = 0;
+  out_map->fb_blue_size = 0;
 
   if (log_boot) {
     ConsoleWrite("[PMM] Multiboot magic=");
@@ -227,19 +363,19 @@ static bool ParseMemoryMapImpl(const uint32_t multiboot_magic,
   const uintptr_t info_phys = multiboot_info_addr;
 
   if (multiboot_magic == kMultiboot2Magic) {
-    int64_t total_size = 0;
-    const uint8_t* const info = Multiboot2MapInfo(
-        info_phys, max_physical_addr, &MapBootstrapIdentity, &total_size);
-    if (info == nullptr) {
+    const StatusOr<Multiboot2MappedInfo> mapped =
+        Multiboot2MapInfo(info_phys, max_physical_addr, &MapBootstrapIdentity);
+    if (!mapped.ok()) {
       return false;
     }
     out_map->mb_reserved_start = info_phys;
-    out_map->mb_reserved_end = info_phys + total_size;
+    out_map->mb_reserved_end = info_phys + mapped->total_size;
 
     constexpr int64_t kMmapTagSize = sizeof(Multiboot2TagMmap);
     constexpr int64_t kMmapEntrySize = sizeof(Multiboot2MmapEntry);
     constexpr int64_t kFbTagSize = sizeof(Multiboot2TagFramebuffer);
-    for (Multiboot2TagIterator it(info, total_size); !it.Done(); it.Next()) {
+    for (Multiboot2TagIterator it(mapped->data, mapped->total_size); !it.Done();
+         it.Next()) {
       const Multiboot2Tag& tag = it.tag();
       const int64_t tag_size = tag.size;
       if (tag.type == kMultiboot2TagMmap && tag_size >= kMmapTagSize) {
@@ -264,38 +400,26 @@ static bool ParseMemoryMapImpl(const uint32_t multiboot_magic,
         }
       } else if (tag.type == kMultiboot2TagFramebuffer &&
                  tag_size >= kFbTagSize) {
-        const Multiboot2TagFramebuffer* const fb_tag =
-            reinterpret_cast<const Multiboot2TagFramebuffer*>(&tag);
-        if (fb_tag->framebuffer_type == kMultiboot2FramebufferTypeRgb &&
-            fb_tag->framebuffer_addr != 0 &&
-            fb_tag->framebuffer_addr < kIdentityMapLimit &&
-            fb_tag->framebuffer_width > 0 && fb_tag->framebuffer_height > 0 &&
-            fb_tag->framebuffer_pitch <= static_cast<uint32_t>(INT32_MAX) &&
-            fb_tag->framebuffer_width <= static_cast<uint32_t>(INT32_MAX) &&
-            fb_tag->framebuffer_height <= static_cast<uint32_t>(INT32_MAX) &&
-            (fb_tag->framebuffer_bpp == 24 || fb_tag->framebuffer_bpp == 32) &&
-            static_cast<int64_t>(fb_tag->framebuffer_pitch) >=
-                static_cast<int64_t>(fb_tag->framebuffer_width) *
-                    (fb_tag->framebuffer_bpp / 8)) {
-          out_map->fb_addr = fb_tag->framebuffer_addr;
-          out_map->fb_pitch = fb_tag->framebuffer_pitch;
-          out_map->fb_width = fb_tag->framebuffer_width;
-          out_map->fb_height = fb_tag->framebuffer_height;
-          out_map->fb_bpp = fb_tag->framebuffer_bpp;
-          out_map->fb_type = fb_tag->framebuffer_type;
-        }
+        RecordFramebuffer(Multiboot2FramebufferFields(tag), out_map);
       }
     }
   } else if (multiboot_magic == kMultiboot1Magic) {
-    constexpr int64_t kInfoSize = sizeof(Multiboot1Info);
-    if ((max_physical_addr - info_phys) < kInfoSize ||
-        !PagingMapBootstrapRange(info_phys, kInfoSize)) {
+    const Multiboot1Info* const info =
+        MapMultiboot1Info(info_phys, max_physical_addr);
+    if (info == nullptr) {
       return false;
     }
-    const Multiboot1Info* const info =
-        reinterpret_cast<const Multiboot1Info*>(info_phys);
     out_map->mb_reserved_start = info_phys;
-    out_map->mb_reserved_end = info_phys + kInfoSize;
+    out_map->mb_reserved_end = info_phys + sizeof(Multiboot1Info);
+    if ((info->flags & kMultiboot1FlagFramebuffer) != 0) {
+      const Multiboot1FramebufferInfo* const fb_info =
+          MapMultiboot1FramebufferInfo(info_phys, max_physical_addr);
+      if (fb_info != nullptr) {
+        out_map->mb_reserved_end =
+            info_phys + kMultiboot1InfoWithFramebufferSize;
+        RecordFramebuffer(Multiboot1FramebufferFields(*fb_info), out_map);
+      }
+    }
     if ((info->flags & kMultiboot1FlagMmap) != 0) {
       const int64_t mmap_length = info->mmap_length;
       if (info->mmap_addr == 0 || mmap_length <= 0 ||
@@ -367,33 +491,30 @@ static bool ParseMemoryMapImpl(const uint32_t multiboot_magic,
   return out_map->region_count > 0 && out_map->usable_ram_bytes > 0;
 }
 
-const uint8_t* Multiboot2MapInfo(const uintptr_t info_addr,
-                                 const uintptr_t max_physical_addr,
-                                 const MultibootPhysicalMapper map,
-                                 int64_t* const out_total_size) {
-  *out_total_size = 0;
+StatusOr<Multiboot2MappedInfo> Multiboot2MapInfo(
+    const uintptr_t info_addr, const uintptr_t max_physical_addr,
+    const MultibootPhysicalMapper map) {
   constexpr int64_t kHeaderSize = sizeof(Multiboot2InfoHeader);
   if (info_addr == 0 || info_addr >= max_physical_addr ||
       (max_physical_addr - info_addr) < static_cast<uintptr_t>(kHeaderSize)) {
-    return nullptr;
+    return kStatusError;
   }
   const Multiboot2InfoHeader* const header =
       static_cast<const Multiboot2InfoHeader*>(map(info_addr, kHeaderSize));
   if (header == nullptr) {
-    return nullptr;
+    return kStatusError;
   }
   const int64_t total_size = header->total_size;
   if (total_size < kHeaderSize || total_size > kMaxMultibootStructureBytes ||
       (max_physical_addr - info_addr) < static_cast<uintptr_t>(total_size)) {
-    return nullptr;
+    return kStatusError;
   }
   const uint8_t* const info =
       static_cast<const uint8_t*>(map(info_addr, total_size));
   if (info == nullptr) {
-    return nullptr;
+    return kStatusError;
   }
-  *out_total_size = total_size;
-  return info;
+  return Multiboot2MappedInfo{info, total_size};
 }
 
 Multiboot2TagIterator::Multiboot2TagIterator(const uint8_t* const info,
@@ -463,6 +584,52 @@ bool MultibootParseMemoryMap(const uint32_t multiboot_magic,
                             max_physical_addr,    //
                             out_map,              //
                             true);
+}
+
+bool MultibootHasVgaTextMode(const uint32_t multiboot_magic,
+                             const uint64_t multiboot_info_addr,
+                             const uintptr_t max_physical_addr) {
+  if (multiboot_info_addr == 0 || multiboot_info_addr >= max_physical_addr) {
+    return false;
+  }
+  const uintptr_t info_phys = multiboot_info_addr;
+  if (multiboot_magic == kMultiboot2Magic) {
+    const StatusOr<Multiboot2MappedInfo> mapped =
+        Multiboot2MapInfo(info_phys, max_physical_addr, &MapBootstrapIdentity);
+    if (!mapped.ok()) {
+      return false;
+    }
+    constexpr int64_t kFbTagSize = sizeof(Multiboot2TagFramebuffer);
+    bool efi_boot = false;
+    for (Multiboot2TagIterator it(mapped->data, mapped->total_size); !it.Done();
+         it.Next()) {
+      const Multiboot2Tag& tag = it.tag();
+      if (tag.type == kMultiboot2TagFramebuffer && tag.size >= kFbTagSize) {
+        return IsVgaTextFramebuffer(Multiboot2FramebufferFields(tag));
+      }
+      efi_boot = efi_boot || IsEfiTag(tag.type);
+    }
+    return !efi_boot;
+  }
+  if (multiboot_magic == kMultiboot1Magic) {
+    // Multiboot1 has no EFI tags, so its boot information without framebuffer
+    // fields is taken to come from a BIOS boot. (Only a UEFI boot loader that
+    // finds no framebuffer, such as GRUB on a headless UEFI machine, passes
+    // that too.)
+    const Multiboot1Info* const info =
+        MapMultiboot1Info(info_phys, max_physical_addr);
+    if (info == nullptr) {
+      return false;
+    }
+    if ((info->flags & kMultiboot1FlagFramebuffer) == 0) {
+      return true;
+    }
+    const Multiboot1FramebufferInfo* const fb_info =
+        MapMultiboot1FramebufferInfo(info_phys, max_physical_addr);
+    return fb_info != nullptr &&
+           IsVgaTextFramebuffer(Multiboot1FramebufferFields(*fb_info));
+  }
+  return false;
 }
 
 }  // namespace protos

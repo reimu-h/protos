@@ -3,6 +3,8 @@
 
 #include <cstdint>
 
+#include "status_or.h"
+
 namespace protos {
 
 // Size of a 2 MiB huge page mapped by a Page Directory (PD) entry with PS=1.
@@ -93,7 +95,8 @@ bool PagingEnsureIdentityMappedRange(uintptr_t phys_addr, int64_t size);
 // from `0` up to `max_physical_addr` (rounded up to `kHugePageSize`),
 // allocating zeroed 4 KiB page-table frames (`PDPT` and `PD`) from the PMM
 // whenever a `1 GiB` or `512 GiB` boundary is crossed.
-// Returns true if the entire `[0, max_physical_addr)` range is mapped.
+// Returns true if the entire `[0, max_physical_addr)` range is mapped, and
+// false if `max_physical_addr` is 0 or above `kIdentityMapLimit`.
 bool PagingExtendIdentityMap(uintptr_t max_physical_addr);
 
 // Marks the single 4 KiB identity-mapped physical page containing `phys_addr`
@@ -272,12 +275,10 @@ bool PagingMapUserDevicePage(uintptr_t root,       //
 // `root`, or 0 if it is not mapped.
 uintptr_t PagingUserPageFrame(uintptr_t root, uintptr_t user_addr);
 
-// Fills `*info` with the attributes of the mapped 4 KiB user page at
-// page-aligned `user_addr` in `root`, and returns true; returns false if the
-// page is not mapped or an argument is invalid.
-bool PagingQueryUserPage(uintptr_t root,       //
-                         uintptr_t user_addr,  //
-                         UserPageInfo* info);
+// Returns the attributes of the mapped 4 KiB user page at page-aligned
+// `user_addr` in `root`, or an error if the page is not mapped or an argument
+// is invalid.
+StatusOr<UserPageInfo> PagingQueryUserPage(uintptr_t root, uintptr_t user_addr);
 
 // Returns the value of the IA32_PAT MSR (0x277) on the calling CPU.
 uint64_t PagingReadPatMsr();

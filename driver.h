@@ -7,6 +7,8 @@
 
 #include "device_irq.h"
 #include "pci.h"
+#include "spinlock.h"
+#include "status_or.h"
 #include "syscall_abi.h"
 
 namespace protos {
@@ -60,6 +62,14 @@ class DriverEnvironment {
   virtual bool MapUserOwnedFrame(AddressSpace* space,  //
                                  uintptr_t user_addr,  //
                                  uintptr_t frame_phys) = 0;
+
+  // Waits at least `microseconds` (> 0), blocking the calling task: only for a
+  // task that may block (such as one in a system call) and holds no lock.
+  virtual void SleepMicroseconds(int64_t microseconds) = 0;
+
+  // Writes `text`, one line ending with '\n', to the kernel console, which
+  // shows it also on a machine without a serial port.
+  virtual void Log(const char* text) = 0;
 };
 
 #if !__STDC_HOSTED__
@@ -77,13 +87,18 @@ void DriverInit();
 
 // Converts a kernel `PciDevice` record (`pci.h`) into the user-ABI
 // `PciDeviceInfo` structure (`syscall_abi.h`).
-void DriverFillPciDeviceInfo(const PciDevice& src, PciDeviceInfo* dst);
+PciDeviceInfo DriverFillPciDeviceInfo(const PciDevice& src);
 
 // Returns true if the 4 KiB physical page at page-aligned `page_phys` overlaps
 // the MSI-X table or Pending Bit Array of `msix` (when `msix.valid` is true).
 // User space must never map pages that hold MSI-X structures, which would let
 // a user-mode driver forge arbitrary MSI writes.
 bool DriverPageHoldsMsixStructure(const PciMsix& msix, uint64_t page_phys);
+
+struct ClaimedBarMatch {
+  int device_index = -1;
+  int bar_index = -1;
+};
 
 // Validates `[phys_addr, phys_addr + size)` for `mmio_map`:
 // - `phys_addr` non-zero and 4 KiB-aligned, `size > 0`, 4 KiB-aligned, `<=
@@ -92,14 +107,12 @@ bool DriverPageHoldsMsixStructure(const PciMsix& msix, uint64_t page_phys);
 //   `claimed_indices[0..claimed_count - 1]` -> else `kSyscallErrorAccess`.
 // - Overlaps no MSI-X table or PBA page of that device -> else
 //   `kSyscallErrorAccess`.
-// Returns 0 on success and sets `*out_device_index` and `*out_bar_index` (if
-// non-null).
-int64_t DriverFindClaimedBarForRange(const int* claimed_indices,  //
-                                     int claimed_count,           //
-                                     uint64_t phys_addr,          //
-                                     int64_t size,                //
-                                     int* out_device_index,       //
-                                     int* out_bar_index);
+// Returns the matching device and BAR indices on success.
+StatusOr<ClaimedBarMatch> DriverFindClaimedBarForRange(
+    const int* claimed_indices,  //
+    int claimed_count,           //
+    uint64_t phys_addr,          //
+    int64_t size);
 
 // Observability record populated by `DriverContext::Release()` so unit tests
 // and boot self-tests can verify teardown ordering without fragile timing.
@@ -115,6 +128,16 @@ struct DriverReleaseRecord {
 // at least one claimed device when released.
 DriverReleaseRecord DriverLastReleaseRecord();
 
+struct DriverPciInfoResult {
+  int64_t count = 0;
+  PciDeviceInfo info{};
+};
+
+struct DriverDmaAllocation {
+  uintptr_t user_addr = 0;
+  uint64_t phys_addr = 0;
+};
+
 class DriverContext {
  public:
   DriverContext() = default;
@@ -127,14 +150,13 @@ class DriverContext {
   // and `DeviceIrqAllocateVectors`.
   uintptr_t OwnerToken() const { return reinterpret_cast<uintptr_t>(this); }
 
-  int64_t PciInfo(int64_t index, PciDeviceInfo* out_info) const;
+  StatusOr<DriverPciInfoResult> PciInfo(int64_t index) const;
   int64_t Claim(int64_t index);
   int64_t SetBusMaster(int64_t index, int64_t enable);
   int64_t MmioMap(AddressSpace* space, uint64_t phys_addr, int64_t size);
-  int64_t DmaAlloc(AddressSpace* space,  //
-                   int64_t size,         //
-                   uint64_t flags,       //
-                   uint64_t* out_phys);
+  StatusOr<DriverDmaAllocation> DmaAlloc(AddressSpace* space,  //
+                                         int64_t size,         //
+                                         uint64_t flags);
   int64_t IrqAlloc(int64_t index,  //
                    int64_t count,  //
                    int64_t mode,   //
@@ -149,19 +171,38 @@ class DriverContext {
   // allocated IDT vectors, and releases all PCI claims in strict hardware-safe
   // order. Idempotent; `UserProcess::Run()` calls this while `address_space_`
   // is still alive (before DMA frames are freed).
-  void Release(bool address_space_alive = true,
-               DriverReleaseRecord* out_record = nullptr);
+  DriverReleaseRecord Release(bool address_space_alive = true);
 
   bool IsClaimed(int index) const;
-  int ClaimedCount() const { return claimed_count_; }
-  int NextIrqBit() const { return next_irq_bit_; }
+  int ClaimedCount() const {
+    const IrqSpinLockGuard guard(lock_);
+    return claimed_count_;
+  }
+  int NextIrqBit() const {
+    const IrqSpinLockGuard guard(lock_);
+    return next_irq_bit_;
+  }
   int64_t DmaTotalBytes() const { return dma_total_bytes_; }
   uint64_t PendingIrqMask() const {
     return irq_pending_.load(std::memory_order_acquire);
   }
 
  private:
+  int FindClaimedSlotLocked(int index) const;
+  // Reserves `count` interrupt bits for claimed device `index`, which must not
+  // have vectors yet, and marks it as having them. Returns the first bit, or a
+  // negative syscall error.
+  int64_t ReserveIrqBitsLocked(int index, int count);
+  // Undoes the `ReserveIrqBitsLocked(index, count)` that returned `first_bit`.
+  void UnreserveIrqBitsLocked(int index, int first_bit, int count);
+
+  // Serializes the claim and interrupt bookkeeping below between the
+  // process's task and `BindVectorsForSelftest()` callers. Never held across
+  // calls that may sleep or shoot down TLBs.
+  mutable IrqSpinLock lock_;
   int claimed_[kSyscallMaxClaims] = {};
+  // Whether the device in the same slot of `claimed_` has vectors.
+  bool irq_allocated_[kSyscallMaxClaims] = {};
   int claimed_count_ = 0;
   uintptr_t next_mmio_addr_ = kDriverMmioWindowBase;
   uintptr_t next_dma_addr_ = kDriverDmaWindowBase;

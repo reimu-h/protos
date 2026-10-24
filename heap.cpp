@@ -34,6 +34,10 @@ constexpr uint32_t kHeapBlockMagic = 0x48454150;
 // physical coalescing.
 struct alignas(kHeapAlignment) HeapBlockHeader {
   uint32_t magic;
+  // 0 while allocated, 1 while free in `g_free_tree`, and 2 from the `Kfree`
+  // that claims the block (atomically, so that another `Kfree` of the block
+  // fails its check instead of queueing it twice) until the heap takes it
+  // back.
   uint32_t is_free;
   int64_t size;
   int64_t max_free_size;
@@ -415,7 +419,16 @@ static HeapBlockHeader* LiveBlockOf(void* const ptr) {
 
   HeapBlockHeader* const block = reinterpret_cast<HeapBlockHeader*>(ptr) - 1;
   CHECK(block->magic == kHeapBlockMagic);
-  CHECK(block->is_free == 0);
+  // Claims the block for this free: of several frees of the same block, only
+  // one gets past here, even when they race (and so only one may queue it).
+  uint32_t expected_free = 0;
+  if (!std::atomic_ref<uint32_t>(block->is_free)
+           .compare_exchange_strong(expected_free,              //
+                                    2,                          //
+                                    std::memory_order_acq_rel,  //
+                                    std::memory_order_relaxed)) {
+    PANIC("Check failed: block->is_free == 0");
+  }
   DCHECK(block->size >= kHeapAlignment);
   DCHECK((block->size & (kHeapAlignment - 1)) == 0);
   DCHECK(block->align_offset >= 0);
@@ -428,7 +441,8 @@ static HeapBlockHeader* LiveBlockOf(void* const ptr) {
 
 static void ReturnBlockToHeapLocked(HeapBlockHeader* block) {
   CHECK(block->magic == kHeapBlockMagic);
-  CHECK(block->is_free == 0);
+  CHECK(block->is_free == 2);
+  block->is_free = 0;
   if (block->align_offset > 0) {
     const int64_t shift = block->align_offset;
     const int64_t restored_size = block->size + shift;

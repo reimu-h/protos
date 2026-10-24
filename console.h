@@ -3,6 +3,8 @@
 
 #include <cstdint>
 
+#include "status_or.h"
+
 namespace protos {
 
 // Writers for boot and status messages that go to both consoles: the serial
@@ -17,9 +19,9 @@ void ConsoleWriteHex(uint64_t value);
 // Writes `value` in decimal.
 void ConsoleWriteDec(uint64_t value);
 
-// Attempts to read one byte from the console input buffer into `*out`.
-// Returns false if no input byte is currently available.
-bool ConsoleTryReadc(char* out);
+// Attempts to read one byte from the console input buffer, or returns an error
+// if no input byte is currently available.
+StatusOr<char> ConsoleTryReadc();
 // Pushes `size` bytes of programmatic input into the console input buffer.
 void ConsolePushInput(const char* data, int64_t size);
 // Clears any pending bytes in the console input buffer.

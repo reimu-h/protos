@@ -1,5 +1,5 @@
-#ifndef PROTOS_XHCI_SIM_H_
-#define PROTOS_XHCI_SIM_H_
+#ifndef PROTOS_USER_USBKBD_XHCI_SIM_H_
+#define PROTOS_USER_USBKBD_XHCI_SIM_H_
 
 #include <gtest/gtest.h>
 
@@ -13,15 +13,16 @@
 #include <string>
 #include <vector>
 
-#include "user/usb_hid.h"
-#include "user/xhci_context.h"
-#include "user/xhci_platform.h"
-#include "user/xhci_ring.h"
-#include "xhci_sim_usb.h"
+#include "user/usbkbd/usb_hid.h"
+#include "user/usbkbd/xhci_context.h"
+#include "user/usbkbd/xhci_platform.h"
+#include "user/usbkbd/xhci_regs.h"
+#include "user/usbkbd/xhci_ring.h"
+#include "user/usbkbd/xhci_sim_usb.h"
 
 // A simulated xHCI controller and a fake platform for the host unit tests of
-// the USB keyboard driver core (user/xhci_*.h). Host-only, single-threaded
-// and deterministic.
+// the USB keyboard driver core (user/usbkbd/xhci_*.h). Host-only,
+// single-threaded and deterministic.
 //
 // - `SimClock` is the time base of a test. Time passes only when the code
 //   under test calls `FakePlatform::Relax()`, so bounded waits of seconds run
@@ -47,8 +48,8 @@
 namespace protos::xhci_sim {
 
 // Register layout and bits, transcribed from the xHCI 1.2 specification
-// independently of user/xhci_regs.h, so that a wrong constant in the driver
-// core is not mirrored here.
+// independently of user/usbkbd/xhci_regs.h, so that a wrong constant in the
+// driver core is not mirrored here.
 namespace spec {
 
 // Capability registers (xHCI 5.3).
@@ -114,6 +115,10 @@ constexpr int kPortSpeedShift = 10;
 constexpr uint32_t kPortIndicatorMask = 0x3u << 14;
 constexpr uint32_t kPortLinkWriteStrobe = 1u << 16;
 constexpr uint32_t kPortConnectChange = 1u << 17;
+constexpr uint32_t kPortWarmResetChange = 1u << 19;
+constexpr uint32_t kPortOverCurrentChange = 1u << 20;
+constexpr uint32_t kPortResetChange = 1u << 21;
+constexpr uint32_t kPortLinkStateChange = 1u << 22;
 // CSC, PEC, WRC, OCC, PRC, PLC, CEC: bits 17-23.
 constexpr uint32_t kPortChangeMask = 0x7Fu << 17;
 // WCE, WDE, WOE: bits 25-27.
@@ -123,7 +128,13 @@ constexpr uint32_t kPortWarmReset = 1u << 31;
 constexpr uint32_t kPortRsvdZMask = (1u << 2) | (1u << 28) | (1u << 29);
 constexpr uint32_t kLinkU0 = 0;
 constexpr uint32_t kLinkRxDetect = 5;
+constexpr uint32_t kLinkInactive = 6;
 constexpr uint32_t kLinkPolling = 7;
+
+// CRCR (xHCI 5.4.5), low dword.
+constexpr uint32_t kCrcrCommandStop = 1u << 1;
+constexpr uint32_t kCrcrCommandAbort = 1u << 2;
+constexpr uint32_t kCrcrRunning = 1u << 3;
 
 // Runtime registers (xHCI 5.5), from the runtime base.
 constexpr int64_t kMfIndex = 0x00;
@@ -204,7 +215,7 @@ class SimClock {
 };
 
 // The longest log line the driver may emit, including its '\n'
-// (`kMaxLogLineLength` in user/xhci_platform.h).
+// (`kMaxLogLineLength` in user/usbkbd/xhci_platform.h).
 constexpr int kSimMaxLogLineLength = 128;
 
 // Simulated guest physical DMA memory arena. High allocations start above
@@ -415,8 +426,13 @@ enum class Violation : uint8_t {
   kInvalidDmaAddress,           // Unmapped, misaligned, or >4GiB (AC64=0) DMA
   kRingModifiedWhileRunning,    // DCBAAP/CRCR/CONFIG/ERST modified while HCH=0
   kErstBaBeforeSize,            // ERSTBA written while ERSTSZ == 0
-  kPortResetOnUsb3Port,         // PORTSC.PR written on a USB 3 protocol port
   kImanClearedBeforeEint,       // IMAN.IP cleared while USBSTS.EINT is still 1
+  kDefaultAddressCollision,     // >1 USB 2.0 device at address 0 per root port
+  kUsbAddressCollision,         // 2 reachable USB 2.0 devices share an address
+  kCommandRingPointerCorrupted,  // CRCR high dword changed the stopped pointer
+  kDcbaaChangedBeforeDisableSlot,  // DCBAA[slot] changed while slot enabled
+  kDeviceContextModified,  // Software wrote an enabled slot's Output Context
+  kDeviceContextShared,    // Two enabled slots use one Output Device Context
 };
 
 inline const char* ViolationName(const Violation violation) {
@@ -465,10 +481,20 @@ inline const char* ViolationName(const Violation violation) {
       return "ring or config register modified while controller is running";
     case Violation::kErstBaBeforeSize:
       return "ERSTBA written while ERSTSZ is zero";
-    case Violation::kPortResetOnUsb3Port:
-      return "PORTSC.PR written on a USB 3 port";
     case Violation::kImanClearedBeforeEint:
       return "IMAN.IP cleared before USBSTS.EINT";
+    case Violation::kDefaultAddressCollision:
+      return "two USB 2.0 devices at the default address below one root port";
+    case Violation::kUsbAddressCollision:
+      return "two reachable USB 2.0 devices share a USB address";
+    case Violation::kCommandRingPointerCorrupted:
+      return "CRCR high dword changed the stopped Command Ring pointer";
+    case Violation::kDcbaaChangedBeforeDisableSlot:
+      return "DCBAA entry changed before Disable Slot completed";
+    case Violation::kDeviceContextModified:
+      return "Output Device Context of an enabled slot modified by software";
+    case Violation::kDeviceContextShared:
+      return "two enabled slots share one Output Device Context";
   }
   return "unknown violation";
 }
@@ -630,7 +656,15 @@ struct XhciSimConfig {
   bool port_reset_never_completes = false;
   bool drop_port_status_change_events = false;
   bool no_slots_available = false;
+  // The next command fetched never completes, until CRCR.CA aborts it.
   bool command_hang = false;
+  // Commands complete this long after they are fetched (0: at once).
+  int64_t command_delay_ticks = 0;
+  // CRCR.CA has no effect: the ring keeps running (CRR = 1).
+  bool command_abort_hangs = false;
+  // Enable Slot hands out slot IDs round-robin instead of the lowest free one
+  // (both are legal, xHCI 4.6.3).
+  bool round_robin_slots = false;
 };
 
 // QEMU's qemu-xhci as the driver finds it after SeaBIOS: running (SeaBIOS
@@ -1009,6 +1043,9 @@ class XhciSim final : public usb::MmioWindow {
     uint64_t dequeue = 0;
     uint32_t dcs = 1;
     bool doorbell_rung = false;
+    // The data toggle (SuperSpeed: sequence number parity) the host expects
+    // next on an IN endpoint; Reset Endpoint with TSP = 0 clears it.
+    uint8_t toggle = 0;
   };
 
   struct SimSlot {
@@ -1017,8 +1054,18 @@ class XhciSim final : public usb::MmioWindow {
     int port = 0;
     int speed = 0;
     int context_entries = 0;
+    uint32_t route_string = 0;
+    bool hub = false;
+    bool mtt = false;
+    int num_ports = 0;
+    uint8_t parent_hub_slot_id = 0;
+    uint8_t parent_port_number = 0;
+    uint8_t ttt = 0;
     uint64_t out_ctx_phys = 0;
     SimEndpoint ep[32] = {};
+    // The Output Device Context as the xHC last wrote it (the driver only
+    // reads it while the slot is enabled), from Address Device on.
+    std::vector<uint8_t> out_ctx_shadow;
   };
 
   void set_dma_arena(SimDmaArena* const arena) { dma_ = arena; }
@@ -1027,6 +1074,9 @@ class XhciSim final : public usb::MmioWindow {
 
   void set_no_slots_available(const bool v) { config_.no_slots_available = v; }
   void set_command_hang(const bool v) { config_.command_hang = v; }
+  void set_command_abort_hangs(const bool v) {
+    config_.command_abort_hangs = v;
+  }
   void set_drop_port_status_change_events(const bool v) {
     config_.drop_port_status_change_events = v;
   }
@@ -1036,6 +1086,56 @@ class XhciSim final : public usb::MmioWindow {
   void StopDecoding() {
     config_.all_ones = true;
     decoding_ = false;
+  }
+
+  // The link of USB 3 port `port` drops to SS.Inactive (e.g. after link
+  // errors): the port is disabled until a Warm Reset (xHCI 4.19.1.2).
+  void SetUsb3LinkInactive(const int port) {
+    if (port < 1 || port > static_cast<int>(ports_.size())) {
+      return;
+    }
+    Update();
+    Port& state = ports_[static_cast<size_t>(port - 1)];
+    if ((state.portsc & spec::kPortConnected) == 0) {
+      return;
+    }
+    state.portsc = (state.portsc & ~(spec::kPortLinkStateMask |
+                                     spec::kPortEnabled | spec::kPortReset)) |
+                   (spec::kLinkInactive << spec::kPortLinkStateShift) |
+                   spec::kPortLinkStateChange;
+    state.reset_due_tick = 0;
+    if (run_state_ == RunState::kRunning) {
+      usbsts_pending_ |= spec::kStsPortChangeDetect;
+      if (!config_.drop_port_status_change_events) {
+        PushPortStatusChangeEvent(port);
+      }
+      FlushPendingEvents();
+    }
+  }
+
+  // A transient over-current on root port `port` (with PPC = 1) powers the
+  // port off (PP = 0) and sets OCC = 1 (xHCI 4.19.4).
+  void PulsePortOverCurrent(const int port) {
+    if (port < 1 || port > static_cast<int>(ports_.size()) || !config_.ppc) {
+      return;
+    }
+    Update();
+    Port& state = ports_[static_cast<size_t>(port - 1)];
+    if (state.device != nullptr) {
+      state.device->OnBusReset();
+    }
+    state.portsc = (spec::kLinkRxDetect << spec::kPortLinkStateShift) |
+                   spec::kPortOverCurrentChange;
+    state.power_on_due_tick = 0;
+    state.reset_due_tick = 0;
+    CheckUsb2Segment(port, -1, 0, 0);
+    if (run_state_ == RunState::kRunning) {
+      usbsts_pending_ |= spec::kStsPortChangeDetect;
+      if (!config_.drop_port_status_change_events) {
+        PushPortStatusChangeEvent(port);
+      }
+      FlushPendingEvents();
+    }
   }
 
   void AttachDevice(const int port, SimUsbDevice* const device) {
@@ -1107,6 +1207,8 @@ class XhciSim final : public usb::MmioWindow {
     Update();
     usbsts_pending_ |= spec::kStsHostSystemError;
     run_state_ = RunState::kHalted;
+    cmd_ring_running_ = false;
+    cmd_executing_ = false;
     if ((usbcmd_ & (spec::kCmdInterrupterEnable |
                     spec::kCmdHostSystemErrorEnable)) != 0) {
       ++irq_count_;
@@ -1118,6 +1220,8 @@ class XhciSim final : public usb::MmioWindow {
     Update();
     hce_ = true;
     run_state_ = RunState::kHalted;
+    cmd_ring_running_ = false;
+    cmd_executing_ = false;
     if ((usbcmd_ & spec::kCmdInterrupterEnable) != 0) {
       ++irq_count_;
       irq_asserted_ = true;
@@ -1177,6 +1281,26 @@ class XhciSim final : public usb::MmioWindow {
   const SimSlot& slot(const int slot_id) const {
     return slots_[static_cast<size_t>(slot_id)];
   }
+  int slot_capacity() const { return static_cast<int>(slots_.size()); }
+
+  // The most USB 2.0 devices seen at the default address 0 at once below one
+  // root port.
+  int max_default_state_devices() const { return max_default_state_devices_; }
+  // USB 2.0 devices at the default address 0 below root port `port` now.
+  int default_state_devices(const int port) const {
+    return CountAddress(Usb2SegmentAddresses(port), 0);
+  }
+  // Stop Endpoint commands received.
+  int stop_endpoint_count() const { return stop_endpoint_count_; }
+  // Slot IDs in the order Disable Slot commands disabled them.
+  const std::vector<int>& disable_slot_log() const { return disable_slot_log_; }
+  // Interrupt IN data packets the host dropped as retransmissions because
+  // their data toggle (sequence number) was not the expected one.
+  int dropped_in_packets() const { return dropped_in_packets_; }
+  // CRCR.CRR: the Command Ring runs (from doorbell 0 until it is stopped).
+  bool command_ring_running() const { return cmd_ring_running_; }
+  // A command has been fetched and has not completed (delayed or hung).
+  bool command_in_progress() const { return cmd_executing_; }
 
   // A readable name of the register at `offset`, for traces.
   std::string DescribeOffset(const int64_t offset) const {
@@ -1235,6 +1359,11 @@ class XhciSim final : public usb::MmioWindow {
     SimUsbDevice* device = nullptr;
     int64_t power_on_due_tick = 0;
     int64_t reset_due_tick = 0;
+    // The reset in progress is a Warm Reset (WPR) of a USB 3 port.
+    bool warm_reset = false;
+    // USB 2.0 segment census below this root port (CheckUsb2Segment()).
+    int default_state_devices = 0;
+    bool address_collision = false;
   };
   struct Interrupter {
     uint32_t iman = 0;
@@ -1390,6 +1519,76 @@ class XhciSim final : public usb::MmioWindow {
         ViolationRecord{kind, seq, clock_->now(), offset, value, detail});
   }
 
+  // The addresses on the USB 2.0 broadcast segment below root port `port`:
+  // the root device (when the port is enabled) and every device behind
+  // connected and enabled USB 2.0 hub ports (USB 2.0 11.1.2.1). Root ports
+  // are separate links, so segments never span them.
+  std::vector<uint8_t> Usb2SegmentAddresses(const int port) const {
+    std::vector<uint8_t> addresses;
+    if (port < 1 || port > static_cast<int>(ports_.size())) {
+      return addresses;
+    }
+    const Port& state = ports_[static_cast<size_t>(port - 1)];
+    if (state.device != nullptr && (state.portsc & spec::kPortEnabled) != 0) {
+      addresses.push_back(state.device->address());
+      state.device->AppendUsb2SegmentAddresses(&addresses);
+    }
+    return addresses;
+  }
+
+  static int CountAddress(const std::vector<uint8_t>& addresses,
+                          const uint8_t address) {
+    int count = 0;
+    for (const uint8_t a : addresses) {
+      if (a == address) {
+        ++count;
+      }
+    }
+    return count;
+  }
+
+  // Records a kDefaultAddressCollision when more than one device answers the
+  // default address 0 below root port `port`, and a kUsbAddressCollision when
+  // two reachable devices there share a non-zero address.
+  void CheckUsb2Segment(const int port,        //
+                        const int64_t seq,     //
+                        const int64_t offset,  //
+                        const uint32_t value) {
+    if (port < 1 || port > static_cast<int>(ports_.size())) {
+      return;
+    }
+    Port& state = ports_[static_cast<size_t>(port - 1)];
+    const std::vector<uint8_t> addresses = Usb2SegmentAddresses(port);
+    const int at_default = CountAddress(addresses, 0);
+    if (at_default > max_default_state_devices_) {
+      max_default_state_devices_ = at_default;
+    }
+    if (at_default > 1 && state.default_state_devices <= 1) {
+      Record(Violation::kDefaultAddressCollision, seq, offset, value,
+             "root port " + std::to_string(port) + ": " +
+                 std::to_string(at_default) + " devices at address 0");
+    }
+    state.default_state_devices = at_default;
+    bool shared = false;
+    for (const uint8_t a : addresses) {
+      if (a != 0 && CountAddress(addresses, a) > 1) {
+        shared = true;
+      }
+    }
+    if (shared && !state.address_collision) {
+      Record(Violation::kUsbAddressCollision, seq, offset, value,
+             "root port " + std::to_string(port));
+    }
+    state.address_collision = shared;
+  }
+
+  // Two devices answering one non-zero address on one USB 2.0 segment: their
+  // responses collide and the xHC sees a USB Transaction Error.
+  bool AddressCollides(const SimSlot& slot, const SimUsbDevice& dev) const {
+    return dev.address() != 0 &&
+           CountAddress(Usb2SegmentAddresses(slot.port), dev.address()) > 1;
+  }
+
   bool NotReady() const {
     const int64_t now = clock_->now();
     const bool power_on = config_.power_on_not_ready_forever ||
@@ -1429,22 +1628,26 @@ class XhciSim final : public usb::MmioWindow {
         now >= request_tick_ + config_.legacy.release_after_ticks) {
       ReleaseByBios();
     }
-    if (cmd_abort_due_tick_ > 0 && now >= cmd_abort_due_tick_) {
-      cmd_abort_due_tick_ = 0;
-      usb::Trb stop_ev{};
-      stop_ev.dw0 = static_cast<uint32_t>(cmd_dequeue_);
-      stop_ev.dw1 = static_cast<uint32_t>(cmd_dequeue_ >> 32);
-      stop_ev.dw2 = static_cast<uint32_t>(usb::kCcCommandRingStopped) << 24;
-      stop_ev.dw3 = static_cast<uint32_t>(usb::kTrbCommandCompletion)
-                    << usb::kTrbTypeShift;
-      pending_events_.push_back(stop_ev);
-      FlushPendingEvents();
+    if (cmd_executing_ && !cmd_exec_hung_ && now >= cmd_exec_due_tick_ &&
+        run_state_ == RunState::kRunning && decoding_) {
+      // A delayed command (command_delay_ticks) completes.
+      cmd_executing_ = false;
+      if (ExecuteCommand(cmd_exec_trb_, cmd_exec_phys_, 0, 0, 0)) {
+        if (cmd_stop_after_current_) {
+          StopCommandRing();
+        } else {
+          ProcessCommandRing(0, 0, 0);
+        }
+      }
     }
     for (int port = 1; port <= static_cast<int>(ports_.size()); ++port) {
       Port& state = ports_[static_cast<size_t>(port - 1)];
       if (state.power_on_due_tick > 0 && now >= state.power_on_due_tick) {
         state.power_on_due_tick = 0;
         if ((state.portsc & spec::kPortPower) != 0) {
+          if (state.device != nullptr) {
+            state.device->OnBusReset();
+          }
           state.portsc = PoweredPortsc(port);
           if (run_state_ == RunState::kRunning &&
               (state.portsc & spec::kPortConnectChange) != 0) {
@@ -1458,8 +1661,23 @@ class XhciSim final : public usb::MmioWindow {
       if (state.reset_due_tick > 0 && now >= state.reset_due_tick) {
         state.reset_due_tick = 0;
         state.portsc &= ~spec::kPortReset;
+        const bool warm = state.warm_reset;
+        state.warm_reset = false;
         const int speed = PortAttachedSpeed(port);
-        if (speed > 0 && (state.portsc & spec::kPortConnected) != 0) {
+        const bool inactive =
+            ((state.portsc & spec::kPortLinkStateMask) >>
+             spec::kPortLinkStateShift) == spec::kLinkInactive;
+        if (speed > 0 && (state.portsc & spec::kPortConnected) != 0 &&
+            inactive && !warm) {
+          // A Hot Reset needs a working link: SS.Inactive stays until a Warm
+          // Reset (USB 3.2 7.5.2), so the port stays disabled.
+          state.portsc |= spec::kPortResetChange;
+          usbsts_pending_ |= spec::kStsPortChangeDetect;
+          if (run_state_ == RunState::kRunning &&
+              !config_.drop_port_status_change_events) {
+            PushPortStatusChangeEvent(port);
+          }
+        } else if (speed > 0 && (state.portsc & spec::kPortConnected) != 0) {
           if (state.device != nullptr) {
             state.device->OnBusReset();
           }
@@ -1469,7 +1687,7 @@ class XhciSim final : public usb::MmioWindow {
               spec::kPortEnabled |
               (spec::kLinkU0 << spec::kPortLinkStateShift) |
               (static_cast<uint32_t>(speed) << spec::kPortSpeedShift) |
-              (1u << 21);  // PRC
+              spec::kPortResetChange | (warm ? spec::kPortWarmResetChange : 0);
           usbsts_pending_ |= spec::kStsPortChangeDetect;
           if (run_state_ == RunState::kRunning &&
               !config_.drop_port_status_change_events) {
@@ -1723,9 +1941,10 @@ class XhciSim final : public usb::MmioWindow {
       case spec::kDnCtrl:
         return dnctrl_;
       case spec::kCrcrLow:
-        return cmd_abort_due_tick_ > clock_->now() ? (1u << 3) : 0u;
+        // The pointer reads 0; CRR is 1 from doorbell 0 until the ring stops.
+        return cmd_ring_running_ ? spec::kCrcrRunning : 0u;
       case spec::kCrcrHigh:
-        return 0;  // The ring pointer reads 0; the ring is not running
+        return 0;
       case spec::kDcbaapLow:
         return static_cast<uint32_t>(dcbaap_);
       case spec::kDcbaapHigh:
@@ -1847,30 +2066,49 @@ class XhciSim final : public usb::MmioWindow {
         return;
       case spec::kCrcrLow:
         CheckProgramming(seq, offset, value);
+        crcr_abort_low_written_ = false;
         if (run_state_ != RunState::kHalted) {
-          if ((value & 0x6u) != 0 && (value & ~0x3Fu) == 0) {
-            crcr_abort_pending_ = true;
-          } else {
+          if ((value & (spec::kCrcrCommandStop | spec::kCrcrCommandAbort)) ==
+              0) {
             Record(Violation::kRingModifiedWhileRunning, seq, offset, value);
+            return;
+          }
+          // CS / CA; the pointer and RCS bits are ignored while the ring runs
+          // (xHCI 5.4.5), and CS / CA have no effect on a stopped ring.
+          crcr_abort_low_written_ = true;
+          if (cmd_ring_running_ && !config_.command_abort_hangs) {
+            if ((value & spec::kCrcrCommandAbort) != 0 || !cmd_executing_) {
+              StopCommandRing();
+            } else {
+              cmd_stop_after_current_ = true;
+            }
+            FlushPendingEvents();
           }
           return;
         }
         crcr_ = (crcr_ & ~uint64_t{0xFFFFFFFF}) | value;
         return;
-      case spec::kCrcrHigh:
+      case spec::kCrcrHigh: {
         CheckProgramming(seq, offset, value);
+        const bool after_stop_request = crcr_abort_low_written_;
+        crcr_abort_low_written_ = false;
         if (run_state_ != RunState::kHalted) {
-          if (crcr_abort_pending_ && value == 0) {
-            crcr_abort_pending_ = false;
-            cmd_abort_due_tick_ = clock_->now() + 1;
-          } else {
-            crcr_abort_pending_ = false;
+          if (!after_stop_request) {
             Record(Violation::kRingModifiedWhileRunning, seq, offset, value);
+          } else if (!cmd_ring_running_ &&
+                     value != static_cast<uint32_t>(cmd_dequeue_ >> 32)) {
+            // The ring stopped before this half of the 64-bit write landed:
+            // the xHC takes it as the upper half of its dequeue pointer (the
+            // corruption behind Linux commits ff0e50d3564f, 09f736aa9547).
+            Record(Violation::kCommandRingPointerCorrupted, seq, offset, value);
+            cmd_dequeue_ =
+                (cmd_dequeue_ & uint64_t{0xFFFFFFFF}) | (uint64_t{value} << 32);
           }
           return;
         }
         crcr_ = (crcr_ & uint64_t{0xFFFFFFFF}) | (uint64_t{value} << 32);
         return;
+      }
       case spec::kDcbaapLow:
         CheckProgramming(seq, offset, value);
         if (run_state_ != RunState::kHalted) {
@@ -1921,6 +2159,10 @@ class XhciSim final : public usb::MmioWindow {
       run_state_ = RunState::kHalting;
       halt_due_tick_ = clock_->now() + config_.halt_delay_ticks;
       awaiting_halt_observation_ = true;
+      // Halting stops the Command Ring (CRR = 0, xHCI 5.4.5).
+      cmd_ring_running_ = false;
+      cmd_executing_ = false;
+      cmd_stop_after_current_ = false;
     } else if (!was_run && run) {
       if (reset_observed_ && dma_ != nullptr) {
         LatchRingsAndValidateOnStart(seq, offset, value);
@@ -1953,8 +2195,10 @@ class XhciSim final : public usb::MmioWindow {
     reset_phase_ = ResetPhase::kResetting;
     reset_due_tick_ = reset_write_tick_ + config_.reset_delay_ticks;
     start_due_tick_ = 0;
-    cmd_abort_due_tick_ = 0;
-    crcr_abort_pending_ = false;
+    cmd_ring_running_ = false;
+    cmd_executing_ = false;
+    cmd_stop_after_current_ = false;
+    crcr_abort_low_written_ = false;
     hcrst_clear_observed_ = false;
     reset_observed_ = false;
     usbcmd_ = 0;
@@ -1973,6 +2217,7 @@ class XhciSim final : public usb::MmioWindow {
     pending_events_.clear();
     irq_asserted_ = false;
     slots_.assign(static_cast<size_t>(config_.max_slots + 1), SimSlot{});
+    last_enabled_slot_ = 0;
     for (Interrupter& state : interrupters_) {
       state = Interrupter{};
       state.imod = config_.imod_reset_value;
@@ -2010,15 +2255,21 @@ class XhciSim final : public usb::MmioWindow {
     if ((value & spec::kPortRsvdZMask) != 0) {
       Record(Violation::kRsvdZWrittenOne, seq, offset, value);
     }
-    if ((value & (spec::kPortWarmReset | spec::kPortLinkWriteStrobe)) != 0 ||
-        ((value & spec::kPortReset) != 0 && run_state_ != RunState::kRunning)) {
+    const bool usb3 = PortProtocolMajor(port) == 3;
+    const bool reset = (value & (spec::kPortReset | spec::kPortWarmReset)) != 0;
+    if ((value & spec::kPortLinkWriteStrobe) != 0 ||
+        (reset && run_state_ != RunState::kRunning)) {
       Record(Violation::kUnmodeledWrite, seq, offset, value, "port reset/link");
-    } else if ((value & spec::kPortReset) != 0) {
-      if (PortProtocolMajor(port) == 3) {
-        Record(Violation::kPortResetOnUsb3Port, seq, offset, value);
-      }
+    } else if ((value & spec::kPortWarmReset) != 0 && !usb3) {
+      // WPR is RsvdZ on USB 2 protocol ports (xHCI 5.4.8).
+      Record(Violation::kRsvdZWrittenOne, seq, offset, value, "WPR");
+    } else if (reset) {
+      // PR: a USB 2 bus reset, or a Hot Reset of a USB 3 port; WPR: a Warm
+      // Reset of a USB 3 port (xHCI 5.4.8, 4.19.5.1). PR also reads 1 while
+      // a Warm Reset runs.
       updated |= spec::kPortReset;
       updated &= ~spec::kPortEnabled;
+      state.warm_reset = (value & spec::kPortWarmReset) != 0;
       if (!config_.port_reset_never_completes) {
         state.reset_due_tick =
             clock_->now() +
@@ -2159,13 +2410,23 @@ class XhciSim final : public usb::MmioWindow {
     }
     if (slot == 0) {
       if ((value & 0xFFu) == 0) {
-        ProcessCommandRing(seq, offset, value);
+        // Doorbell 0 starts (or restarts) the Command Ring (xHCI 4.6.1).
+        cmd_ring_running_ = true;
+        if (!cmd_executing_) {
+          ProcessCommandRing(seq, offset, value);
+        }
       }
     } else if (slot >= 1 && slot < static_cast<int>(slots_.size())) {
       const uint8_t dci = static_cast<uint8_t>(value & 0xFFu);
       SimSlot& s = slots_[static_cast<size_t>(slot)];
       if (s.enabled && dci >= 1 && dci < 32) {
         s.ep[dci].doorbell_rung = true;
+        if (s.ep[dci].state == usb::kEpStateStopped) {
+          // A doorbell restarts a Stopped endpoint (xHCI 4.8.3).
+          s.ep[dci].state = usb::kEpStateRunning;
+          UpdateOutputEpState(s, dci, config_.csz64 ? 64 : 32, seq, offset,
+                              value);
+        }
         if (dci == 1) {
           ProcessEp0Ring(static_cast<uint8_t>(slot), seq, offset, value);
         } else {
@@ -2229,6 +2490,7 @@ class XhciSim final : public usb::MmioWindow {
                                     const int64_t offset,  //
                                     const uint32_t value) {
     slots_.assign(static_cast<size_t>(config_.max_slots + 1), SimSlot{});
+    last_enabled_slot_ = 0;
     if (!bus_master_) {
       Record(Violation::kDmaWhileBusMasterOff, seq, offset, value);
       return;
@@ -2265,6 +2527,9 @@ class XhciSim final : public usb::MmioWindow {
     }
     cmd_dequeue_ = crcr_ & ~0x3Full;
     cmd_ccs_ = static_cast<uint32_t>(crcr_ & 1u);
+    cmd_ring_running_ = false;
+    cmd_executing_ = false;
+    cmd_stop_after_current_ = false;
     usb::Trb probe_trb{};
     if (cmd_dequeue_ == 0 || !ReadDma(cmd_dequeue_, &probe_trb,
                                       sizeof(probe_trb), seq, offset, value)) {
@@ -2390,16 +2655,13 @@ class XhciSim final : public usb::MmioWindow {
     }
   }
 
+  // Fetches and executes commands while the ring runs, until it is empty or
+  // a command takes time (command_delay_ticks) or hangs.
   void ProcessCommandRing(const int64_t seq,     //
                           const int64_t offset,  //
                           const uint32_t value) {
-    if (config_.command_hang) {
-      return;
-    }
-    const int csz = config_.csz64 ? 64 : 32;
-    const int max_slots_en = static_cast<int>(config_register_ & 0xFFu);
     int steps = 0;
-    while (steps++ < 512) {
+    while (cmd_ring_running_ && !cmd_executing_ && steps++ < 512) {
       usb::Trb trb{};
       if (!ReadDma(cmd_dequeue_, &trb, sizeof(trb), seq, offset, value)) {
         return;
@@ -2408,8 +2670,7 @@ class XhciSim final : public usb::MmioWindow {
         return;
       }
       const uint64_t trb_phys = cmd_dequeue_;
-      const uint8_t type = usb::TrbType(trb);
-      if (type == usb::kTrbLink) {
+      if (usb::TrbType(trb) == usb::kTrbLink) {
         cmd_dequeue_ = usb::TrbPointer(trb) & ~0xFull;
         if ((trb.dw3 & usb::kTrbToggleCycle) != 0) {
           cmd_ccs_ ^= 1u;
@@ -2417,15 +2678,69 @@ class XhciSim final : public usb::MmioWindow {
         continue;
       }
       cmd_dequeue_ += 16;
+      if (config_.command_hang) {
+        HangCommand(trb, trb_phys);
+        return;
+      }
+      if (config_.command_delay_ticks > 0) {
+        cmd_executing_ = true;
+        cmd_exec_hung_ = false;
+        cmd_exec_trb_ = trb;
+        cmd_exec_phys_ = trb_phys;
+        cmd_exec_due_tick_ = clock_->now() + config_.command_delay_ticks;
+        return;
+      }
+      if (ExecuteCommand(trb, trb_phys, seq, offset, value) &&
+          cmd_stop_after_current_) {
+        StopCommandRing();
+      }
+    }
+  }
 
+  // The command never completes on its own (e.g. a SET_ADDRESS that the
+  // device NAKs forever): only CRCR.CA ends it.
+  void HangCommand(const usb::Trb& trb, const uint64_t trb_phys) {
+    cmd_executing_ = true;
+    cmd_exec_hung_ = true;
+    cmd_exec_trb_ = trb;
+    cmd_exec_phys_ = trb_phys;
+  }
+
+  // CRCR.CA (or CS once the command in progress is done): an executing
+  // command completes with Command Aborted, then the ring stops with a
+  // Command Ring Stopped event at its dequeue pointer, the next command TRB
+  // (xHCI 4.6.1.2).
+  void StopCommandRing() {
+    if (cmd_executing_) {
+      cmd_executing_ = false;
+      PushCommandCompletion(cmd_exec_phys_, usb::kCcCommandAborted, 0);
+    }
+    cmd_stop_after_current_ = false;
+    cmd_ring_running_ = false;
+    PushCommandCompletion(cmd_dequeue_, usb::kCcCommandRingStopped, 0);
+  }
+
+  // Executes one command and posts its completion. Returns false if the
+  // command hangs instead (HangCommand()).
+  bool ExecuteCommand(const usb::Trb& trb,      //
+                      const uint64_t trb_phys,  //
+                      const int64_t seq,        //
+                      const int64_t offset,     //
+                      const uint32_t value) {
+    const int csz = config_.csz64 ? 64 : 32;
+    const int max_slots_en = static_cast<int>(config_register_ & 0xFFu);
+    {
+      const uint8_t type = usb::TrbType(trb);
       switch (type) {
         case usb::kTrbEnableSlot: {
           uint8_t chosen = 0;
           if (!config_.no_slots_available) {
-            for (int s = 1;
-                 s <= max_slots_en && s < static_cast<int>(slots_.size());
-                 ++s) {
-              if (!slots_[static_cast<size_t>(s)].enabled) {
+            const int first =
+                config_.round_robin_slots ? last_enabled_slot_ : 0;
+            for (int k = 1; k <= max_slots_en; ++k) {
+              const int s = (first + k - 1) % max_slots_en + 1;
+              if (s < static_cast<int>(slots_.size()) &&
+                  !slots_[static_cast<size_t>(s)].enabled) {
                 chosen = static_cast<uint8_t>(s);
                 break;
               }
@@ -2438,6 +2753,7 @@ class XhciSim final : public usb::MmioWindow {
             slot = SimSlot{};
             slot.enabled = true;
             slot.slot_state = usb::kSlotStateDisabledOrEnabled;
+            last_enabled_slot_ = chosen;
             PushCommandCompletion(trb_phys, usb::kCcSuccess, chosen);
           }
           break;
@@ -2448,7 +2764,21 @@ class XhciSim final : public usb::MmioWindow {
               !slots_[static_cast<size_t>(s)].enabled) {
             PushCommandCompletion(trb_phys, usb::kCcSlotNotEnabled, s);
           } else {
-            slots_[static_cast<size_t>(s)] = SimSlot{};
+            SimSlot& slot = slots_[static_cast<size_t>(s)];
+            if (slot.out_ctx_phys != 0) {
+              // The xHC finds the slot's contexts through DCBAA, which
+              // software clears only after this command (xHCI 4.6.4).
+              uint64_t entry = 0;
+              ReadDma(dcbaap_ + static_cast<uint64_t>(s) * 8, &entry, 8, seq,
+                      offset, value);
+              if (entry != slot.out_ctx_phys) {
+                Record(Violation::kDcbaaChangedBeforeDisableSlot, seq, offset,
+                       value, "slot " + std::to_string(s));
+              }
+              CheckOutputContext(slot, s, seq, offset, value);
+            }
+            slot = SimSlot{};
+            disable_slot_log_.push_back(s);
             PushCommandCompletion(trb_phys, usb::kCcSuccess, s);
           }
           break;
@@ -2489,10 +2819,38 @@ class XhciSim final : public usb::MmioWindow {
           slot.port = port;
           slot.speed = usb::SlotContextSpeed(*in_slot);
           slot.context_entries = 1;
+          slot.route_string = in_slot->dw0 & 0xFFFFFu;
+          slot.mtt = ((in_slot->dw0 >> 25) & 1u) != 0;
+          slot.hub = ((in_slot->dw0 >> 26) & 1u) != 0;
+          slot.num_ports = static_cast<int>((in_slot->dw1 >> 24) & 0xFFu);
+          slot.parent_hub_slot_id = static_cast<uint8_t>(in_slot->dw2 & 0xFFu);
+          slot.parent_port_number =
+              static_cast<uint8_t>((in_slot->dw2 >> 8) & 0xFFu);
+          slot.ttt = static_cast<uint8_t>((in_slot->dw2 >> 16) & 0x3u);
+          const bool bsr = (trb.dw3 & usb::kTrbBsr) != 0;
+          SimUsbDevice* const target_dev = ResolveDeviceForSlot(slot);
+          if (!bsr && target_dev != nullptr && target_dev->naks_set_address()) {
+            HangCommand(trb, trb_phys);
+            return false;
+          }
+          if (!bsr && (target_dev == nullptr || target_dev->address() != 0)) {
+            // Only a device at the default address takes the SET_ADDRESS;
+            // an addressed one ignores it, so it gets no handshake (xHCI
+            // 4.6.5: USB Transaction Error) and the slot isn't addressed.
+            PushCommandCompletion(trb_phys, usb::kCcUsbTransactionError, s);
+            break;
+          }
+          for (int t = 1; t < static_cast<int>(slots_.size()); ++t) {
+            if (t != s && slots_[static_cast<size_t>(t)].enabled &&
+                slots_[static_cast<size_t>(t)].out_ctx_phys == out_ctx_phys) {
+              Record(
+                  Violation::kDeviceContextShared, seq, offset, value,
+                  "slots " + std::to_string(t) + " and " + std::to_string(s));
+            }
+          }
           slot.out_ctx_phys = out_ctx_phys;
-          slot.slot_state = (trb.dw3 & usb::kTrbBsr) != 0
-                                ? usb::kSlotStateDefault
-                                : usb::kSlotStateAddressed;
+          slot.slot_state =
+              bsr ? usb::kSlotStateDefault : usb::kSlotStateAddressed;
           slot.ep[1].state = usb::kEpStateRunning;
           slot.ep[1].type = usb::kEpTypeControlBiDir;
           slot.ep[1].max_packet_size = usb::EpContextMaxPacketSize(*in_ep0);
@@ -2501,18 +2859,22 @@ class XhciSim final : public usb::MmioWindow {
           slot.ep[1].dcs = usb::EpContextDcs(*in_ep0);
 
           usb::SlotContext out_slot = *in_slot;
-          out_slot.dw3 = (static_cast<uint32_t>(slot.slot_state) << 27) |
-                         ((trb.dw3 & usb::kTrbBsr) != 0 ? 0u : s);
+          out_slot.dw3 =
+              (static_cast<uint32_t>(slot.slot_state) << 27) | (bsr ? 0u : s);
           usb::EndpointContext out_ep0 = *in_ep0;
           out_ep0.dw0 = (out_ep0.dw0 & ~0x7u) | usb::kEpStateRunning;
-          WriteDma(out_ctx_phys, &out_slot, sizeof(out_slot), seq, offset,
-                   value);
-          WriteDma(out_ctx_phys + static_cast<uint64_t>(csz), &out_ep0,
-                   sizeof(out_ep0), seq, offset, value);
-          if ((trb.dw3 & usb::kTrbBsr) == 0 &&
-              ports_[static_cast<size_t>(port - 1)].device != nullptr) {
-            ports_[static_cast<size_t>(port - 1)].device->OnSetAddress(s);
+          // From here on the xHC owns the Output Device Context.
+          slot.out_ctx_shadow.assign(static_cast<size_t>(32 * csz), 0);
+          ReadDma(out_ctx_phys, slot.out_ctx_shadow.data(), 32 * csz, seq,
+                  offset, value);
+          WriteOutputContext(slot, 0, &out_slot, sizeof(out_slot), seq, offset,
+                             value);
+          WriteOutputContext(slot, csz, &out_ep0, sizeof(out_ep0), seq, offset,
+                             value);
+          if (!bsr) {
+            target_dev->OnSetAddress(s);
           }
+          CheckUsb2Segment(port, seq, offset, value);
           PushCommandCompletion(trb_phys, usb::kCcSuccess, s);
           break;
         }
@@ -2532,18 +2894,37 @@ class XhciSim final : public usb::MmioWindow {
           const usb::InputControlContext* const icc =
               usb::InputCtrlCtx(in_ctx.data());
           SimSlot& slot = slots_[s];
+          if ((icc->add_flags & 0x1u) != 0) {
+            const usb::SlotContext* const in_slot =
+                usb::InputSlotCtx(in_ctx.data(), csz);
+            slot.mtt = ((in_slot->dw0 >> 25) & 1u) != 0;
+            slot.hub = ((in_slot->dw0 >> 26) & 1u) != 0;
+            slot.num_ports = static_cast<int>((in_slot->dw1 >> 24) & 0xFFu);
+            slot.ttt = static_cast<uint8_t>((in_slot->dw2 >> 16) & 0x3u);
+            usb::SlotContext out_slot{};
+            ReadOutputContext(slot, 0, &out_slot, sizeof(out_slot), seq, offset,
+                              value);
+            out_slot.dw0 = (out_slot.dw0 & ~((1u << 26) | (1u << 25))) |
+                           (in_slot->dw0 & ((1u << 26) | (1u << 25)));
+            out_slot.dw1 =
+                (out_slot.dw1 & 0x00FF'FFFFu) | (in_slot->dw1 & 0xFF00'0000u);
+            out_slot.dw2 =
+                (out_slot.dw2 & ~(0x3u << 16)) | (in_slot->dw2 & (0x3u << 16));
+            WriteOutputContext(slot, 0, &out_slot, sizeof(out_slot), seq,
+                               offset, value);
+          }
           if ((icc->add_flags & 0x2u) != 0) {
             const usb::EndpointContext* const in_ep0 =
                 usb::InputEpCtx(in_ctx.data(), csz, 1);
             slot.ep[1].max_packet_size = usb::EpContextMaxPacketSize(*in_ep0);
             usb::EndpointContext out_ep0{};
-            ReadDma(slot.out_ctx_phys + static_cast<uint64_t>(csz), &out_ep0,
-                    sizeof(out_ep0), seq, offset, value);
+            ReadOutputContext(slot, csz, &out_ep0, sizeof(out_ep0), seq, offset,
+                              value);
             out_ep0.dw1 =
                 (out_ep0.dw1 & 0x0000FFFFu) |
                 (static_cast<uint32_t>(slot.ep[1].max_packet_size) << 16);
-            WriteDma(slot.out_ctx_phys + static_cast<uint64_t>(csz), &out_ep0,
-                     sizeof(out_ep0), seq, offset, value);
+            WriteOutputContext(slot, csz, &out_ep0, sizeof(out_ep0), seq,
+                               offset, value);
           }
           PushCommandCompletion(trb_phys, usb::kCcSuccess, s);
           break;
@@ -2571,6 +2952,14 @@ class XhciSim final : public usb::MmioWindow {
           }
           SimSlot& slot = slots_[s];
           slot.context_entries = usb::SlotContextEntries(*in_slot);
+          slot.route_string = in_slot->dw0 & 0xFFFFFu;
+          slot.mtt = ((in_slot->dw0 >> 25) & 1u) != 0;
+          slot.hub = ((in_slot->dw0 >> 26) & 1u) != 0;
+          slot.num_ports = static_cast<int>((in_slot->dw1 >> 24) & 0xFFu);
+          slot.parent_hub_slot_id = static_cast<uint8_t>(in_slot->dw2 & 0xFFu);
+          slot.parent_port_number =
+              static_cast<uint8_t>((in_slot->dw2 >> 8) & 0xFFu);
+          slot.ttt = static_cast<uint8_t>((in_slot->dw2 >> 16) & 0x3u);
           slot.slot_state = usb::kSlotStateConfigured;
           for (int dci = 2; dci < 32; ++dci) {
             if ((icc->add_flags & (1u << dci)) != 0) {
@@ -2586,17 +2975,18 @@ class XhciSim final : public usb::MmioWindow {
               ep.max_esit = usb::EpContextMaxEsitPayload(*in_ep);
               ep.dequeue = usb::EpContextDequeuePtr(*in_ep);
               ep.dcs = usb::EpContextDcs(*in_ep);
+              ep.toggle = 0;
               usb::EndpointContext out_ep = *in_ep;
               out_ep.dw0 = (out_ep.dw0 & ~0x7u) | usb::kEpStateRunning;
-              WriteDma(slot.out_ctx_phys + static_cast<uint64_t>(dci * csz),
-                       &out_ep, sizeof(out_ep), seq, offset, value);
+              WriteOutputContext(slot, dci * csz, &out_ep, sizeof(out_ep), seq,
+                                 offset, value);
             }
           }
           usb::SlotContext out_slot = *in_slot;
           out_slot.dw3 =
               (static_cast<uint32_t>(usb::kSlotStateConfigured) << 27) | s;
-          WriteDma(slot.out_ctx_phys, &out_slot, sizeof(out_slot), seq, offset,
-                   value);
+          WriteOutputContext(slot, 0, &out_slot, sizeof(out_slot), seq, offset,
+                             value);
           PushCommandCompletion(trb_phys, usb::kCcSuccess, s);
           break;
         }
@@ -2613,6 +3003,12 @@ class XhciSim final : public usb::MmioWindow {
             PushCommandCompletion(trb_phys, usb::kCcContextStateError, s);
             break;
           }
+          // TSP = 1 (Soft Retry) keeps the transfer state, so the TD at the
+          // dequeue pointer is retried with the same data toggle; TSP = 0
+          // resets the host's toggle / sequence number (xHCI 4.6.8).
+          if ((trb.dw3 & usb::kTrbTsp) == 0) {
+            slot.ep[dci].toggle = 0;
+          }
           slot.ep[dci].state = usb::kEpStateStopped;
           UpdateOutputEpState(slot, dci, csz, seq, offset, value);
           PushCommandCompletion(trb_phys, usb::kCcSuccess, s);
@@ -2621,12 +3017,19 @@ class XhciSim final : public usb::MmioWindow {
         case usb::kTrbStopEndpoint: {
           const uint8_t s = usb::TrbSlotId(trb);
           const uint8_t dci = usb::TrbEndpointId(trb);
+          ++stop_endpoint_count_;
           if (s < 1 || s > max_slots_en ||
               !slots_[static_cast<size_t>(s)].enabled || dci < 1 || dci >= 32) {
             PushCommandCompletion(trb_phys, usb::kCcParameterError, s);
             break;
           }
           SimSlot& slot = slots_[s];
+          if (slot.ep[dci].state != usb::kEpStateRunning) {
+            // Only a Running endpoint can be stopped; a Halted, Stopped or
+            // Error one is left as it is (xHCI 4.6.9).
+            PushCommandCompletion(trb_phys, usb::kCcContextStateError, s);
+            break;
+          }
           slot.ep[dci].state = usb::kEpStateStopped;
           UpdateOutputEpState(slot, dci, csz, seq, offset, value);
           PushCommandCompletion(trb_phys, usb::kCcSuccess, s);
@@ -2641,14 +3044,15 @@ class XhciSim final : public usb::MmioWindow {
             break;
           }
           SimSlot& slot = slots_[s];
-          if (slot.ep[dci].state != usb::kEpStateStopped) {
+          if (slot.ep[dci].state != usb::kEpStateStopped &&
+              slot.ep[dci].state != usb::kEpStateError) {
             PushCommandCompletion(trb_phys, usb::kCcContextStateError, s);
             break;
           }
           const uint64_t raw = usb::TrbPointer(trb);
           slot.ep[dci].dequeue = raw & ~0xFull;
           slot.ep[dci].dcs = static_cast<uint32_t>(raw & 1u);
-          slot.ep[dci].state = usb::kEpStateRunning;
+          slot.ep[dci].state = usb::kEpStateStopped;
           UpdateOutputEpState(slot, dci, csz, seq, offset, value);
           PushCommandCompletion(trb_phys, usb::kCcSuccess, s);
           break;
@@ -2661,9 +3065,64 @@ class XhciSim final : public usb::MmioWindow {
           break;
       }
     }
+    return true;
   }
 
-  void UpdateOutputEpState(const SimSlot& slot,   //
+  // The Output Device Context of `slot` at `ctx_offset`: the xHC's own copy
+  // (the shadow) once it owns the context, else memory.
+  void ReadOutputContext(const SimSlot& slot,       //
+                         const int64_t ctx_offset,  //
+                         void* const dst,           //
+                         const int64_t len,         //
+                         const int64_t seq,         //
+                         const int64_t offset,      //
+                         const uint32_t value) {
+    if (ctx_offset >= 0 && len >= 0 &&
+        ctx_offset + len <= static_cast<int64_t>(slot.out_ctx_shadow.size())) {
+      std::memcpy(dst, slot.out_ctx_shadow.data() + ctx_offset,
+                  static_cast<size_t>(len));
+      return;
+    }
+    ReadDma(slot.out_ctx_phys + static_cast<uint64_t>(ctx_offset), dst, len,
+            seq, offset, value);
+  }
+
+  void WriteOutputContext(SimSlot& slot,             //
+                          const int64_t ctx_offset,  //
+                          const void* const src,     //
+                          const int64_t len,         //
+                          const int64_t seq,         //
+                          const int64_t offset,      //
+                          const uint32_t value) {
+    WriteDma(slot.out_ctx_phys + static_cast<uint64_t>(ctx_offset), src, len,
+             seq, offset, value);
+    if (ctx_offset >= 0 && len >= 0 &&
+        ctx_offset + len <= static_cast<int64_t>(slot.out_ctx_shadow.size())) {
+      std::memcpy(slot.out_ctx_shadow.data() + ctx_offset, src,
+                  static_cast<size_t>(len));
+    }
+  }
+
+  // Software must not write the Output Device Context of an enabled slot
+  // (xHCI 4.5.3, 6.1), e.g. reuse its memory for another device.
+  void CheckOutputContext(const SimSlot& slot,   //
+                          const int slot_id,     //
+                          const int64_t seq,     //
+                          const int64_t offset,  //
+                          const uint32_t value) {
+    if (slot.out_ctx_shadow.empty()) {
+      return;
+    }
+    std::vector<uint8_t> current(slot.out_ctx_shadow.size(), 0);
+    if (ReadDma(slot.out_ctx_phys, current.data(),
+                static_cast<int64_t>(current.size()), seq, offset, value) &&
+        current != slot.out_ctx_shadow) {
+      Record(Violation::kDeviceContextModified, seq, offset, value,
+             "slot " + std::to_string(slot_id));
+    }
+  }
+
+  void UpdateOutputEpState(SimSlot& slot,         //
                            const uint8_t dci,     //
                            const int csz,         //
                            const int64_t seq,     //
@@ -2673,14 +3132,16 @@ class XhciSim final : public usb::MmioWindow {
       return;
     }
     usb::EndpointContext out_ep{};
-    const uint64_t addr = slot.out_ctx_phys + static_cast<uint64_t>(dci * csz);
-    ReadDma(addr, &out_ep, sizeof(out_ep), seq, offset, value);
+    const int64_t ctx_offset = static_cast<int64_t>(dci) * csz;
+    ReadOutputContext(slot, ctx_offset, &out_ep, sizeof(out_ep), seq, offset,
+                      value);
     out_ep.dw0 = (out_ep.dw0 & ~0x7u) | (slot.ep[dci].state & 0x7u);
     out_ep.tr_dequeue_low =
         static_cast<uint32_t>(slot.ep[dci].dequeue & ~0xFull) |
         (slot.ep[dci].dcs & 1u);
     out_ep.tr_dequeue_high = static_cast<uint32_t>(slot.ep[dci].dequeue >> 32);
-    WriteDma(addr, &out_ep, sizeof(out_ep), seq, offset, value);
+    WriteOutputContext(slot, ctx_offset, &out_ep, sizeof(out_ep), seq, offset,
+                       value);
   }
 
   bool PopEndpointTrb(SimEndpoint& ep,         //
@@ -2740,6 +3201,53 @@ class XhciSim final : public usb::MmioWindow {
     return false;
   }
 
+  SimUsbDevice* ResolveDeviceForSlot(const SimSlot& slot) const {
+    if (slot.port < 1 || slot.port > static_cast<int>(ports_.size())) {
+      return nullptr;
+    }
+    SimUsbDevice* dev = ports_[static_cast<size_t>(slot.port - 1)].device;
+    uint32_t route = slot.route_string & 0xFFFFFu;
+    uint32_t expected_tt_route = 0;
+    int expected_tt_port = 0;
+    for (int tier = 0; tier < 5 && route != 0 && dev != nullptr; ++tier) {
+      const int hub_port = static_cast<int>(route & 0xFu);
+      if (hub_port == 0) {
+        return nullptr;
+      }
+      if (dev->speed() == usb::kPortSpeedHigh) {
+        expected_tt_route =
+            slot.route_string & ((uint32_t{1} << (tier * 4)) - 1u);
+        expected_tt_port = hub_port;
+      }
+      dev = dev->ResolveDownstreamDevice(hub_port);
+      route >>= 4;
+    }
+    if (dev == nullptr) {
+      return nullptr;
+    }
+    // Split transactions to an LS/FS device behind a High-Speed hub use the
+    // slot's Parent Hub Slot ID and Parent Port Number to reach the TT (xHCI
+    // 6.2.2); other devices must leave both fields 0.
+    const bool needs_tt = (slot.speed == usb::kPortSpeedLow ||
+                           slot.speed == usb::kPortSpeedFull) &&
+                          expected_tt_port != 0;
+    if (needs_tt) {
+      const int hs = slot.parent_hub_slot_id;
+      if (hs < 1 || hs >= static_cast<int>(slots_.size())) {
+        return nullptr;
+      }
+      const SimSlot& tt = slots_[static_cast<size_t>(hs)];
+      if (!tt.enabled || !tt.hub || tt.port != slot.port ||
+          (tt.route_string & 0xFFFFFu) != expected_tt_route ||
+          slot.parent_port_number != expected_tt_port) {
+        return nullptr;
+      }
+    } else if (slot.parent_hub_slot_id != 0 || slot.parent_port_number != 0) {
+      return nullptr;
+    }
+    return dev;
+  }
+
   void ProcessEp0Ring(const uint8_t slot_id,  //
                       const int64_t seq,      //
                       const int64_t offset,   //
@@ -2756,6 +3264,14 @@ class XhciSim final : public usb::MmioWindow {
     }
     if (usb::TrbType(setup_trb) != usb::kTrbSetupStage ||
         (setup_trb.dw3 & usb::kTrbIdt) == 0) {
+      PushTransferEvent(setup_pa, usb::kCcTrbError, 0, slot_id, 1);
+      return;
+    }
+    if (config_.hci_version < 0x0100 && ((setup_trb.dw3 >> 16) & 0x3u) != 0) {
+      // Transfer Type exists since xHCI 1.0; a 0.96 controller may reject
+      // its RsvdZ bits.
+      ep0.state = usb::kEpStateHalted;
+      UpdateOutputEpState(slot, 1, config_.csz64 ? 64 : 32, seq, offset, value);
       PushTransferEvent(setup_pa, usb::kCcTrbError, 0, slot_id, 1);
       return;
     }
@@ -2796,11 +3312,8 @@ class XhciSim final : public usb::MmioWindow {
       return;
     }
 
-    SimUsbDevice* const dev =
-        (slot.port >= 1 && slot.port <= static_cast<int>(ports_.size()))
-            ? ports_[static_cast<size_t>(slot.port - 1)].device
-            : nullptr;
-    if (dev == nullptr) {
+    SimUsbDevice* const dev = ResolveDeviceForSlot(slot);
+    if (dev == nullptr || AddressCollides(slot, *dev)) {
       ep0.state = usb::kEpStateHalted;
       UpdateOutputEpState(slot, 1, config_.csz64 ? 64 : 32, seq, offset, value);
       PushTransferEvent(has_data ? data_pa : status_pa,
@@ -2827,6 +3340,8 @@ class XhciSim final : public usb::MmioWindow {
     uint16_t actual_len = 0;
     const ControlOutcome outcome =
         dev->OnControl(setup, buf.data(), setup.w_length, &actual_len);
+    // Hub port resets and status reads move devices into the default state.
+    CheckUsb2Segment(slot.port, seq, offset, value);
     if (outcome == ControlOutcome::kNoResponse) {
       return;
     }
@@ -2886,11 +3401,21 @@ class XhciSim final : public usb::MmioWindow {
     if (ep.state != usb::kEpStateRunning || !ep.doorbell_rung) {
       return;
     }
-    SimUsbDevice* const dev =
-        (slot.port >= 1 && slot.port <= static_cast<int>(ports_.size()))
-            ? ports_[static_cast<size_t>(slot.port - 1)].device
-            : nullptr;
+    SimUsbDevice* const dev = ResolveDeviceForSlot(slot);
     if (dev == nullptr) {
+      return;
+    }
+    if (AddressCollides(slot, *dev)) {
+      usb::Trb trb{};
+      uint64_t trb_pa = 0;
+      if (!PeekEndpointTrb(ep, &trb, &trb_pa, seq, offset, value)) {
+        return;
+      }
+      ep.state = usb::kEpStateHalted;
+      UpdateOutputEpState(slot, dci, config_.csz64 ? 64 : 32, seq, offset,
+                          value);
+      PushTransferEvent(trb_pa, usb::kCcUsbTransactionError, trb.dw2 & 0x1FFFFu,
+                        slot_id, dci);
       return;
     }
 
@@ -2916,8 +3441,20 @@ class XhciSim final : public usb::MmioWindow {
       if (outcome == IntrOutcome::kNak) {
         return;
       }
-      ep.dequeue += 16;
       if (outcome == IntrOutcome::kData) {
+        const int device_toggle = dev->InterruptInToggle(dci);
+        if (device_toggle >= 0) {
+          // The host ACKs every data packet, also one it drops as a
+          // retransmission because its toggle (sequence number) is not the
+          // expected one: the device moves on either way (USB 2.0 8.6.4).
+          dev->OnInterruptInAck(dci);
+          if (device_toggle != ep.toggle) {
+            ++dropped_in_packets_;
+            continue;  // The data is lost; the TRB stays armed
+          }
+          ep.toggle ^= 1u;
+        }
+        ep.dequeue += 16;
         const uint16_t copy_len =
             actual_len < req_len ? actual_len : static_cast<uint16_t>(req_len);
         if (copy_len > 0) {
@@ -2932,6 +3469,8 @@ class XhciSim final : public usb::MmioWindow {
           PushTransferEvent(trb_pa, cc, residual, slot_id, dci);
         }
       } else {
+        // A halting error: the dequeue pointer stays on the TD that failed,
+        // which a Soft Retry retries (xHCI 4.10.2, 4.6.8.1).
         ep.state = usb::kEpStateHalted;
         UpdateOutputEpState(slot, dci, config_.csz64 ? 64 : 32, seq, offset,
                             value);
@@ -3063,8 +3602,17 @@ class XhciSim final : public usb::MmioWindow {
   // Phase-2 DMA, event ring, command ring, and slots.
   SimDmaArena* dma_ = nullptr;
   bool bus_master_ = true;
-  bool crcr_abort_pending_ = false;
-  int64_t cmd_abort_due_tick_ = 0;
+  // Command Ring Running (CRR), and the command in progress: delayed
+  // (command_delay_ticks, due at cmd_exec_due_tick_) or hung until aborted.
+  bool cmd_ring_running_ = false;
+  bool cmd_executing_ = false;
+  bool cmd_exec_hung_ = false;
+  usb::Trb cmd_exec_trb_ = {};
+  uint64_t cmd_exec_phys_ = 0;
+  int64_t cmd_exec_due_tick_ = 0;
+  bool cmd_stop_after_current_ = false;
+  // The last write was a CRCR low dword with CS or CA.
+  bool crcr_abort_low_written_ = false;
   bool erdp_ehb_written_ = false;
   uint64_t cmd_dequeue_ = 0;
   uint32_t cmd_ccs_ = 1;
@@ -3078,6 +3626,11 @@ class XhciSim final : public usb::MmioWindow {
   int irq_count_ = 0;
   bool irq_asserted_ = false;
   std::vector<SimSlot> slots_{65};
+  int last_enabled_slot_ = 0;
+  int max_default_state_devices_ = 0;
+  int stop_endpoint_count_ = 0;
+  int dropped_in_packets_ = 0;
+  std::vector<int> disable_slot_log_;
 
   // USB Legacy Support state.
   bool bios_owned_ = false;
@@ -3093,4 +3646,4 @@ class XhciSim final : public usb::MmioWindow {
 
 }  // namespace protos::xhci_sim
 
-#endif  // PROTOS_XHCI_SIM_H_
+#endif  // PROTOS_USER_USBKBD_XHCI_SIM_H_

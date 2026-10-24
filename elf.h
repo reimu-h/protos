@@ -4,6 +4,7 @@
 #include <cstdint>
 
 #include "paging.h"
+#include "status_or.h"
 
 namespace protos {
 
@@ -67,13 +68,11 @@ enum class ElfError : uint8_t {
 // user-space addresses, take their contents from inside the file, share no
 // page, and are not both writable and executable, and whose entry point lies
 // in an executable segment. Loadable segments of size 0 are left out. On
-// success, stores the result in `*out` and returns `ElfError::kNone`;
-// otherwise returns the first problem found. The file may be unaligned.
-ElfError ElfParseExecutable(const uint8_t* data,  //
-                            int64_t size,         //
-                            ElfExecutable* out);
+// success, returns the parsed executable; otherwise returns the first problem
+// found. The file may be unaligned.
+StatusOr<ElfExecutable, ElfError> ElfParseExecutable(const uint8_t* data,
+                                                     int64_t size);
 
 }  // namespace protos
 
 #endif  // PROTOS_ELF_H_
-

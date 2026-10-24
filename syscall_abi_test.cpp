@@ -5,10 +5,12 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <new>
 #include <string>
+#include <type_traits>
 #include <vector>
 
-#include "user/sh_lib.h"
+#include "user/sh/sh_lib.h"
 #include "user_programs.h"
 
 namespace protos {
@@ -198,11 +200,49 @@ TEST(SyscallAbiTest, UserProgramResultDefaultsAndOutcomes) {
 
   const UserProgramResult result{};
   EXPECT_THAT(result.outcome, t::Eq(UserProgramOutcome::kLoadFailed));
+  EXPECT_THAT(result.reserved0, t::Each(t::Eq(0)));
   EXPECT_THAT(result.exit_status, t::Eq(0));
   EXPECT_THAT(result.fault_vector, t::Eq(-1));
+  EXPECT_THAT(result.reserved1, t::Eq(0U));
   EXPECT_THAT(result.fault_error_code, t::Eq(0U));
   EXPECT_THAT(result.fault_rip, t::Eq(0U));
   EXPECT_THAT(result.fault_address, t::Eq(0U));
+}
+
+// wait() copies the whole struct to user memory, so each of its bytes must
+// belong to a field that the kernel sets: implicit padding would carry stale
+// kernel memory to user space.
+TEST(SyscallAbiTest, UserProgramResultIsAllFieldsWithZeroReservedBytes) {
+  EXPECT_TRUE(std::has_unique_object_representations_v<UserProgramResult>);
+  const UserProgramResult result;
+  EXPECT_THAT(sizeof(result.outcome) + sizeof(result.reserved0) +
+                  sizeof(result.exit_status) + sizeof(result.fault_vector) +
+                  sizeof(result.reserved1) + sizeof(result.fault_error_code) +
+                  sizeof(result.fault_rip) + sizeof(result.fault_address),
+              t::Eq(sizeof(UserProgramResult)));
+
+  // Constructed in dirty memory, as `UserProcess::result_` is in a heap
+  // object that the kernel doesn't clear, it holds its default value in every
+  // byte, and so do its copies.
+  constexpr int kSize = static_cast<int>(sizeof(UserProgramResult));
+  alignas(UserProgramResult) uint8_t storage[kSize];
+  volatile uint8_t* const dirty = storage;
+  for (int i = 0; i < kSize; ++i) {
+    dirty[i] = 0xA5;
+  }
+  const UserProgramResult* const constructed = new (storage) UserProgramResult;
+  std::vector<uint8_t> expected(kSize, 0);
+  expected[0] = static_cast<uint8_t>(UserProgramOutcome::kLoadFailed);
+  // `fault_vector` (-1) takes bytes 16 to 19.
+  for (int i = 16; i < 20; ++i) {
+    expected[i] = 0xFF;
+  }
+  EXPECT_THAT(std::vector<uint8_t>(storage, storage + kSize),
+              t::ElementsAreArray(expected));
+  const UserProgramResult copy = *constructed;
+  const uint8_t* const copy_bytes = reinterpret_cast<const uint8_t*>(&copy);
+  EXPECT_THAT(std::vector<uint8_t>(copy_bytes, copy_bytes + kSize),
+              t::ElementsAreArray(expected));
 }
 
 TEST(SyscallAbiTest, UserProgramNameEqualsMatchesExactLengthStrings) {
@@ -266,26 +306,24 @@ struct FakeShellState {
     return static_cast<int64_t>(s->spawns.size());
   }
 
-  static int64_t Wait(void* const ctx,    //
-                      const int64_t pid,  //
-                      UserProgramResult* const result) {
+  static StatusOr<UserProgramResult> Wait(void* const ctx, const int64_t pid) {
     FakeShellState* const s = static_cast<FakeShellState*>(ctx);
-    if (pid < 1 || pid > static_cast<int64_t>(s->spawns.size()) ||
-        result == nullptr) {
+    if (pid < 1 || pid > static_cast<int64_t>(s->spawns.size())) {
       return kSyscallErrorInvalid;
     }
     const SpawnCall& call = s->spawns[static_cast<size_t>(pid - 1)];
+    UserProgramResult result{};
     if (call.arg == 6) {
-      result->outcome = UserProgramOutcome::kFaulted;
-      result->fault_vector = 6;
-      result->fault_error_code = 0;
+      result.outcome = UserProgramOutcome::kFaulted;
+      result.fault_vector = 6;
+      result.fault_error_code = 0;
     } else if (call.arg == 99) {
-      result->outcome = UserProgramOutcome::kKilled;
+      result.outcome = UserProgramOutcome::kKilled;
     } else {
-      result->outcome = UserProgramOutcome::kExited;
-      result->exit_status = static_cast<int64_t>(call.arg);
+      result.outcome = UserProgramOutcome::kExited;
+      result.exit_status = static_cast<int64_t>(call.arg);
     }
-    return 0;
+    return result;
   }
 
   sh::ShellEnv Env() {
@@ -347,35 +385,27 @@ TEST(ShellLibTest, LineEditorHandlesBackspaceCrLfAndClamping) {
 }
 
 TEST(ShellLibTest, TokenizeAndParseInt64HandleEdgeCases) {
-  sh::ShellCommand cmd;
   constexpr const char kLine[] = "  echo   hello\tworld  ";
-  EXPECT_THAT(sh::TokenizeLine(kLine, sizeof(kLine) - 1, &cmd), t::Eq(3));
+  const sh::ShellCommand cmd = sh::TokenizeLine(kLine, sizeof(kLine) - 1);
+  EXPECT_THAT(cmd.token_count, t::Eq(3));
   EXPECT_TRUE(sh::TokenEquals(cmd.tokens[0], "echo"));
   EXPECT_TRUE(sh::TokenEquals(cmd.tokens[1], "hello"));
   EXPECT_TRUE(sh::TokenEquals(cmd.tokens[2], "world"));
 
-  int64_t val = 0;
-  EXPECT_TRUE(sh::ParseInt64(sh::ShellToken{"0", 1}, &val));
-  EXPECT_THAT(val, t::Eq(0));
-  EXPECT_TRUE(sh::ParseInt64(sh::ShellToken{"-42", 3}, &val));
-  EXPECT_THAT(val, t::Eq(-42));
-  EXPECT_TRUE(sh::ParseInt64(sh::ShellToken{"0x10", 4}, &val));
-  EXPECT_THAT(val, t::Eq(16));
-  EXPECT_TRUE(sh::ParseInt64(sh::ShellToken{"-9223372036854775808", 20}, &val));
-  EXPECT_THAT(val, t::Eq(INT64_MIN));
-  EXPECT_FALSE(sh::ParseInt64(sh::ShellToken{"9223372036854775808", 19}, &val));
-  EXPECT_FALSE(sh::ParseInt64(sh::ShellToken{"0x", 2}, &val));
-  EXPECT_FALSE(sh::ParseInt64(sh::ShellToken{"-", 1}, &val));
-  EXPECT_FALSE(sh::ParseInt64(sh::ShellToken{"12a", 3}, &val));
+  EXPECT_THAT(*sh::ParseInt64(sh::ShellToken{"0", 1}), t::Eq(0));
+  EXPECT_THAT(*sh::ParseInt64(sh::ShellToken{"-42", 3}), t::Eq(-42));
+  EXPECT_THAT(*sh::ParseInt64(sh::ShellToken{"0x10", 4}), t::Eq(16));
+  EXPECT_THAT(*sh::ParseInt64(sh::ShellToken{"-9223372036854775808", 20}),
+              t::Eq(INT64_MIN));
+  EXPECT_FALSE(sh::ParseInt64(sh::ShellToken{"9223372036854775808", 19}).ok());
+  EXPECT_FALSE(sh::ParseInt64(sh::ShellToken{"0x", 2}).ok());
+  EXPECT_FALSE(sh::ParseInt64(sh::ShellToken{"-", 1}).ok());
+  EXPECT_FALSE(sh::ParseInt64(sh::ShellToken{"12a", 3}).ok());
 
-  uint64_t prog_arg = 0;
-  EXPECT_TRUE(sh::ParseProgramArg(sh::ShellToken{"syscalls", 8}, &prog_arg));
-  EXPECT_THAT(prog_arg, t::Eq(1U));
-  EXPECT_TRUE(sh::ParseProgramArg(sh::ShellToken{"fault", 5}, &prog_arg));
-  EXPECT_THAT(prog_arg, t::Eq(6U));
-  EXPECT_TRUE(sh::ParseProgramArg(sh::ShellToken{"buffers", 7}, &prog_arg));
-  EXPECT_THAT(prog_arg, t::Eq(16U));
-  EXPECT_FALSE(sh::ParseProgramArg(sh::ShellToken{"bad_alias", 9}, &prog_arg));
+  EXPECT_THAT(*sh::ParseProgramArg(sh::ShellToken{"syscalls", 8}), t::Eq(1U));
+  EXPECT_THAT(*sh::ParseProgramArg(sh::ShellToken{"fault", 5}), t::Eq(6U));
+  EXPECT_THAT(*sh::ParseProgramArg(sh::ShellToken{"buffers", 7}), t::Eq(16U));
+  EXPECT_FALSE(sh::ParseProgramArg(sh::ShellToken{"bad_alias", 9}).ok());
 }
 
 TEST(ShellLibTest, RunShellExecutesBuiltinsSpawnsProgramsAndExitsCleanly) {

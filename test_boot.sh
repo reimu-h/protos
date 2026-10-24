@@ -42,14 +42,18 @@
 # Usage: test_boot.sh [--passes LIST] [--artifact-dir DIR] [--drain-on-fail]
 #                     [kernel.iso [kernel-mb1.iso]]
 #
-# Options (for deflake.py; never passed by make):
+# Options (for deflake.py; make passes them only on from the Docker fallback
+# below):
 #   --passes LIST      Run only these passes (names from: bios uefi mb1 max
 #                      smep, separated by spaces or commas), in the usual
 #                      order, each with all of its checks (default: all).
 #   --artifact-dir DIR Also save, for each pass that runs, its QEMU command
-#                      line (qemu_argv, NUL-terminated arguments, and
-#                      qemu_cwd), its complete serial log (serial.log), its
-#                      output (output.log) and its result (result: PASS,
+#                      line (qemu_argv, NUL-terminated arguments; qemu_cwd,
+#                      the directory it runs in; and qemu_run_dir, the
+#                      directory of the run's files that it names, which the
+#                      script deletes at its end), its complete serial log
+#                      (serial.log), QEMU's error output (qemu_stderr.log),
+#                      its output (output.log) and its result (result: PASS,
 #                      FAIL or SKIPPED) in <dir>/<pass>/.
 #   --drain-on-fail    When the serial log of a pass shows a failure, keep
 #                      QEMU running until the self-tests end, the kernel
@@ -164,9 +168,85 @@ else
   MB1_ISO_FILE="${BUILD_DIR}/kernel-mb1.iso"
 fi
 
+# Prints the path of file or directory $1 relative to this directory, the
+# repository; fails if $1 is outside it (or the directory of a file $1 does
+# not exist).
+repo_relative_path() {
+  local dir="$1" base=""
+  if [[ ! -d "${dir}" ]]; then
+    dir="$(dirname -- "$1")"
+    base="/$(basename -- "$1")"
+  fi
+  local repo
+  dir="$(CDPATH='' cd -- "${dir}" 2>/dev/null && pwd -P)" || return 1
+  repo="$(pwd -P)"
+  if [[ "${dir}" == "${repo}" ]]; then
+    base="${base#/}"
+    printf '%s\n' "${base:-.}"
+  elif [[ "${dir}" == "${repo}/"* ]]; then
+    printf '%s\n' "${dir#"${repo}/"}${base}"
+  else
+    return 1
+  fi
+}
+
+# Prints its arguments as the value of a make variable that a recipe passes to
+# the shell: each argument single-quoted for the shell, with $ doubled for
+# make.
+make_shell_words() {
+  local word words=() quote="'\\''"
+  for word in "$@"; do
+    word="${word//\'/${quote}}"
+    words+=("'${word//\$/\$\$}'")
+  done
+  printf '%s' "${words[*]-}"
+}
+
+# Outside a container, without QEMU on the host or with USE_DOCKER=1, the boot
+# test runs in the Docker image: `make run-boot-test` runs this script there
+# with the same options and ISO files (without ISO files, the ISOs of the
+# working tree, which it builds first). The container sees only the
+# repository, as its working directory, so the artifact directory and the ISO
+# files must be in it (ISO files that don't exist are passed on as they are:
+# the script in the container reports them like on the host).
 if [[ ! -f /.dockerenv && ! -f /run/.containerenv ]]; then
   if [[ "${USE_DOCKER:-0}" == "1" ]] || ! command -v qemu-system-x86_64 >/dev/null 2>&1; then
-    exec make run-boot-test USE_DOCKER=1
+    docker_opts=()
+    if [[ "${PASSES_SET}" -eq 1 ]]; then
+      docker_opts+=("--passes=${PASSES_SPEC}")
+    fi
+    if [[ -n "${ARTIFACT_DIR}" ]]; then
+      if ! mkdir -p "${ARTIFACT_DIR}" ||
+         ! docker_path="$(repo_relative_path "${ARTIFACT_DIR}")"; then
+        echo "FAIL: The boot test runs in Docker, which sees only the repository '${PWD}': --artifact-dir must be inside it, not '${ARTIFACT_DIR}'." >&2
+        exit 1
+      fi
+      docker_opts+=("--artifact-dir=${docker_path}")
+    fi
+    if [[ "${DRAIN_ON_FAIL}" -eq 1 ]]; then
+      docker_opts+=(--drain-on-fail)
+    fi
+    iso_args=()
+    if [[ $# -ge 1 ]]; then
+      iso_args+=("${ISO_FILE}")
+    fi
+    if [[ $# -ge 2 ]]; then
+      iso_args+=("${MB1_ISO_FILE}")
+    fi
+    docker_isos=()
+    for iso in ${iso_args[@]+"${iso_args[@]}"}; do
+      if docker_path="$(repo_relative_path "${iso}")"; then
+        docker_isos+=("${docker_path}")
+      elif [[ -e "${iso}" ]]; then
+        echo "FAIL: The boot test runs in Docker, which sees only the repository '${PWD}': the ISO files must be inside it, not '${iso}'." >&2
+        exit 1
+      else
+        docker_isos+=("${iso}")
+      fi
+    done
+    exec make run-boot-test USE_DOCKER=1 \
+      "BOOT_TEST_OPTS=$(make_shell_words ${docker_opts[@]+"${docker_opts[@]}"})" \
+      "BOOT_TEST_ISOS=$(make_shell_words ${docker_isos[@]+"${docker_isos[@]}"})"
   fi
   if [[ $# -eq 0 && ( ! -f "${ISO_FILE}" || ! -f "${MB1_ISO_FILE}" ) ]]; then
     make "${ISO_FILE}" "${MB1_ISO_FILE}"
@@ -315,6 +395,8 @@ USB_FW_CFG_ARGS=(-fw_cfg name=opt/protos/boot_session,string=interactive)
 USB_MULTI_ARGS=(
   -device pci-bridge,id=br1,chassis_nr=1
   -device nec-usb-xhci,id=xhci1,bus=br1,addr=1,msi=on,msix=off
+  -device usb-hub,bus=xhci1.0,port=2,id=hub0
+  -device usb-kbd,bus=xhci1.0,port=2.1,id=hkbd0,usb_version=1
   -device usb-kbd,bus=xhci1.0,port=1,id=kbd1,usb_version=1
 )
 # Markers that the USB passes require besides REQUIRED_MARKERS: the driver's
@@ -451,19 +533,6 @@ else
 fi
 
 PASS_NAMES=(bios uefi mb1 max smep)
-TEMP_FILES=()
-for name in "${PASS_NAMES[@]}"; do
-  TEMP_FILES+=(
-    "${BUILD_DIR}/serial_${name}_output.log"
-    "${BUILD_DIR}/qemu_${name}_monitor.sock"
-    "${BUILD_DIR}/qemu_${name}_qmp.sock"
-    "${BUILD_DIR}/qemu_${name}_serial.sock"
-    "${BUILD_DIR}/vga_${name}_dump.bin"
-    "${BUILD_DIR}/${name}_pass_stdout.log"
-    "${BUILD_DIR}/${name}_pass_result"
-  )
-done
-TEMP_FILES+=("${BUILD_DIR}/ovmf_vars.fd")
 if [[ "${PASSES_SET}" -eq 1 ]]; then
   IFS=', ' read -r -a wanted_passes <<<"${PASSES_SPEC}"
   for wanted in ${wanted_passes[@]+"${wanted_passes[@]}"}; do
@@ -486,24 +555,48 @@ if [[ "${PASSES_SET}" -eq 1 ]]; then
   echo "Running only the passes that --passes selects: ${PASS_NAMES[*]}."
 fi
 
+# The files of this run: for each pass, QEMU's serial log, monitor, QMP and
+# serial console sockets, error output and memory dump, and the pass's output
+# and result. They go in a directory of the run's own under build/ (created
+# below, deleted at exit), so that runs at the same time in one checkout (make
+# test during a deflake.py session, for example) don't touch each other's
+# files.
+RUN_DIR=""
 PASSES_STARTED=0
 cleanup() {
   if [[ -n "${ARTIFACT_DIR}" && "${PASSES_STARTED}" -eq 1 ]]; then
     local name
     for name in "${PASS_NAMES[@]}"; do
       if [[ ! -f "${ARTIFACT_DIR}/${name}/result" ]]; then
-        { mkdir -p "${ARTIFACT_DIR}/${name}" &&
-          { [[ ! -f "${BUILD_DIR}/serial_${name}_output.log" ]] ||
-            cp "${BUILD_DIR}/serial_${name}_output.log" "${ARTIFACT_DIR}/${name}/serial.log"; } &&
-          { [[ ! -f "${BUILD_DIR}/${name}_pass_stdout.log" ]] ||
-            cp "${BUILD_DIR}/${name}_pass_stdout.log" "${ARTIFACT_DIR}/${name}/output.log"; }; } ||
+        { mkdir -p "${ARTIFACT_DIR}/${name}" && copy_pass_logs "${name}"; } ||
           echo "WARNING: Could not save the artifacts of the ${name} pass in '${ARTIFACT_DIR}'." >&2
       fi
     done
   fi
-  rm -f "${TEMP_FILES[@]}"
+  if [[ -n "${RUN_DIR}" ]]; then
+    rm -rf -- "${RUN_DIR}"
+  fi
 }
 trap cleanup EXIT
+# A signal ends the run through the EXIT trap too. (Bash runs EXIT traps on
+# fatal signals by itself, but as PID 1 of a container, where deflake.py stops
+# it with SIGTERM, the script gets only the signals that it traps.)
+trap 'exit 129' HUP
+trap 'exit 130' INT
+trap 'exit 143' TERM
+
+# With --artifact-dir, copies the serial log, QEMU's error output and the
+# output of pass $1 (those that exist so far) to its artifact directory.
+copy_pass_logs() {
+  local name="$1"
+  local dir="${ARTIFACT_DIR}/${name}"
+  { [[ ! -f "${RUN_DIR}/serial_${name}_output.log" ]] ||
+    cp "${RUN_DIR}/serial_${name}_output.log" "${dir}/serial.log"; } &&
+    { [[ ! -f "${RUN_DIR}/qemu_${name}_stderr.log" ]] ||
+      cp "${RUN_DIR}/qemu_${name}_stderr.log" "${dir}/qemu_stderr.log"; } &&
+    { [[ ! -f "${RUN_DIR}/${name}_pass_stdout.log" ]] ||
+      cp "${RUN_DIR}/${name}_pass_stdout.log" "${dir}/output.log"; }
+}
 
 if [[ ! -f "${ISO_FILE}" ]]; then
   echo "Error: ISO file '${ISO_FILE}' not found." >&2
@@ -518,7 +611,7 @@ if [[ "${KVM}" == "1" ]]; then
 fi
 
 mkdir -p "${BUILD_DIR}"
-cleanup
+RUN_DIR="$(mktemp -d "${BUILD_DIR}/test_boot.XXXXXX")"
 
 # Prints the number of lines in file $1 that contain the fixed string $2.
 count_matches() {
@@ -847,7 +940,8 @@ verify_framebuffer() {
   echo "Verified GOP framebuffer at ${fb_addr} has rendered glyph pixels (${lit} lit subpixels in the top rows)."
 }
 
-# Selects the OVMF firmware. Sets OVMF_ARGS, or returns 1 if none is found.
+# Selects the OVMF firmware. Sets OVMF_ARGS, or returns 1 if none is found (2
+# after reporting an OVMF_VARS template that QEMU can't read).
 find_ovmf() {
   local code="" vars=""
   if [[ -n "${OVMF:-}" ]]; then
@@ -888,26 +982,33 @@ find_ovmf() {
   if [[ -z "${vars}" ]]; then
     OVMF_ARGS=(-bios "${code}")
   else
-    cp "${vars}" "${BUILD_DIR}/ovmf_vars.fd"
+    if [[ ! -f "${vars}" || ! -r "${vars}" ]]; then
+      echo "FAIL: The OVMF_VARS template '${vars}' is not a readable file." >&2
+      return 2
+    fi
+    # With snapshot=on, QEMU keeps the firmware's writes to its variable store
+    # in a temporary file, so every boot starts from the template, and the
+    # QEMU command line (which deflake.py's rerun.sh runs again) can name it.
     OVMF_ARGS=(
       -drive "if=pflash,format=raw,unit=0,readonly=on,file=${code}"
-      -drive "if=pflash,format=raw,unit=1,file=${BUILD_DIR}/ovmf_vars.fd"
+      -drive "if=pflash,format=raw,unit=1,snapshot=on,file=${vars}"
     )
   fi
 }
 
-# Runs one QEMU boot pass named $1 with timeout $2 seconds; the remaining
-# arguments are passed to QEMU. Leaves QEMU running (PID in QEMU_PID) so the
-# caller can inspect the live machine; the caller's RETURN trap kills it. In a
-# USB pass (the caller's USB_SESSION=1) the serial console is a socket that the
-# harness can type into, which also logs its output to the same file.
+# Starts the QEMU of the boot pass named $1; the remaining arguments are passed
+# to QEMU. Leaves QEMU running (PID in QEMU_PID) so the caller can inspect the
+# live machine; the caller's RETURN trap kills it. In a USB pass (the caller's
+# USB_SESSION=1) the serial console is a socket that the harness can type into,
+# which also logs its output to the same file. QEMU's error output goes to
+# qemu_<pass>_stderr.log, which failure reports show.
 start_qemu() {
   local name="$1"
   shift
-  local serial_args=(-serial "file:${BUILD_DIR}/serial_${name}_output.log")
+  local serial_args=(-serial "file:${RUN_DIR}/serial_${name}_output.log")
   if [[ "${USB_SESSION:-0}" == "1" ]]; then
     serial_args=(
-      -chardev "socket,id=ser0,path=${BUILD_DIR}/qemu_${name}_serial.sock,server=on,wait=off,logfile=${BUILD_DIR}/serial_${name}_output.log"
+      -chardev "socket,id=ser0,path=${RUN_DIR}/qemu_${name}_serial.sock,server=on,wait=off,logfile=${RUN_DIR}/serial_${name}_output.log"
       -serial chardev:ser0
     )
   fi
@@ -916,18 +1017,18 @@ start_qemu() {
     -smp "${VCPUS_PER_PASS}"
     -display none
     "${serial_args[@]}"
-    -monitor "unix:${BUILD_DIR}/qemu_${name}_monitor.sock,server,nowait"
-    -qmp "unix:${BUILD_DIR}/qemu_${name}_qmp.sock,server,nowait"
+    -monitor "unix:${RUN_DIR}/qemu_${name}_monitor.sock,server,nowait"
+    -qmp "unix:${RUN_DIR}/qemu_${name}_qmp.sock,server,nowait"
     -no-reboot
     "$@"
   )
   save_qemu_command "${name}" "${qemu_argv[@]}"
-  "${qemu_argv[@]}" >/dev/null 2>&1 &
+  "${qemu_argv[@]}" >/dev/null 2>"${RUN_DIR}/qemu_${name}_stderr.log" &
   QEMU_PID=$!
 }
 
-# With --artifact-dir, saves the QEMU command line $2... of pass $1 and the
-# directory it runs in.
+# With --artifact-dir, saves the QEMU command line $2... of pass $1, the
+# directory it runs in and the directory of the run's files.
 save_qemu_command() {
   local name="$1"
   shift
@@ -936,23 +1037,22 @@ save_qemu_command() {
   fi
   { mkdir -p "${ARTIFACT_DIR}/${name}" &&
     printf '%s\0' "$@" >"${ARTIFACT_DIR}/${name}/qemu_argv" &&
-    printf '%s\n' "${PWD}" >"${ARTIFACT_DIR}/${name}/qemu_cwd"; } ||
+    printf '%s\n' "${PWD}" >"${ARTIFACT_DIR}/${name}/qemu_cwd" &&
+    printf '%s\n' "${RUN_DIR}" >"${ARTIFACT_DIR}/${name}/qemu_run_dir"; } ||
     echo "WARNING: Could not save the QEMU command line of the ${name} pass in '${ARTIFACT_DIR}'." >&2
 }
 
-# With --artifact-dir, saves the complete serial log, the output and the result
-# $2 (PASS, FAIL or SKIPPED) of pass $1, whose QEMU has exited.
+# With --artifact-dir, saves the complete serial log, QEMU's error output, the
+# output and the result $2 (PASS, FAIL or SKIPPED) of pass $1, whose QEMU has
+# exited.
 save_pass_artifacts() {
   local name="$1" result="$2"
   if [[ -z "${ARTIFACT_DIR}" ]]; then
     return 0
   fi
   local dir="${ARTIFACT_DIR}/${name}"
-  local log="${BUILD_DIR}/serial_${name}_output.log"
-  local output="${BUILD_DIR}/${name}_pass_stdout.log"
   { mkdir -p "${dir}" &&
-    { [[ ! -f "${log}" ]] || cp "${log}" "${dir}/serial.log"; } &&
-    { [[ ! -f "${output}" ]] || cp "${output}" "${dir}/output.log"; } &&
+    copy_pass_logs "${name}" &&
     printf '%s\n' "${result}" >"${dir}/result"; } ||
     echo "WARNING: Could not save the artifacts of the ${name} pass in '${ARTIFACT_DIR}'." >&2
 }
@@ -962,14 +1062,53 @@ kill_qemu() {
     kill -9 "${QEMU_PID}" 2>/dev/null || true
     wait "${QEMU_PID}" 2>/dev/null || true
   fi
+  # Once reaped, the PID may name another process.
+  QEMU_PID=""
 }
 
+# Prints the error output of the QEMU of pass $1, if any, on stderr.
+print_qemu_stderr() {
+  local file="${RUN_DIR}/qemu_$1_stderr.log"
+  if [[ -s "${file}" ]]; then
+    echo "QEMU error output of the $1 pass:" >&2
+    cat "${file}" >&2
+  fi
+}
+
+# Reports that the boot of pass $3 (label $1, serial log $2) did not complete:
+# that QEMU exited (a triple fault, a shutdown or a QEMU error, such as an
+# option that it doesn't support), or that the boot timed out or printed a
+# failure; then QEMU's error output and the serial log.
 report_failure() {
-  local name="$1" log="$2"
-  echo "FAIL: ${name} boot did not complete within its timeout (needs '${EXPECTED_STRING}', '${COMPLETION_MARKER}' and ${MIN_STRESS_PASSES}x '${STRESS_MARKER}'), or printed a failure." >&2
+  local name="$1" log="$2" pass="$3"
+  if [[ -n "${QEMU_PID:-}" ]] && ! kill -0 "${QEMU_PID}" 2>/dev/null; then
+    echo "FAIL: ${name}: QEMU exited unexpectedly before the boot completed (triple fault, shutdown or QEMU error)." >&2
+  else
+    echo "FAIL: ${name} boot did not complete within its timeout (needs '${EXPECTED_STRING}', '${COMPLETION_MARKER}' and ${MIN_STRESS_PASSES}x '${STRESS_MARKER}'), or printed a failure." >&2
+  fi
+  print_qemu_stderr "${pass}"
   if [[ -f "${log}" ]]; then
     echo "Captured ${name} serial output:" >&2
     cat "${log}" >&2
+  fi
+}
+
+# Ends the QEMU of QEMU_PID after the checks of a completed boot and checks its
+# complete serial log $1 once more. QEMU keeps running the stress test during
+# the checks after verify_serial_log (seconds of QMP and monitor queries), so
+# a failure or panic printed meanwhile, which the saved serial log shows, must
+# still fail the pass.
+stop_qemu_and_recheck_log() {
+  local log="$1"
+  if ! kill -0 "${QEMU_PID}" 2>/dev/null; then
+    echo "FAIL: QEMU exited unexpectedly (triple fault or shutdown)." >&2
+    return 1
+  fi
+  kill_qemu
+  if grep -Eq -- "${FAILURE_PATTERN}" "${log}"; then
+    echo "FAIL: Found a failure line in serial output:" >&2
+    grep -E -- "${FAILURE_PATTERN}" "${log}" >&2
+    return 1
   fi
 }
 
@@ -1009,7 +1148,7 @@ run_usb_session() {
     echo "FAIL: usb_session: python3 not found; the USB keyboard scenarios need it to type through QMP." >&2
     return 1
   fi
-  python3 - "$1" "$2" "${BUILD_DIR}/qemu_$1_qmp.sock" "${BUILD_DIR}/qemu_$1_serial.sock" \
+  python3 - "$1" "$2" "${RUN_DIR}/qemu_$1_qmp.sock" "${RUN_DIR}/qemu_$1_serial.sock" \
     "${QEMU_PID}" "$4" "$3" "${USB_FLAGS_ARE_DEFAULT}" <<'USB_SESSION_PY'
 import json
 import os
@@ -1044,7 +1183,7 @@ POLL = 0.01
 # 16 and drops the rest): the harness waits for the shell's echo after every
 # key that types a character.
 MAX_UNPOLLED = 12
-LINE_MAX = 128  # the shell's line limit (kShellMaxLineLength in user/sh_lib.h)
+LINE_MAX = 128  # the shell's line limit (kShellMaxLineLength in user/sh/sh_lib.h)
 ECHO_MAX_TOKENS = 16  # the shell's token limit (kShellMaxTokens)
 
 COMPLETION = "[TEST] ALL BOOT SELF-TESTS PASSED"
@@ -1061,11 +1200,12 @@ SCRIPTED_ECHO = "boot_sh_ok"
 USERTEST_RE = re.compile(r"sh: usertest exited with status -?[0-9]+")
 FAILURE_RE = re.compile(r"FAIL|\[FATAL\]")
 BDF = r"[0-9a-f]{2}:[0-9a-f]{2}\.[0-7]"
+PORT_PATH = r"[0-9]+(?:\.[0-9]+)*"
 READY_RE = re.compile(r"\[USBKBD\] controller (%s) ready \((msix|msi)\)$" % BDF)
-ATTACHED_RE = re.compile(r"\[USBKBD\] keyboard attached: (%s) port ([0-9]+) "
-                         r"\((ls|fs|hs|ss)\)$" % BDF)
-DETACHED_RE = re.compile(r"\[USBKBD\] keyboard detached: (%s) port ([0-9]+)$" %
-                         BDF)
+ATTACHED_RE = re.compile(r"\[USBKBD\] keyboard attached: (%s) port (%s) "
+                         r"\((ls|fs|hs|ss)\)$" % (BDF, PORT_PATH))
+DETACHED_RE = re.compile(r"\[USBKBD\] keyboard detached: (%s) port (%s)$" %
+                         (BDF, PORT_PATH))
 # A kernel or driver log line. Typed text never has "[" before a letter.
 LOG_LINE_RE = re.compile(r"\[[A-Z][A-Za-z0-9_]*\][^\n]*\n")
 # Text that typed lines must not contain: what test_boot.sh and deflake.py
@@ -1197,7 +1337,7 @@ class KeyboardModel:
 
 
 class ShellModel:
-    """The line editor of sh (user/sh_lib.h): printable characters are echoed
+    """The line editor of sh (user/sh/sh_lib.h): printable characters are echoed
     up to the line limit and later ones dropped silently, Tab becomes a space,
     Backspace (0x08 or 0x7F) erases one character with "\\b \\b" (nothing on an
     empty line), CR or LF submits the line (LF right after CR is ignored), and
@@ -1407,6 +1547,7 @@ class Session:
         self.bdf = {}
         self.keyboards = []  # attached USB keyboards (QMP ids), newest last
         self.ports = {}  # QMP id -> (bdf, xHCI port)
+        self.hubs = {}  # QMP hub id -> (controller, QEMU port)
         self.initial_markers = []
         self.hotplug_markers = []
         self.journal = []  # everything typed into the serial console
@@ -1692,12 +1833,14 @@ class Session:
             raise Failure(self.scenario, "QMP %s failed" % command, [str(e)])
 
     def expected_port(self, controller, qemu_port):
-        """The xHCI root port of QEMU port `qemu_port` (USB 2 ports follow the
-        four USB 3 ports); None if QEMU_USB_FLAGS replaced the root
-        controller."""
+        """The xHCI port path of QEMU port `qemu_port` (USB 2 root ports
+        follow the four USB 3 root ports); None if QEMU_USB_FLAGS replaced
+        the root controller."""
         if controller == "xhci0" and not EXACT_ROOT:
             return None
-        return str(qemu_port + 4)
+        parts = str(qemu_port).split(".")
+        parts[0] = str(int(parts[0]) + 4)
+        return ".".join(parts)
 
     def plug(self, scenario, controller, qemu_port, kid, full_speed):
         """Hot-plugs a USB keyboard and waits for its 'keyboard attached'
@@ -1711,25 +1854,77 @@ class Session:
         self.qmp_execute("device_add", **args)
         bdf = self.bdf[controller]
         port = self.expected_port(controller, qemu_port)
-        speed = "fs" if full_speed else "hs"
+        speed = "fs" if (full_speed or "." in str(qemu_port)) else "hs"
         if port is None:
             pattern = re.compile(r"\[USBKBD\] keyboard attached: %s port "
-                                 r"([0-9]+) \((ls|fs|hs|ss)\)" % re.escape(bdf))
+                                 r"(%s) \((ls|fs|hs|ss)\)" % (
+                                     re.escape(bdf), PORT_PATH))
         else:
-            pattern = re.compile(re.escape("[USBKBD] keyboard attached: %s "
-                                           "port %s (%s)" % (bdf, port, speed)))
+            root_port = port.split(".")[0]
+            port_pat = (re.escape(port) if port == root_port else
+                        "(?:%s|%s)" % (re.escape(port), re.escape(root_port)))
+            pattern = re.compile(r"\[USBKBD\] keyboard attached: %s port "
+                                 r"(%s) \(%s\)" % (
+                                     re.escape(bdf), port_pat, re.escape(speed)))
         self.cursor, match = self.expect_marker(
             cursor, pattern, MARKER_TIMEOUT,
             "the 'keyboard attached' marker of the keyboard hot-plugged on "
-            "%s port %d" % (controller, qemu_port))
-        if port is None:
-            port = match.group(1)
+            "%s port %s" % (controller, qemu_port))
+        port = match.group(1)
         self.hotplug_markers.append(match.group(0))
         self.keyboards.append(kid)
         self.ports[kid] = (bdf, port)
-        say("USB %s: hot-plugged %s (%s-speed) on %s port %d: %r." % (
-            scenario, kid, "full" if full_speed else "high", controller,
+        say("USB %s: hot-plugged %s (%s-speed) on %s port %s: %r." % (
+            scenario, kid, "full" if speed == "fs" else "high", controller,
             qemu_port, match.group(0)))
+
+    def plug_hub(self, scenario, controller, qemu_port, hid):
+        """Hot-plugs a USB hub on `controller` port `qemu_port`."""
+        self.scenario = scenario
+        self.qmp_execute("device_add", driver="usb-hub",
+                         bus=controller + ".0", port=str(qemu_port), id=hid)
+        self.hubs[hid] = (controller, str(qemu_port))
+        say("USB %s: hot-plugged hub %s on %s port %s." % (
+            scenario, hid, controller, qemu_port))
+
+    def unplug_hub(self, scenario, hid, kids=(), sub_hubs=()):
+        """Unplugs a USB hub: QEMU cascade-deletes its child devices and emits
+        DEVICE_DELETED for the hub and each child, and the driver emits
+        'keyboard detached' for every attached downstream keyboard."""
+        self.scenario = scenario
+        cursor = self.cursor
+        self.qmp_execute("device_del", id=hid)
+        for dev_id in [hid] + list(sub_hubs) + list(kids):
+            try:
+                event = self.qmp.wait_event(
+                    lambda e, d=dev_id: (e.get("event") == "DEVICE_DELETED" and
+                                         e.get("data", {}).get("device") == d),
+                    EVENT_TIMEOUT)
+            except (QmpError, OSError) as e:
+                raise Failure(scenario, "QMP failed while waiting for "
+                              "DEVICE_DELETED", [str(e)])
+            if event is None:
+                raise Failure(scenario, "QEMU reported no DEVICE_DELETED event "
+                              "for %s" % dev_id)
+        self.hubs.pop(hid, None)
+        for sub_id in sub_hubs:
+            self.hubs.pop(sub_id, None)
+        remaining = []
+        for kid in kids:
+            bdf, port = self.ports.pop(kid)
+            self.keyboards.remove(kid)
+            remaining.append("[USBKBD] keyboard detached: %s port %s" % (
+                bdf, port))
+        while remaining:
+            pattern = re.compile("|".join(re.escape(m) for m in remaining))
+            cursor, match = self.expect_marker(
+                cursor, pattern, MARKER_TIMEOUT,
+                "the 'keyboard detached' marker of a keyboard behind %s" % hid)
+            remaining.remove(match.group(0))
+            self.hotplug_markers.append(match.group(0))
+        self.cursor = cursor
+        say("USB %s: unplugged hub %s (sub_hubs=%r, kids=%r)." % (
+            scenario, hid, list(sub_hubs), list(kids)))
 
     def unplug(self, scenario, kid):
         """Unplugs a USB keyboard: QEMU's DEVICE_DELETED event and the
@@ -1814,13 +2009,14 @@ class Session:
         """Checks the driver's markers of the init session against the
         controllers and cold-plugged keyboards of the pass."""
         self.scenario = "usb_ready"
-        count = 2 if MULTI else 1
+        ready_count = 2 if MULTI else 1
+        kbd_count = 3 if MULTI else 1
 
         def markers(t):
             lines = complete_lines(t, self.s0)
             ready = [m for m in map(READY_RE.search, lines) if m]
             attached = [m for m in map(ATTACHED_RE.search, lines) if m]
-            if len(ready) >= count and len(attached) >= count:
+            if len(ready) >= ready_count and len(attached) >= kbd_count:
                 return ready, attached
             return None
 
@@ -1848,24 +2044,38 @@ class Session:
             raise Failure("usb_ready", "QEMU's query-pci does not list the "
                           "xHCI controllers of the pass", [repr(self.bdf)])
         want_ready = {"xhci0": "msix" if EXACT_ROOT else None, "xhci1": "msi"}
-        want_kbd = {"xhci0": ("kbd0", "5" if EXACT_ROOT else None,
-                              "hs" if EXACT_ROOT else None),
-                    "xhci1": ("kbd1", "5", "fs")}
         got_ready = sorted(m.groups() for m in ready)
-        got_attached = sorted(m.groups() for m in attached)
-        ok = len(got_ready) == count and len(got_attached) == count
-        for c in controllers:
-            bdf = self.bdf[c]
-            r = [g for g in got_ready if g[0] == bdf]
-            a = [g for g in got_attached if g[0] == bdf]
-            kid, port, speed = want_kbd[c]
-            if (len(r) != 1 or len(a) != 1 or
-                    want_ready[c] not in (None, r[0][1]) or
-                    port not in (None, a[0][1]) or speed not in (None, a[0][2])):
+        got_attached = [m.groups() for m in attached]
+        ok = len(got_ready) == ready_count and len(got_attached) == kbd_count
+        if ok:
+            bdf0 = self.bdf["xhci0"]
+            r0 = [g for g in got_ready if g[0] == bdf0]
+            a0 = [g for g in got_attached if g[0] == bdf0]
+            want_p0 = "5" if EXACT_ROOT else None
+            want_s0 = "hs" if EXACT_ROOT else None
+            if (len(r0) != 1 or len(a0) != 1 or
+                    want_ready["xhci0"] not in (None, r0[0][1]) or
+                    want_p0 not in (None, a0[0][1]) or
+                    want_s0 not in (None, a0[0][2])):
                 ok = False
-                continue
-            self.keyboards.append(kid)
-            self.ports[kid] = (bdf, a[0][1])
+            else:
+                self.keyboards.append("kbd0")
+                self.ports["kbd0"] = (bdf0, a0[0][1])
+        if ok and MULTI:
+            bdf1 = self.bdf["xhci1"]
+            r1 = [g for g in got_ready if g[0] == bdf1]
+            a1 = [g for g in got_attached if g[0] == bdf1]
+            root_a1 = [g for g in a1 if g[1] == "5" and g[2] == "fs"]
+            hub_a1 = [g for g in a1 if g[1] in ("6.1", "6") and g[2] == "fs"]
+            if (len(r1) != 1 or r1[0][1] != "msi" or len(root_a1) != 1 or
+                    len(hub_a1) != 1):
+                ok = False
+            else:
+                self.hubs["hub0"] = ("xhci1", "2")
+                self.keyboards.append("hkbd0")
+                self.ports["hkbd0"] = (bdf1, hub_a1[0][1])
+                self.keyboards.append("kbd1")
+                self.ports["kbd1"] = (bdf1, root_a1[0][1])
         if not ok:
             raise Failure("usb_ready", "the driver's markers do not match the "
                           "xHCI controllers and keyboards of the pass", [
@@ -1873,11 +2083,7 @@ class Session:
                                   c: self.bdf[c] for c in controllers},
                               "ready markers: %r" % [m.group(0) for m in ready],
                               "attached markers: %r" % [m.group(0)
-                                                        for m in attached],
-                              "expected: one 'ready (msix)' for xhci0%s and "
-                              "one keyboard on QEMU port 1 (xHCI port 5) of "
-                              "each" % (", one 'ready (msi)' for xhci1 (behind"
-                                        " the bridge)" if MULTI else "")])
+                                                        for m in attached]])
         self.initial_markers = ([m.group(0) for m in ready] +
                                 [m.group(0) for m in attached])
         say("USB session: %s." % "; ".join(self.initial_markers))
@@ -2160,6 +2366,34 @@ class Session:
                        "the token line")
         self.echo_line("usb_long_line", lambda: self.long_line(2),
                        "the 128-character line")
+        # Single USB hub + downstream keyboard (the only attached keyboard).
+        self.unplug("usb_hub_single", "kbd_hs")
+        self.unplug("usb_hub_single", "kbd_fs")
+        self.plug_hub("usb_hub_single", "xhci0", 2, "hub0")
+        self.plug("usb_hub_single", "xhci0", "2.1", "hkbd0", True)
+        self.require_only("hkbd0")
+        self.echo_line("usb_hub_single", lambda: self.token_line(16),
+                       "the single-hub token line")
+        # Chained/nested hubs: xhci0 -> hub0 (port 2) -> hub1 (port 2.2) -> hkbd1 (port 2.2.3).
+        self.plug_hub("usb_hub_chained", "xhci0", "2.2", "hub1")
+        self.plug("usb_hub_chained", "xhci0", "2.2.3", "hkbd1", True)
+        self.echo_line("usb_hub_chained", lambda: self.token_line(16),
+                       "the chained-hub token line")
+        # Downstream keyboard unplug and hot-plug on a hub port.
+        self.unplug("usb_hub_hotplug", "hkbd0")
+        self.unplug("usb_hub_hotplug", "hkbd1")
+        self.plug("usb_hub_hotplug", "xhci0", "2.3", "hkbd2", True)
+        self.require_only("hkbd2")
+        self.echo_line("usb_hub_hotplug", lambda: self.token_line(16),
+                       "the hub hot-plug token line")
+        # Unplugging and re-plugging the hub (and its downstream devices).
+        self.unplug_hub("usb_hub_replug", "hub0", kids=("hkbd2",),
+                        sub_hubs=("hub1",))
+        self.plug_hub("usb_hub_replug", "xhci0", 2, "hub0")
+        self.plug("usb_hub_replug", "xhci0", "2.1", "hkbd0", True)
+        self.require_only("hkbd0")
+        self.echo_line("usb_hub_replug", lambda: self.token_line(16),
+                       "the hub re-plug token line")
         self.commands("usb_commands")
 
     def uefi_scenarios(self):
@@ -2168,8 +2402,13 @@ class Session:
         self.echo_line("usb_token", lambda: self.token_line(16), "the token line")
         self.echo_line("usb_shift_backspace", self.shift_backspace_line,
                        "the Shift/Backspace line")
-        # Only kbd0 left (high-speed, root controller with MSI-X).
+        # Unplug kbd1: hkbd0 (cold-plugged behind hub0 on xhci1 port 2.1) is now
+        # the newest keyboard; type a fresh token through it, then unplug hkbd0
+        # so only kbd0 remains.
         self.unplug("usb_unplug", "kbd1")
+        self.echo_line("usb_hub_single", lambda: self.token_line(16),
+                       "the single-hub token line")
+        self.unplug("usb_unplug", "hkbd0")
         self.require_only("kbd0")
         self.echo_line("usb_root_controller", lambda: self.symbols_line(1),
                        "the symbols line")
@@ -2196,6 +2435,24 @@ class Session:
         self.plug("usb_hotplug_add", "xhci1", 3, "kbd_br", True)
         self.echo_line("usb_hotplug_add", lambda: self.token_line(12),
                        "the token line")
+        # Chained/nested hubs on the bridged MSI controller (hub0 is already on
+        # xhci1 port 2): attach hub1 on 2.2 and hkbd1 on 2.2.3.
+        self.plug_hub("usb_hub_chained", "xhci1", "2.2", "hub1")
+        self.plug("usb_hub_chained", "xhci1", "2.2.3", "hkbd1", True)
+        self.echo_line("usb_hub_chained", lambda: self.token_line(16),
+                       "the chained-hub token line")
+        # Downstream keyboard unplug and hot-plug on a hub port.
+        self.unplug("usb_hub_hotplug", "hkbd1")
+        self.plug("usb_hub_hotplug", "xhci1", "2.3", "hkbd2", True)
+        self.echo_line("usb_hub_hotplug", lambda: self.token_line(16),
+                       "the hub hot-plug token line")
+        # Unplugging and re-plugging hub0 (cleaning up hub1 and hkbd2).
+        self.unplug_hub("usb_hub_replug", "hub0", kids=("hkbd2",),
+                        sub_hubs=("hub1",))
+        self.plug_hub("usb_hub_replug", "xhci1", 2, "hub0")
+        self.plug("usb_hub_replug", "xhci1", "2.1", "hkbd0", True)
+        self.echo_line("usb_hub_replug", lambda: self.token_line(16),
+                       "the hub re-plug token line")
         self.commands("usb_commands")
 
     # -- Failure handling ------------------------------------------------------
@@ -2287,8 +2544,9 @@ run_usb_pass_session() {
   fi
   drain_after_failure "${log}" "${QEMU_PID}" "${deadline}"
   if [[ "${rc}" -eq 2 ]]; then
-    report_failure "${label}" "${log}"
+    report_failure "${label}" "${log}" "${name}"
   else
+    print_qemu_stderr "${name}"
     echo "Captured ${label} serial output:" >&2
     cat "${log}" >&2
   fi
@@ -2303,7 +2561,7 @@ run_usb_pass_session() {
 run_bios_pass() {
   local name="$1" iso="$2" label="$3" cpu="$4"
   shift 4
-  local log="${BUILD_DIR}/serial_${name}_output.log"
+  local log="${RUN_DIR}/serial_${name}_output.log"
   local QEMU_PID=""
   trap kill_qemu RETURN
 
@@ -2331,13 +2589,15 @@ run_bios_pass() {
     fi
   fi
   if ! wait_for_boot "${log}" "${QEMU_PID}" "${timeout}"; then
-    report_failure "${label}" "${log}"
+    report_failure "${label}" "${log}" "${name}"
     return 1
   fi
   if ! verify_serial_log "${log}" "${QEMU_PID}" "$@" ${usb_markers[@]+"${usb_markers[@]}"} ||
      ! verify_pass_absent_markers "${name}" "${log}" ||
-     ! verify_x87_pointer_reset "${log}" "${BUILD_DIR}/qemu_${name}_qmp.sock" ||
-     ! verify_vga_text "${BUILD_DIR}/qemu_${name}_monitor.sock" "${BUILD_DIR}/vga_${name}_dump.bin"; then
+     ! verify_x87_pointer_reset "${log}" "${RUN_DIR}/qemu_${name}_qmp.sock" ||
+     ! verify_vga_text "${RUN_DIR}/qemu_${name}_monitor.sock" "${RUN_DIR}/vga_${name}_dump.bin" ||
+     ! stop_qemu_and_recheck_log "${log}"; then
+    print_qemu_stderr "${name}"
     cat "${log}" >&2
     return 1
   fi
@@ -2351,18 +2611,22 @@ run_bios_pass() {
 run_uefi_pass() {
   local iso="$1"
   local name="uefi" label="UEFI/Multiboot2 (OVMF, x2APIC, 4 GiB)"
-  local log="${BUILD_DIR}/serial_${name}_output.log"
+  local log="${RUN_DIR}/serial_${name}_output.log"
   local QEMU_PID=""
   trap kill_qemu RETURN
 
-  local OVMF_ARGS=()
-  if ! find_ovmf; then
+  local OVMF_ARGS=() ovmf_rc=0
+  find_ovmf || ovmf_rc=$?
+  if [[ "${ovmf_rc}" -eq 2 ]]; then
+    return 1
+  fi
+  if [[ "${ovmf_rc}" -ne 0 ]]; then
     if [[ "${REQUIRE_UEFI:-0}" == "1" ]]; then
       echo "FAIL: No OVMF firmware found and REQUIRE_UEFI=1 (set OVMF=/path/to/OVMF.fd)." >&2
       return 1
     fi
     echo "SKIPPED: ${label} pass (no OVMF firmware found; set OVMF=/path/to/OVMF.fd)."
-    echo "skipped" >"${BUILD_DIR}/${name}_pass_result"
+    echo "skipped" >"${RUN_DIR}/${name}_pass_result"
     return 0
   fi
 
@@ -2391,15 +2655,17 @@ run_uefi_pass() {
     fi
   fi
   if ! wait_for_boot "${log}" "${QEMU_PID}" "${timeout}"; then
-    report_failure "${label}" "${log}"
+    report_failure "${label}" "${log}" "${name}"
     return 1
   fi
   if ! verify_serial_log "${log}" "${QEMU_PID}" \
          "[PMM] mmap entry: base=0x100000000" "[PMM] Framebuffer: addr=" \
          "${QEMU64_MARKERS[@]}" ${usb_markers[@]+"${usb_markers[@]}"} ||
      ! verify_pass_absent_markers "${name}" "${log}" ||
-     ! verify_x87_pointer_reset "${log}" "${BUILD_DIR}/qemu_${name}_qmp.sock" ||
-     ! verify_framebuffer "${log}" "${BUILD_DIR}/qemu_${name}_monitor.sock" "${BUILD_DIR}/vga_${name}_dump.bin"; then
+     ! verify_x87_pointer_reset "${log}" "${RUN_DIR}/qemu_${name}_qmp.sock" ||
+     ! verify_framebuffer "${log}" "${RUN_DIR}/qemu_${name}_monitor.sock" "${RUN_DIR}/vga_${name}_dump.bin" ||
+     ! stop_qemu_and_recheck_log "${log}"; then
+    print_qemu_stderr "${name}"
     cat "${log}" >&2
     return 1
   fi
@@ -2411,7 +2677,7 @@ run_mb1_pass() {
   local iso="$1"
   if [[ ! -f "${iso}" ]]; then
     echo "SKIPPED: BIOS/Multiboot1 pass (ISO '${iso}' not found)."
-    echo "skipped" >"${BUILD_DIR}/mb1_pass_result"
+    echo "skipped" >"${RUN_DIR}/mb1_pass_result"
     return 0
   fi
   run_bios_pass mb1 "${iso}" "BIOS/Multiboot1" qemu64 "${QEMU64_MARKERS[@]}"
@@ -2427,7 +2693,7 @@ run_smep_pass() {
   local label="BIOS/Multiboot2 (-cpu ${cpu})"
   if [[ "${KVM}" == "1" ]]; then
     echo "SKIPPED: ${label} pass (TCG-only CPU model; KVM=1)."
-    echo "skipped" >"${BUILD_DIR}/smep_pass_result"
+    echo "skipped" >"${RUN_DIR}/smep_pass_result"
     return 0
   fi
   run_bios_pass smep "${iso}" "${label}" "${cpu}" "${SMEP_MARKERS[@]}"
@@ -2456,7 +2722,7 @@ while [[ "${batch_start}" -lt "${#PASS_NAMES[@]}" ]]; do
   batch_pids=()
   for ((i = batch_start; i < batch_end; ++i)); do
     name="${PASS_NAMES[i]}"
-    run_pass "${name}" >"${BUILD_DIR}/${name}_pass_stdout.log" 2>&1 &
+    run_pass "${name}" >"${RUN_DIR}/${name}_pass_stdout.log" 2>&1 &
     batch_pids+=("$!")
   done
   for j in "${!batch_pids[@]}"; do
@@ -2473,7 +2739,7 @@ usb_passed=()
 for i in "${!PASS_NAMES[@]}"; do
   name="${PASS_NAMES[i]}"
   rc="${PASS_RCS[i]}"
-  pass_stdout="${BUILD_DIR}/${name}_pass_stdout.log"
+  pass_stdout="${RUN_DIR}/${name}_pass_stdout.log"
   cat "${pass_stdout}"
   # The pass output ends with the serial log, whose last line is cut off if
   # QEMU was stopped in the middle of it.
@@ -2483,7 +2749,7 @@ for i in "${!PASS_NAMES[@]}"; do
   if [[ "${rc}" -ne 0 ]]; then
     overall_rc=1
     status="FAIL"
-  elif [[ -f "${BUILD_DIR}/${name}_pass_result" ]]; then
+  elif [[ -f "${RUN_DIR}/${name}_pass_result" ]]; then
     status="SKIPPED"
   else
     status="PASS"

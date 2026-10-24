@@ -9,10 +9,34 @@
 
 namespace protos {
 
-// Bound on the self-tests' busy waits, in TSC cycles: roughly 2.5-10 s on the
-// 1-4 GHz TSCs of real and emulated x86-64 CPUs, well below the boot test's
-// per-boot timeout. This is a heuristic; the TSC frequency is not calibrated.
+// Bound on the self-tests' busy waits, in TSC cycles: 2-10 s on the 1-5 GHz
+// TSCs of real and emulated x86-64 CPUs (the TSC frequency is not calibrated),
+// well below the boot test's per-boot timeout. It suits waits for events that
+// take far less time. A wait that may legitimately last a given number of
+// timer ticks must not use it alone (a 550-tick window is 2.2 s, longer than
+// this bound on a TSC above 4.5 GHz): see `TickWaitTimeoutTscCycles()`.
 constexpr uint64_t kSelfTestWaitTimeoutTscCycles = 10'000'000'000ULL;
+
+// Bound, in TSC cycles, on a wait that may legitimately last `ticks` timer
+// ticks (`kApicTimerTargetHz`), given that a tick took `tsc_cycles_per_tick`
+// cycles when it was measured: twice the ticks at that rate (late ticks
+// stretch a window, and a measurement that began with a late tick
+// underestimates the rate) plus `kSelfTestWaitTimeoutTscCycles` for whatever
+// else the wait involves. Negative arguments count as 0, and the result
+// saturates at UINT64_MAX (a `TscDeadline` that never expires).
+constexpr uint64_t TickWaitTimeoutTscCycles(const int64_t ticks,
+                                            const int64_t tsc_cycles_per_tick) {
+  const uint64_t window_ticks = (ticks > 0) ? static_cast<uint64_t>(ticks) : 0;
+  const uint64_t cycles_per_tick =
+      (tsc_cycles_per_tick > 0) ? static_cast<uint64_t>(tsc_cycles_per_tick)
+                                : 0;
+  constexpr uint64_t kMaxWindowCycles =
+      (UINT64_MAX - kSelfTestWaitTimeoutTscCycles) / 2;
+  if (window_ticks != 0 && cycles_per_tick > kMaxWindowCycles / window_ticks) {
+    return UINT64_MAX;
+  }
+  return 2 * window_ticks * cycles_per_tick + kSelfTestWaitTimeoutTscCycles;
+}
 
 // Valid ranges of the `StressTestConfig` fields. `ExecuteRandomMultiCpuStress`
 // CHECK-fails on values outside them.

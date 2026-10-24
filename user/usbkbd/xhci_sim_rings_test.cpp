@@ -3,12 +3,12 @@
 
 #include "gmock/gmock.h"
 #include "gtest/gtest.h"
-#include "user/xhci_controller.h"
-#include "user/xhci_regs.h"
-#include "user/xhci_ring.h"
-#include "xhci_sim.h"
-#include "xhci_sim_usb.h"
-#include "xhci_sim_world.h"
+#include "user/usbkbd/xhci_controller.h"
+#include "user/usbkbd/xhci_regs.h"
+#include "user/usbkbd/xhci_ring.h"
+#include "user/usbkbd/xhci_sim.h"
+#include "user/usbkbd/xhci_sim_usb.h"
+#include "user/usbkbd/xhci_sim_world.h"
 
 namespace protos::xhci_sim {
 namespace {
@@ -123,15 +123,18 @@ TEST(XhciSimRingsTest, RingModifiedWhileRunningIsAViolationExceptCrcrAbort) {
   EXPECT_THAT(sim.CountViolations(Violation::kRingModifiedWhileRunning),
               t::Eq(8));
 
-  // Writing CRCR Command Abort (bit 2) with 0 address while running is valid.
+  // Writing CRCR Command Abort (bit 2) while preserving the upper 32 bits of
+  // the Command Ring pointer while running is valid.
   const int before = sim.CountViolations(Violation::kRingModifiedWhileRunning);
   sim.Write32(sim.op(usb::kOpCrcr), usb::kCrcrCa);
-  sim.Write32(sim.op(usb::kOpCrcr + 4), 0u);
+  sim.Write32(sim.op(usb::kOpCrcr + 4),
+              static_cast<uint32_t>(SimDmaArena::kHighBase >> 32));
   EXPECT_THAT(sim.CountViolations(Violation::kRingModifiedWhileRunning),
               t::Eq(before));
 }
 
-TEST(XhciSimRingsTest, PortResetOnUsb3PortIsAViolation) {
+TEST(XhciSimRingsTest,
+     Usb3HotResetIsValidAndUsb2WarmResetOrCrcrHighMismatchIsViolation) {
   XhciSimConfig cfg;
   cfg.attached_speed = {4};  // SuperSpeed on USB 3 port 1.
   SimWorld world;
@@ -139,11 +142,26 @@ TEST(XhciSimRingsTest, PortResetOnUsb3PortIsAViolation) {
   ASSERT_THAT(world.BringUp(idx), t::Eq(usb::XhciStatus::kOk));
 
   XhciSim& sim = world.sim(idx);
-  sim.AllowViolation(Violation::kPortResetOnUsb3Port);
+  // Hot Reset (PR) on a USB 3 port is legal per xHCI 5.4.8.
   const int64_t p1 = sim.portsc(1);
-  const uint32_t portsc = sim.Read32(p1);
-  sim.Write32(p1, (portsc & usb::kPortScPreserveMask) | usb::kPortScPr);
-  EXPECT_THAT(sim.CountViolations(Violation::kPortResetOnUsb3Port), t::Eq(1));
+  const uint32_t portsc1 = sim.Read32(p1);
+  sim.Write32(p1, (portsc1 & usb::kPortScPreserveMask) | usb::kPortScPr);
+  EXPECT_THAT(sim.violations(), t::IsEmpty());
+
+  // Warm Port Reset (WPR, bit 31) on a USB 2 port is RsvdZ.
+  sim.AllowViolation(Violation::kRsvdZWrittenOne);
+  const int64_t p5 = sim.portsc(5);
+  const uint32_t portsc5 = sim.Read32(p5);
+  sim.Write32(p5, (portsc5 & usb::kPortScPreserveMask) | usb::kPortScWpr);
+  EXPECT_THAT(sim.CountViolations(Violation::kRsvdZWrittenOne), t::Eq(1));
+
+  // Writing a mismatched upper 32-bit CRCR address after CRCR.CA stops the
+  // Command Ring corrupts the high dword of CRCR.
+  sim.AllowViolation(Violation::kCommandRingPointerCorrupted);
+  sim.Write32(sim.op(usb::kOpCrcr), usb::kCrcrCa);
+  sim.Write32(sim.op(usb::kOpCrcr + 4), 0xDEAD'BEEFu);
+  EXPECT_THAT(sim.CountViolations(Violation::kCommandRingPointerCorrupted),
+              t::Eq(1));
 }
 
 TEST(XhciSimRingsTest, EventRingEhbGatesIrqUntilClearedAndReassertsIfNonEmpty) {
@@ -204,7 +222,8 @@ TEST(XhciSimRingsTest, EventRingEhbGatesIrqUntilClearedAndReassertsIfNonEmpty) {
 
 TEST(XhciSimRingsTest,
      M5TwoPhaseBringUpWithBusMasterOffDuringResetAndEarlySpuriousIrq) {
-  // Mirrors user/usbkbd.cpp BringUpController: Phase 1 (TakeOwnershipAndReset)
+  // Mirrors user/usbkbd/usbkbd.cpp BringUpController: Phase 1
+  // (TakeOwnershipAndReset)
   // runs before sys_pci_enable_bus_master(), then Bus Master and IRQ are
   // enabled, and Phase 2 (Start) programs DMA and starts the controller.
   SimClock clock;

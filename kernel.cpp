@@ -9,6 +9,7 @@
 #include "gdt.h"
 #include "heap.h"
 #include "idt.h"
+#include "multiboot.h"
 #include "paging.h"
 #include "pci.h"
 #include "pmm.h"
@@ -114,15 +115,36 @@ static bool FwCfgReadString(const char* const target_name,  //
   return false;
 }
 
+// Returns true in a virtual machine: hypervisors set CPUID.01H:ECX bit 31
+// (QEMU does for TCG and KVM, also with -cpu host), and physical processors
+// return 0 there (Intel SDM Vol. 2A, CPUID: "Not Used. Always returns 0"; AMD
+// APM Vol. 3: reserved for use by hypervisors to indicate guest status).
+static bool RunsUnderHypervisor() {
+  constexpr uint32_t kCpuidLeaf1EcxHypervisor = 1u << 31;
+  uint32_t eax = 1;
+  uint32_t ebx = 0;
+  uint32_t ecx = 0;
+  uint32_t edx = 0;
+  asm volatile("cpuid" : "+a"(eax), "=b"(ebx), "+c"(ecx), "=d"(edx));
+  return (ecx & kCpuidLeaf1EcxHypervisor) != 0;
+}
+
 static bool IsInteractiveBootSession() {
+  // QEMU's fw_cfg device exists only in virtual machines. On a physical PC, I/O
+  // port 0x510 can be a chipset register (PROC_CNT of an ICH whose PMBASE is
+  // 0x500, or a GPIO or vendor register), which the selector write would
+  // clobber.
+  if (!RunsUnderHypervisor()) {
+    return false;
+  }
   char mode[32] = {};
   return FwCfgReadString("opt/protos/boot_session", mode, sizeof(mode)) &&
          StringsEqual(mode, "interactive");
 }
 #endif
 
-// Runs the first user process, init (user/init.cpp), in an address space of
-// its own until it ends, and reports how it ended.
+// Runs the first user process, init (user/init/init.cpp), in an address space
+// of its own until it ends, and reports how it ended.
 static bool RunInitProcess(const bool interactive) {
   ConsoleClearInput();
 #if PROTOS_SELFTEST
@@ -187,10 +209,18 @@ extern "C" [[noreturn]] void kernel_main(const uint32_t multiboot_magic,
                                          const uint64_t multiboot_info_addr) {
   constexpr const char* kGreeting = "Hello, x86-64 Kernel World!\n";
 
+  UartInit();
+  // Before anything is written to the screen: the legacy VGA text buffer and
+  // the CRT controller exist only if the boot loader left the screen in VGA
+  // text mode. Otherwise the console keeps its text in memory until PmmInit()
+  // attaches the framebuffer that the boot loader describes, if there is one.
+  if (MultibootHasVgaTextMode(multiboot_magic,      //
+                              multiboot_info_addr,  //
+                              kIdentityMapLimit)) {
+    VgaEnableLegacyText();
+  }
   VgaClear();
   VgaWrite(kGreeting);
-
-  UartInit();
   UartWrite(kGreeting);
 
   // CPU 0's TSS must be loaded before the IDT, whose #DF, NMI and #MC gates

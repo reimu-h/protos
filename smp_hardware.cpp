@@ -89,14 +89,14 @@ class KernelSmpHardware final : public SmpHardware {
 
   const void* MapPhysicalMemory(const uintptr_t phys_addr,
                                 const int64_t size) override {
-    if (!PagingMapBootstrapRange(phys_addr, size)) {
+    if (!PagingEnsureIdentityMappedRange(phys_addr, size)) {
       return nullptr;
     }
     return reinterpret_cast<const void*>(phys_addr);
   }
 
   bool MapLocalApicPage(const uintptr_t phys_addr) override {
-    return PagingMapBootstrapRange(phys_addr, kPageSize) &&
+    return PagingEnsureIdentityMappedRange(phys_addr, kPageSize) &&
            PagingMarkPageUncacheable(phys_addr);
   }
 

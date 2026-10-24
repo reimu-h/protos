@@ -3,6 +3,7 @@
 #include <cstdint>
 
 #include "check.h"
+#include "cpu.h"
 #include "pmm.h"
 #include "smp.h"
 #include "spinlock.h"
@@ -16,8 +17,10 @@ constexpr int kEntriesPerPageTable = 512;
 constexpr int kFirstUserPml4Entry =
     static_cast<int>((kUserSpaceBase >> 39) & 0x1FF);
 static_assert(kFirstUserPml4Entry == kEntriesPerPageTable / 2);
-// The kernel virtual ranges start where the identity map ends.
+// The kernel virtual ranges start where the identity map ends, at a 2 MiB
+// boundary.
 static_assert(kKernelVirtualBase == kIdentityMapLimit);
+static_assert(kIdentityMapLimit % kHugePageSize == 0);
 constexpr int kMaxBootstrapPageTables = 16;
 constexpr uint64_t kPtePresent = 1ULL << 0;
 constexpr uint64_t kPteWritable = 1ULL << 1;
@@ -130,15 +133,14 @@ static bool MapHugePageRangeLocked(const uintptr_t phys_addr,  //
   if (size <= 0) {
     return size == 0;
   }
+  // The range may end at `kIdentityMapLimit` (the PMM manages RAM up to it),
+  // which rounding the end up to a huge page never passes.
   if (phys_addr >= kIdentityMapLimit ||
       (kIdentityMapLimit - phys_addr) < static_cast<uintptr_t>(size)) {
     return false;
   }
 
   const uintptr_t end_addr = phys_addr + size;
-  if (end_addr > kIdentityMapLimit - kHugePageSize) {
-    return false;
-  }
   const uintptr_t start_page = phys_addr & ~(kHugePageSize - 1);
   const uintptr_t end_page = AlignUp(end_addr, kHugePageSize);
 
@@ -529,8 +531,7 @@ bool PagingEnsureIdentityMappedRange(const uintptr_t phys_addr,
 
 bool PagingExtendIdentityMap(const uintptr_t max_physical_addr) {
   const IrqSpinLockGuard lock_guard(g_paging_lock);
-  if (max_physical_addr == 0 ||
-      max_physical_addr > kIdentityMapLimit - kHugePageSize) {
+  if (max_physical_addr == 0 || max_physical_addr > kIdentityMapLimit) {
     return false;
   }
 
@@ -788,6 +789,10 @@ void PagingInitKernelHalf() {
     }
   }
   g_no_execute_enabled = (ReadMsr(kMsrIa32Efer) & kEferNoExecuteEnable) != 0;
+  // boot.S sets EFER.NXE exactly on CPUs with NX, which is what `nx` says
+  // about the BSP; CpuInitAp() requires NX on every AP if it is set, so every
+  // CPU can walk entries with `kPteNoExecute`.
+  DCHECK(g_no_execute_enabled == CpuGetConfig().nx);
   g_kernel_root = root;
 }
 
@@ -857,26 +862,26 @@ uintptr_t PagingUserPageFrame(const uintptr_t root, const uintptr_t user_addr) {
   return *pte & kPteAddressMask;
 }
 
-bool PagingQueryUserPage(const uintptr_t root,       //
-                         const uintptr_t user_addr,  //
-                         UserPageInfo* const info) {
-  if (!IsUserRoot(root) || !IsUserPage(user_addr) || info == nullptr) {
-    return false;
+StatusOr<UserPageInfo> PagingQueryUserPage(const uintptr_t root,
+                                           const uintptr_t user_addr) {
+  if (!IsUserRoot(root) || !IsUserPage(user_addr)) {
+    return kStatusError;
   }
   const IrqSpinLockGuard lock_guard(g_paging_lock);
   const uint64_t* const pte = FindPtEntryInRootLocked(root, user_addr);
   if (pte == nullptr || (*pte & kPtePresent) == 0) {
-    return false;
+    return kStatusError;
   }
   const uint64_t entry = *pte;
-  info->phys_addr = entry & kPteAddressMask;
-  info->writable = (entry & kPteWritable) != 0;
-  info->executable = !g_no_execute_enabled || (entry & kPteNoExecute) == 0;
-  info->write_through = (entry & kPteWriteThrough) != 0;
-  info->cache_disable = (entry & kPteCacheDisable) != 0;
-  info->pat = (entry & kPtePat) != 0;
-  info->owned = (entry & kPteNotOwned) == 0;
-  return true;
+  UserPageInfo info{};
+  info.phys_addr = entry & kPteAddressMask;
+  info.writable = (entry & kPteWritable) != 0;
+  info.executable = !g_no_execute_enabled || (entry & kPteNoExecute) == 0;
+  info.write_through = (entry & kPteWriteThrough) != 0;
+  info.cache_disable = (entry & kPteCacheDisable) != 0;
+  info.pat = (entry & kPtePat) != 0;
+  info.owned = (entry & kPteNotOwned) == 0;
+  return info;
 }
 
 uint64_t PagingReadPatMsr() { return ReadMsr(kMsrIa32Pat); }

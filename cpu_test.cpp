@@ -5,6 +5,7 @@
 
 #include <cstdint>
 #include <string>
+#include <utility>
 #include <vector>
 
 #include "fpu.h"
@@ -21,6 +22,12 @@ constexpr uint32_t kCpuid1EdxOther = (1u << 0) | (1u << 4) | (1u << 9);
 constexpr uint32_t kCpuid1EcxOther = (1u << 0) | (1u << 13);
 constexpr uint32_t kCpuid1EdxFxsrSse =
     kCpuid1EdxFxsr | kCpuid1EdxSse | kCpuid1EdxSse2;
+// The CPUID.1:EDX flags of the machine-check exception, SYSENTER and PAT,
+// which every x86-64 CPU has.
+constexpr uint32_t kCpuid1EdxMceSepPat =
+    kCpuid1EdxMce | kCpuid1EdxSep | kCpuid1EdxPat;
+// CPUID.80000001H:EDX flags that the configuration ignores: SYSCALL, LM.
+constexpr uint32_t kCpuidExt1EdxOther = (1u << 11) | (1u << 29);
 // CPUID.(EAX=7,ECX=0):EBX flags that the configuration ignores: FSGSBASE,
 // AVX2.
 constexpr uint32_t kCpuid7EbxOther = (1u << 0) | (1u << 5);
@@ -29,17 +36,19 @@ constexpr uint32_t kXcr0Mpx = (1u << 3) | (1u << 4);
 constexpr uint32_t kXcr0Pkru = 1u << 9;
 
 // QEMU's qemu64 model (the bios, uefi and mb1 boot passes): SSE2, no XSAVE,
-// no SMEP or SMAP. Under TCG, QEMU 7.2's models are AuthenticAMD (family 15)
-// and report no CPUID.80000008H:EBX flags, so no XSaveErPtr.
+// no SMEP or SMAP, but NX, the machine-check exception, SYSENTER and PAT.
+// Under TCG, QEMU 7.2's models are AuthenticAMD (family 15) and report no
+// CPUID.80000008H:EBX flags, so no XSaveErPtr.
 static CpuidLeaves Qemu64Leaves() {
   CpuidLeaves leaves;
   leaves.max_basic_leaf = 0xD;
   leaves.vendor_ebx = kCpuidVendorAmdEbx;
   leaves.vendor_edx = kCpuidVendorAmdEdx;
   leaves.vendor_ecx = kCpuidVendorAmdEcx;
-  leaves.leaf1.edx = kCpuid1EdxFxsrSse | kCpuid1EdxOther;
+  leaves.leaf1.edx = kCpuid1EdxFxsrSse | kCpuid1EdxMceSepPat | kCpuid1EdxOther;
   leaves.leaf1.ecx = kCpuid1EcxOther;
   leaves.max_extended_leaf = 0x8000000A;
+  leaves.leaf_ext1.edx = kCpuidExt1EdxNx | kCpuidExt1EdxOther;
   return leaves;
 }
 
@@ -266,6 +275,39 @@ TEST(CpuTest, IgnoresLeaf7AboveTheHighestBasicLeaf) {
   EXPECT_FALSE(config.xsave);
 }
 
+TEST(CpuTest, ChoosesNxAndMceEachOnItsOwn) {
+  const CpuConfig both = CpuChooseConfig(Qemu64Leaves());
+  EXPECT_TRUE(both.nx);
+  EXPECT_TRUE(both.mce);
+
+  CpuidLeaves no_nx = Qemu64Leaves();
+  no_nx.leaf_ext1.edx &= ~kCpuidExt1EdxNx;
+  EXPECT_FALSE(CpuChooseConfig(no_nx).nx);
+  EXPECT_TRUE(CpuChooseConfig(no_nx).mce);
+
+  CpuidLeaves no_mce = MaxLeaves();
+  no_mce.leaf1.edx &= ~kCpuid1EdxMce;
+  const CpuConfig nx_only = CpuChooseConfig(no_mce);
+  EXPECT_TRUE(nx_only.nx);
+  EXPECT_FALSE(nx_only.mce);
+  // The register-state format doesn't depend on them.
+  EXPECT_THAT(nx_only.xcr0, t::Eq(0x7u));
+
+  // Neither do they depend on the register-state format.
+  CpuidLeaves no_sse2 = Qemu64Leaves();
+  no_sse2.leaf1.edx &= ~kCpuid1EdxSse2;
+  EXPECT_TRUE(CpuChooseConfig(no_sse2).nx);
+  EXPECT_TRUE(CpuChooseConfig(no_sse2).mce);
+}
+
+TEST(CpuTest, IgnoresLeaf80000001HAboveTheHighestExtendedLeaf) {
+  CpuidLeaves old_cpu = Qemu64Leaves();
+  old_cpu.max_extended_leaf = 0x80000000;
+  EXPECT_FALSE(CpuChooseConfig(old_cpu).nx);
+  old_cpu.max_extended_leaf = 0x80000001;
+  EXPECT_TRUE(CpuChooseConfig(old_cpu).nx);
+}
+
 // The CPUID leaves that FakeCpuid() answers and the leaves it was asked for.
 // Like Intel CPUs, it answers a basic leaf above the highest basic leaf with
 // the highest basic leaf's values. It answers the extended leaves up to
@@ -323,6 +365,10 @@ static void SetFakeCpuid(const CpuidLeaves& leaves) {
     g_fake_extended_leaves[i].edx = 0xFFFFFFFF;
   }
   g_fake_extended_leaves[0].eax = leaves.max_extended_leaf;
+  if (leaves.max_extended_leaf >= kCpuidExtendedLeaf1) {
+    g_fake_extended_leaves[kCpuidExtendedLeaf1 - kCpuidExtendedLeafMax] =
+        leaves.leaf_ext1;
+  }
   if (leaves.max_extended_leaf >= kCpuidExtendedLeaf8) {
     g_fake_extended_leaves[kExt8Index] = leaves.leaf_ext8;
   }
@@ -333,8 +379,8 @@ TEST(CpuTest, ReaderReadsTheLeavesUpToTheHighestBasicLeaf) {
   const CpuidLeaves amd = AmdXsaveErPtrLeaves();
   SetFakeCpuid(amd);
   const CpuidLeaves read = CpuReadCpuidLeaves(FakeCpuid);
-  EXPECT_THAT(g_queried_leaves,
-              t::ElementsAre(0u, 1u, 7u, 0xDu, 0x80000000u, 0x80000008u));
+  EXPECT_THAT(g_queried_leaves, t::ElementsAre(0u, 1u, 7u, 0xDu, 0x80000000u,
+                                               0x80000001u, 0x80000008u));
   EXPECT_THAT(read.max_basic_leaf, t::Eq(0xDu));
   EXPECT_THAT(read.vendor_ebx, t::Eq(kCpuidVendorAmdEbx));
   EXPECT_THAT(read.vendor_edx, t::Eq(kCpuidVendorAmdEdx));
@@ -344,12 +390,15 @@ TEST(CpuTest, ReaderReadsTheLeavesUpToTheHighestBasicLeaf) {
   EXPECT_THAT(read.leaf7.ebx, t::Eq(amd.leaf7.ebx));
   EXPECT_THAT(read.leaf_xsave.eax, t::Eq(amd.leaf_xsave.eax));
   EXPECT_THAT(read.max_extended_leaf, t::Eq(0x8000000Au));
+  EXPECT_THAT(read.leaf_ext1.edx, t::Eq(amd.leaf_ext1.edx));
   EXPECT_THAT(read.leaf_ext8.ebx, t::Eq(amd.leaf_ext8.ebx));
   const CpuConfig config = CpuChooseConfig(read);
   EXPECT_THAT(config.xcr0, t::Eq(0x7u));
   EXPECT_FALSE(config.reset_x87_pointers);
   EXPECT_TRUE(config.smep);
   EXPECT_TRUE(config.smap);
+  EXPECT_TRUE(config.nx);
+  EXPECT_TRUE(config.mce);
 }
 
 TEST(CpuTest, ReaderSkipsTheLeavesAboveTheHighestBasicLeaf) {
@@ -359,7 +408,7 @@ TEST(CpuTest, ReaderSkipsTheLeavesAboveTheHighestBasicLeaf) {
   const CpuidLeaves read = CpuReadCpuidLeaves(FakeCpuid);
   // Leaves 7 and 0DH would have returned leaf 6's garbage.
   EXPECT_THAT(g_queried_leaves,
-              t::ElementsAre(0u, 1u, 0x80000000u, 0x80000008u));
+              t::ElementsAre(0u, 1u, 0x80000000u, 0x80000001u, 0x80000008u));
   EXPECT_THAT(read.leaf7.ebx, t::Eq(0u));
   EXPECT_THAT(read.leaf_xsave.eax, t::Eq(0u));
   EXPECT_THAT(read.leaf_xsave.edx, t::Eq(0u));
@@ -390,50 +439,78 @@ TEST(CpuTest, ReaderSkipsLeaf80000008HAboveTheHighestExtendedLeaf) {
   SetFakeCpuid(old_cpu);
   const CpuidLeaves read = CpuReadCpuidLeaves(FakeCpuid);
   // Leaf 80000008H would have returned garbage with XSaveErPtr set.
-  EXPECT_THAT(g_queried_leaves, t::ElementsAre(0u, 1u, 7u, 0xDu, 0x80000000u));
+  EXPECT_THAT(g_queried_leaves,
+              t::ElementsAre(0u, 1u, 7u, 0xDu, 0x80000000u, 0x80000001u));
   EXPECT_THAT(read.max_extended_leaf, t::Eq(0x80000007u));
   EXPECT_THAT(read.leaf_ext8.ebx, t::Eq(0u));
   EXPECT_TRUE(CpuChooseConfig(read).reset_x87_pointers);
 }
 
-TEST(CpuTest, Cr4KeepsOtherBitsSetsOsxsaveForXsaveAndClearsFsgsbase) {
-  // What boot.S sets: PAE, OSFXSR and OSXMMEXCPT.
-  constexpr uint64_t kPae = uint64_t{1} << 5;
-  constexpr uint64_t kPge = uint64_t{1} << 7;
-  constexpr uint64_t kBoot = kPae | kCr4Osfxsr | kCr4Osxmmexcpt;
+TEST(CpuTest, ReaderSkipsLeaf80000001HAboveTheHighestExtendedLeaf) {
+  CpuidLeaves old_cpu = Qemu64Leaves();
+  old_cpu.max_extended_leaf = 0x80000000;
+  SetFakeCpuid(old_cpu);
+  const CpuidLeaves read = CpuReadCpuidLeaves(FakeCpuid);
+  // Leaf 80000001H would have returned garbage with NX set.
+  EXPECT_THAT(g_queried_leaves, t::ElementsAre(0u, 1u, 7u, 0xDu, 0x80000000u));
+  EXPECT_THAT(read.leaf_ext1.edx, t::Eq(0u));
+  EXPECT_FALSE(CpuChooseConfig(read).nx);
+}
+
+// The CR4 bits that boot.S sets: PAE, OSFXSR and OSXMMEXCPT.
+constexpr uint64_t kCr4Boot = kCr4Pae | kCr4Osfxsr | kCr4Osxmmexcpt;
+
+TEST(CpuTest, Cr4HasTheBootBitsAndOsxsaveAndMceAsConfigured) {
   const CpuConfig xsave = MakeConfig(true, 0x7);
   const CpuConfig fxsave = MakeConfig(false, 0);
+  CpuConfig mce = fxsave;
+  mce.mce = true;
+  CpuConfig nx = xsave;
+  nx.nx = true;
 
-  EXPECT_THAT(CpuCr4ForConfig(kBoot, xsave), t::Eq(kBoot | kCr4Osxsave));
-  EXPECT_THAT(CpuCr4ForConfig(kBoot, fxsave), t::Eq(kBoot));
-  EXPECT_THAT(CpuCr4ForConfig(kBoot | kCr4Fsgsbase, xsave),
-              t::Eq(kBoot | kCr4Osxsave));
-  EXPECT_THAT(CpuCr4ForConfig(kBoot | kCr4Osxsave, fxsave), t::Eq(kBoot));
-  // Missing bits are set, and unrelated bits are kept.
-  EXPECT_THAT(CpuCr4ForConfig(kPae, fxsave), t::Eq(kBoot));
-  EXPECT_THAT(CpuCr4ForConfig(kBoot | kPge, xsave),
-              t::Eq(kBoot | kPge | kCr4Osxsave));
+  EXPECT_THAT(CpuCr4ForConfig(xsave), t::Eq(kCr4Boot | kCr4Osxsave));
+  EXPECT_THAT(CpuCr4ForConfig(fxsave), t::Eq(kCr4Boot));
+  EXPECT_THAT(CpuCr4ForConfig(mce), t::Eq(kCr4Boot | kCr4Mce));
+  // NX is in IA32_EFER, not in CR4.
+  EXPECT_THAT(CpuCr4ForConfig(nx), t::Eq(kCr4Boot | kCr4Osxsave));
 }
 
 TEST(CpuTest, Cr4SetsSmepAndSmapAsConfigured) {
-  constexpr uint64_t kPae = uint64_t{1} << 5;
-  constexpr uint64_t kBoot = kPae | kCr4Osfxsr | kCr4Osxmmexcpt;
   const CpuConfig fxsave = MakeConfig(false, 0);
   const CpuConfig smep_only = WithProtections(fxsave, true, false);
   const CpuConfig smap_only = WithProtections(fxsave, false, true);
   const CpuConfig both = WithProtections(MakeConfig(true, 0x7), true, true);
 
-  EXPECT_THAT(CpuCr4ForConfig(kBoot, smep_only), t::Eq(kBoot | kCr4Smep));
-  EXPECT_THAT(CpuCr4ForConfig(kBoot, smap_only), t::Eq(kBoot | kCr4Smap));
-  EXPECT_THAT(CpuCr4ForConfig(kBoot, both),
-              t::Eq(kBoot | kCr4Osxsave | kCr4Smep | kCr4Smap));
-  // Bits that the configuration doesn't enable are cleared.
-  EXPECT_THAT(CpuCr4ForConfig(kBoot | kCr4Smep | kCr4Smap, fxsave),
-              t::Eq(kBoot));
-  EXPECT_THAT(CpuCr4ForConfig(kBoot | kCr4Smap, smep_only),
-              t::Eq(kBoot | kCr4Smep));
-  EXPECT_THAT(CpuCr4ForConfig(kBoot | kCr4Smep, smap_only),
-              t::Eq(kBoot | kCr4Smap));
+  EXPECT_THAT(CpuCr4ForConfig(smep_only), t::Eq(kCr4Boot | kCr4Smep));
+  EXPECT_THAT(CpuCr4ForConfig(smap_only), t::Eq(kCr4Boot | kCr4Smap));
+  EXPECT_THAT(CpuCr4ForConfig(both),
+              t::Eq(kCr4Boot | kCr4Osxsave | kCr4Smep | kCr4Smap));
+}
+
+TEST(CpuTest, Cr4OfTheBootPassModelsHasNoOtherBit) {
+  // Bits that firmware may leave set, which no CPU may run with: the kernel
+  // walks 4-level page tables, maps no global page, keeps no PKRU, relies on
+  // FSGSBASE being clear, and doesn't support CET, UMIP, TSD or PCE.
+  constexpr uint64_t kTsd = uint64_t{1} << 2;
+  constexpr uint64_t kPge = uint64_t{1} << 7;
+  constexpr uint64_t kPce = uint64_t{1} << 8;
+  constexpr uint64_t kUmip = uint64_t{1} << 11;
+  constexpr uint64_t kLa57 = uint64_t{1} << 12;
+  constexpr uint64_t kPcide = uint64_t{1} << 17;
+  constexpr uint64_t kPke = uint64_t{1} << 22;
+  constexpr uint64_t kCet = uint64_t{1} << 23;
+  constexpr uint64_t kAllowed =
+      kCr4Boot | kCr4Mce | kCr4Osxsave | kCr4Smep | kCr4Smap;
+  for (const CpuidLeaves& leaves :
+       {Qemu64Leaves(), Qemu64XsaveLeaves(), Qemu64SmapLeaves(), MaxLeaves(),
+        Avx512Leaves(), IntelLeaves()}) {
+    const uint64_t cr4 = CpuCr4ForConfig(CpuChooseConfig(leaves));
+    EXPECT_THAT(cr4 & ~kAllowed, t::Eq(0u)) << "CR4 " << cr4;
+    EXPECT_THAT(cr4 & (kTsd | kPge | kPce | kUmip | kLa57 | kPcide | kPke |
+                       kCet | kCr4Fsgsbase),
+                t::Eq(0u));
+    EXPECT_THAT(cr4 & (kCr4Boot | kCr4Mce), t::Eq(kCr4Boot | kCr4Mce));
+  }
 }
 
 TEST(CpuTest, SupportsConfigOnlyIfTheCpuHasEveryEnabledFeature) {
@@ -495,6 +572,98 @@ TEST(CpuTest, SupportsConfigOnlyIfTheCpuHasTheEnabledSmepAndSmap) {
       CpuSupportsConfig(old_cpu, WithProtections(qemu64, true, false)));
 }
 
+TEST(CpuTest, SupportsConfigOnlyIfTheCpuHasTheEnabledNxAndMce) {
+  CpuidLeaves no_nx = MaxLeaves();
+  no_nx.leaf_ext1.edx &= ~kCpuidExt1EdxNx;
+  CpuidLeaves no_mce = MaxLeaves();
+  no_mce.leaf1.edx &= ~kCpuid1EdxMce;
+  // An AP that lacks NX would take reserved-bit page faults in the BSP's page
+  // tables, and one that lacks the machine-check exception would shut down.
+  const CpuConfig max = CpuChooseConfig(MaxLeaves());
+  EXPECT_TRUE(CpuSupportsConfig(MaxLeaves(), max));
+  EXPECT_FALSE(CpuSupportsConfig(no_nx, max));
+  EXPECT_FALSE(CpuSupportsConfig(no_mce, max));
+  // Leaf 80000001H above the highest extended leaf doesn't count.
+  CpuidLeaves old_cpu = MaxLeaves();
+  old_cpu.max_extended_leaf = 0x80000000;
+  EXPECT_FALSE(CpuSupportsConfig(old_cpu, max));
+  // A CPU that has them runs with a configuration without them.
+  EXPECT_TRUE(CpuSupportsConfig(MaxLeaves(), CpuChooseConfig(no_nx)));
+  EXPECT_TRUE(CpuSupportsConfig(MaxLeaves(), CpuChooseConfig(no_mce)));
+  EXPECT_TRUE(CpuSupportsConfig(no_nx, CpuChooseConfig(no_nx)));
+  EXPECT_TRUE(CpuSupportsConfig(no_mce, CpuChooseConfig(no_mce)));
+}
+
+// Returns the MSR values of a CPU with `leaves` (CpuMsrValuesFor()) as pairs
+// of MSR and value.
+static std::vector<std::pair<uint32_t, uint64_t>> MsrValues(
+    const CpuidLeaves& leaves) {
+  const CpuMsrValues msrs = CpuMsrValuesFor(leaves);
+  std::vector<std::pair<uint32_t, uint64_t>> values;
+  for (int i = 0; i < msrs.count; ++i) {
+    values.emplace_back(msrs.values[i].msr, msrs.values[i].value);
+  }
+  return values;
+}
+
+TEST(CpuTest, MsrValuesDisableSysenterAndSyscallAndLoadThePat) {
+  constexpr uint64_t kZero = 0;
+  // With a null IA32_SYSENTER_CS, SYSENTER raises #GP.
+  EXPECT_THAT(MsrValues(Qemu64Leaves()),
+              t::ElementsAre(t::Pair(kMsrSysenterCs, kZero),   //
+                             t::Pair(kMsrSysenterEsp, kZero),  //
+                             t::Pair(kMsrSysenterEip, kZero),  //
+                             t::Pair(kMsrStar, kZero),         //
+                             t::Pair(kMsrLstar, kZero),        //
+                             t::Pair(kMsrFmask, kZero),        //
+                             t::Pair(kMsrPat, kCpuPat)));
+  // The same on every model.
+  for (const CpuidLeaves& leaves :
+       {Qemu64XsaveLeaves(), MaxLeaves(), Avx512Leaves(), IntelLeaves()}) {
+    EXPECT_THAT(MsrValues(leaves), t::ContainerEq(MsrValues(Qemu64Leaves())));
+  }
+}
+
+TEST(CpuTest, MsrValuesLeaveOutTheSysenterAndPatMsrsThatTheCpuLacks) {
+  constexpr uint64_t kZero = 0;
+  CpuidLeaves no_sep = Qemu64Leaves();
+  no_sep.leaf1.edx &= ~kCpuid1EdxSep;
+  EXPECT_THAT(MsrValues(no_sep), t::ElementsAre(t::Pair(kMsrStar, kZero),   //
+                                                t::Pair(kMsrLstar, kZero),  //
+                                                t::Pair(kMsrFmask, kZero),  //
+                                                t::Pair(kMsrPat, kCpuPat)));
+  CpuidLeaves no_pat = Qemu64Leaves();
+  no_pat.leaf1.edx &= ~kCpuid1EdxPat;
+  EXPECT_THAT(MsrValues(no_pat),
+              t::ElementsAre(t::Pair(kMsrSysenterCs, kZero),   //
+                             t::Pair(kMsrSysenterEsp, kZero),  //
+                             t::Pair(kMsrSysenterEip, kZero),  //
+                             t::Pair(kMsrStar, kZero),         //
+                             t::Pair(kMsrLstar, kZero),        //
+                             t::Pair(kMsrFmask, kZero)));
+}
+
+TEST(CpuTest, PatIsThePowerOnValueWithUcForPcdAndPwt) {
+  // PAT memory type encodings (Intel SDM Vol. 3A).
+  constexpr uint64_t kUc = 0x00;
+  constexpr uint64_t kWt = 0x04;
+  constexpr uint64_t kWb = 0x06;
+  constexpr uint64_t kUcMinus = 0x07;
+  const auto entry = [](const int index) {
+    return (kCpuPat >> (8 * index)) & 0xFF;
+  };
+  // Entry 4 * PAT + 2 * PCD + PWT: RAM uses entry 0, MMIO entry 3 (paging.h),
+  // and on CPUs without PAT, PCD and PWT select these types too.
+  EXPECT_THAT(entry(0), t::Eq(kWb));
+  EXPECT_THAT(entry(1), t::Eq(kWt));
+  EXPECT_THAT(entry(2), t::Eq(kUcMinus));
+  EXPECT_THAT(entry(3), t::Eq(kUc));
+  for (int index = 4; index < 8; ++index) {
+    EXPECT_THAT(entry(index), t::Eq(entry(index - 4)));
+  }
+  EXPECT_THAT(kCpuPat, t::Eq(0x0007040600070406u));
+}
+
 std::string g_report;
 
 static void AppendToReport(const char* const text) { g_report += text; }
@@ -504,7 +673,7 @@ static void AppendToReport(const char* const text) { g_report += text; }
 static std::string BootReport(const CpuConfig& config,
                               const int fpu_state_size) {
   g_report.clear();
-  const uint64_t cr4 = CpuCr4ForConfig(0, config);
+  const uint64_t cr4 = CpuCr4ForConfig(config);
   CpuWriteBootReport(config, fpu_state_size, cr4, AppendToReport);
   return g_report;
 }
@@ -605,6 +774,8 @@ TEST(CpuTest, HostApInitOnlyCountsTheCalls) {
   EXPECT_FALSE(CpuGetConfig().xsave);
   EXPECT_FALSE(CpuGetConfig().smep);
   EXPECT_FALSE(CpuGetConfig().smap);
+  EXPECT_FALSE(CpuGetConfig().nx);
+  EXPECT_FALSE(CpuGetConfig().mce);
   CpuResetForTest();
   EXPECT_THAT(CpuGetHostApInitCountForTest(), t::Eq(0));
 }

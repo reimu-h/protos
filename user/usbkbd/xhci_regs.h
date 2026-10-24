@@ -1,13 +1,14 @@
-#ifndef PROTOS_USER_XHCI_REGS_H_
-#define PROTOS_USER_XHCI_REGS_H_
+#ifndef PROTOS_USER_USBKBD_XHCI_REGS_H_
+#define PROTOS_USER_USBKBD_XHCI_REGS_H_
 
 #include <cstdint>
 
-#include "user/xhci_platform.h"
+#include "status_or.h"
+#include "user/usbkbd/xhci_platform.h"
 
 // xHCI register definitions (xHCI 1.2 chapter 5 and section 7) and the
 // decoding of a controller's capability registers and extended capabilities.
-// Freestanding and header-only; see user/xhci_platform.h for the rules.
+// Freestanding and header-only; see user/usbkbd/xhci_platform.h for the rules.
 //
 // Access rules (xHCI 5.1): only aligned 32-bit accesses; 64-bit registers are
 // written as two dwords, low dword first (Write64LoHi()); RsvdP bits are
@@ -193,6 +194,11 @@ constexpr uint32_t kPortScOca = 1u << 3;  // Over-current Active (RO)
 constexpr uint32_t kPortScPr = 1u << 4;   // Port Reset (RW1S)
 constexpr int kPortScPlsShift = 5;        // Port Link State [8:5] (RWS)
 constexpr uint32_t kPortScPlsMask = 0xFu << kPortScPlsShift;
+// Port Link State values (xHCI 5.4.8 Table 5-27). A USB 3 port's link in
+// SS.Inactive or Compliance Mode recovers only by a Warm Reset (WPR).
+constexpr uint32_t kPlsU0 = 0;
+constexpr uint32_t kPlsInactive = 6;
+constexpr uint32_t kPlsComplianceMode = 10;
 constexpr uint32_t kPortScPp = 1u << 9;  // Port Power (RWS)
 constexpr int kPortScSpeedShift = 10;    // Port Speed [13:10] (RO)
 constexpr uint32_t kPortScSpeedMask = 0xFu << kPortScSpeedShift;
@@ -234,6 +240,10 @@ constexpr int kPortSpeedSuperPlus = 5;
 
 constexpr int PortSpeedOf(const uint32_t portsc) {
   return static_cast<int>((portsc & kPortScSpeedMask) >> kPortScSpeedShift);
+}
+
+constexpr uint32_t PortLinkStateOf(const uint32_t portsc) {
+  return (portsc & kPortScPlsMask) >> kPortScPlsShift;
 }
 
 // Runtime registers (xHCI 5.5), byte offsets from the runtime base
@@ -409,14 +419,13 @@ struct XhciCaps {
   }
 };
 
-// Reads and checks the capability registers of the controller behind `mmio`
-// into `*caps`. Every register region that the driver uses must lie inside
-// the window and the operational registers (with all port register sets) must
-// not overlap the runtime registers or the doorbells. Reads nothing beyond
-// the capability registers and writes nothing. Returns kNotDecoding if a
-// register reads 0xFFFFFFFF, kBadCapabilities if a check fails.
-inline XhciStatus DecodeCaps(MmioWindow& mmio, XhciCaps* const caps) {
-  *caps = XhciCaps{};
+// Reads and checks the capability registers of the controller behind `mmio`.
+// Every register region that the driver uses must lie inside the window and
+// the operational registers (with all port register sets) must not overlap the
+// runtime registers or the doorbells. Reads nothing beyond the capability
+// registers and writes nothing. Returns kNotDecoding if a register reads
+// 0xFFFFFFFF, kBadCapabilities if a check fails.
+inline StatusOr<XhciCaps, XhciStatus> DecodeCaps(MmioWindow& mmio) {
   const int64_t size = mmio.Size();
   if (size < kMinCapLength) {
     return XhciStatus::kBadCapabilities;
@@ -469,8 +478,7 @@ inline XhciStatus DecodeCaps(MmioWindow& mmio, XhciCaps* const caps) {
       (decoded.rt_base < db_end && decoded.db_base < rt_end)) {
     return XhciStatus::kBadCapabilities;
   }
-  *caps = decoded;
-  return XhciStatus::kOk;
+  return decoded;
 }
 
 namespace regs_internal {
@@ -585,4 +593,4 @@ inline void Write64LoHi(MmioWindow& mmio,      //
 
 }  // namespace protos::usb
 
-#endif  // PROTOS_USER_XHCI_REGS_H_
+#endif  // PROTOS_USER_USBKBD_XHCI_REGS_H_

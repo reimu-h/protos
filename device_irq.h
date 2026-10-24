@@ -19,7 +19,8 @@ struct Task;
 
 enum class DeviceIrqStatus {
   kOk = 0,
-  kInvalid,   // count/mode/capability mismatch, or MSI with count > 1
+  kInvalid,   // count/mode/capability mismatch, MSI with count > 1, or no CPU
+              // that an MSI can address (DeviceIrqMsiCanTarget())
   kBusy,      // irq_alloc already succeeded for this device during this claim
   kNoMemory,  // fewer than `count` free IDT vectors in [0x50, 0x7F]
 };
@@ -31,7 +32,11 @@ class DeviceIrqEnvironment {
 
   virtual void RegisterIdtHandler(int vector, InterruptHandlerFn handler) = 0;
   virtual void UnregisterIdtHandler(int vector) = 0;
-  virtual uint8_t BspApicId() = 0;
+  // The Local APIC ID of the online CPU that device MSIs are sent to: the
+  // BSP's if DeviceIrqMsiCanTarget() it, else that of another online CPU that
+  // it can, or -1 if there is none. Every device vector is registered in the
+  // IDT that all CPUs share, so any CPU can take the interrupts.
+  virtual int MsiDestinationApicId() = 0;
 
   // Returns a writable 32-bit word pointer to the MSI-X table of `device_index`
   // (`msix.table_size * 4` 32-bit words), or nullptr if it cannot be mapped.
@@ -66,6 +71,20 @@ constexpr uint16_t DeviceIrqMsiData(const int vector) {
   return static_cast<uint16_t>(vector & 0xFF);
 }
 
+// Whether a compatibility-format MSI can be sent to the CPU whose Local APIC
+// ID is `apic_id`: its Destination ID field (Message Address bits 19:12) has
+// 8 bits, and in physical destination mode 0xFF addresses every CPU (Intel SDM
+// Vol. 3A, "Message Address Register Format"). Larger x2APIC IDs would need
+// interrupt remapping, or the extended destination ID of some hypervisors,
+// which the kernel doesn't support.
+constexpr bool DeviceIrqMsiCanTarget(const uint32_t apic_id) {
+  return apic_id < 0xFF;
+}
+
+// The Local APIC ID that DeviceIrqProgramDevice() would send MSIs to
+// (DeviceIrqEnvironment::MsiDestinationApicId()), or -1 if no CPU qualifies.
+int DeviceIrqMsiDestinationApicId();
+
 // Allocates `count` IDT vectors in `[kDeviceIrqVectorFirst,
 // kDeviceIrqVectorLast]` for `owner`, binding vector `i` (`0 <= i < count`) to
 // `(pending, 1ULL << (first_bit + i), task)`, registers the IDT handler on
@@ -81,9 +100,14 @@ DeviceIrqStatus DeviceIrqAllocateVectors(uintptr_t owner,                 //
 
 // Programs MSI or MSI-X on claimed PCI device `device_index` (`0 <=
 // device_index < PciDeviceCount()`) with `vectors[0..count - 1]` according to
-// `mode` (`kSyscallIrqModeAuto`, `kSyscallIrqModeMsi`, `kSyscallIrqModeMsix`).
+// `mode` (`kSyscallIrqModeAuto`, `kSyscallIrqModeMsi`, `kSyscallIrqModeMsix`),
+// for the CPU of `DeviceIrqEnvironment::MsiDestinationApicId()`. Turns the
+// other mechanism off first. Programs MSI-X with MSI-X Enable and the Function
+// Mask set, which some devices need to accept table writes, and changes only
+// the Mask bit of each entry's Vector Control (its other bits are reserved).
 // Returns `kBusy` if interrupts were already programmed on `device_index`
-// during its current claim.
+// during its current claim, and `kInvalid` without touching the device if no
+// CPU can be addressed.
 DeviceIrqStatus DeviceIrqProgramDevice(int device_index,  //
                                        int count,         //
                                        int64_t mode,      //
@@ -92,7 +116,9 @@ DeviceIrqStatus DeviceIrqProgramDevice(int device_index,  //
 // Masks any MSI-X table entries (and MSI per-vector mask bits) programmed for
 // `device_index`, unmaps its kernel MSI-X table mapping if any, and clears its
 // per-claim configured state. Call during teardown after `PciQuiesce()` while
-// `Command.Memory Space` is still enabled.
+// `Command.Memory Space` is still enabled. Sets MSI-X Enable (with the
+// Function Mask) while it masks the table entries, then puts Message Control
+// back as it found it.
 void DeviceIrqReleaseDevice(int device_index);
 
 // Clears the per-claim configured state of `device_index` when it is newly
@@ -118,7 +144,8 @@ int DeviceIrqVectorForBit(uintptr_t owner, int bit_index);
 
 // Reads 32-bit word `word_index` of the kernel-mapped MSI-X table of
 // `device_index`, or returns 0 if `device_index` does not currently have a
-// mapped MSI-X table.
+// mapped MSI-X table or the word lies outside the table (`table_size * 4`
+// words).
 uint32_t DeviceIrqReadMsixTableWord(int device_index, int word_index);
 
 // Top-half interrupt dispatch for `vector` (`0x50..0x7F`): under the device

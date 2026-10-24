@@ -3,12 +3,17 @@
 
 #include <cstdint>
 
+#include "status_or.h"
+
 namespace protos {
 
-// Initializes COM1 (0x3F8) at 38400 baud, 8N1, with FIFOs enabled.
+// Initializes COM1 (0x3F8) at 38400 baud, 8N1, with FIFOs enabled. If no UART
+// answers at 0x3F8, the functions below send and receive nothing (the software
+// RX buffer that UartPushRx() fills still works).
 void UartInit();
 // Writes a single byte to COM1, polling until the transmit holding register is
-// empty.
+// empty. The byte is dropped if it does not empty in time; while the
+// transmitter stays busy, further bytes are dropped without waiting.
 void UartPutc(char c);
 // Writes a null-terminated string to COM1, translating '\n' to "\r\n".
 void UartWrite(const char* str);
@@ -22,8 +27,8 @@ void UartWriteDec(uint64_t value);
 void UartPanicWrite(const char* str);
 
 // Polls COM1 for any received bytes and pops the next byte from the software
-// RX ring buffer into `*out`. Returns false if no byte is available.
-bool UartTryGetc(char* out);
+// RX ring buffer, or returns an error if no byte is available.
+StatusOr<char> UartTryGetc();
 // Appends up to `size` bytes from `data` into the software RX ring buffer
 // (dropping any excess once the buffer is full).
 void UartPushRx(const char* data, int64_t size);

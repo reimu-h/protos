@@ -348,8 +348,9 @@ namespace {
 // Ends the fault probe armed on the calling CPU at the page fault of kernel
 // code in `frame`, if the fault is the probed function's (RunFaultProbe() in
 // idt.h): records it in the probe, disarms the probe and makes `frame` return
-// to the probe's resume point with RFLAGS.AC clear. Returns false, changing
-// nothing, otherwise.
+// to the probe's resume point with RFLAGS.AC and RFLAGS.DF clear (the probed
+// function may fault in the middle of a backward string copy). Returns false,
+// changing nothing, otherwise.
 static bool RecoverFaultProbe(InterruptFrame* const frame) {
   // Read CR2 first, like PanicUnhandledException().
   const uint64_t cr2 = ReadCr2();
@@ -373,7 +374,7 @@ static bool RecoverFaultProbe(InterruptFrame* const frame) {
   probe->fault_rip = frame->rip;
   frame->rip = probe->resume_rip;
   frame->rsp = probe->resume_rsp;
-  frame->rflags &= ~kRflagsAlignmentCheckBit;
+  frame->rflags &= ~(kRflagsAlignmentCheckBit | kRflagsDirectionBit);
   return true;
 }
 
