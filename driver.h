@@ -91,8 +91,12 @@ PciDeviceInfo DriverFillPciDeviceInfo(const PciDevice& src);
 
 // Returns true if the 4 KiB physical page at page-aligned `page_phys` overlaps
 // the MSI-X table or Pending Bit Array of `msix` (when `msix.valid` is true).
-// User space must never map pages that hold MSI-X structures, which would let
-// a user-mode driver forge arbitrary MSI writes.
+// User space must never map pages that hold MSI-X structures: the kernel
+// programs and masks the vectors there (device_irq.h), and a driver that could
+// rewrite them could aim the device's interrupts at any vector. This is not a
+// security boundary, though: without an IOMMU, a driver that enables Bus Master
+// can make its device write any physical address, the MSI range included, so a
+// `kUserCapDriver` process is effectively as privileged as the kernel.
 bool DriverPageHoldsMsixStructure(const PciMsix& msix, uint64_t page_phys);
 
 struct ClaimedBarMatch {

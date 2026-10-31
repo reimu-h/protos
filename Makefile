@@ -11,7 +11,8 @@ WERROR_FLAG := $(if $(filter 1,$(WERROR)),-Werror)
 # Link the self-tests in selftest/ into the kernel and run them from
 # kernel_main (RunSelfTests() in selftest/selftest.h): the boot self-tests,
 # which end with "[TEST] ALL BOOT SELF-TESTS PASSED", then the multi-CPU stress
-# test in a loop. With SELFTEST=0 the kernel initializes and then idles.
+# test in a loop. With SELFTEST=0 the kernel only runs init, which starts the
+# shell, and idles once init exits.
 # `make run-boot-test`/`make test` require SELFTEST=1.
 SELFTEST ?= 1
 
@@ -582,9 +583,11 @@ run-boot-test: $(if $(BOOT_TEST_ISOS),,$(KERNEL_ISO) $(KERNEL_MB1_ISO)) $(DOCKER
 	$(DOCKER_RUN) ./test_boot.sh $(BOOT_TEST_OPTS) $(or $(BOOT_TEST_ISOS),$(KERNEL_ISO) $(KERNEL_MB1_ISO))
 
 # Boots the kernel interactively; the serial console is attached to the
-# terminal (press Ctrl-A X to quit QEMU). KVM=1 enables KVM acceleration.
+# terminal (press Ctrl-A X to quit QEMU). KVM=1 enables KVM acceleration. The
+# `+` exempts QEMU from output synchronization (-O, which host builds turn on),
+# which would hold back its output until it exits.
 run: $(KERNEL_ISO) $(DOCKER_DEPS)
-	$(DOCKER_RUN_INTERACTIVE) qemu-system-x86_64 $(QEMU_RUN_FLAGS) $(QEMU_USB_FLAGS) $(QEMU_KVM_FLAGS) \
+	+$(DOCKER_RUN_INTERACTIVE) qemu-system-x86_64 $(QEMU_RUN_FLAGS) $(QEMU_USB_FLAGS) $(QEMU_KVM_FLAGS) \
 		$(if $(filter 1,$(USE_DOCKER)),-display none) -cdrom $(KERNEL_ISO)
 
 # The QEMU boot test is timing-sensitive, so it runs only after the unit tests
