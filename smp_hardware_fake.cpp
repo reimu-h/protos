@@ -239,8 +239,9 @@ uint32_t FakeSmpHardware::ReadLapicLocked(Cpu& cpu, const int reg_offset) {
       if (it != cpu.lapic.end()) {
         return it->second;
       }
-      // The Spurious Interrupt Vector Register resets to 0xFF.
-      return (reg_offset == kLapicSvr) ? 0xFFu : 0u;
+      // The Spurious Interrupt Vector Register resets to `initial_lapic_svr`
+      // (`0xFF` by default).
+      return (reg_offset == kLapicSvr) ? options_.initial_lapic_svr : 0u;
     }
   }
 }

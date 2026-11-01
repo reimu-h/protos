@@ -12,6 +12,7 @@
 #include <vector>
 
 #include "idt.h"
+#include "ioapic.h"
 #include "pci.h"
 #include "pci_config_fake.h"
 #include "syscall_abi.h"
@@ -118,6 +119,7 @@ class DeviceIrqTest : public t::Test {
   void SetUp() override {
     PciResetForTest();
     DeviceIrqResetForTest();
+    IoApicResetForTest();
     pci_ = std::make_shared<FakePciConfigSpace>();
     env_ = std::make_shared<FakeDeviceIrqEnvironment>();
     AddQemuPcMachine(pci_.get(), QemuFirmware::kSeaBios, QemuTopology::kMulti);
@@ -733,6 +735,103 @@ TEST_F(DeviceIrqTest, ReleaseMasksTheTableWithMsixEnabledAndMasked) {
     EXPECT_THAT(table[i * 4 + 3], t::Eq(0x12340001U)) << "entry " << i;
   }
   EXPECT_FALSE(env_->msix_mapped_[msix_dev]);
+}
+
+class SimpleIoApicHardware final : public IoApicHardware {
+ public:
+  SimpleIoApicHardware() { regs_[kIoApicRegVer] = 0x00170011u; }
+  bool MapController(const int /*index*/,
+                     const uintptr_t /*phys_addr*/) override {
+    return true;
+  }
+  uint32_t ReadReg(const int /*index*/, const uint8_t reg) override {
+    return regs_[reg];
+  }
+  void WriteReg(const int /*index*/,  //
+                const uint8_t reg,    //
+                const uint32_t value) override {
+    regs_[reg] = value;
+  }
+  uint32_t regs_[256] = {};
+};
+
+TEST_F(DeviceIrqTest, IsaDeviceIrqProgrammingAndLevelTriggeredMaskUnmask) {
+  auto ioapic_hw = std::make_shared<SimpleIoApicHardware>();
+  const IoApicInfo ioapic = {.ioapic_id = 1, .phys_addr = 0xFEC00000u};
+  IsaIrqRoute routes[kIsaIrqCount] = {};
+  for (int i = 0; i < kIsaIrqCount; ++i) {
+    routes[i].gsi = static_cast<uint32_t>(i);
+  }
+  // Test level-triggered override on ISA IRQ 1 (`kIsaDeviceI8042`) to exercise
+  // top-half masking in DeviceIrqDispatch and unmasking in DeviceIrqWait.
+  routes[1] = {.gsi = 1, .active_low = true, .level_triggered = true};
+  IoApicInit(ioapic_hw, &ioapic, 1, routes);
+
+  std::atomic<uint64_t> pending{0};
+  int vector = -1;
+  ASSERT_THAT(DeviceIrqAllocateVectors(kOwnerA,                              //
+                                       DeviceIrqIsaSlotId(kIsaDeviceI8042),  //
+                                       1,                                    //
+                                       0,                                    //
+                                       &pending,                             //
+                                       nullptr,                              //
+                                       &vector),
+              t::Eq(DeviceIrqStatus::kOk));
+  ASSERT_THAT(DeviceIrqProgramIsaDevice(kIsaDeviceI8042, vector),
+              t::Eq(DeviceIrqStatus::kOk));
+  EXPECT_THAT(DeviceIrqProgramIsaDevice(kIsaDeviceI8042, vector),
+              t::Eq(DeviceIrqStatus::kBusy));
+
+  // Level-triggered pins remain masked right after programming until the first
+  // `DeviceIrqWait` arms and unmasks them.
+  EXPECT_NE(ioapic_hw->regs_[IoApicRedirLowReg(1)] & kIoApicRedirMaskBit, 0u);
+  EXPECT_THAT(DeviceIrqWait(&pending, 1u, 0, nullptr, nullptr), t::Eq(0));
+  EXPECT_EQ(ioapic_hw->regs_[IoApicRedirLowReg(1)] & kIoApicRedirMaskBit, 0u);
+
+  // Firing the vector sets pending bit 0 AND masks the level-triggered pin.
+  env_->TriggerIdtInterrupt(vector);
+  EXPECT_THAT(pending.load(), t::Eq(1u));
+  EXPECT_NE(ioapic_hw->regs_[IoApicRedirLowReg(1)] & kIoApicRedirMaskBit, 0u);
+
+  // Consuming the pending bit returns 1 immediately; a subsequent non-blocking
+  // wait (when pending is now 0) re-unmasks the pin!
+  EXPECT_THAT(DeviceIrqWait(&pending, 1u, 0, nullptr, nullptr), t::Eq(1));
+  EXPECT_NE(ioapic_hw->regs_[IoApicRedirLowReg(1)] & kIoApicRedirMaskBit, 0u);
+  EXPECT_THAT(DeviceIrqWait(&pending, 1u, 0, nullptr, nullptr), t::Eq(0));
+  EXPECT_EQ(ioapic_hw->regs_[IoApicRedirLowReg(1)] & kIoApicRedirMaskBit, 0u);
+
+  // Release masks the pin and frees the vector cleanly.
+  DeviceIrqReleaseIsaDevice(kIsaDeviceI8042);
+  EXPECT_NE(ioapic_hw->regs_[IoApicRedirLowReg(1)] & kIoApicRedirMaskBit, 0u);
+  EXPECT_THAT(DeviceIrqFreeVectors(kOwnerA), t::Eq(1));
+
+  // Verify `DeviceIrqInit` resets `g_isa_device_configured` and
+  // `g_level_isa_slot_count` when vectors are freed without calling
+  // `DeviceIrqReleaseIsaDevice` first.
+  ASSERT_THAT(DeviceIrqAllocateVectors(kOwnerA,                              //
+                                       DeviceIrqIsaSlotId(kIsaDeviceI8042),  //
+                                       1,                                    //
+                                       0,                                    //
+                                       &pending,                             //
+                                       nullptr,                              //
+                                       &vector),
+              t::Eq(DeviceIrqStatus::kOk));
+  ASSERT_THAT(DeviceIrqProgramIsaDevice(kIsaDeviceI8042, vector),
+              t::Eq(DeviceIrqStatus::kOk));
+  EXPECT_THAT(DeviceIrqFreeVectors(kOwnerA), t::Eq(1));
+  DeviceIrqInit(env_);
+  ASSERT_THAT(DeviceIrqAllocateVectors(kOwnerA,                              //
+                                       DeviceIrqIsaSlotId(kIsaDeviceI8042),  //
+                                       1,                                    //
+                                       0,                                    //
+                                       &pending,                             //
+                                       nullptr,                              //
+                                       &vector),
+              t::Eq(DeviceIrqStatus::kOk));
+  EXPECT_THAT(DeviceIrqProgramIsaDevice(kIsaDeviceI8042, vector),
+              t::Eq(DeviceIrqStatus::kOk));
+  DeviceIrqReleaseIsaDevice(kIsaDeviceI8042);
+  EXPECT_THAT(DeviceIrqFreeVectors(kOwnerA), t::Eq(1));
 }
 
 }  // namespace

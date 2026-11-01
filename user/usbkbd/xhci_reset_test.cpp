@@ -468,6 +468,39 @@ TEST_F(XhciResetTest, PcControllerFoundRunningIsHandedOverHaltedAndReset) {
                   "[USBKBD] 00:04.0: controller was running, halted"));
 }
 
+TEST_F(XhciResetTest,
+       TakeOwnershipAndHaltReleasesBiosDisablesSmisAndHaltsWithoutHcrst) {
+  XhciSimConfig config = IntelLikeConfig();
+  config.running = true;
+  config.usbcmd_extra = kInterrupterEnable;
+  config.halt_delay_ticks = 3;
+  config.legacy.behavior = BiosBehavior::kReleasesAfterTicks;
+  config.legacy.release_after_ticks = 10;  // 40 ms
+  XhciSim& sim = Start(config);
+
+  EXPECT_THAT(controller_.TakeOwnershipAndHalt(), t::Eq(XhciStatus::kOk));
+  EXPECT_THAT(controller_.state(), t::Eq(XhciState::kBound));
+  EXPECT_THAT(controller_.handoff_outcome(), t::Eq(HandoffOutcome::kReleased));
+  EXPECT_TRUE(sim.released_by_bios());
+  EXPECT_THAT(sim.Peek(0x8004) & (xhci_sim::spec::kSmiEnableMask |
+                                  xhci_sim::spec::kSmiEventMask),
+              t::Eq(0u));
+  EXPECT_THAT(sim.Peek(0x80 + xhci_sim::spec::kUsbSts) & kHalted,
+              t::Eq(kHalted));
+  EXPECT_THAT(sim.reset_count(), t::Eq(0));
+  EXPECT_FALSE(sim.reset_observed());
+
+  // Subsequent normal bring-up (`TakeOwnershipAndReset`) finds the controller
+  // already OS-owned and halted, performing the single HCRST cleanly.
+  XhciController daemon_ctrl;
+  daemon_ctrl.Init(platform_, sim, "00:04.0");
+  EXPECT_THAT(daemon_ctrl.TakeOwnershipAndReset(), t::Eq(XhciStatus::kOk));
+  EXPECT_THAT(daemon_ctrl.state(), t::Eq(XhciState::kReset));
+  EXPECT_THAT(daemon_ctrl.handoff_outcome(),
+              t::Eq(HandoffOutcome::kNotBiosOwned));
+  EXPECT_THAT(sim.reset_count(), t::Eq(1));
+}
+
 TEST_F(XhciResetTest, SlowestSuccessfulBringUpIsBounded) {
   XhciSimConfig config = IntelLikeConfig();
   config.legacy.behavior = BiosBehavior::kNeverReleases;

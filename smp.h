@@ -207,6 +207,27 @@ inline void ResetCpuLocalForTest() {
 }
 #endif
 
+// Maximum number of I/O APIC controllers recorded from the ACPI MADT.
+constexpr int kMaxSupportedIoApics = 8;
+// Number of legacy ISA IRQ lines (`0 .. 15`).
+constexpr int kIsaIrqCount = 16;
+
+// I/O APIC controller descriptor from ACPI MADT Type 1 (`IO APIC`).
+struct IoApicInfo {
+  uint8_t ioapic_id = 0;
+  uintptr_t phys_addr = 0;
+  uint32_t gsi_base = 0;
+};
+
+// Legacy ISA IRQ routing entry: identity-mapped (`gsi = irq`, active-high,
+// edge-triggered) unless overridden by an ACPI MADT Type 2 (`Interrupt Source
+// Override`, `bus == 0`) entry.
+struct IsaIrqRoute {
+  uint32_t gsi = 0;
+  bool active_low = false;
+  bool level_triggered = false;
+};
+
 // Discovered multiprocessor topology from ACPI MADT firmware tables.
 struct SmpTopology {
   uintptr_t local_apic_phys_addr = 0;
@@ -216,6 +237,12 @@ struct SmpTopology {
   // `kMaxSupportedCpus` limit.
   int ignored_cpu_count = 0;
   std::unique_ptr<CpuInfo[]> cpus;
+  int ioapic_count = 0;
+  IoApicInfo ioapics[kMaxSupportedIoApics] = {};
+  IsaIrqRoute isa_irq_routes[kIsaIrqCount] = {};
+  // True unless ACPI FADT (`FACP`) revision >= 3 explicitly clears bit 1
+  // (`8042`) of `IAPC_BOOT_ARCH`.
+  bool has_i8042 = true;
 };
 
 // Installs `hardware` (non-null) as the machine that the functions below act
@@ -385,6 +412,35 @@ inline bool IsCpuOnline(const int cpu_index, const int cpu_count) {
 // Returns the physical base address of the Local APIC MMIO region discovered
 // during `SmpInit`. Validates with `DCHECK` that `SmpInit` has completed.
 uintptr_t SmpLocalApicPhysAddr();
+
+// Returns the number of I/O APIC controllers (`0 .. kMaxSupportedIoApics`)
+// discovered in the ACPI MADT during `SmpInit`. Validates with `DCHECK` that
+// `SmpInit` has completed.
+int SmpIoApicCount();
+
+// Returns a non-null pointer to the descriptor for I/O APIC `index`. Validates
+// with `DCHECK` that `SmpInit` has completed and
+// `0 <= index < SmpIoApicCount()`.
+const IoApicInfo* SmpGetIoApicInfo(int index);
+
+// Returns the array of `SmpIoApicCount()` I/O APIC descriptors discovered
+// during `SmpInit`. Validates with `DCHECK` that `SmpInit` has completed.
+const IoApicInfo* SmpIoApicInfos();
+
+// Returns the GSI, polarity, and trigger mode for legacy ISA IRQ `isa_irq`
+// (`0 <= isa_irq < kIsaIrqCount`). Validates with `DCHECK` that `SmpInit` has
+// completed and `isa_irq` is in range.
+IsaIrqRoute SmpGetIsaIrqRoute(int isa_irq);
+
+// Returns the 16-entry legacy ISA IRQ routing table (`0 .. kIsaIrqCount - 1`)
+// populated during `SmpInit`. Validates with `DCHECK` that `SmpInit` has
+// completed.
+const IsaIrqRoute* SmpIsaIrqRoutes();
+
+// Returns true unless ACPI FADT (`FACP`) revision >= 3 explicitly reported no
+// legacy 8042 controller (`IAPC_BOOT_ARCH` bit 1 == 0). Validates with `DCHECK`
+// that `SmpInit` has completed.
+bool SmpHas8042();
 
 // Returns true if the Local APIC is operating in MSR-based x2APIC mode.
 bool SmpIsX2ApicEnabled();

@@ -113,6 +113,13 @@ TEST(SyscallAbiTest, NumbersAndLimitsStayTheSame) {
   EXPECT_THAT(kSyscallIrqWait, t::Eq(14));
   EXPECT_THAT(kSyscallConsolePush, t::Eq(15));
   EXPECT_THAT(kSyscallGetTicks, t::Eq(16));
+  EXPECT_THAT(kSyscallIsaClaim, t::Eq(17));
+  EXPECT_THAT(kSyscallIsaPortIo, t::Eq(18));
+  EXPECT_THAT(kSyscallIsaIrqAlloc, t::Eq(19));
+  EXPECT_THAT(kIsaDeviceI8042, t::Eq(0));
+  EXPECT_THAT(kIsaDeviceCount, t::Eq(1));
+  EXPECT_THAT(kSyscallPortIoRead8, t::Eq(0));
+  EXPECT_THAT(kSyscallPortIoWrite8, t::Eq(1));
   EXPECT_THAT(kSyscallWriteMaxSize, t::Eq(4096));
   EXPECT_THAT(kSyscallSpinMaxSize, t::Eq(4096));
   EXPECT_THAT(kSyscallSpinMaxTicks, t::Eq(1000000));
@@ -162,16 +169,17 @@ TEST(SyscallAbiTest, DriverAbiLayoutsAndHelpers) {
   EXPECT_FALSE(SyscallIsError(static_cast<int64_t>(0xFFFF900000000000ULL)));
   EXPECT_FALSE(SyscallIsError(static_cast<int64_t>(0xFFFFA00000000000ULL)));
 
-  for (int64_t num = -1; num <= 20; ++num) {
-    const bool expected = (num >= 8 && num <= 15);
+  for (int64_t num = -1; num <= 22; ++num) {
+    const bool expected = (num >= 8 && num <= 15) || (num >= 17 && num <= 19);
     EXPECT_THAT(SyscallIsDriverOnly(num), t::Eq(expected)) << "syscall " << num;
   }
 
-  for (int64_t num = -1; num <= 20; ++num) {
+  for (int64_t num = -1; num <= 22; ++num) {
     const bool is_unpriv = (num >= 0 && num <= 6) || num == kSyscallGetTicks;
     const bool is_spawn_drv = (num == kSyscallSpawnDriver);
     const bool is_drv_only =
-        (num >= kSyscallPciInfo && num <= kSyscallConsolePush);
+        (num >= kSyscallPciInfo && num <= kSyscallConsolePush) ||
+        (num >= kSyscallIsaClaim && num <= kSyscallIsaIrqAlloc);
     EXPECT_THAT(MayMakeSyscall(kUserCapNone, num),
                 t::Eq(is_unpriv || (!is_spawn_drv && !is_drv_only)))
         << "syscall " << num;

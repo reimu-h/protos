@@ -16,6 +16,7 @@ constexpr int64_t kConsoleCaptureBufferSize = 8192;
 
 IrqSpinLock g_console_lock;
 std::atomic<bool> g_vga_echo_enabled{true};
+std::atomic<void (*)()> g_input_wake_callback{nullptr};
 char g_capture_buf[kConsoleCaptureBufferSize];
 int64_t g_capture_head = 0;
 int64_t g_capture_tail = 0;
@@ -81,10 +82,21 @@ void ConsoleWriteDec(const uint64_t value) {
 StatusOr<char> ConsoleTryReadc() { return UartTryGetc(); }
 
 void ConsolePushInput(const char* const data, const int64_t size) {
+  if (data == nullptr || size <= 0) {
+    return;
+  }
   UartPushRx(data, size);
+  void (*const wake)() = g_input_wake_callback.load(std::memory_order_acquire);
+  if (wake != nullptr) {
+    wake();
+  }
 }
 
 void ConsoleClearInput() { UartClearRx(); }
+
+void ConsoleSetInputWakeCallback(void (*const callback)()) {
+  g_input_wake_callback.store(callback, std::memory_order_release);
+}
 
 void ConsoleSetVgaEcho(const bool enabled) {
   g_vga_echo_enabled.store(enabled, std::memory_order_release);

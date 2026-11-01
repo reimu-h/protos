@@ -34,9 +34,18 @@ jobs:
             make \
             mtools \
             ovmf \
+            pipx \
             python3 \
             qemu-system-x86 \
             xorriso
+
+      # clang-format versions format some code differently, so the check pins
+      # the one that README.md names instead of the distribution's.
+      - name: Check C++ formatting
+        run: |
+          pipx run --spec clang-format==21.1.8 clang-format --dry-run --Werror \
+            *.cpp *.h selftest/*.cpp selftest/*.h \
+            user/*.cpp user/*.h user/*/*.cpp user/*/*.h
 
       - name: Configure ASLR entropy for ThreadSanitizer
         run: sudo sysctl -w vm.mmap_rnd_bits=28
@@ -45,15 +54,15 @@ jobs:
         run: make test USE_DOCKER=0 WERROR=1 REQUIRE_UEFI=1
 
   docker:
-    name: Docker Build and Boot Test
+    name: Docker Build, Unit, and Boot Tests
     runs-on: ubuntu-latest
     timeout-minutes: 45
     steps:
       - name: Checkout repository
         uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
 
-      - name: Build the kernel in the Docker image
-        run: make all USE_DOCKER=1 WERROR=1
+      - name: Configure ASLR entropy for ThreadSanitizer
+        run: sudo sysctl -w vm.mmap_rnd_bits=28
 
-      - name: Boot test in the Docker image
-        run: make run-boot-test USE_DOCKER=1 REQUIRE_UEFI=1
+      - name: Build and run unit and boot tests in the Docker image
+        run: make docker-test WERROR=1 REQUIRE_UEFI=1

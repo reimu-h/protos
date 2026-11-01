@@ -33,5 +33,12 @@ g_usbkbd_elf_start:
     .incbin "user/usbkbd.elf"
 g_usbkbd_elf_end:
 
+.balign 16
+.global g_ps2kbd_elf_start
+.global g_ps2kbd_elf_end
+g_ps2kbd_elf_start:
+    .incbin "user/ps2kbd.elf"
+g_ps2kbd_elf_end:
+
 .section .note.GNU-stack,"",@progbits
 

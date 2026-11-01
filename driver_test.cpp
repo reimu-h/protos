@@ -12,6 +12,7 @@
 
 #include "device_irq.h"
 #include "idt.h"
+#include "ioapic.h"
 #include "paging.h"
 #include "pci.h"
 #include "pci_config_fake.h"
@@ -100,6 +101,16 @@ class FakeDriverEnvironment final : public DriverEnvironment {
 
   void Log(const char* const text) override { logs_.push_back(text); }
 
+  uint8_t PortRead8(const uint16_t port) override {
+    port_ops_.emplace_back(/*write=*/false, port, port_in_[port]);
+    return port_in_[port];
+  }
+
+  void PortWrite8(const uint16_t port, const uint8_t value) override {
+    port_ops_.emplace_back(/*write=*/true, port, value);
+    port_out_[port] = value;
+  }
+
   uint64_t ram_range_base_ = 0;
   int64_t ram_range_size_ = 0;
   int fail_map_after_ = -1;
@@ -112,6 +123,9 @@ class FakeDriverEnvironment final : public DriverEnvironment {
   std::vector<std::pair<uintptr_t, int64_t>> zeroed_ranges_;
   std::vector<int64_t> slept_us_;
   std::vector<std::string> logs_;
+  uint8_t port_in_[65536] = {};
+  uint8_t port_out_[65536] = {};
+  std::vector<std::tuple<bool, uint16_t, uint8_t>> port_ops_;
 };
 
 class FakeIrqEnv final : public DeviceIrqEnvironment {
@@ -180,7 +194,10 @@ TEST_F(DriverTest, MayMakeSyscallEnforcesCapabilityGates) {
     EXPECT_TRUE(MayMakeSyscall(kUserCapNone, num)) << "syscall " << num;
   }
   EXPECT_FALSE(MayMakeSyscall(kUserCapNone, kSyscallSpawnDriver));
-  for (int64_t num = kSyscallPciInfo; num <= kSyscallConsolePush; ++num) {
+  for (int64_t num : {kSyscallPciInfo, kSyscallPciClaim, kSyscallPciBusMaster,
+                      kSyscallMmioMap, kSyscallDmaAlloc, kSyscallIrqAlloc,
+                      kSyscallIrqWait, kSyscallConsolePush, kSyscallIsaClaim,
+                      kSyscallIsaPortIo, kSyscallIsaIrqAlloc}) {
     EXPECT_FALSE(MayMakeSyscall(kUserCapNone, num)) << "syscall " << num;
     EXPECT_FALSE(MayMakeSyscall(kUserCapSpawnDrivers, num))
         << "syscall " << num;
@@ -606,19 +623,31 @@ TEST_F(DriverTest, DmaAllocRollsBackUnmappedFramesAndHandlesAllocFailure) {
   driver_env_->fail_alloc_frames_ = false;
 
   // Partial mapping failure on page 1 of a 3-page allocation frees the 2
-  // remaining unmapped frames and does not charge quota.
+  // remaining unmapped frames and charges quota for the 1 page already mapped
+  // into `space` (reclaimed on process teardown).
   driver_env_->fail_map_after_ = 1;
   EXPECT_THAT(ctx.DmaAlloc(nullptr, 0x3000, 0).status(),
               t::Eq(kSyscallErrorNoMemory));
   EXPECT_THAT(driver_env_->allocated_frames_, t::Eq(3));
   EXPECT_THAT(driver_env_->freed_frames_, t::Eq(2));
-  EXPECT_THAT(ctx.DmaTotalBytes(), t::Eq(0));
+  EXPECT_THAT(ctx.DmaTotalBytes(), t::Eq(0x1000));
   driver_env_->fail_map_after_ = -1;
 
-  // Exact 16 MiB quota can still be allocated across 16 calls of 1 MiB.
-  for (int i = 0; i < 16; ++i) {
+  // Mapping failure on page 0 frees all frames and charges 0 bytes.
+  driver_env_->fail_map_after_ = 0;
+  EXPECT_THAT(ctx.DmaAlloc(nullptr, 0x2000, 0).status(),
+              t::Eq(kSyscallErrorNoMemory));
+  EXPECT_THAT(driver_env_->allocated_frames_, t::Eq(5));
+  EXPECT_THAT(driver_env_->freed_frames_, t::Eq(4));
+  EXPECT_THAT(ctx.DmaTotalBytes(), t::Eq(0x1000));
+  driver_env_->fail_map_after_ = -1;
+
+  // Remaining quota (16 MiB - 4 KiB) can be allocated cleanly, and exceeding
+  // 16 MiB returns ENOMEM.
+  for (int i = 0; i < 15; ++i) {
     ASSERT_TRUE(ctx.DmaAlloc(nullptr, kSyscallDmaMaxSize, 0).ok());
   }
+  ASSERT_TRUE(ctx.DmaAlloc(nullptr, kSyscallDmaMaxSize - 0x1000, 0).ok());
   EXPECT_THAT(ctx.DmaTotalBytes(), t::Eq(kSyscallDmaMaxTotalSize));
   EXPECT_THAT(ctx.DmaAlloc(nullptr, 0x1000, 0).status(),
               t::Eq(kSyscallErrorNoMemory));
@@ -939,6 +968,106 @@ TEST_F(DriverTest, ADeviceWithVectorsGetsNoSecondSetOfThem) {
   EXPECT_THAT(DeviceIrqUsedVectorCount(), t::Eq(3));
   EXPECT_THAT(DeviceIrqVectorForBit(ctx.OwnerToken(), 2), t::Ge(0));
   EXPECT_THAT(DeviceIrqVectorForBit(ctx.OwnerToken(), 3), t::Lt(0));
+}
+
+class DriverFakeIoApic final : public IoApicHardware {
+ public:
+  DriverFakeIoApic() { regs_[kIoApicRegVer] = 0x00170011u; }
+  bool MapController(const int /*index*/,
+                     const uintptr_t /*phys_addr*/) override {
+    return true;
+  }
+  uint32_t ReadReg(const int /*index*/, const uint8_t reg) override {
+    return regs_[reg];
+  }
+  void WriteReg(const int /*index*/,  //
+                const uint8_t reg,    //
+                const uint32_t value) override {
+    regs_[reg] = value;
+  }
+  uint32_t regs_[256] = {};
+};
+
+TEST_F(DriverTest, IsaClaimPortIoIrqAllocAndTeardownOrdering) {
+  auto ioapic = std::make_shared<DriverFakeIoApic>();
+  const IoApicInfo info = {.ioapic_id = 1, .phys_addr = 0xFEC00000u};
+  IoApicInit(ioapic, &info, 1, nullptr);
+
+  DriverContext ctx_a;
+  DriverContext ctx_b;
+
+  // Before claiming kIsaDeviceI8042, port I/O and IRQ alloc fail with EACCES.
+  EXPECT_THAT(ctx_a.IsaPortIo(kSyscallPortIoRead8, 0x60, 0),
+              t::Eq(kSyscallErrorAccess));
+  EXPECT_THAT(ctx_a.IsaPortIo(kSyscallPortIoWrite8, 0x64, 0xAD),
+              t::Eq(kSyscallErrorAccess));
+  EXPECT_THAT(ctx_a.IsaIrqAlloc(kIsaDeviceI8042, nullptr),
+              t::Eq(kSyscallErrorAccess));
+  EXPECT_THAT(ctx_a.IsaClaim(-1), t::Eq(kSyscallErrorNoDevice));
+  EXPECT_THAT(ctx_a.IsaClaim(kIsaDeviceCount), t::Eq(kSyscallErrorNoDevice));
+
+  ASSERT_THAT(ctx_a.IsaClaim(kIsaDeviceI8042), t::Eq(0));
+  EXPECT_THAT(ctx_a.IsaClaim(kIsaDeviceI8042), t::Eq(0));
+  EXPECT_THAT(ctx_b.IsaClaim(kIsaDeviceI8042), t::Eq(kSyscallErrorBusy));
+  EXPECT_THAT(IsaClaimedCount(), t::Eq(1));
+
+  // Port I/O allows 0x60 and 0x64, rejects unauthorized ports and bad args.
+  driver_env_->port_in_[0x64] = 0x1C;
+  driver_env_->port_in_[0x60] = 0x1E;
+  EXPECT_THAT(ctx_a.IsaPortIo(kSyscallPortIoRead8, 0x64, 0), t::Eq(0x1C));
+  EXPECT_THAT(ctx_a.IsaPortIo(kSyscallPortIoRead8, 0x60, 0), t::Eq(0x1E));
+  EXPECT_THAT(ctx_a.IsaPortIo(kSyscallPortIoWrite8, 0x64, 0xAD), t::Eq(0));
+  EXPECT_THAT(driver_env_->port_out_[0x64], t::Eq(0xAD));
+
+  EXPECT_THAT(ctx_a.IsaPortIo(kSyscallPortIoRead8, 0x61, 0),
+              t::Eq(kSyscallErrorAccess));
+  EXPECT_THAT(ctx_a.IsaPortIo(kSyscallPortIoWrite8, 0xCF8, 0),
+              t::Eq(kSyscallErrorAccess));
+  EXPECT_THAT(ctx_b.IsaPortIo(kSyscallPortIoRead8, 0x60, 0),
+              t::Eq(kSyscallErrorAccess));
+  EXPECT_THAT(ctx_a.IsaPortIo(2, 0x60, 0), t::Eq(kSyscallErrorInvalid));
+  EXPECT_THAT(ctx_a.IsaPortIo(kSyscallPortIoRead8, 0x10000, 0),
+              t::Eq(kSyscallErrorInvalid));
+  EXPECT_THAT(ctx_a.IsaPortIo(kSyscallPortIoRead8, 0x60, 1),
+              t::Eq(kSyscallErrorInvalid));
+  EXPECT_THAT(ctx_a.IsaPortIo(kSyscallPortIoWrite8, 0x60, 0x100),
+              t::Eq(kSyscallErrorInvalid));
+
+  // Allocate ISA IRQ 1 and verify IOAPIC pin 1 is unmasked and routes to
+  // vector.
+  const int64_t bit = ctx_a.IsaIrqAlloc(kIsaDeviceI8042, nullptr);
+  ASSERT_THAT(bit, t::Eq(0));
+  EXPECT_THAT(ctx_a.IsaIrqAlloc(kIsaDeviceI8042, nullptr),
+              t::Eq(kSyscallErrorBusy));
+  const int vector = DeviceIrqVectorForBit(ctx_a.OwnerToken(), 0);
+  ASSERT_THAT(vector, t::Ge(kDeviceIrqVectorFirst));
+  EXPECT_THAT(ioapic->regs_[IoApicRedirLowReg(1)],
+              t::Eq(static_cast<uint32_t>(vector)));
+
+  // Release masks IOAPIC pin 1 before freeing IDT vectors and releases claim.
+  const DriverReleaseRecord rec = ctx_a.Release(/*address_space_alive=*/true);
+  EXPECT_THAT(rec.quiesced_count, t::Eq(1));
+  EXPECT_THAT(rec.freed_vectors, t::Eq(1));
+  EXPECT_THAT(rec.released_claims, t::Eq(1));
+  EXPECT_TRUE(rec.quiesced_before_vectors_freed);
+  EXPECT_TRUE(rec.quiesced_before_address_space_destroyed);
+  EXPECT_NE(ioapic->regs_[IoApicRedirLowReg(1)] & kIoApicRedirMaskBit, 0u);
+  EXPECT_THAT(IsaClaimedCount(), t::Eq(0));
+  EXPECT_THAT(DeviceIrqUsedVectorCount(), t::Eq(0));
+
+  // Another DriverContext can now claim and allocate IRQ 1 cleanly.
+  ASSERT_THAT(ctx_b.IsaClaim(kIsaDeviceI8042), t::Eq(0));
+  ASSERT_THAT(ctx_b.IsaIrqAlloc(kIsaDeviceI8042, nullptr), t::Eq(0));
+
+  // Without an IOAPIC, IsaIrqAlloc returns ENODEV without leaking vectors/bits.
+  (void)ctx_b.Release();
+  IoApicInit(ioapic, nullptr, 0, nullptr);
+  DriverContext ctx_c;
+  ASSERT_THAT(ctx_c.IsaClaim(kIsaDeviceI8042), t::Eq(0));
+  EXPECT_THAT(ctx_c.IsaIrqAlloc(kIsaDeviceI8042, nullptr),
+              t::Eq(kSyscallErrorNoDevice));
+  EXPECT_THAT(ctx_c.NextIrqBit(), t::Eq(0));
+  EXPECT_THAT(DeviceIrqUsedVectorCount(), t::Eq(0));
 }
 
 }  // namespace

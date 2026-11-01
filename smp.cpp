@@ -45,8 +45,22 @@ constexpr int64_t kBiosRomScanBytes = 0x00020000;
 constexpr int64_t kRsdpScanAlignment = 16;
 
 constexpr uint8_t kMadtTypeLocalApic = 0;
+constexpr uint8_t kMadtTypeIoApic = 1;
+constexpr uint8_t kMadtTypeInterruptSourceOverride = 2;
 constexpr uint8_t kMadtTypeLocalApicOverride = 5;
 constexpr uint8_t kMadtTypeLocalX2Apic = 9;
+// ACPI MADT Interrupt Source Override (`kMadtTypeInterruptSourceOverride`):
+// `bus == 0` identifies the legacy ISA bus, and `flags` encodes MPS INTI
+// polarity (bits 1:0) and trigger mode (bits 3:2).
+constexpr uint8_t kMadtIsoBusIsa = 0;
+constexpr uint16_t kMadtIntiPolarityMask = 0x03u;
+constexpr uint16_t kMadtIntiPolarityConforms = 0x00u;
+constexpr uint16_t kMadtIntiPolarityReserved = 0x02u;
+constexpr uint16_t kMadtIntiPolarityActiveLow = 0x03u;
+constexpr uint16_t kMadtIntiTriggerShift = 2;
+constexpr uint16_t kMadtIntiTriggerMask = 0x03u;
+constexpr uint16_t kMadtIntiTriggerReserved = 0x02u;
+constexpr uint16_t kMadtIntiTriggerLevel = 0x03u;
 // Enabled flag (bit 0) of Local APIC and Local x2APIC entries. Bit 1, Online
 // Capable, marks a processor that is not present but can be hot-added later;
 // such entries are not started.
@@ -76,6 +90,10 @@ constexpr int kLapicRegTimerCurrCount = 0x390;
 constexpr int kLapicRegTimerDivConfig = 0x3E0;
 
 constexpr uint32_t kLapicSvrSoftwareEnable = 1u << 8;
+// Local APIC SVR bit 12: EOI-Broadcast Suppression (Intel SDM Vol. 3A 11.4.7).
+// Must be cleared so Local APIC EOI writes broadcast to I/O APICs and clear
+// `Remote IRR` on level-triggered redirection entries.
+constexpr uint32_t kLapicSvrEoiBroadcastSuppression = 1u << 12;
 constexpr uint32_t kLapicSpuriousVector = 0xFFu;
 constexpr uint32_t kLapicTimerDivBy16 = 0x03u;
 constexpr uint32_t kLapicTimerMaskBit = 1u << 16;
@@ -228,6 +246,24 @@ struct [[gnu::packed]] AcpiMadtLocalApic {
   uint8_t apic_id;
   uint32_t flags;
 };
+
+struct [[gnu::packed]] AcpiMadtIoApic {
+  AcpiMadtEntryHeader header;
+  uint8_t ioapic_id;
+  uint8_t reserved;
+  uint32_t ioapic_address;
+  uint32_t gsi_base;
+};
+static_assert(sizeof(AcpiMadtIoApic) == 12);
+
+struct [[gnu::packed]] AcpiMadtInterruptSourceOverride {
+  AcpiMadtEntryHeader header;
+  uint8_t bus;
+  uint8_t source;
+  uint32_t gsi;
+  uint16_t flags;
+};
+static_assert(sizeof(AcpiMadtInterruptSourceOverride) == 10);
 
 struct [[gnu::packed]] AcpiMadtLocalApicOverride {
   AcpiMadtEntryHeader header;
@@ -538,11 +574,184 @@ static const AcpiSdtHeader* MapAndValidateSdt(
   return table;
 }
 
+static const AcpiSdtHeader* FindTableInSdt(
+    const uintptr_t rsdt_addr,          //
+    const uintptr_t xsdt_addr,          //
+    const uintptr_t max_physical_addr,  //
+    const char* const expected_sig,     //
+    const int64_t min_length,           //
+    uintptr_t* const out_phys_addr) {
+  DCHECK(rsdt_addr != 0 || xsdt_addr != 0);
+  DCHECK(max_physical_addr > 0);
+  DCHECK(expected_sig != nullptr);
+  constexpr int64_t kHeaderSize = sizeof(AcpiSdtHeader);
+
+  if (xsdt_addr != 0) {
+    const AcpiSdtHeader* const xsdt =
+        MapAndValidateSdt(xsdt_addr, max_physical_addr, "XSDT");
+    if (xsdt != nullptr) {
+      const int64_t payload_bytes = xsdt->length - kHeaderSize;
+      const int entry_count = payload_bytes / sizeof(uint64_t);
+      const uint8_t* const entries_base =
+          reinterpret_cast<const uint8_t*>(xsdt) + kHeaderSize;
+      for (int i = 0; i < entry_count; ++i) {
+        uint64_t entry_phys = 0;
+        const uint8_t* const src = entries_base + i * sizeof(uint64_t);
+        for (int b = 0; b < static_cast<int>(sizeof(uint64_t)); ++b) {
+          entry_phys |= static_cast<uint64_t>(src[b]) << (b * 8);
+        }
+        const AcpiSdtHeader* const candidate =
+            MapAndValidateSdt(entry_phys, max_physical_addr, expected_sig);
+        if (candidate != nullptr && candidate->length >= min_length) {
+          if (out_phys_addr != nullptr) {
+            *out_phys_addr = entry_phys;
+          }
+          return candidate;
+        }
+      }
+    }
+  }
+
+  if (rsdt_addr != 0) {
+    const AcpiSdtHeader* const rsdt =
+        MapAndValidateSdt(rsdt_addr, max_physical_addr, "RSDT");
+    if (rsdt != nullptr) {
+      const int64_t payload_bytes = rsdt->length - kHeaderSize;
+      const int entry_count = payload_bytes / sizeof(uint32_t);
+      const uint8_t* const entries_base =
+          reinterpret_cast<const uint8_t*>(rsdt) + kHeaderSize;
+      for (int i = 0; i < entry_count; ++i) {
+        uint32_t raw_entry = 0;
+        const uint8_t* const src = entries_base + i * sizeof(uint32_t);
+        for (int b = 0; b < static_cast<int>(sizeof(uint32_t)); ++b) {
+          raw_entry |= static_cast<uint32_t>(src[b]) << (b * 8);
+        }
+        const uintptr_t entry_phys = raw_entry;
+        const AcpiSdtHeader* const candidate =
+            MapAndValidateSdt(entry_phys, max_physical_addr, expected_sig);
+        if (candidate != nullptr && candidate->length >= min_length) {
+          if (out_phys_addr != nullptr) {
+            *out_phys_addr = entry_phys;
+          }
+          return candidate;
+        }
+      }
+    }
+  }
+
+  if (out_phys_addr != nullptr) {
+    *out_phys_addr = 0;
+  }
+  return nullptr;
+}
+
+// Per ACPI 6.5 Table 5.34 & 5.37, Fixed ACPI Description Table (`FACP`)
+// revision >= 3 exposes `IAPC_BOOT_ARCH` at byte offset 109 (uint16_t), where
+// bit 1 (`0x0002`) indicates presence of an 8042-compatible controller on ports
+// 0x60/0x64. Older FADT revisions (such as ACPI 1.0 PCs) and systems without a
+// FADT default to `true`.
+static bool ParseFadtHas8042(const uintptr_t rsdt_addr,  //
+                             const uintptr_t xsdt_addr,  //
+                             const uintptr_t max_physical_addr) {
+  constexpr uint8_t kMinFadtRevisionForBootArch = 3;
+  constexpr int64_t kFadtIapcBootArchOffset = 109;
+  constexpr int64_t kMinFadtBytesForBootArch =
+      kFadtIapcBootArchOffset + sizeof(uint16_t);
+  constexpr uint16_t kFadtIapcBootArch8042 = 1u << 1;
+
+  const AcpiSdtHeader* const fadt = FindTableInSdt(
+      rsdt_addr, xsdt_addr, max_physical_addr, "FACP", sizeof(AcpiSdtHeader),
+      /*out_phys_addr=*/nullptr);
+  if (fadt == nullptr || fadt->revision < kMinFadtRevisionForBootArch ||
+      fadt->length < kMinFadtBytesForBootArch) {
+    return true;
+  }
+  const uint8_t* const bytes = reinterpret_cast<const uint8_t*>(fadt);
+  const uint16_t iapc_boot_arch =
+      static_cast<uint16_t>(bytes[kFadtIapcBootArchOffset]) |
+      (static_cast<uint16_t>(bytes[kFadtIapcBootArchOffset + 1]) << 8);
+  return (iapc_boot_arch & kFadtIapcBootArch8042) != 0;
+}
+
 static bool IsValidLocalApicAddress(const uintptr_t addr,
                                     const uintptr_t max_physical_addr) {
   return addr != 0 && (addr & (kPageSize - 1)) == 0 &&
          addr < max_physical_addr &&
          (max_physical_addr - addr) >= static_cast<uintptr_t>(kPageSize);
+}
+
+static bool IsValidIoApicAddress(const uintptr_t addr,
+                                 const uintptr_t max_physical_addr) {
+  constexpr uintptr_t kIoApicMmioBytes = 0x20;
+  const uintptr_t page_base = addr & ~(static_cast<uintptr_t>(kPageSize) - 1);
+  const uintptr_t page_offset = addr & (static_cast<uintptr_t>(kPageSize) - 1);
+  return page_base != 0 && (addr & 0x3u) == 0 &&
+         page_offset + kIoApicMmioBytes <= static_cast<uintptr_t>(kPageSize) &&
+         page_base < max_physical_addr &&
+         (max_physical_addr - page_base) >= static_cast<uintptr_t>(kPageSize);
+}
+
+static void InitIdentityIsaIrqRoutes(SmpTopology* const topology) {
+  DCHECK(topology != nullptr);
+  for (int irq = 0; irq < kIsaIrqCount; ++irq) {
+    topology->isa_irq_routes[irq] = {
+        .gsi = static_cast<uint32_t>(irq),
+        .active_low = false,
+        .level_triggered = false,
+    };
+  }
+}
+
+static void AddDiscoveredIoApic(SmpTopology* const topology,
+                                const AcpiMadtIoApic& entry,
+                                const uintptr_t max_physical_addr) {
+  DCHECK(topology != nullptr);
+  const uintptr_t phys_addr = entry.ioapic_address;
+  if (!IsValidIoApicAddress(phys_addr, max_physical_addr)) {
+    return;
+  }
+  for (int i = 0; i < topology->ioapic_count; ++i) {
+    if (topology->ioapics[i].phys_addr == phys_addr) {
+      return;
+    }
+  }
+  if (topology->ioapic_count >= kMaxSupportedIoApics) {
+    return;
+  }
+  topology->ioapics[topology->ioapic_count] = {
+      .ioapic_id = entry.ioapic_id,
+      .phys_addr = phys_addr,
+      .gsi_base = entry.gsi_base,
+  };
+  ++topology->ioapic_count;
+}
+
+static void ApplyInterruptSourceOverride(
+    SmpTopology* const topology, const AcpiMadtInterruptSourceOverride& entry) {
+  DCHECK(topology != nullptr);
+  if (entry.bus != kMadtIsoBusIsa || entry.source >= kIsaIrqCount) {
+    return;
+  }
+  const uint16_t polarity = entry.flags & kMadtIntiPolarityMask;
+  const uint16_t trigger =
+      (entry.flags >> kMadtIntiTriggerShift) & kMadtIntiTriggerMask;
+  if (polarity == kMadtIntiPolarityReserved ||
+      trigger == kMadtIntiTriggerReserved) {
+    return;
+  }
+  // Per ACPI 6.5 Table 5.51 (MPS INTI Flags), bus-conforming trigger (`00`) on
+  // ISA is edge-triggered, and bus-conforming polarity (`00`) on ISA/EISA is
+  // active-low for level-triggered lines and active-high for edge-triggered
+  // lines.
+  const bool level_triggered = (trigger == kMadtIntiTriggerLevel);
+  const bool active_low =
+      (polarity == kMadtIntiPolarityActiveLow) ||
+      (polarity == kMadtIntiPolarityConforms && level_triggered);
+  topology->isa_irq_routes[entry.source] = {
+      .gsi = entry.gsi,
+      .active_low = active_low,
+      .level_triggered = level_triggered,
+  };
 }
 
 // Records an enabled MADT processor entry in `topology`, whose index 0 is
@@ -617,6 +826,8 @@ static StatusOr<SmpTopology> TryDiscoverFromRsdp(
     StatusOr<SmpTopology> topology =
         SmpParseMadt(madt_addr, max_physical_addr, bsp_apic_id);
     if (topology.ok()) {
+      topology->has_i8042 =
+          ParseFadtHas8042(rsdt_addr, xsdt_addr, max_physical_addr);
       return topology;
     }
   }
@@ -625,9 +836,14 @@ static StatusOr<SmpTopology> TryDiscoverFromRsdp(
     const uintptr_t rsdt_madt_addr =
         SmpFindMadtInSdt(rsdt_addr, 0, max_physical_addr);
     if (rsdt_madt_addr != 0 && rsdt_madt_addr != madt_addr) {
-      return SmpParseMadt(rsdt_madt_addr,     //
-                          max_physical_addr,  //
-                          bsp_apic_id);
+      StatusOr<SmpTopology> topology = SmpParseMadt(rsdt_madt_addr,     //
+                                                    max_physical_addr,  //
+                                                    bsp_apic_id);
+      if (topology.ok()) {
+        topology->has_i8042 =
+            ParseFadtHas8042(rsdt_addr, xsdt_addr, max_physical_addr);
+        return topology;
+      }
     }
   }
   return kStatusError;
@@ -1069,7 +1285,8 @@ static void EnableLocalApic(const uintptr_t lapic_base) {
   const uint32_t svr = LapicRead(lapic_base, kLapicRegSvr);
   LapicWrite(lapic_base,    //
              kLapicRegSvr,  //
-             svr | kLapicSvrSoftwareEnable | kLapicSpuriousVector);
+             (svr & ~kLapicSvrEoiBroadcastSuppression) |
+                 kLapicSvrSoftwareEnable | kLapicSpuriousVector);
 }
 
 static bool IsLongModeActive() {
@@ -1443,6 +1660,7 @@ static uintptr_t ReadEbdaBase() {
 static StatusOr<SmpTopology> MakeBspOnlyTopology(const uint32_t bsp_apic_id) {
   DCHECK(bsp_apic_id != kInvalidX2ApicId);
   SmpTopology topology{};
+  InitIdentityIsaIrqRoutes(&topology);
   topology.cpus.reset(new (std::nothrow) CpuInfo[1]());
   if (topology.cpus == nullptr) {
     return kStatusError;
@@ -1549,58 +1767,14 @@ uintptr_t SmpFindRsdpInMemoryRange(const uintptr_t range_start,
 uintptr_t SmpFindMadtInSdt(const uintptr_t rsdt_addr,  //
                            const uintptr_t xsdt_addr,  //
                            const uintptr_t max_physical_addr) {
-  DCHECK(rsdt_addr != 0 || xsdt_addr != 0);
-  DCHECK(max_physical_addr > 0);
-  constexpr int64_t kHeaderSize = sizeof(AcpiSdtHeader);
-
-  if (xsdt_addr != 0) {
-    const AcpiSdtHeader* const xsdt =
-        MapAndValidateSdt(xsdt_addr, max_physical_addr, "XSDT");
-    if (xsdt != nullptr) {
-      const int64_t payload_bytes = xsdt->length - kHeaderSize;
-      const int entry_count = payload_bytes / sizeof(uint64_t);
-      const uint8_t* const entries_base =
-          reinterpret_cast<const uint8_t*>(xsdt) + kHeaderSize;
-      for (int i = 0; i < entry_count; ++i) {
-        uint64_t entry_phys = 0;
-        const uint8_t* const src = entries_base + i * sizeof(uint64_t);
-        for (int b = 0; b < static_cast<int>(sizeof(uint64_t)); ++b) {
-          entry_phys |= static_cast<uint64_t>(src[b]) << (b * 8);
-        }
-        const AcpiSdtHeader* const candidate =
-            MapAndValidateSdt(entry_phys, max_physical_addr, "APIC");
-        if (candidate != nullptr && candidate->length >= sizeof(AcpiMadt)) {
-          return entry_phys;
-        }
-      }
-    }
-  }
-
-  if (rsdt_addr != 0) {
-    const AcpiSdtHeader* const rsdt =
-        MapAndValidateSdt(rsdt_addr, max_physical_addr, "RSDT");
-    if (rsdt != nullptr) {
-      const int64_t payload_bytes = rsdt->length - kHeaderSize;
-      const int entry_count = payload_bytes / sizeof(uint32_t);
-      const uint8_t* const entries_base =
-          reinterpret_cast<const uint8_t*>(rsdt) + kHeaderSize;
-      for (int i = 0; i < entry_count; ++i) {
-        uint32_t raw_entry = 0;
-        const uint8_t* const src = entries_base + i * sizeof(uint32_t);
-        for (int b = 0; b < static_cast<int>(sizeof(uint32_t)); ++b) {
-          raw_entry |= static_cast<uint32_t>(src[b]) << (b * 8);
-        }
-        const uintptr_t entry_phys = raw_entry;
-        const AcpiSdtHeader* const candidate =
-            MapAndValidateSdt(entry_phys, max_physical_addr, "APIC");
-        if (candidate != nullptr && candidate->length >= sizeof(AcpiMadt)) {
-          return entry_phys;
-        }
-      }
-    }
-  }
-
-  return 0;
+  uintptr_t madt_addr = 0;
+  (void)FindTableInSdt(rsdt_addr,          //
+                       xsdt_addr,          //
+                       max_physical_addr,  //
+                       "APIC",             //
+                       sizeof(AcpiMadt),   //
+                       &madt_addr);
+  return madt_addr;
 }
 
 StatusOr<SmpTopology> SmpParseMadt(const uintptr_t madt_addr,          //
@@ -1610,6 +1784,7 @@ StatusOr<SmpTopology> SmpParseMadt(const uintptr_t madt_addr,          //
   DCHECK(max_physical_addr > 0);
   DCHECK(bsp_apic_id != kInvalidX2ApicId);
   SmpTopology topology{};
+  InitIdentityIsaIrqRoutes(&topology);
 
   const AcpiSdtHeader* const header =
       MapAndValidateSdt(madt_addr, max_physical_addr, "APIC");
@@ -1647,6 +1822,15 @@ StatusOr<SmpTopology> SmpParseMadt(const uintptr_t madt_addr,          //
       if ((lapic->flags & kMadtLapicFlagEnabled) != 0 &&
           lapic->apic_id != kInvalidXapicId) {
         ++candidate_count;
+      }
+    } else if (entry->type == kMadtTypeIoApic) {
+      if (entry_len < static_cast<int64_t>(sizeof(AcpiMadtIoApic))) {
+        break;
+      }
+    } else if (entry->type == kMadtTypeInterruptSourceOverride) {
+      if (entry_len <
+          static_cast<int64_t>(sizeof(AcpiMadtInterruptSourceOverride))) {
+        break;
       }
     } else if (entry->type == kMadtTypeLocalApicOverride) {
       if (entry_len < static_cast<int64_t>(sizeof(AcpiMadtLocalApicOverride))) {
@@ -1714,6 +1898,21 @@ StatusOr<SmpTopology> SmpParseMadt(const uintptr_t madt_addr,          //
                          lapic->acpi_processor_id,  //
                          &bsp_listed);
       }
+    } else if (entry->type == kMadtTypeIoApic) {
+      if (entry_len < static_cast<int64_t>(sizeof(AcpiMadtIoApic))) {
+        break;
+      }
+      AddDiscoveredIoApic(&topology,
+                          *reinterpret_cast<const AcpiMadtIoApic*>(entry),
+                          max_physical_addr);
+    } else if (entry->type == kMadtTypeInterruptSourceOverride) {
+      if (entry_len <
+          static_cast<int64_t>(sizeof(AcpiMadtInterruptSourceOverride))) {
+        break;
+      }
+      ApplyInterruptSourceOverride(
+          &topology,
+          *reinterpret_cast<const AcpiMadtInterruptSourceOverride*>(entry));
     } else if (entry->type == kMadtTypeLocalApicOverride) {
       if (entry_len < static_cast<int64_t>(sizeof(AcpiMadtLocalApicOverride))) {
         break;
@@ -2112,6 +2311,38 @@ CpuLocal* SmpGetCpuLocal(const int cpu_index) {
 uintptr_t SmpLocalApicPhysAddr() {
   DCHECK(g_smp_initialized);
   return g_topology.local_apic_phys_addr;
+}
+
+int SmpIoApicCount() {
+  DCHECK(g_smp_initialized);
+  return g_topology.ioapic_count;
+}
+
+const IoApicInfo* SmpGetIoApicInfo(const int index) {
+  DCHECK(g_smp_initialized);
+  DCHECK(index >= 0 && index < g_topology.ioapic_count);
+  return &g_topology.ioapics[index];
+}
+
+const IoApicInfo* SmpIoApicInfos() {
+  DCHECK(g_smp_initialized);
+  return g_topology.ioapics;
+}
+
+IsaIrqRoute SmpGetIsaIrqRoute(const int isa_irq) {
+  DCHECK(g_smp_initialized);
+  DCHECK(isa_irq >= 0 && isa_irq < kIsaIrqCount);
+  return g_topology.isa_irq_routes[isa_irq];
+}
+
+const IsaIrqRoute* SmpIsaIrqRoutes() {
+  DCHECK(g_smp_initialized);
+  return g_topology.isa_irq_routes;
+}
+
+bool SmpHas8042() {
+  DCHECK(g_smp_initialized);
+  return g_topology.has_i8042;
 }
 
 bool SmpIsX2ApicEnabled() { return g_x2apic_mode; }

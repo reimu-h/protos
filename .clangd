@@ -23,6 +23,8 @@ CompileFlags:
     - -mgeneral-regs-only
     - -fno-stack-protector
     - -fno-pie
+    - -U_GLIBCXX_ASSERTIONS
+    - -fcf-protection=none
     - -DPROTOS_SELFTEST=1
     - -Ibuild/include
 

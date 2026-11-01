@@ -176,7 +176,7 @@ static StatusOr<usb::MappedMmioWindow> MapControllerBar0(
       offset += kPageSize;  // The page at `offset` holds MSI-X structures
       continue;
     }
-    if (!window.AddSegment(offset,                                   //
+    if (!window.AddSegment(offset,                                    //
                            reinterpret_cast<volatile uint8_t*>(*va),  //
                            size)) {
       break;  // Out of segments: the registers above stay unmapped
@@ -281,13 +281,17 @@ int64_t Main(const uint64_t arg) {
     return kDriverExitNotDriver;
   }
   if (pci_count <= 0) {
+    if (arg == kDriverArgHandoffOnly) {
+      return 0;
+    }
     usb::LogLine line;
     line.Str(usb::kLogPrefix).Str("no xHCI controllers found").Emit(g_platform);
     return (arg == kDriverArgNormal) ? 0 : 1;
   }
 
   // Phase 1: PCI discovery, PciClaim (Memory Space on, Bus Master untouched),
-  // BAR0 MMIO mapping, BIOS-to-OS handoff, halt, and HCRST.
+  // BAR0 MMIO mapping, BIOS-to-OS handoff, halt, and (except in handoff-only
+  // mode) HCRST.
   int discovered_count = 0;
   int decoding_count = 0;
   for (int64_t idx = 0; idx < pci_count && discovered_count < kMaxControllers;
@@ -320,18 +324,25 @@ int64_t Main(const uint64_t arg) {
                                  g_mmio[slot_idx],  //
                                  slot.label,        //
                                  &g_shared_locks);
-    const usb::XhciStatus reset_status =
-        g_controllers[slot_idx].TakeOwnershipAndReset();
-    if (reset_status != usb::XhciStatus::kNotDecoding) {
+    const usb::XhciStatus phase1_status =
+        (arg == kDriverArgHandoffOnly)
+            ? g_controllers[slot_idx].TakeOwnershipAndHalt()
+            : g_controllers[slot_idx].TakeOwnershipAndReset();
+    if (phase1_status != usb::XhciStatus::kNotDecoding) {
       ++decoding_count;
     }
-    if (reset_status != usb::XhciStatus::kOk) {
+    if (phase1_status != usb::XhciStatus::kOk) {
       (void)PciBusMaster(idx, /*enable=*/0);
-      LogBringUpError(slot.label, "reset");
+      LogBringUpError(slot.label,
+                      (arg == kDriverArgHandoffOnly) ? "handoff" : "reset");
       continue;
     }
 
     slot.phase1_ok = true;
+  }
+
+  if (arg == kDriverArgHandoffOnly) {
+    return 0;
   }
 
   if (discovered_count == 0) {

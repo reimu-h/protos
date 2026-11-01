@@ -15,6 +15,8 @@ extern "C" const uint8_t g_usertest_elf_start[];
 extern "C" const uint8_t g_usertest_elf_end[];
 extern "C" const uint8_t g_usbkbd_elf_start[];
 extern "C" const uint8_t g_usbkbd_elf_end[];
+extern "C" const uint8_t g_ps2kbd_elf_start[];
+extern "C" const uint8_t g_ps2kbd_elf_end[];
 
 namespace protos {
 
@@ -45,6 +47,13 @@ inline UserProgram UsbkbdProgram() {
 }
 inline UserProgram UsbKbdProgram() { return UsbkbdProgram(); }
 inline UserProgram UsbkbdUserProgram() { return UsbkbdProgram(); }
+
+// user/ps2kbd/ps2kbd.cpp: the ring-3 i8042 PS/2 keyboard driver.
+inline UserProgram Ps2kbdProgram() {
+  return UserProgram{g_ps2kbd_elf_start, g_ps2kbd_elf_end - g_ps2kbd_elf_start};
+}
+inline UserProgram Ps2KbdProgram() { return Ps2kbdProgram(); }
+inline UserProgram Ps2kbdUserProgram() { return Ps2kbdProgram(); }
 
 // Returns true if `[name, name + name_len)` equals the null-terminated string
 // `literal`.
@@ -79,6 +88,9 @@ inline StatusOr<UserProgram> FindUserProgram(const char* const name,
   }
   if (UserProgramNameEquals(name, name_len, "usbkbd")) {
     return UsbkbdProgram();
+  }
+  if (UserProgramNameEquals(name, name_len, "ps2kbd")) {
+    return Ps2kbdProgram();
   }
   return kStatusError;
 }

@@ -207,6 +207,32 @@ inline int64_t ConsolePush(const void* const buffer, const int64_t size) {
 
 inline int64_t GetTicks() { return Syscall(kSyscallGetTicks); }
 
+inline int64_t IsaClaim(const int64_t device) {
+  return Syscall(kSyscallIsaClaim, static_cast<uint64_t>(device));
+}
+
+inline int64_t IsaPortIo(const int64_t op,     //
+                         const uint64_t port,  //
+                         const uint64_t value = 0) {
+  return Syscall(kSyscallIsaPortIo, static_cast<uint64_t>(op), port, value);
+}
+
+inline StatusOr<uint8_t> IsaPortIn8(const uint16_t port) {
+  const int64_t rc = IsaPortIo(kSyscallPortIoRead8, port, 0);
+  if (SyscallIsError(rc)) {
+    return Error(rc);
+  }
+  return static_cast<uint8_t>(rc);
+}
+
+inline int64_t IsaPortOut8(const uint16_t port, const uint8_t value) {
+  return IsaPortIo(kSyscallPortIoWrite8, port, value);
+}
+
+inline int64_t IsaIrqAlloc(const int64_t device) {
+  return Syscall(kSyscallIsaIrqAlloc, static_cast<uint64_t>(device));
+}
+
 // Each user program defines its main function, which the entry point
 // (user/crt.cpp) calls with the argument that the kernel passed in rdi. The
 // program exits with the status that it returns.

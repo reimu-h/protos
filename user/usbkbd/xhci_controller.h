@@ -204,6 +204,13 @@ class XhciController {
   // finds the controller OS-owned and does not wait).
   [[nodiscard]] XhciStatus TakeOwnershipAndReset();
 
+  // Performs steps 1..4 of TakeOwnershipAndReset() (capability check, USB
+  // Legacy Support BIOS-to-OS handoff + SMI disable, CNR wait, and USBCMD halt)
+  // without issuing HCRST. Leaves state() == XhciState::kBound on success so an
+  // early-boot handoff pass can release SMM port 0x60/0x64 emulation before
+  // `ps2kbd` probes the i8042 controller without resetting xHCI twice.
+  [[nodiscard]] XhciStatus TakeOwnershipAndHalt();
+
   // Phase 2 of the bring-up: requires state() == XhciState::kReset, PCI Bus
   // Master enabled, and the controller's interrupt allocated. Allocates and
   // zeroes DMA structures (DCBAA, scratchpads, command/event/transfer rings,
@@ -457,6 +464,7 @@ class XhciController {
     int64_t deadline = kNoDeadline;
   };
 
+  XhciStatus RunHandoffAndHalt();
   XhciStatus RunPhase1();
   XhciStatus TakeOwnershipFromFirmware();
   XhciStatus WaitUntilReady();
@@ -576,6 +584,12 @@ class XhciController {
   IrqMode irq_mode_ = IrqMode::kMsix;
   XhciCaps caps_ = {};
 
+  static constexpr int kMaxScratchpadBatches = 4;
+  struct ScratchpadBatch {
+    uint8_t* va = nullptr;
+    int64_t bytes = 0;
+  };
+
   bool dma_ready_ = false;
   uint8_t* core_dma_va_ = nullptr;
   uint64_t core_dma_phys_ = 0;
@@ -583,6 +597,8 @@ class XhciController {
   uint64_t* dcbaa_ = nullptr;
   uint64_t dcbaa_phys_ = 0;
   uint64_t sp_array_phys_ = 0;
+  ScratchpadBatch sp_batches_[kMaxScratchpadBatches] = {};
+  int sp_batch_count_ = 0;
   ProducerRing<kRingTrbs> cmd_ring_ = {};
   EventRing<kRingTrbs> event_ring_ = {};
 
@@ -636,6 +652,10 @@ inline void XhciController::Init(Platform& platform,       //
   dcbaa_ = nullptr;
   dcbaa_phys_ = 0;
   sp_array_phys_ = 0;
+  sp_batch_count_ = 0;
+  for (int i = 0; i < kMaxScratchpadBatches; ++i) {
+    sp_batches_[i] = ScratchpadBatch{};
+  }
   ports_ = 0;
   slots_ = 0;
   attached_keyboards_ = 0;
@@ -674,7 +694,23 @@ inline XhciStatus XhciController::TakeOwnershipAndReset() {
   return XhciStatus::kOk;
 }
 
-inline XhciStatus XhciController::RunPhase1() {
+inline XhciStatus XhciController::TakeOwnershipAndHalt() {
+  if (platform_ == nullptr || mmio_ == nullptr) {
+    return XhciStatus::kNotBound;
+  }
+  state_ = XhciState::kBound;
+  handoff_ = HandoffOutcome::kNotRun;
+  const XhciStatus status = RunHandoffAndHalt();
+  if (status != XhciStatus::kOk) {
+    state_ = XhciState::kError;
+    StartLogLine().Str("error: ").Str(XhciStatusName(status)).Emit(*platform_);
+    return status;
+  }
+  state_ = XhciState::kBound;
+  return XhciStatus::kOk;
+}
+
+inline XhciStatus XhciController::RunHandoffAndHalt() {
   const StatusOr<XhciCaps, XhciStatus> decoded = DecodeCaps(*mmio_);
   if (!decoded.ok()) {
     return decoded.status();
@@ -694,7 +730,12 @@ inline XhciStatus XhciController::RunPhase1() {
   if (const XhciStatus status = WaitUntilReady(); status != XhciStatus::kOk) {
     return status;
   }
-  if (const XhciStatus status = HaltIfRunning(); status != XhciStatus::kOk) {
+  return HaltIfRunning();
+}
+
+inline XhciStatus XhciController::RunPhase1() {
+  if (const XhciStatus status = RunHandoffAndHalt();
+      status != XhciStatus::kOk) {
     return status;
   }
   return ResetHalted();
@@ -965,6 +1006,8 @@ inline XhciStatus XhciController::EnsureDmaAllocated() {
   ctrl_internal::ZeroBytesVolatile(static_cast<uint8_t*>(core.va), core_bytes);
 
   uint64_t sp_array_phys = 0;
+  ScratchpadBatch sp_batches[kMaxScratchpadBatches] = {};
+  int sp_batch_count = 0;
   if (sp_count > 0) {
     uint64_t* const sp_array = reinterpret_cast<uint64_t*>(
         static_cast<uint8_t*>(core.va) +
@@ -974,6 +1017,9 @@ inline XhciStatus XhciController::EnsureDmaAllocated() {
                         ctrl_internal::kPageBytes;
     int allocated = 0;
     while (allocated < sp_count) {
+      if (sp_batch_count >= kMaxScratchpadBatches) {
+        return XhciStatus::kNoMemory;
+      }
       const int batch =
           (sp_count - allocated) > 256 ? 256 : (sp_count - allocated);
       const int64_t batch_bytes =
@@ -982,8 +1028,10 @@ inline XhciStatus XhciController::EnsureDmaAllocated() {
       if (!ctrl_internal::ValidDmaBuffer(sp_buf, batch_bytes, below_4gib)) {
         return XhciStatus::kNoMemory;
       }
-      ctrl_internal::ZeroBytesVolatile(static_cast<uint8_t*>(sp_buf.va),
-                                       batch_bytes);
+      sp_batches[sp_batch_count++] = ScratchpadBatch{
+          .va = static_cast<uint8_t*>(sp_buf.va),
+          .bytes = batch_bytes,
+      };
       for (int j = 0; j < batch; ++j) {
         sp_array[allocated + j] =
             sp_buf.phys + static_cast<uint64_t>(j) * ctrl_internal::kPageBytes;
@@ -999,12 +1047,19 @@ inline XhciStatus XhciController::EnsureDmaAllocated() {
   dcbaa_ = reinterpret_cast<uint64_t*>(core_dma_va_);
   dcbaa_phys_ = core_dma_phys_;
   sp_array_phys_ = sp_array_phys;
+  sp_batch_count_ = sp_batch_count;
+  for (int i = 0; i < kMaxScratchpadBatches; ++i) {
+    sp_batches_[i] = sp_batches[i];
+  }
   dma_ready_ = true;
   return XhciStatus::kOk;
 }
 
 inline void XhciController::FormatCoreDma() {
   ctrl_internal::ZeroBytesVolatile(core_dma_va_, core_dma_bytes_);
+  for (int i = 0; i < sp_batch_count_; ++i) {
+    ctrl_internal::ZeroBytesVolatile(sp_batches_[i].va, sp_batches_[i].bytes);
+  }
   dcbaa_[0] = sp_array_phys_;
 
   ErstEntry* const erst = reinterpret_cast<ErstEntry*>(core_dma_va_ + 0x800);

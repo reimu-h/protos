@@ -1,5 +1,6 @@
 #include <cstdint>
 #include <cstring>
+#include <vector>
 
 #include "gmock/gmock.h"
 #include "gtest/gtest.h"
@@ -136,7 +137,9 @@ TEST(XhciSimRingsTest, RingModifiedWhileRunningIsAViolationExceptCrcrAbort) {
 TEST(XhciSimRingsTest,
      Usb3HotResetIsValidAndUsb2WarmResetOrCrcrHighMismatchIsViolation) {
   XhciSimConfig cfg;
-  cfg.attached_speed = {4};  // SuperSpeed on USB 3 port 1.
+  // SuperSpeed on USB 3 port 1. (Not `= {4}`, for which GCC 13 with -O2
+  // -fsanitize=address reports a false -Warray-bounds inside std::vector.)
+  cfg.attached_speed = std::vector<int>{4};
   SimWorld world;
   const int idx = world.AddController("00:04.0", cfg);
   ASSERT_THAT(world.BringUp(idx), t::Eq(usb::XhciStatus::kOk));

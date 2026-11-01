@@ -63,11 +63,13 @@ class ConsoleTest : public t::Test {
  protected:
   void SetUp() override {
     g_consoles = FakeConsoles{};
+    ConsoleSetInputWakeCallback(nullptr);
     ConsoleSetVgaEcho(true);
     ConsoleResetOutputCapture();
   }
 
   void TearDown() override {
+    ConsoleSetInputWakeCallback(nullptr);
     ConsoleSetVgaEcho(true);
     ConsoleResetOutputCapture();
   }
@@ -165,6 +167,31 @@ TEST_F(ConsoleTest, OutputCaptureRecordsWritesAndSupportsTruncationAndReset) {
   ConsoleResetOutputCapture();
   EXPECT_THAT(ConsoleCopyOutputCapture(full, sizeof(full)), t::Eq(0));
   EXPECT_THAT(std::string(full), t::IsEmpty());
+}
+
+int g_wake_count = 0;
+
+void CountInputWake() { ++g_wake_count; }
+
+TEST_F(ConsoleTest, InputWakeCallbackFiresOnlyOnNonEmptyPush) {
+  g_wake_count = 0;
+  ConsoleSetInputWakeCallback(&CountInputWake);
+
+  ConsolePushInput(nullptr, 4);
+  ConsolePushInput("a", 0);
+  ConsolePushInput("a", -1);
+  EXPECT_THAT(g_wake_count, t::Eq(0));
+
+  ConsolePushInput("ab", 2);
+  EXPECT_THAT(g_wake_count, t::Eq(1));
+  ConsolePushInput("c", 1);
+  EXPECT_THAT(g_wake_count, t::Eq(2));
+
+  ConsoleClearInput();
+  ConsoleSetInputWakeCallback(nullptr);
+  ConsolePushInput("d", 1);
+  EXPECT_THAT(g_wake_count, t::Eq(2));
+  ConsoleClearInput();
 }
 
 }  // namespace

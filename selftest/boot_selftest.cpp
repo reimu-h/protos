@@ -16,11 +16,13 @@
 #include "gdt.h"
 #include "heap.h"
 #include "idt.h"
+#include "ioapic.h"
 #include "kill_delay_injection.h"
 #include "multiboot.h"
 #include "paging.h"
 #include "pci.h"
 #include "pmm.h"
+#include "port_io.h"
 #include "rbtree.h"
 #include "selftest/line_buffer.h"
 #include "selftest/stress.h"
@@ -3837,6 +3839,11 @@ static bool TestUserModePrograms() {
 
   SELFTEST_EXPECT(RunUserTest(Mode::kExit, &result));
   SELFTEST_EXPECT(ExitedWith(result, usertest::kExitStatus));
+  SELFTEST_EXPECT(RunUserTest(Mode::kSyscalls, &result));
+  SELFTEST_EXPECT(ExitedWith(result, 0));
+  // Run `kSyscalls` a second time right away: the first run exits with dirty
+  // DS/ES/FS/GS selectors (`1, 2, 3, 0`), so the second verifies fresh process
+  // entry resets all four selectors to `0x23` without cross-process leakage.
   SELFTEST_EXPECT(RunUserTest(Mode::kSyscalls, &result));
   SELFTEST_EXPECT(ExitedWith(result, 0));
 
@@ -7740,12 +7747,13 @@ static bool PrepareDeviceForDriverTests(const char* const test_name,
 
 // Verifies capability separation and EPERM gating:
 // - An unprivileged process (`kUserCapNone`) receives `kSyscallErrorPermission`
-//   on every privileged syscall (`7..15`), succeeds on `kSyscallGetTicks`
-//   (`16`), and receives `kSyscallErrorNoSys` on `17`/`-1`.
+//   on every privileged syscall (`7..15` and `17..19`), succeeds on
+//   `kSyscallGetTicks` (`16`), and receives `kSyscallErrorNoSys` on `20`/`-1`.
 // - A `kUserCapSpawnDrivers` process receives `kSyscallErrorPermission` on
-//   driver syscalls `8..15`, succeeds on `kSyscallSpawnDriver`, and its
-//   spawned driver child runs with `kUserCapDriver` (succeeds on `pci_info`
-//   and `get_ticks`, and gets `kSyscallErrorPermission` on `spawn_driver`).
+//   driver syscalls `8..15` and `17..19`, succeeds on `kSyscallSpawnDriver`,
+//   and its spawned driver child runs with `kUserCapDriver` (succeeds on
+//   `pci_info` and `get_ticks`, and gets `kSyscallErrorPermission` on
+//   `spawn_driver`).
 // - A child spawned via `kSyscallSpawn` from either a `kUserCapSpawnDrivers`
 //   or a `kUserCapDriver` process receives `kUserCapNone`.
 // - A `kUserCapDriver` process validates `kSyscallConsolePush` error cases and
@@ -8925,6 +8933,210 @@ static bool TestUsbKbdDriverLifecycle() {
   return true;
 }
 
+static bool VerifyPs2DeviceQuiescedAndReleased(const int64_t expected_pmm,
+                                               const int64_t expected_heap) {
+  const DriverReleaseRecord rec = DriverLastReleaseRecord();
+  SELFTEST_EXPECT(rec.quiesced_count == 1);
+  SELFTEST_EXPECT(rec.freed_vectors == 1);
+  SELFTEST_EXPECT(rec.released_claims == 1);
+  SELFTEST_EXPECT(rec.quiesced_before_vectors_freed);
+  SELFTEST_EXPECT(rec.quiesced_before_address_space_destroyed);
+
+  SELFTEST_EXPECT(IsaOwner(kIsaDeviceI8042) == 0);
+  SELFTEST_EXPECT(IsaClaimedCount() == 0);
+  SELFTEST_EXPECT(PciClaimedCount() == 0);
+  SELFTEST_EXPECT(DeviceIrqUsedVectorCount() == 0);
+  for (int v = kDeviceIrqVectorFirst; v <= kDeviceIrqVectorLast; ++v) {
+    SELFTEST_EXPECT(IdtGetHandler(v) == nullptr);
+  }
+  SELFTEST_EXPECT(PagingActiveRoot() == PagingKernelRoot());
+  SELFTEST_EXPECT(PagingUserSpaceIsEmpty());
+  SELFTEST_EXPECT(PmmFreeFrameCount() == expected_pmm);
+  SELFTEST_EXPECT(HeapTotalFreeBytes() == expected_heap);
+  return true;
+}
+
+// During bring-up, `ps2kbd` polls the controller and, when a real controller is
+// slow to reply, sleeps in `Relax()`, which blocks in `IrqWait` (mask 0) for 1
+// tick. So `blocked_in_irq_wait` alone does not mean that the driver has parked
+// in `IrqWait(mask, -1)`: it must also have made no system call for
+// kPs2QuietSettleTicks. Bring-up takes well below kPs2MaxSettleTicks: a few
+// controller polls of at most `I8042Controller::kPollTimeoutMs` (50 ms) each.
+constexpr int64_t kPs2QuietSettleTicks = 5;
+constexpr int64_t kPs2MaxSettleTicks = 250;
+
+// Waits until `proc` has stayed blocked in `IrqWait` without a system call for
+// kPs2QuietSettleTicks. Returns false if it doesn't within kPs2MaxSettleTicks.
+static bool WaitForPs2KbdToPark(const std::unique_ptr<UserProcess>& proc) {
+  TaskScheduler* const scheduler = GetTaskScheduler();
+  const TickDeadline deadline(kPs2MaxSettleTicks);
+  int64_t last_activity_tick = Cpu0TimerTicks();
+  int64_t last_syscalls = proc->stats().syscalls;
+  for (;;) {
+    const int64_t now_tick = Cpu0TimerTicks();
+    const UserProcessStats stats = proc->stats();
+    if (!stats.blocked_in_irq_wait || stats.syscalls != last_syscalls) {
+      last_activity_tick = now_tick;
+      last_syscalls = stats.syscalls;
+    } else if (now_tick - last_activity_tick >= kPs2QuietSettleTicks) {
+      return true;
+    }
+    SELFTEST_EXPECT(!deadline.Expired());
+    scheduler->Yield();
+  }
+}
+
+// Verifies the real `ps2kbd` ring-3 driver binary across:
+// 0. Started without `kUserCapDriver` (`kUserCapNone`): exits with
+//    `kDriverExitNotDriver` without claiming `i8042` or allocating vectors.
+// 1. Systems without `i8042` (`inb(0x64) == 0xFF`) or without an IOAPIC route
+//    for ISA IRQ 1 (e.g. Hyper-V Gen 2): exits cleanly with status 0 in
+//    `kDriverArgNormal` and releases all resources.
+// 2. Systems with `i8042` + IOAPIC IRQ 1:
+//    (a) Clean `exit(0)` after bring-up (`kDriverArgExitAfterReady`).
+//    (b) Ring-3 `#UD` fault after bring-up (`kDriverArgFaultAfterReady`).
+//    (c) Normal daemon mode (`kDriverArgNormal`): verifies exclusive `IsaClaim`
+//        ownership, vector allocation, `<= 2%` CPU usage while parked in
+//        `IrqWait(mask, -1)`, and deterministic `Kill()` teardown.
+//    (d) Re-claim after `Kill()` (`kDriverArgExitAfterReady`).
+static bool TestPs2KbdDriverLifecycle() {
+  const ScopedQuietConsole quiet_console;
+  TaskScheduler* const scheduler = GetTaskScheduler();
+  SELFTEST_EXPECT(scheduler != nullptr);
+  SELFTEST_EXPECT(IsaClaimedCount() == 0);
+  SELFTEST_EXPECT(PciClaimedCount() == 0);
+  SELFTEST_EXPECT(DeviceIrqUsedVectorCount() == 0);
+
+  const int64_t pmm_free_before = PmmFreeFrameCount();
+  const int64_t heap_free_before = HeapTotalFreeBytes();
+
+  // 0. Unprivileged spawn fails with `kDriverExitNotDriver`.
+  {
+    const std::unique_ptr<UserProcess> proc =
+        UserProcess::Start(Ps2kbdProgram(), kDriverArgNormal, kUserCapNone);
+    SELFTEST_EXPECT(proc != nullptr);
+    SELFTEST_EXPECT(WaitForProcesses(&proc, 1, HasEnded, WaitMode::kYield));
+    SELFTEST_EXPECT(ExitedWith(proc->Wait(), kDriverExitNotDriver));
+  }
+  SELFTEST_EXPECT(IsaClaimedCount() == 0);
+  SELFTEST_EXPECT(DeviceIrqUsedVectorCount() == 0);
+
+  const bool has_ps2 =
+      SmpHas8042() && IoApicHasIsaIrq(1) && PortIn8(0x64) != 0xFF;
+  if (!has_ps2) {
+    {
+      const std::unique_ptr<UserProcess> proc =
+          UserProcess::Start(Ps2kbdProgram(), kDriverArgNormal, kUserCapDriver);
+      SELFTEST_EXPECT(proc != nullptr);
+      SELFTEST_EXPECT(WaitForProcesses(&proc, 1, HasEnded, WaitMode::kYield));
+      SELFTEST_EXPECT(ExitedWith(proc->Wait(), 0));
+    }
+    ConsoleClearInput();
+    SELFTEST_EXPECT(IsaClaimedCount() == 0);
+    SELFTEST_EXPECT(DeviceIrqUsedVectorCount() == 0);
+    SELFTEST_EXPECT(PagingActiveRoot() == PagingKernelRoot());
+    SELFTEST_EXPECT(PagingUserSpaceIsEmpty());
+    SELFTEST_EXPECT(PmmFreeFrameCount() == pmm_free_before);
+    SELFTEST_EXPECT(HeapTotalFreeBytes() == heap_free_before);
+    UartWrite("[TEST] ps2kbd_driver_lifecycle: status=no_i8042\n");
+    return true;
+  }
+
+  // (a) Clean exit(0) after controller bring-up and IRQ 1 enable.
+  {
+    const std::unique_ptr<UserProcess> proc = UserProcess::Start(
+        Ps2kbdProgram(), kDriverArgExitAfterReady, kUserCapDriver);
+    SELFTEST_EXPECT(proc != nullptr);
+    SELFTEST_EXPECT(WaitForProcesses(&proc, 1, HasEnded, WaitMode::kYield));
+    SELFTEST_EXPECT(ExitedWith(proc->Wait(), 0));
+  }
+  SELFTEST_EXPECT(
+      VerifyPs2DeviceQuiescedAndReleased(pmm_free_before, heap_free_before));
+
+  // (b) Ring-3 fault (#UD) after re-claiming and enabling IRQ 1.
+  {
+    const std::unique_ptr<UserProcess> proc = UserProcess::Start(
+        Ps2kbdProgram(), kDriverArgFaultAfterReady, kUserCapDriver);
+    SELFTEST_EXPECT(proc != nullptr);
+    SELFTEST_EXPECT(WaitForProcesses(&proc, 1, HasEnded, WaitMode::kYield));
+    SELFTEST_EXPECT(FaultedWith(proc->Wait(), kVectorInvalidOpcode, 0, 0));
+  }
+  SELFTEST_EXPECT(
+      VerifyPs2DeviceQuiescedAndReleased(pmm_free_before, heap_free_before));
+
+  // (c) Normal daemon mode: verify exclusive claim, parked IrqWait, <= 2% idle
+  // CPU ticks over 150 ticks (0.6 s), and Kill() teardown.
+  constexpr int64_t kPs2IdleWindowTicks = 150;
+  constexpr int64_t kPs2MinIdleWindowTicks = 125;
+  int64_t measured_driver_ticks = 0;
+  int64_t measured_total_ticks = 0;
+  {
+    const std::unique_ptr<UserProcess> proc =
+        UserProcess::Start(Ps2kbdProgram(), kDriverArgNormal, kUserCapDriver);
+    SELFTEST_EXPECT(proc != nullptr);
+    const uintptr_t expected_owner = proc->OwnerToken();
+
+    SELFTEST_EXPECT(WaitForPs2KbdToPark(proc));
+    SELFTEST_EXPECT(proc->stats().blocked_in_irq_wait);
+    SELFTEST_EXPECT(IsaOwner(kIsaDeviceI8042) == expected_owner);
+    SELFTEST_EXPECT(IsaClaimedCount() == 1);
+    SELFTEST_EXPECT(IsaClaim(kIsaDeviceI8042, expected_owner ^ 0x55AAu) ==
+                    IsaStatus::kBusy);
+    SELFTEST_EXPECT(DeviceIrqUsedVectorCount() == 1);
+
+    const TickDeadline idle_deadline(2 * kPs2IdleWindowTicks);
+    const int64_t driver_ticks_before = proc->stats().task_timer_ticks;
+    const int64_t total_ticks_before = Cpu0TimerTicks();
+    for (;;) {
+      const int64_t elapsed = Cpu0TimerTicks() - total_ticks_before;
+      if (elapsed >= kPs2IdleWindowTicks) {
+        break;
+      }
+      SELFTEST_EXPECT(!idle_deadline.Expired());
+      scheduler->Yield();
+    }
+
+    const UserProcessStats end_stats = proc->stats();
+    const int64_t total_ticks_after = Cpu0TimerTicks();
+    measured_driver_ticks = end_stats.task_timer_ticks - driver_ticks_before;
+    measured_total_ticks = total_ticks_after - total_ticks_before;
+
+    SELFTEST_EXPECT(end_stats.blocked_in_irq_wait);
+    SELFTEST_EXPECT(measured_total_ticks >= kPs2MinIdleWindowTicks);
+    SELFTEST_EXPECT(measured_driver_ticks >= 0);
+    SELFTEST_EXPECT(measured_driver_ticks * 100 <= measured_total_ticks * 2);
+
+    proc->Kill();
+    UserProcessStats kill_stats{};
+    SELFTEST_EXPECT(EndedKilled(proc, &kill_stats));
+    SELFTEST_EXPECT(kill_stats.kill_in_syscall);
+    SELFTEST_EXPECT(KillTicks(kill_stats) <= 5 * kKillDeadlineTicks);
+  }
+  SELFTEST_EXPECT(
+      VerifyPs2DeviceQuiescedAndReleased(pmm_free_before, heap_free_before));
+
+  // (d) Re-claim after Kill().
+  {
+    const std::unique_ptr<UserProcess> proc = UserProcess::Start(
+        Ps2kbdProgram(), kDriverArgExitAfterReady, kUserCapDriver);
+    SELFTEST_EXPECT(proc != nullptr);
+    SELFTEST_EXPECT(WaitForProcesses(&proc, 1, HasEnded, WaitMode::kYield));
+    SELFTEST_EXPECT(ExitedWith(proc->Wait(), 0));
+  }
+  SELFTEST_EXPECT(
+      VerifyPs2DeviceQuiescedAndReleased(pmm_free_before, heap_free_before));
+  ConsoleClearInput();
+
+  LineBuffer summary;
+  summary.Append("[TEST] ps2kbd_driver_lifecycle: driver_ticks=")
+      .AppendDec(static_cast<uint64_t>(measured_driver_ticks))
+      .Append(" total_ticks=")
+      .AppendDec(static_cast<uint64_t>(measured_total_ticks))
+      .Append("\n");
+  UartWrite(summary.c_str());
+  return true;
+}
+
 struct BootTest {
   const char* name;
   bool (*run)();
@@ -8969,6 +9181,7 @@ constexpr BootTest kBootTests[] = {
     {"driver_irq_wait", TestDriverIrqWait},
     {"driver_teardown", TestDriverTeardown},
     {"usbkbd_driver_lifecycle", TestUsbKbdDriverLifecycle},
+    {"ps2kbd_driver_lifecycle", TestPs2KbdDriverLifecycle},
     // End-to-end tests.
     {"user_mode_kill_edge_cases", TestUserModeKillEdgeCases},
     {"user_mode_syscall_buffer_checks", TestUserModeSyscallBufferChecks},

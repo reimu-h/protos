@@ -470,10 +470,17 @@ static void DispatchToHandler(InterruptFrame* const frame) {
     return;
   }
 
-  SmpSendLocalApicEoi();
+  // The other vectors get their EOI after the handler, so that the handler of
+  // a level-triggered I/O APIC line (device_irq.cpp) masks the line before the
+  // EOI broadcast clears its Remote IRR, which would let the still-asserted
+  // line fire again at once. Until the EOI, the in-service bit holds back the
+  // interrupts of the vector's priority class and below on this CPU (the timer
+  // and the wakeup and kick IPIs among them), so these handlers must neither
+  // enable interrupts nor block or switch tasks.
   if (handler != nullptr) {
     handler(frame);
   }
+  SmpSendLocalApicEoi();
 }
 
 }  // namespace

@@ -24,8 +24,26 @@ int64_t Main(const uint64_t arg) {
     return 2;
   }
   if ((arg & kInitArgStartDrivers) != 0) {
+    // Release any xHCI SMM USB Legacy Support (including Port 60h/64h
+    // emulation SMIs) and halt firmware-running xHCI controllers before
+    // `ps2kbd` touches I/O ports 0x60/0x64. If this helper faults, is killed
+    // or reports an error, the drivers and the shell start anyway: a keyboard
+    // may then not work, but the serial console does.
+    const int64_t handoff_pid = SpawnDriver("usbkbd", kDriverArgHandoffOnly);
+    if (handoff_pid < 0) {
+      return 7;
+    }
+    const StatusOr<UserProgramResult> handoff_result = Wait(handoff_pid);
+    if (!handoff_result.ok() ||
+        handoff_result->outcome != UserProgramOutcome::kExited ||
+        handoff_result->exit_status != 0) {
+      (void)Print("[INIT] usbkbd handoff did not complete; continuing\n");
+    }
     if (SpawnDriver("usbkbd", kDriverArgNormal) < 0) {
       return 7;
+    }
+    if (SpawnDriver("ps2kbd", kDriverArgNormal) < 0) {
+      return 8;
     }
   }
   const int64_t sh_pid = Spawn("sh", arg & ~kInitArgStartDrivers);

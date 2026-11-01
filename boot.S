@@ -639,10 +639,43 @@ isr_common_stub:
     CLEAR_AC_IF_SMAP
     mov rdi, rsp
     mov rbp, rsp
+    /* For interrupts/syscalls from Ring 3 (InterruptFrame::cs at [rbp + 144]),
+     * pack the user DS/ES/FS/GS selectors into callee-saved r12 so they survive
+     * preemption and CPU migration, and zero DS/ES/FS for the kernel. GS is
+     * restored after swapgs on return so IA32_KERNEL_GS_BASE stays intact. */
+    test byte ptr [rbp + 144], 3
+    jz 2f
+    mov eax, ds
+    mov r12d, eax
+    mov eax, es
+    shl rax, 16
+    or r12, rax
+    mov eax, fs
+    shl rax, 32
+    or r12, rax
+    mov eax, gs
+    shl rax, 48
+    or r12, rax
+    xor eax, eax
+    mov ds, ax
+    mov es, ax
+    mov fs, ax
+2:
     and rsp, -16
     call IdtDispatch
     mov rsp, rbp
 
+    test byte ptr [rbp + 144], 3
+    jz 3f
+    swapgs
+    mov ds, r12w
+    shr r12, 16
+    mov es, r12w
+    shr r12, 16
+    mov fs, r12w
+    shr r12, 16
+    mov gs, r12w
+3:
     pop r15
     pop r14
     pop r13
@@ -658,10 +691,6 @@ isr_common_stub:
     pop rcx
     pop rbx
     pop rax
-    test byte ptr [rsp + 24], 3
-    jz 2f
-    swapgs
-2:
     add rsp, 16
     iretq
 

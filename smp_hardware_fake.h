@@ -79,6 +79,8 @@ class FakeSmpHardware final : public SmpHardware {
     // BSP. SetApicBaseMsr() overrides it for one CPU.
     uint64_t bsp_apic_base_msr = 0xFEE00900;
     uint64_t ap_apic_base_msr = 0xFEE00800;
+    // Reset value of each CPU's Spurious Interrupt Vector Register (`0x0F0`).
+    uint32_t initial_lapic_svr = 0xFFu;
     // Ticks that a Local APIC timer counts down while the PIT calibration
     // countdown runs.
     uint32_t lapic_timer_calibration_ticks = 625000;

@@ -110,6 +110,9 @@ static void UartWriteLocked(const char* const str) {
 
 void UartInit() {
   const IrqSpinLockGuard lock_guard(g_uart_lock);
+  // 38400 baud (divisor 3), 8N1. Console reads poll the receiver once per
+  // timer tick (UserProcess::Read() in user_mode.cpp), which keeps up with
+  // the 16-byte receive FIFO only up to about this rate.
   Outb(kCom1Port + 1, 0x00);
   Outb(kCom1Port + 3, 0x80);
   Outb(kCom1Port + 0, 0x03);

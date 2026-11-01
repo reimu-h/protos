@@ -1345,5 +1345,65 @@ TEST(XhciHotplugTest,
   EXPECT_THAT(world.platform().input(), t::Eq("rph"));
 }
 
+TEST(XhciHotplugTest, RecoveryReZeroesScratchpadBuffersBeforeRestart) {
+  SimWorld world;
+  const int idx = world.AddController("00:04.0", IntelLikeConfig());
+  SimUsbKeyboard& kbd = world.AttachKeyboard(idx, 5, HighSpeedKeyboardConfig());
+  ASSERT_THAT(world.BringUp(idx), t::Eq(usb::XhciStatus::kOk));
+  ASSERT_TRUE(world.RunUntil(
+      [&] { return world.controller(idx).attached_keyboard_count() == 1; }));
+
+  // IntelLikeConfig() has cap_length = 0x80 and max_scratchpads = 35.
+  constexpr int kSpCount = 35;
+  const uint64_t dcbaap =
+      static_cast<uint64_t>(world.sim(idx).Peek(0x80 + spec::kDcbaapLow)) |
+      (static_cast<uint64_t>(world.sim(idx).Peek(0x80 + spec::kDcbaapHigh))
+       << 32);
+  uint8_t* const dcbaa_bytes =
+      world.arena().Translate(dcbaap, 8, /*require_below_4gib=*/false);
+  ASSERT_NE(dcbaa_bytes, nullptr);
+  uint64_t sp_array_phys = 0;
+  std::memcpy(&sp_array_phys, dcbaa_bytes, sizeof(sp_array_phys));
+  ASSERT_NE(sp_array_phys, 0u);
+
+  const uint8_t* const sp_array_bytes = world.arena().Translate(
+      sp_array_phys, kSpCount * 8, /*require_below_4gib=*/false);
+  ASSERT_NE(sp_array_bytes, nullptr);
+
+  // Simulate controller scratchpad writes while running by dirtying every
+  // scratchpad buffer page.
+  for (int i = 0; i < kSpCount; ++i) {
+    uint64_t sp_phys = 0;
+    std::memcpy(&sp_phys, sp_array_bytes + static_cast<size_t>(i) * 8,
+                sizeof(sp_phys));
+    uint8_t* const page =
+        world.arena().Translate(sp_phys, 4096, /*require_below_4gib=*/false);
+    ASSERT_NE(page, nullptr);
+    std::memset(page, 0x5A, 4096);
+  }
+
+  // Trigger controller recovery (HCRST + Start): xHCI 1.2 §4.20 requires all
+  // scratchpad buffers to be cleared to 0 again before USBCMD.RS = 1.
+  world.sim(idx).InjectHostSystemError();
+  world.ServiceReady();
+  ASSERT_TRUE(world.RunUntil(
+      [&] { return world.controller(idx).attached_keyboard_count() == 1; }));
+
+  for (int i = 0; i < kSpCount; ++i) {
+    uint64_t sp_phys = 0;
+    std::memcpy(&sp_phys, sp_array_bytes + static_cast<size_t>(i) * 8,
+                sizeof(sp_phys));
+    const uint8_t* const page =
+        world.arena().Translate(sp_phys, 4096, /*require_below_4gib=*/false);
+    ASSERT_NE(page, nullptr);
+    for (int b = 0; b < 4096; ++b) {
+      ASSERT_EQ(page[b], 0u) << "scratchpad " << i << " byte " << b;
+    }
+  }
+
+  world.TypeAscii(kbd, "k");
+  EXPECT_THAT(world.platform().input(), t::Eq("k"));
+}
+
 }  // namespace
 }  // namespace protos::xhci_sim

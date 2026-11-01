@@ -239,6 +239,27 @@ constexpr int64_t kSyscallConsolePush = 15;
 // GetTicks(): returns the monotonic 250 Hz timer tick counter. Available to
 // all processes.
 constexpr int64_t kSyscallGetTicks = 16;
+// IsaClaim(device): claims legacy ISA device `device` (`kIsaDevice*`)
+// exclusively for the calling driver process and returns 0 on success. Fails
+// with `kSyscallErrorNoDevice` if `device` is out of range,
+// `kSyscallErrorBusy` if another process owns it, or `kSyscallErrorNoMemory` if
+// the caller already holds `kSyscallMaxClaims` claims. Driver-only.
+constexpr int64_t kSyscallIsaClaim = 17;
+// IsaPortIo(op, port, value): executes an 8-bit x86 I/O-port read
+// (`op == kSyscallPortIoRead8`, `value == 0`, returns `0..255`) or write
+// (`op == kSyscallPortIoWrite8`, `0 <= value <= 255`, returns `0`) on `port`
+// (`0..0xFFFF`). Fails with `kSyscallErrorInvalid` if `op`, `port`, or `value`
+// is invalid, or `kSyscallErrorAccess` unless `port` belongs to a legacy ISA
+// device currently claimed by the calling driver process. Driver-only.
+constexpr int64_t kSyscallIsaPortIo = 18;
+// IsaIrqAlloc(device): allocates 1 interrupt vector for claimed legacy ISA
+// device `device`, programs and unmasks its I/O APIC redirection entry, and
+// returns the bit index `b` (`0..31`) in the process's `IrqWait` mask. Fails
+// with `kSyscallErrorNoDevice` if `device` is out of range or no I/O APIC
+// routes its ISA IRQ, `kSyscallErrorAccess` if the caller has not claimed
+// `device`, `kSyscallErrorBusy` if already allocated during this claim, or
+// `kSyscallErrorNoMemory` if no vector or mask bit is free. Driver-only.
+constexpr int64_t kSyscallIsaIrqAlloc = 19;
 
 // The most bytes that one Write() writes.
 constexpr int64_t kSyscallWriteMaxSize = 4096;
@@ -270,6 +291,14 @@ constexpr int64_t kSyscallIrqMaxCount = 32;
 constexpr int64_t kSyscallIrqWaitMaxTicks = 1000000;
 constexpr int64_t kSyscallTicksPerSecond = 250;
 
+// Legacy ISA device identifiers (`IsaClaim`, `IsaIrqAlloc`) and port I/O
+// operations (`IsaPortIo`).
+constexpr int kIsaDeviceI8042 = 0;
+constexpr int kIsaDeviceCount = 1;
+
+constexpr int64_t kSyscallPortIoRead8 = 0;
+constexpr int64_t kSyscallPortIoWrite8 = 1;
+
 // Errors, with the numbers of the corresponding Linux errno values.
 constexpr int64_t kSyscallErrorPermission = -1;  // EPERM: operation not allowed
 constexpr int64_t kSyscallErrorNoMemory = -12;   // ENOMEM: out of memory
@@ -298,9 +327,14 @@ constexpr uint64_t kInitArgStartDrivers = 1ULL << 0;
 // - `kDriverArgFaultAfterReady` (2): same as `kDriverArgExitAfterReady`, but
 //   executes `ud2` (`#UD`) after all controllers are running with Bus Master,
 //   MMIO, DMA, and MSI/MSI-X active.
+// - `kDriverArgHandoffOnly` (3): claims all matching controllers, completes
+//   firmware/SMM ownership handoff and halts any running controller without
+//   issuing a full hardware reset, then exits with status 0 so legacy-port
+//   drivers (such as `ps2kbd` on `0x60`/`0x64`) can safely probe afterwards.
 constexpr uint64_t kDriverArgNormal = 0;
 constexpr uint64_t kDriverArgExitAfterReady = 1;
 constexpr uint64_t kDriverArgFaultAfterReady = 2;
+constexpr uint64_t kDriverArgHandoffOnly = 3;
 
 // Exit status of a driver program started without `kUserCapDriver`, that is by
 // `Spawn()` (as `sh`'s `run <program>` does) rather than by `SpawnDriver()`:
@@ -315,9 +349,10 @@ constexpr bool SyscallIsError(const int64_t result) {
   return result >= -4095 && result < 0;
 }
 
-// True if system call `number` requires `kUserCapDriver` (`8..15`).
+// True if system call `number` requires `kUserCapDriver` (`8..15` or `17..19`).
 constexpr bool SyscallIsDriverOnly(const int64_t number) {
-  return number >= kSyscallPciInfo && number <= kSyscallConsolePush;
+  return (number >= kSyscallPciInfo && number <= kSyscallConsolePush) ||
+         (number >= kSyscallIsaClaim && number <= kSyscallIsaIrqAlloc);
 }
 
 // True if a process with `capabilities` is allowed to invoke system call

@@ -22,8 +22,16 @@ enum class DeviceIrqStatus {
   kInvalid,   // count/mode/capability mismatch, MSI with count > 1, or no CPU
               // that an MSI can address (DeviceIrqMsiCanTarget())
   kBusy,      // irq_alloc already succeeded for this device during this claim
+  kNoDevice,  // unknown ISA device or no I/O APIC routes its ISA IRQ
   kNoMemory,  // fewer than `count` free IDT vectors in [0x50, 0x7F]
 };
+
+// Negative `device_index` tag encoding legacy ISA device `isa_device`
+// (`0 <= isa_device < kIsaDeviceCount`) in `DeviceIrqAllocateVectors` and
+// `DeviceIrqFreeDeviceVectors`, disjoint from PCI indices (`>= 0`) and `-1`.
+constexpr int DeviceIrqIsaSlotId(const int isa_device) {
+  return -2 - isa_device;
+}
 
 // Environment seams for host unit tests and the kernel implementation.
 class DeviceIrqEnvironment {
@@ -124,6 +132,20 @@ void DeviceIrqReleaseDevice(int device_index);
 // Clears the per-claim configured state of `device_index` when it is newly
 // claimed.
 void DeviceIrqResetDevice(int device_index);
+
+// Programs and unmasks the I/O APIC redirection entry for claimed legacy ISA
+// device `isa_device` (`0 <= isa_device < kIsaDeviceCount`) with `vector`
+// (`kDeviceIrqVectorFirst..kDeviceIrqVectorLast`), targeting
+// `DeviceIrqEnvironment::MsiDestinationApicId()`.
+DeviceIrqStatus DeviceIrqProgramIsaDevice(int isa_device, int vector);
+
+// Masks the I/O APIC redirection entry programmed for `isa_device` (flushing
+// the posted MMIO write) and clears its per-claim configured state.
+void DeviceIrqReleaseIsaDevice(int isa_device);
+
+// Clears the per-claim configured state of `isa_device` when it is newly
+// claimed.
+void DeviceIrqResetIsaDevice(int isa_device);
 
 // Unregisters and frees every IDT vector owned by `owner`. Returns how many
 // vectors were freed.

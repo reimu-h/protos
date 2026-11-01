@@ -26,6 +26,9 @@ StatusOr<char> ConsoleTryReadc();
 void ConsolePushInput(const char* data, int64_t size);
 // Clears any pending bytes in the console input buffer.
 void ConsoleClearInput();
+// Installs an optional notification callback invoked after `ConsolePushInput`
+// enqueues at least one byte (`nullptr` clears it).
+void ConsoleSetInputWakeCallback(void (*callback)());
 
 // Enables or disables echoing ConsoleWrite() output to the VGA screen (default
 // true). Serial output and output capture remain active when VGA echo is off.

@@ -75,7 +75,7 @@ TEST_COMMON_LDFLAGS := -lgmock_main -lgmock -lgtest -pthread
 # inline assembly, which the kernel keeps for each process (user_mode.h), so
 # GCC may use SSE in them. GCC must not turn their loops into calls of the
 # memory functions that user/crt.cpp defines with such loops.
-USER_PROGRAMS := init sh usertest usbkbd
+USER_PROGRAMS := init sh usertest usbkbd ps2kbd
 USER_CXXFLAGS := -m64 -masm=intel -std=c++20 -O2 -Wall -Wextra $(WERROR_FLAG) \
                  -ffreestanding -nostdlib -fno-builtin \
                  -fno-exceptions -fno-rtti -mno-red-zone \
@@ -90,7 +90,8 @@ USER_HDRS := status_or.h syscall_abi.h user/syscall.h user/sh/sh_lib.h \
              user/usertest/usertest.h user/usbkbd/usb_descriptors.h \
              user/usbkbd/usb_hid.h user/usbkbd/xhci_context.h \
              user/usbkbd/xhci_controller.h user/usbkbd/xhci_platform.h \
-             user/usbkbd/xhci_regs.h user/usbkbd/xhci_ring.h
+             user/usbkbd/xhci_regs.h user/usbkbd/xhci_ring.h \
+             user/ps2kbd/ps2_scancode.h user/ps2kbd/i8042.h
 USER_ELFS := $(patsubst %,$(BUILD_DIR)/user/%.elf,$(USER_PROGRAMS))
 
 TEST_BUILD_MODES := debug opt
@@ -171,8 +172,9 @@ TEST_EXTRA_SRCS_join_lifecycle_scheduler_test := join_lifecycle_scheduler.cpp $(
 TEST_EXTRA_SRCS_preemptive_scheduler_test := preemptive_scheduler.cpp $(SCHED_TEST_FAKES) $(SCHED_TEST_IDT_TASK_FAKES)
 TEST_EXTRA_SRCS_task_test := $(TASK_LAYER_SRCS) context_switch.S task.cpp $(IDT_TEST_SRCS) $(SCHED_TEST_FAKES)
 TEST_EXTRA_SRCS_stress_test := selftest/stress.cpp random.cpp $(TASK_LAYER_SRCS) context_switch.S task.cpp $(IDT_TEST_SRCS) $(SCHED_TEST_FAKES)
-TEST_EXTRA_SRCS_device_irq_test := device_irq.cpp pci.cpp pci_config_fake.cpp $(TASK_LAYER_SRCS) context_switch.S task.cpp $(IDT_TEST_SRCS) $(SCHED_TEST_FAKES)
-TEST_EXTRA_SRCS_driver_test := driver.cpp device_irq.cpp pci.cpp pci_config_fake.cpp $(TASK_LAYER_SRCS) context_switch.S task.cpp $(IDT_TEST_SRCS) $(SCHED_TEST_FAKES)
+TEST_EXTRA_SRCS_ioapic_test := ioapic.cpp
+TEST_EXTRA_SRCS_device_irq_test := device_irq.cpp ioapic.cpp pci.cpp pci_config_fake.cpp $(TASK_LAYER_SRCS) context_switch.S task.cpp $(IDT_TEST_SRCS) $(SCHED_TEST_FAKES)
+TEST_EXTRA_SRCS_driver_test := driver.cpp device_irq.cpp ioapic.cpp pci.cpp pci_config_fake.cpp $(TASK_LAYER_SRCS) context_switch.S task.cpp $(IDT_TEST_SRCS) $(SCHED_TEST_FAKES)
 
 SELFTEST_SRCS := selftest/selftest.cpp selftest/boot_selftest.cpp selftest/stress.cpp
 
@@ -199,6 +201,7 @@ CXX_SRCS := \
     user_mode.cpp \
     user_access.cpp \
     pci.cpp \
+    ioapic.cpp \
     device_irq.cpp \
     driver.cpp \
     random.cpp \
@@ -227,6 +230,7 @@ CXX_HDRS := \
     smp_hardware.h \
     port_io.h \
     pci.h \
+    ioapic.h \
     device_irq.h \
     driver.h \
     steal_time.h \
@@ -243,16 +247,7 @@ CXX_HDRS := \
     user_mode.h \
     user_access.h \
     user_programs.h \
-    user/syscall.h \
-    user/sh/sh_lib.h \
-    user/usertest/usertest.h \
-    user/usbkbd/usb_descriptors.h \
-    user/usbkbd/usb_hid.h \
-    user/usbkbd/xhci_context.h \
-    user/usbkbd/xhci_controller.h \
-    user/usbkbd/xhci_platform.h \
-    user/usbkbd/xhci_regs.h \
-    user/usbkbd/xhci_ring.h \
+    $(filter-out status_or.h syscall_abi.h,$(USER_HDRS)) \
     selftest/selftest.h \
     selftest/boot_selftest.h \
     selftest/fpu_lifecycle_layout.h \
@@ -298,23 +293,30 @@ OUTPUT_SYNC := $(if $(filter-out 0.% 1.% 2.% 3.%,$(MAKE_VERSION)),-Otarget)
 # need QEMU. Set USE_DOCKER=0/1 to override.
 IN_DOCKER := $(wildcard /.dockerenv /run/.containerenv)
 HOST_GRUB_MKRESCUE := $(firstword $(foreach bin,grub-mkrescue grub2-mkrescue,$(if $(shell command -v $(bin) 2>/dev/null),$(bin))))
+GRUB_MOD_DIRS := /usr/lib/grub /usr/lib64/grub /usr/lib/grub2 /usr/share/grub2
+HAVE_HOST_GRUB_PC := $(wildcard $(addsuffix /i386-pc/modinfo.sh,$(GRUB_MOD_DIRS)))
+HAVE_HOST_GRUB_EFI := $(wildcard $(addsuffix /x86_64-efi/modinfo.sh,$(GRUB_MOD_DIRS)))
 missing_bins = $(strip $(foreach bin,$(1),$(if $(shell command -v $(bin) 2>/dev/null),,$(bin))))
 HAVE_HOST_GTEST := $(and $(wildcard /usr/include/gtest/gtest.h),$(wildcard /usr/include/gmock/gmock.h))
 
 GOALS := $(or $(MAKECMDGOALS),all)
-UNIT_TEST_ONLY_GOALS := unit-test test-host test-% $(BUILD_DIR)/obj/% \
+UNIT_TEST_ONLY_GOALS := unit-test test-host run-deflake_test test-% $(BUILD_DIR)/obj/% \
     $(foreach b,$(TEST_BUILD_MODES),$(foreach s,$(TEST_SAN_MODES),run-%-$(b)-$(s) $(BUILD_DIR)/%_$(b)_$(s)))
-NEED_GTEST := $(filter test $(UNIT_TEST_ONLY_GOALS),$(GOALS))
+NEED_GTEST := $(filter-out run-deflake_test,$(filter test $(UNIT_TEST_ONLY_GOALS),$(GOALS)))
+NEED_PYTHON := $(filter test unit-test test-host run-deflake_test run-boot-test,$(GOALS))
 NEED_QEMU := $(filter test run run-boot-test,$(GOALS))
 NEED_KERNEL_TOOLS := $(filter-out clean docker-build docker-test $(UNIT_TEST_ONLY_GOALS),$(GOALS))
 
 ifneq ($(IN_DOCKER),)
 USE_DOCKER := 0
 else
-MISSING_HOST_DEPS := $(call missing_bins,$(CXX) \
+MISSING_HOST_DEPS := $(call missing_bins,$(if $(filter-out run-deflake_test,$(GOALS)),$(CXX)) \
+    $(if $(NEED_PYTHON),python3) \
     $(if $(NEED_KERNEL_TOOLS),$(AS) $(LD) xorriso mformat) \
     $(if $(NEED_QEMU),qemu-system-x86_64)) \
-    $(if $(NEED_KERNEL_TOOLS),$(if $(HOST_GRUB_MKRESCUE),,grub-mkrescue)) \
+    $(if $(NEED_KERNEL_TOOLS),$(if $(HOST_GRUB_MKRESCUE),,grub-mkrescue) \
+        $(if $(HAVE_HOST_GRUB_PC),,grub-pc-bin) \
+        $(if $(HAVE_HOST_GRUB_EFI),,grub-efi-amd64-bin)) \
     $(if $(NEED_GTEST),$(if $(HAVE_HOST_GTEST),,gtest/gmock-headers))
 ifeq ($(strip $(MISSING_HOST_DEPS)),)
 USE_DOCKER ?= 0
@@ -340,6 +342,7 @@ LDFLAGS := -m elf_x86_64 -z max-page-size=0x1000 $(LD_NO_WARN_RWX) -T linker.ld
 # Settings forwarded to the make that runs inside the Docker container
 # (including -k, so that `make -k ... USE_DOCKER=1` keeps going there too).
 INNER_MAKE := make --no-print-directory WERROR=$(WERROR) SELFTEST=$(SELFTEST) \
+              $(if $(patsubst /%,,$(BUILD_DIR)),BUILD_DIR=$(BUILD_DIR)) \
               $(if $(findstring k,$(firstword -$(MAKEFLAGS))),-k)
 ifneq ($(strip $(INJECT_KILL_DELAY)),)
 INNER_MAKE += INJECT_KILL_DELAY=$(strip $(INJECT_KILL_DELAY))
@@ -348,6 +351,11 @@ endif
 BOOT_TEST_ENV_VARS := BIOS_TIMEOUT_SECS UEFI_TIMEOUT_SECS MIN_STRESS_PASSES OVMF OVMF_VARS REQUIRE_UEFI BOOT_TEST_JOBS BOOT_TEST_USB QEMU_USB_FLAGS USB_SESSION_TIMEOUT_SECS
 
 ifeq ($(USE_DOCKER),1)
+ifneq ($(filter-out clean,$(GOALS)),)
+ifneq ($(filter /%,$(BUILD_DIR)),)
+$(error BUILD_DIR='$(BUILD_DIR)' must be a relative path inside the repository when USE_DOCKER=1)
+endif
+endif
 # The container runs as the host user, so that the files it writes in the
 # bind-mounted checkout are the user's. Rootless Docker and Podman map
 # container root to the host user instead (and the other container users to
@@ -464,6 +472,7 @@ $(BUILD_DIR)/kernel.bin: $(OBJS) linker.ld $(KERNEL_CONFIG_STAMP) $(DOCKER_DEPS)
 # Builds a GRUB rescue ISO (bootable via legacy BIOS and UEFI) that loads
 # kernel.bin with the given GRUB multiboot command (multiboot2 or multiboot).
 define MAKE_ISO
+	$(if $(filter 0,$(USE_DOCKER)),$(if $(and $(HAVE_HOST_GRUB_PC),$(HAVE_HOST_GRUB_EFI)),,$(error Missing host GRUB platform modules (need both i386-pc and x86_64-efi, e.g. grub-pc-bin and grub-efi-amd64-bin))))
 	rm -rf $(1).dir
 	mkdir -p $(1).dir/boot/grub
 	cp $(BUILD_DIR)/kernel.bin $(1).dir/boot/kernel.bin

@@ -654,6 +654,35 @@ static uint64_t ReadRflags() {
   return rflags;
 }
 
+struct SegmentSelectors {
+  uint16_t ds = 0;
+  uint16_t es = 0;
+  uint16_t fs = 0;
+  uint16_t gs = 0;
+};
+
+static SegmentSelectors ReadDataSelectors() {
+  SegmentSelectors s;
+  asm volatile(
+      "mov %0, ds\n\t"
+      "mov %1, es\n\t"
+      "mov %2, fs\n\t"
+      "mov %3, gs"
+      : "=r"(s.ds), "=r"(s.es), "=r"(s.fs), "=r"(s.gs));
+  return s;
+}
+
+static void WriteDataSelectors(const SegmentSelectors& s) {
+  asm volatile(
+      "mov ds, %0\n\t"
+      "mov es, %1\n\t"
+      "mov fs, %2\n\t"
+      "mov gs, %3"
+      :
+      : "r"(s.ds), "r"(s.es), "r"(s.fs), "r"(s.gs)
+      : "memory");
+}
+
 // Returns true if a spin() call of the `size` bytes at `buffer` fails with
 // `kSyscallErrorFault`.
 static bool SpinFaults(const uintptr_t buffer, const int64_t size) {
@@ -664,8 +693,14 @@ static bool SpinFaults(const uintptr_t buffer, const int64_t size) {
 // Runs the checks of `Mode::kSyscalls` and returns 0 if all pass, else the
 // number of the first failed check.
 static int64_t RunSyscallChecks() {
+  constexpr uint16_t kUserDataSelector = 0x23;
+  const SegmentSelectors initial_selectors = ReadDataSelectors();
   int64_t check = 1;
-  if (CurrentPrivilegeLevel() != 3) {
+  if (CurrentPrivilegeLevel() != 3 ||
+      initial_selectors.ds != kUserDataSelector ||
+      initial_selectors.es != kUserDataSelector ||
+      initial_selectors.fs != kUserDataSelector ||
+      initial_selectors.gs != kUserDataSelector) {
     return check;
   }
   ++check;
@@ -764,6 +799,37 @@ static int64_t RunSyscallChecks() {
       Wait(kMaxUserChildProcesses + 1).status() != kSyscallErrorInvalid ||
       Wait(1).status() != kSyscallErrorInvalid) {
     return check;
+  }
+  ++check;
+  const SegmentSelectors before_dirty = ReadDataSelectors();
+  if (before_dirty.ds != kUserDataSelector ||
+      before_dirty.es != kUserDataSelector ||
+      before_dirty.fs != kUserDataSelector ||
+      before_dirty.gs != kUserDataSelector) {
+    return check;
+  }
+  // Load distinct combinations of null (`0x00`) and DPL-3 (`0x23`) selectors
+  // across DS/ES/FS/GS so every register has a unique signature across two
+  // preemptible syscalls, then leave all four zeroed on exit so the next
+  // process verifies `UserModeEnter` resets all four to `0x23`.
+  constexpr SegmentSelectors kPatterns[] = {
+      {.ds = 0, .es = kUserDataSelector, .fs = 0, .gs = kUserDataSelector},
+      {.ds = 0, .es = 0, .fs = kUserDataSelector, .gs = kUserDataSelector},
+      {.ds = 0, .es = 0, .fs = 0, .gs = 0},
+  };
+  const uint64_t expected_checksum = SyscallSpinChecksum(
+      reinterpret_cast<const uint8_t*>(kNulBytes), kNulByteCount);
+  for (const SegmentSelectors& pat : kPatterns) {
+    WriteDataSelectors(pat);
+    if (SpinOnBuffer(kNulBytes, kNulByteCount, 1) !=
+        static_cast<int64_t>(expected_checksum)) {
+      return check;
+    }
+    const SegmentSelectors got = ReadDataSelectors();
+    if (got.ds != pat.ds || got.es != pat.es || got.fs != pat.fs ||
+        got.gs != pat.gs) {
+      return check;
+    }
   }
   return 0;
 }
@@ -1829,7 +1895,16 @@ static int64_t RunDriverDenied() {
   if (GetTicks() < 0) {
     return 10;
   }
-  if (Syscall(kSyscallGetTicks + 1, 0, 0, 0) != kSyscallErrorNoSys) {
+  if (IsaClaim(kIsaDeviceI8042) != kSyscallErrorPermission) {
+    return 13;
+  }
+  if (IsaPortIo(kSyscallPortIoRead8, 0x60, 0) != kSyscallErrorPermission) {
+    return 14;
+  }
+  if (IsaIrqAlloc(kIsaDeviceI8042) != kSyscallErrorPermission) {
+    return 15;
+  }
+  if (Syscall(kSyscallIsaIrqAlloc + 1, 0, 0, 0) != kSyscallErrorNoSys) {
     return 11;
   }
   if (Syscall(-1, 0, 0, 0) != kSyscallErrorNoSys) {
@@ -1854,6 +1929,14 @@ static int64_t RunDriverCapProbe(const uint64_t arg) {
     if (GetTicks() < 0) {
       return 3;
     }
+    if (IsaClaim(-1) != kSyscallErrorNoDevice ||
+        IsaClaim(kIsaDeviceCount) != kSyscallErrorNoDevice ||
+        IsaPortIo(kSyscallPortIoRead8, 0x3F8, 0) != kSyscallErrorAccess ||
+        IsaPortIo(kSyscallPortIoRead8, 0x60, 0) != kSyscallErrorAccess ||
+        IsaIrqAlloc(kIsaDeviceI8042) != kSyscallErrorAccess ||
+        Syscall(kSyscallIsaIrqAlloc + 1, 0, 0, 0) != kSyscallErrorNoSys) {
+      return 6;
+    }
     const int64_t child_pid =
         Spawn("usertest", usertest::Arg(Mode::kDriverDenied));
     if (child_pid < 1) {
@@ -1876,7 +1959,11 @@ static int64_t RunDriverCapProbe(const uint64_t arg) {
       DmaAlloc(4096, 0).status() != kSyscallErrorPermission ||
       IrqAlloc(0, 1, kSyscallIrqModeAuto) != kSyscallErrorPermission ||
       IrqWait(1, 0) != kSyscallErrorPermission ||
-      ConsolePush("a", 1) != kSyscallErrorPermission || GetTicks() < 0) {
+      ConsolePush("a", 1) != kSyscallErrorPermission ||
+      IsaClaim(kIsaDeviceI8042) != kSyscallErrorPermission ||
+      IsaPortIo(kSyscallPortIoRead8, 0x60, 0) != kSyscallErrorPermission ||
+      IsaIrqAlloc(kIsaDeviceI8042) != kSyscallErrorPermission ||
+      GetTicks() < 0) {
     return 10;
   }
   if (SpawnDriver(nullptr, 0, 0) != kSyscallErrorInvalid ||

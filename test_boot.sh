@@ -357,6 +357,7 @@ REQUIRED_MARKERS=(
   "[TEST] smp_multicpu_sync_stress: PASS"
   "[TEST] idt_percpu_and_lapic_timer: PASS"
   "[TEST] task_scheduler_smp: PASS"
+  "[TEST] scheduler_block_wake: PASS"
   "[TEST] tlb_shootdown: PASS"
   "[TEST] task_stack_guard_pages: PASS"
   "[TEST] address_spaces: PASS"
@@ -369,6 +370,14 @@ REQUIRED_MARKERS=(
   "[TEST] user_mode_fpu_initial_state: PASS"
   "[TEST] cpu_protection_features: PASS"
   "[TEST] smap_smep_protection: PASS"
+  "[TEST] driver_privilege: PASS"
+  "[TEST] driver_device_ownership: PASS"
+  "[TEST] driver_mmio_mapping: PASS"
+  "[TEST] driver_dma_memory: PASS"
+  "[TEST] driver_irq_wait: PASS"
+  "[TEST] driver_teardown: PASS"
+  "[TEST] usbkbd_driver_lifecycle: PASS"
+  "[TEST] ps2kbd_driver_lifecycle: PASS"
   "[TEST] user_mode_kill_edge_cases: PASS"
   "[TEST] user_mode_syscall_buffer_checks: PASS"
   "[TEST] user_mode_fpu_lifecycle: PASS"
@@ -405,6 +414,7 @@ USB_MULTI_ARGS=(
 USB_REQUIRED_MARKERS=(
   "[USBKBD] controller "
   "[USBKBD] keyboard attached: "
+  "[PS2KBD] controller i8042 ready (irq1)"
   "[TEST] driver_session_cleanup: PASS"
 )
 
@@ -563,7 +573,45 @@ fi
 # files.
 RUN_DIR=""
 PASSES_STARTED=0
+QEMU_PID=""
+batch_pids=()
 cleanup() {
+  local pid pid_file qpid
+  for pid in ${batch_pids[@]+"${batch_pids[@]}"}; do
+    if kill -0 "${pid}" 2>/dev/null; then
+      pkill -TERM -P "${pid}" 2>/dev/null || true
+      kill -TERM "${pid}" 2>/dev/null || true
+    fi
+  done
+  if [[ -n "${QEMU_PID:-}" ]] && kill -0 "${QEMU_PID}" 2>/dev/null; then
+    kill -9 "${QEMU_PID}" 2>/dev/null || true
+    wait "${QEMU_PID}" 2>/dev/null || true
+  fi
+  if [[ -n "${RUN_DIR}" && -d "${RUN_DIR}" ]]; then
+    for pid_file in "${RUN_DIR}"/*.qemu_pid; do
+      [[ -f "${pid_file}" ]] || continue
+      qpid="$(cat "${pid_file}" 2>/dev/null || true)"
+      if [[ "${qpid}" =~ ^[0-9]+$ ]] && kill -0 "${qpid}" 2>/dev/null; then
+        kill -9 "${qpid}" 2>/dev/null || true
+      fi
+    done
+  fi
+  for pid in ${batch_pids[@]+"${batch_pids[@]}"}; do
+    if kill -0 "${pid}" 2>/dev/null; then
+      pkill -KILL -P "${pid}" 2>/dev/null || true
+      kill -9 "${pid}" 2>/dev/null || true
+    fi
+    wait "${pid}" 2>/dev/null || true
+  done
+  if [[ -n "${RUN_DIR}" && -d "${RUN_DIR}" ]]; then
+    for pid_file in "${RUN_DIR}"/*.qemu_pid; do
+      [[ -f "${pid_file}" ]] || continue
+      qpid="$(cat "${pid_file}" 2>/dev/null || true)"
+      if [[ "${qpid}" =~ ^[0-9]+$ ]] && kill -0 "${qpid}" 2>/dev/null; then
+        kill -9 "${qpid}" 2>/dev/null || true
+      fi
+    done
+  fi
   if [[ -n "${ARTIFACT_DIR}" && "${PASSES_STARTED}" -eq 1 ]]; then
     local name
     for name in "${PASS_NAMES[@]}"; do
@@ -868,6 +916,7 @@ import sys
 import time
 
 s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+s.settimeout(5.0)
 s.connect(sys.argv[1])
 s.sendall(sys.argv[2].encode() + b"\n")
 time.sleep(0.2)
@@ -959,15 +1008,20 @@ find_ovmf() {
     if [[ -z "${code}" ]]; then
       local brew_prefix=""
       if command -v brew >/dev/null 2>&1; then
-        brew_prefix="$(brew --prefix)"
+        brew_prefix="$(brew --prefix 2>/dev/null || true)"
+      fi
+      local pairs=(
+        /usr/share/OVMF/OVMF_CODE_4M.fd:/usr/share/OVMF/OVMF_VARS_4M.fd
+        /usr/share/OVMF/OVMF_CODE.fd:/usr/share/OVMF/OVMF_VARS.fd
+        /usr/share/edk2/ovmf/OVMF_CODE.fd:/usr/share/edk2/ovmf/OVMF_VARS.fd
+        /usr/share/edk2/x64/OVMF_CODE.4m.fd:/usr/share/edk2/x64/OVMF_VARS.4m.fd
+        /usr/share/edk2-ovmf/x64/OVMF_CODE.fd:/usr/share/edk2-ovmf/x64/OVMF_VARS.fd
+      )
+      if [[ -n "${brew_prefix}" ]]; then
+        pairs+=("${brew_prefix}/share/qemu/edk2-x86_64-code.fd:${brew_prefix}/share/qemu/edk2-i386-vars.fd")
       fi
       local pair
-      for pair in /usr/share/OVMF/OVMF_CODE_4M.fd:/usr/share/OVMF/OVMF_VARS_4M.fd \
-                  /usr/share/OVMF/OVMF_CODE.fd:/usr/share/OVMF/OVMF_VARS.fd \
-                  /usr/share/edk2/ovmf/OVMF_CODE.fd:/usr/share/edk2/ovmf/OVMF_VARS.fd \
-                  /usr/share/edk2/x64/OVMF_CODE.4m.fd:/usr/share/edk2/x64/OVMF_VARS.4m.fd \
-                  /usr/share/edk2-ovmf/x64/OVMF_CODE.fd:/usr/share/edk2-ovmf/x64/OVMF_VARS.fd \
-                  "${brew_prefix}/share/qemu/edk2-x86_64-code.fd:${brew_prefix}/share/qemu/edk2-i386-vars.fd"; do
+      for pair in "${pairs[@]}"; do
         if [[ -f "${pair%%:*}" && -f "${pair##*:}" ]]; then
           code="${pair%%:*}"
           vars="${pair##*:}"
@@ -1025,6 +1079,7 @@ start_qemu() {
   save_qemu_command "${name}" "${qemu_argv[@]}"
   "${qemu_argv[@]}" >/dev/null 2>"${RUN_DIR}/qemu_${name}_stderr.log" &
   QEMU_PID=$!
+  printf '%s\n' "${QEMU_PID}" >"${RUN_DIR}/${name}.qemu_pid"
 }
 
 # With --artifact-dir, saves the QEMU command line $2... of pass $1, the
@@ -1061,6 +1116,9 @@ kill_qemu() {
   if [[ -n "${QEMU_PID:-}" ]] && kill -0 "${QEMU_PID}" 2>/dev/null; then
     kill -9 "${QEMU_PID}" 2>/dev/null || true
     wait "${QEMU_PID}" 2>/dev/null || true
+  fi
+  if [[ -n "${RUN_DIR:-}" && -n "${name:-}" ]]; then
+    rm -f -- "${RUN_DIR}/${name}.qemu_pid"
   fi
   # Once reaped, the PID may name another process.
   QEMU_PID=""
@@ -1128,7 +1186,7 @@ stop_qemu_and_recheck_log() {
 # bios: a random token; Shift (both keys) with Backspace corrections; an empty
 # line, Backspace on an empty line and Caps Lock (with Shift); a line typed
 # partly over USB and partly into the serial console; the keyboard unplugged
-# and keys sent with no USB keyboard (which must not reach the shell); a
+# and keys typed over the i8042 PS/2 keyboard (ps2kbd); a
 # full-speed keyboard hot-plugged on the last root port (symbols, rollover),
 # unplugged and attached again (Tab, spaces, digits); a second, high-speed
 # keyboard; a line of exactly 128 characters plus two dropped ones; help, an
@@ -1176,7 +1234,6 @@ ECHO_TIMEOUT = 10.0  # the shell's echo of one key
 OUTPUT_TIMEOUT = 15.0  # a command's output and the next prompt
 MARKER_TIMEOUT = 15.0  # a keyboard attached/detached marker after hot-plug
 EVENT_TIMEOUT = 10.0  # QEMU's DEVICE_DELETED event
-NEGATIVE_WINDOW = 2.0  # keys typed without a USB keyboard must not arrive
 KEY_GAP = 0.02  # between two input-send-event commands
 POLL = 0.01
 # Key events that may wait for the guest at once (QEMU's USB keyboard queues
@@ -1192,6 +1249,8 @@ INIT_EXITED = "[INIT] exited with status"
 INIT_EXITED_OK = "[INIT] exited with status 0"
 CLEANUP_PASS = "[TEST] driver_session_cleanup: PASS"
 NO_CONTROLLERS = "[USBKBD] no xHCI controllers found"
+PS2_READY = "[PS2KBD] controller i8042 ready (irq1)"
+NO_PS2 = "[PS2KBD] no i8042 controller found"
 STRESS = "[STRESS]"
 PROMPT = "sh> "
 HELP_LINES = ("built-in commands: help echo cpu programs run exit",
@@ -1206,14 +1265,15 @@ ATTACHED_RE = re.compile(r"\[USBKBD\] keyboard attached: (%s) port (%s) "
                          r"\((ls|fs|hs|ss)\)$" % (BDF, PORT_PATH))
 DETACHED_RE = re.compile(r"\[USBKBD\] keyboard detached: (%s) port (%s)$" %
                          (BDF, PORT_PATH))
+PS2_READY_RE = re.compile(re.escape(PS2_READY) + r"$")
 # A kernel or driver log line. Typed text never has "[" before a letter.
 LOG_LINE_RE = re.compile(r"\[[A-Z][A-Za-z0-9_]*\][^\n]*\n")
 # Text that typed lines must not contain: what test_boot.sh and deflake.py
 # read as failures, test results, tags, seeds, CPU reports or the greeting,
 # and the harness's own sync words.
 FORBIDDEN_RE = re.compile(
-    r"FAIL|FATAL|PASS|TEST|BOOT|INIT|STRESS|USBKBD|Hello|XSAVE|SMEP|SMAP|"
-    r"smep|smap|seed=|sh>|ser_|boot_sh_ok|\[[A-Za-z_]")
+    r"FAIL|FATAL|PASS|TEST|BOOT|INIT|STRESS|USBKBD|PS2KBD|Hello|XSAVE|SMEP|"
+    r"SMAP|smep|smap|seed=|sh>|ser_|boot_sh_ok|\[[A-Za-z_]")
 
 LETTERS = "abcdefghijklmnopqrstuvwxyz"
 DIGITS = "0123456789"
@@ -1542,6 +1602,7 @@ class Session:
         self.pressed = set()
         self.next_key = 0.0
         self.kbd = KeyboardModel()
+        self.ps2_kbd = KeyboardModel()
         self.shell = ShellModel()
         self.cursor = 0
         self.bdf = {}
@@ -1553,6 +1614,15 @@ class Session:
         self.journal = []  # everything typed into the serial console
         self.usb_outputs = []  # outputs of the lines typed only over USB
         self.lines_typed = 0
+
+    def active_kbd(self):
+        return self.kbd if self.keyboards else self.ps2_kbd
+
+    def set_active_kbd(self, kbd):
+        if self.keyboards:
+            self.kbd = kbd
+        else:
+            self.ps2_kbd = kbd
 
     # -- The serial log ----------------------------------------------------
 
@@ -1587,6 +1657,9 @@ class Session:
             if t.find(NO_CONTROLLERS, start) >= 0:
                 raise Failure("usb_ready", "the driver reported that it "
                               "found no xHCI controller")
+            if t.find(NO_PS2, start) >= 0:
+                raise Failure("usb_ready", "ps2kbd reported that it "
+                              "found no i8042 controller")
             self.session_scan = len(t)
         if not qemu_alive():
             raise Failure(self.scenario, "QEMU exited unexpectedly")
@@ -1624,7 +1697,8 @@ class Session:
         unexpected keyboard or controller marker fails, others are noted."""
         s = line.rstrip("\r\n")
         if (READY_RE.search(s) or ATTACHED_RE.search(s) or
-                DETACHED_RE.search(s) or NO_CONTROLLERS in s):
+                DETACHED_RE.search(s) or NO_CONTROLLERS in s or
+                PS2_READY_RE.search(s) or NO_PS2 in s):
             raise Failure(self.scenario, "unexpected driver marker in the "
                           "serial log", ["line: %r" % s])
         say("USB note: log line during the session: %r" % s)
@@ -1741,7 +1815,8 @@ class Session:
         builder's expected output against the models."""
         for _ in range(200):
             chunks, expected = build()
-            kbd, shell = KeyboardModel(self.kbd), ShellModel(self.shell)
+            kbd = KeyboardModel(self.active_kbd())
+            shell = ShellModel(self.shell)
             plan = Plan(chunks, kbd, shell)
             if len(plan.lines) != 1:
                 raise RuntimeError("a planned line must end with one Enter")
@@ -1755,18 +1830,21 @@ class Session:
         raise RuntimeError("could not generate a line without reserved text")
 
     def echo_line(self, scenario, build, what):
-        """Types an echo command with random parts over USB and checks that
-        the shell prints exactly the edited arguments."""
+        """Types an echo command with random parts over the active keyboard
+        (USB if attached, else PS/2 i8042) and checks that the shell prints
+        exactly the edited arguments."""
         self.scenario = scenario
         plan, kbd, shell, output = self.plan(build)
+        target = self.keyboards[-1] if self.keyboards else "ps2/i8042"
         started = time.monotonic()
         try:
             self.type_plan(plan, what)
-            self.kbd, self.shell = kbd, shell
+            self.set_active_kbd(kbd)
+            self.shell = shell
             self.cursor = self.consume(
                 self.cursor, output + "\r\n" + PROMPT, OUTPUT_TIMEOUT,
-                "the output of the echo command typed over USB (%s) and the "
-                "next prompt" % what)
+                "the output of the echo command typed over %s (%s) and the "
+                "next prompt" % (target, what))
         except Failure as e:
             e.info += ["keys typed: %s" % describe(plan.chunks),
                        "edited line: %r" % plan.lines[0],
@@ -1776,14 +1854,15 @@ class Session:
         self.usb_outputs.append(output)
         self.lines_typed += 1
         say("USB %s: typed %r (%d key events) over %s; output %r (%.1f s)." % (
-            scenario, plan.lines[0], plan.events, self.keyboards[-1], output,
+            scenario, plan.lines[0], plan.events, target, output,
             time.monotonic() - started))
 
     def command(self, line, output, what):
-        kbd, shell = KeyboardModel(self.kbd), ShellModel(self.shell)
+        kbd, shell = KeyboardModel(self.active_kbd()), ShellModel(self.shell)
         plan = Plan(keys(line) + ENTER, kbd, shell)
         self.type_plan(plan, what)
-        self.kbd, self.shell = kbd, shell
+        self.set_active_kbd(kbd)
+        self.shell = shell
         self.cursor = self.consume(self.cursor, output + "\r\n" + PROMPT,
                                    OUTPUT_TIMEOUT,
                                    "the output of %s and the next prompt" % what)
@@ -2015,13 +2094,16 @@ class Session:
         def markers(t):
             lines = complete_lines(t, self.s0)
             ready = [m for m in map(READY_RE.search, lines) if m]
+            ps2_ready = [m.group(0) for m in map(PS2_READY_RE.search, lines)
+                         if m]
             attached = [m for m in map(ATTACHED_RE.search, lines) if m]
-            if len(ready) >= ready_count and len(attached) >= kbd_count:
-                return ready, attached
+            if (len(ready) >= ready_count and len(ps2_ready) >= 1 and
+                    len(attached) >= kbd_count):
+                return ready, ps2_ready, attached
             return None
 
-        ready, attached = self.wait_for(
-            "the driver's 'controller ... ready' and 'keyboard attached' "
+        ready, ps2_ready, attached = self.wait_for(
+            "the drivers' 'controller ... ready' and 'keyboard attached' "
             "markers in the init session", SESSION_READY_TIMEOUT, markers)
         try:
             self.qmp = Qmp(QMP_PATH)
@@ -2046,7 +2128,8 @@ class Session:
         want_ready = {"xhci0": "msix" if EXACT_ROOT else None, "xhci1": "msi"}
         got_ready = sorted(m.groups() for m in ready)
         got_attached = [m.groups() for m in attached]
-        ok = len(got_ready) == ready_count and len(got_attached) == kbd_count
+        ok = (len(got_ready) == ready_count and len(ps2_ready) == 1 and
+              len(got_attached) == kbd_count)
         if ok:
             bdf0 = self.bdf["xhci0"]
             r0 = [g for g in got_ready if g[0] == bdf0]
@@ -2077,14 +2160,15 @@ class Session:
                 self.keyboards.append("kbd1")
                 self.ports["kbd1"] = (bdf1, root_a1[0][1])
         if not ok:
-            raise Failure("usb_ready", "the driver's markers do not match the "
-                          "xHCI controllers and keyboards of the pass", [
+            raise Failure("usb_ready", "the drivers' markers do not match the "
+                          "controllers and keyboards of the pass", [
                               "controllers (query-pci): %r" % {
                                   c: self.bdf[c] for c in controllers},
                               "ready markers: %r" % [m.group(0) for m in ready],
+                              "ps2 ready markers: %r" % ps2_ready,
                               "attached markers: %r" % [m.group(0)
                                                         for m in attached]])
-        self.initial_markers = ([m.group(0) for m in ready] +
+        self.initial_markers = ([m.group(0) for m in ready] + ps2_ready +
                                 [m.group(0) for m in attached])
         say("USB session: %s." % "; ".join(self.initial_markers))
 
@@ -2095,48 +2179,17 @@ class Session:
             "the shell to wait for input", OUTPUT_TIMEOUT,
             lambda t: len(t) if t.endswith(PROMPT) or t.endswith("\n") else None)
 
-    def negative_control(self, scenario):
-        """With no USB keyboard attached, keys sent through QMP go to the
-        PS/2 keyboard, which the kernel does not drive: none may reach the
-        shell. This shows that the shell got the other lines through the USB
-        keyboard."""
-        self.scenario = scenario
-        if self.keyboards:
-            raise RuntimeError("USB keyboards are attached: %r" % self.keyboards)
-        token = rand(12, LETTERS)
-        cursor = self.cursor
-        for chunk in keys("echo " + token) + ENTER:
-            self.send_keys(chunk)
-        end = time.monotonic() + NEGATIVE_WINDOW
-        while time.monotonic() < end:
-            self.check()
-            self.idle()
-        t = self.text()
-        i = cursor
-        while True:
-            match = LOG_LINE_RE.match(t, i)
-            if not match:
-                break
-            self.log_line(match.group(0))
-            i = match.end()
-        if i < len(t):
-            raise Failure(scenario, "keys typed while no USB keyboard was "
-                          "attached reached the shell", [
-                              "serial output: %r" % t[i:i + 120]])
-        say("USB %s: %d key events without a USB keyboard; no shell output "
-            "within %g s." % (scenario, 2 * len("echo " + token) + 2,
-                              NEGATIVE_WINDOW))
-
     def exit_session(self):
-        """Ends the init session with 'exit 0' typed over USB: init must exit
-        with status 0, and the kernel must find every driver resource
-        released."""
+        """Ends the init session with 'exit 0' typed over the active keyboard:
+        init must exit with status 0, and the kernel must find every driver
+        resource released."""
         self.scenario = "usb_exit"
-        kbd, shell = KeyboardModel(self.kbd), ShellModel(self.shell)
+        kbd, shell = KeyboardModel(self.active_kbd()), ShellModel(self.shell)
         plan = Plan(keys("exit 0") + ENTER, kbd, shell)
         self.exit_typed = True
         self.type_plan(plan, "the exit command")
-        self.kbd, self.shell = kbd, shell
+        self.set_active_kbd(kbd)
+        self.shell = shell
         start = self.cursor
 
         def exited(t):
@@ -2158,8 +2211,8 @@ class Session:
         self.lines_typed += 1
         markers = []
         for line in complete_lines(self.log[:end_of_session], self.s0):
-            match = (READY_RE.search(line) or ATTACHED_RE.search(line) or
-                     DETACHED_RE.search(line))
+            match = (READY_RE.search(line) or PS2_READY_RE.search(line) or
+                     ATTACHED_RE.search(line) or DETACHED_RE.search(line))
             if match:
                 markers.append(match.group(0))
         n = len(self.initial_markers)
@@ -2311,8 +2364,9 @@ class Session:
         self.command(unknown, "sh: unknown command: " + unknown,
                      "an unknown command")
         self.command("usertest 0", self.usertest_line, "usertest 0")
+        target = self.keyboards[-1] if self.keyboards else "ps2/i8042"
         say("USB %s: help, %r and usertest 0 typed over %s; outputs OK." % (
-            scenario, unknown, self.keyboards[-1]))
+            scenario, unknown, target))
 
     # -- Scenarios -----------------------------------------------------------
 
@@ -2346,9 +2400,13 @@ class Session:
         self.echo_line("usb_editing_edges", lambda: self.caps_line(" "),
                        "the Caps Lock line")
         self.mixed_line("usb_serial_mixed")
-        # Unplugged, the keyboard is gone, and keys reach nothing.
+        # With kbd0 unplugged, no USB keyboard is attached, so QEMU routes QMP
+        # input-send-event directly to the i8042 PS/2 keyboard (`ps2kbd`).
         self.unplug("usb_unplug", "kbd0")
-        self.negative_control("usb_no_keyboard")
+        self.echo_line("ps2_typing", self.shift_backspace_line,
+                       "the PS/2 Shift/Backspace line")
+        self.echo_line("ps2_caps", lambda: self.caps_line(" "),
+                       "the PS/2 Caps Lock line")
         # A full-speed keyboard hot-plugged after the shell started, on the
         # last root port; the only USB keyboard, so the line came through it.
         self.plug("usb_hotplug_add", "xhci0", 4, "kbd_fs", True)
@@ -2454,6 +2512,13 @@ class Session:
         self.echo_line("usb_hub_replug", lambda: self.token_line(16),
                        "the hub re-plug token line")
         self.commands("usb_commands")
+        # Unplug all USB keyboards under UEFI + x2APIC and verify PS/2 typing
+        # (including 'exit 0' in exit_session()) via IOAPIC IRQ 1 -> x2APIC.
+        self.unplug("ps2_typing", "kbd_br")
+        self.unplug("ps2_typing", "kbd1")
+        self.unplug_hub("ps2_typing", "hub0", kids=("hkbd0",))
+        self.echo_line("ps2_typing", self.shift_backspace_line,
+                       "the UEFI PS/2 Shift/Backspace line")
 
     # -- Failure handling ------------------------------------------------------
 
@@ -2730,6 +2795,7 @@ while [[ "${batch_start}" -lt "${#PASS_NAMES[@]}" ]]; do
     wait "${batch_pids[j]}" || rc=$?
     PASS_RCS[batch_start + j]="${rc}"
   done
+  batch_pids=()
   batch_start="${batch_end}"
 done
 

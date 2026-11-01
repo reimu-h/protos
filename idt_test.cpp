@@ -292,12 +292,14 @@ TEST(IdtTest, DispatchHandlesLocalApicTimerWakeupIpiSpuriousAndCustomVectors) {
   IdtDispatch(&custom_frame);
   EXPECT_THAT(g_env.eoi_count.load(), t::Eq(4));
 
-  // General external vector (0x50) with handler registered: invokes handler and
-  // sends EOI.
+  // General external vector (0x50) with handler registered: invokes handler
+  // before sending EOI (so level-triggered I/O APIC handlers can mask their
+  // redirection entry before `IdtDispatch` broadcasts EOI).
   static int custom_irq_calls = 0;
   custom_irq_calls = 0;
   IdtRegisterHandler(0x50, [](InterruptFrame* const frame) {
     EXPECT_THAT(frame->vector, t::Eq(0x50u));
+    EXPECT_THAT(g_env.eoi_count.load(), t::Eq(4));
     ++custom_irq_calls;
   });
   IdtDispatch(&custom_frame);

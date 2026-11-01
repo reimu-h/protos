@@ -109,7 +109,9 @@ void GdtLoadForCpu(const int cpu_index,
   const uint16_t selector = GdtTssSelector(cpu_index);
 #if !__STDC_HOSTED__
   const GdtPointer gdtr = GdtGetPointer();
+  const uint16_t null_ldt = 0;
   asm volatile("lgdt [%0]" : : "r"(&gdtr) : "memory");
+  asm volatile("lldt %0" : : "r"(null_ldt) : "memory");
   asm volatile("ltr %0" : : "r"(selector) : "memory");
 #else
   t_host_task_register = selector;

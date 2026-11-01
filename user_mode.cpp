@@ -59,6 +59,26 @@ static int64_t GlobalTimerTicks() {
   return SmpGetCpuLocal(0)->timer_ticks.load(std::memory_order_relaxed);
 }
 
+struct ConsoleReadWaiter {
+  Task* task = nullptr;
+  ConsoleReadWaiter* next = nullptr;
+};
+
+IrqSpinLock g_console_read_wait_lock;
+ConsoleReadWaiter* g_console_read_waiters = nullptr;
+
+static void WakeConsoleReaders() {
+  TaskScheduler* const scheduler = GetTaskScheduler();
+  if (scheduler == nullptr) {
+    return;
+  }
+  const IrqSpinLockGuard guard(g_console_read_wait_lock);
+  for (ConsoleReadWaiter* w = g_console_read_waiters; w != nullptr;
+       w = w->next) {
+    scheduler->Wake(w->task);
+  }
+}
+
 // Copies the `size` bytes at `user_address` in the address space of the
 // running program to `dst`. Every kernel read of user memory goes through
 // here, and from here through CopyFromUser(), the only code that reads user
@@ -119,6 +139,7 @@ void UserModeInit() {
   IdtRegisterHandler(kVectorSyscall, UserProcess::OnSyscall);
   IdtSetUserFaultHandler(UserProcess::OnUserFault);
   IdtSetUserReturnHandler(UserProcess::OnReturnToUser);
+  ConsoleSetInputWakeCallback(WakeConsoleReaders);
 }
 
 void WriteUserProgramResult(const UserProgramResult& result,
@@ -576,6 +597,18 @@ void UserProcess::OnSyscall(InterruptFrame* const frame) {
       case kSyscallGetTicks:
         ret = GlobalTimerTicks();
         break;
+      case kSyscallIsaClaim:
+        ret = process->driver_.IsaClaim(static_cast<int64_t>(frame->rdi));
+        break;
+      case kSyscallIsaPortIo:
+        ret = process->driver_.IsaPortIo(static_cast<int64_t>(frame->rdi),  //
+                                         frame->rsi,                        //
+                                         frame->rdx);
+        break;
+      case kSyscallIsaIrqAlloc:
+        ret = process->driver_.IsaIrqAlloc(static_cast<int64_t>(frame->rdi),
+                                           GetTaskScheduler()->CurrentTask());
+        break;
       default:
         break;
     }
@@ -714,10 +747,43 @@ int64_t UserProcess::Read(const uintptr_t buffer, const int64_t size) {
       return 0;
     }
     TaskScheduler* const scheduler = GetTaskScheduler();
-    if (scheduler != nullptr) {
-      scheduler->Yield();
+    Task* const self =
+        (scheduler != nullptr) ? scheduler->CurrentTask() : nullptr;
+    if (self != nullptr) {
+      ConsoleReadWaiter waiter{.task = self, .next = nullptr};
+      {
+        const IrqSpinLockGuard guard(g_console_read_wait_lock);
+        waiter.next = g_console_read_waiters;
+        g_console_read_waiters = &waiter;
+      }
+      first = ConsoleTryReadc();
+      if (!first.ok() && !IsKillRequested()) {
+        // Wake immediately on `ConsolePushInput()` (`usbkbd`/`ps2kbd`) or
+        // `Kill()`, and poll at most once per 250 Hz tick for hardware COM1 RX.
+        // The kernel takes no COM1 interrupt, so this poll has to keep up with
+        // the 16-byte receive FIFO: a tick (4 ms) brings about 15 bytes at the
+        // 38400 baud of UartInit(), and while the shell echoes, the transmit
+        // path drains the receiver too (uart.cpp). A faster baud rate would
+        // need the receive interrupt.
+        scheduler->BlockUntil(GlobalTimerTicks() + 1);
+      }
+      {
+        const IrqSpinLockGuard guard(g_console_read_wait_lock);
+        ConsoleReadWaiter** link = &g_console_read_waiters;
+        while (*link != nullptr) {
+          if (*link == &waiter) {
+            *link = waiter.next;
+            break;
+          }
+          link = &(*link)->next;
+        }
+      }
+      if (first.ok()) {
+        break;
+      }
+    } else {
+      asm volatile("pause" : : : "memory");
     }
-    asm volatile("pause" : : : "memory");
     first = ConsoleTryReadc();
   }
 
@@ -818,10 +884,23 @@ int64_t UserProcess::WaitChild(const int64_t pid, const uintptr_t result_ptr) {
       return 0;
     }
     TaskScheduler* const scheduler = GetTaskScheduler();
-    if (scheduler != nullptr) {
-      scheduler->Yield();
+    Task* const self =
+        (scheduler != nullptr) ? scheduler->CurrentTask() : nullptr;
+    if (self != nullptr) {
+      {
+        const IrqSpinLockGuard guard(child->kill_lock_);
+        child->exit_waiter_task_ = self;
+      }
+      if (child->stats().end_tick < 0 && !IsKillRequested()) {
+        scheduler->Block();
+      }
+      {
+        const IrqSpinLockGuard guard(child->kill_lock_);
+        child->exit_waiter_task_ = nullptr;
+      }
+    } else {
+      asm volatile("pause" : : : "memory");
     }
-    asm volatile("pause" : : : "memory");
   }
   const UserProgramResult child_result = child->Wait();
   children_[slot].reset();
@@ -972,6 +1051,13 @@ void UserProcess::RecordEnd() {
   kill_end_cpu_.store(cpu_id, std::memory_order_relaxed);
   kill_end_switches_.store(switches, std::memory_order_relaxed);
   end_tick_.store(now, std::memory_order_release);
+  TaskScheduler* const scheduler = GetTaskScheduler();
+  if (scheduler != nullptr) {
+    const IrqSpinLockGuard guard(kill_lock_);
+    if (exit_waiter_task_ != nullptr) {
+      scheduler->Wake(exit_waiter_task_);
+    }
+  }
 }
 
 void UserProcess::OnUserFault(InterruptFrame* const frame) {

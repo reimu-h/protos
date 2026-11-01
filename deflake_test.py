@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import ast
+import contextlib
 import dataclasses
 import fcntl
 import io
@@ -35,17 +36,19 @@ def process_gone(pid: int, timeout_s: float = 10.0) -> bool:
   """Waits up to `timeout_s` for process `pid` to end (a zombie counts)."""
   deadline = time.monotonic() + timeout_s
   while True:
-    try:
-      with open(f"/proc/{pid}/stat", encoding="latin-1") as f:
-        if f.read().rsplit(")", 1)[1].split()[0] == "Z":
-          return True
-    except OSError:
+    if sys.platform.startswith("linux"):
       try:
-        os.kill(pid, 0)
-      except ProcessLookupError:
-        return True
-      except PermissionError:
+        with open(f"/proc/{pid}/stat", encoding="latin-1") as f:
+          if f.read().rsplit(")", 1)[1].split()[0] == "Z":
+            return True
+      except OSError:
         pass
+    try:
+      os.kill(pid, 0)
+    except ProcessLookupError:
+      return True
+    except PermissionError:
+      pass
     if time.monotonic() >= deadline:
       return False
     time.sleep(0.05)
@@ -283,8 +286,11 @@ lock = threading.Lock()
 
 
 def new_keyboard(spec):
-    return dict(spec, events=[], mods=set(), keys=[], previous=[],
-                armed=False)
+    return dict({"caps": None, "armed": False}, **spec, events=[], mods=set(),
+                keys=[], previous=[])
+
+
+ps2_kb = new_keyboard({"id": "ps2", "armed": True, "caps": False})
 
 
 def driver():
@@ -292,7 +298,8 @@ def driver():
     report into characters for the shell."""
     while True:
         with lock:
-            ready = [k for k in keyboards if k["armed"] and k["events"]]
+            ready = ([ps2_kb] if ps2_kb["events"] else []) + [
+                k for k in keyboards if k["armed"] and k["events"]]
         for kb in ready:
             qcode, down = kb["events"].pop(0)
             if qcode in ("shift", "shift_r"):
@@ -306,9 +313,13 @@ def driver():
             shift = bool(kb["mods"])
             for key in new:
                 if key == "caps_lock":
-                    caps_lock[0] = not caps_lock[0]
+                    if kb["caps"] is None:
+                        caps_lock[0] = not caps_lock[0]
+                    else:
+                        kb["caps"] = not kb["caps"]
                 elif len(key) == 1 and key.isalpha():
-                    shell_input.put(key.upper() if shift != caps_lock[0] else key)
+                    caps = caps_lock[0] if kb["caps"] is None else kb["caps"]
+                    shell_input.put(key.upper() if shift != caps else key)
                 else:
                     use_shift = shift and BUG != "symbols_unshifted"
                     shell_input.put(KEYS[key][1 if use_shift else 0])
@@ -408,6 +419,10 @@ def boot():
     for bdf, mode in controllers.values():
         if mode:
             log("[USBKBD] controller %s ready (%s)\n" % (bdf, mode))
+    if BUG == "ps2_prefixed":
+        log("sh> [PS2KBD] controller i8042 ready (irq1)\n")
+    else:
+        log("[PS2KBD] controller i8042 ready (irq1)\n")
     with lock:
         for spec in cold:
             kb = new_keyboard(spec)
@@ -456,9 +471,9 @@ def qmp_server():
                                     else "AuthenticAMD")}
             elif command == "input-send-event":
                 with lock:
-                    target = keyboards[-1] if keyboards else None  # else PS/2
+                    target = keyboards[-1] if keyboards else ps2_kb
                 for e in args["events"]:
-                    if target is not None and len(target["events"]) < 16:
+                    if len(target["events"]) < 16:
                         target["events"].append((e["data"]["key"]["data"],
                                                  e["data"]["down"]))
             elif command == "device_add":
@@ -1297,6 +1312,147 @@ class LockAndRunnersTest(unittest.TestCase):
       finally:
         os.close(fd3)
 
+      # Per-user default_lock_path honors XDG_RUNTIME_DIR and UID fallback.
+      self.assertEqual(
+          deflake.default_lock_path({"XDG_RUNTIME_DIR": "/run/user/9999"}),
+          Path("/run/user/9999/protos_deflake/host.lock"),
+      )
+      self.assertEqual(
+          deflake.default_lock_path({}),
+          Path(f"/tmp/protos_deflake-{os.getuid()}/host.lock"),
+      )
+
+      # Symlinked lock file or symlinked lock directory is rejected.
+      target_file = Path(tmp) / "real.lock"
+      target_file.write_text("", encoding="utf-8")
+      symlink_lock = Path(tmp) / "sym.lock"
+      symlink_lock.symlink_to(target_file)
+      if hasattr(os, "O_NOFOLLOW"):
+        with self.assertRaises(OSError):
+          with deflake.HostLock(symlink_lock):
+            pass
+
+      real_dir = Path(tmp) / "real_dir"
+      real_dir.mkdir()
+      sym_dir = Path(tmp) / "sym_dir"
+      sym_dir.symlink_to(real_dir)
+      with self.assertRaises(OSError):
+        with deflake.HostLock(sym_dir / "host.lock"):
+          pass
+
+  def test_vcs_provenance_git_fallback_and_toolchain_detection(self) -> None:
+    if shutil.which("git") is None:
+      self.skipTest("git not found")
+    # git runs here and in vcs_provenance without the developer's git
+    # configuration, which may sign commits or run hooks (the -c options cover
+    # git older than 2.32, which ignores GIT_CONFIG_GLOBAL), and without the
+    # GIT_* variables that may name another repository.
+    git_env = {
+        key: value
+        for key, value in os.environ.items()
+        if not key.startswith("GIT_")
+    }
+    git_env.update({
+        "GIT_CONFIG_GLOBAL": os.devnull,
+        "GIT_CONFIG_NOSYSTEM": "1",
+        "GIT_AUTHOR_NAME": "Test",
+        "GIT_AUTHOR_EMAIL": "test@example.com",
+        "GIT_COMMITTER_NAME": "Test",
+        "GIT_COMMITTER_EMAIL": "test@example.com",
+    })
+    git = [
+        "git", "-c", "commit.gpgsign=false", "-c", "core.hooksPath=/dev/null"
+    ]
+    with tempfile.TemporaryDirectory() as tmp, mock.patch.dict(
+        os.environ, git_env, clear=True
+    ):
+      repo = Path(tmp) / "git_repo"
+      repo.mkdir()
+      subprocess.run([*git, "init", "-q"], cwd=repo, check=True)
+      (repo / "README.md").write_text("hello\n", encoding="utf-8")
+      subprocess.run([*git, "add", "README.md"], cwd=repo, check=True)
+      subprocess.run(
+          [*git, "commit", "-q", "-m", "initial"], cwd=repo, check=True
+      )
+      prov_clean = deflake.vcs_provenance(repo)
+      self.assertEqual(prov_clean["tool"], "git")
+      self.assertFalse(prov_clean["dirty"])
+      self.assertTrue(bool(prov_clean["commit_id"]))
+
+      (repo / "README.md").write_text("modified\n", encoding="utf-8")
+      prov_dirty = deflake.vcs_provenance(repo)
+      self.assertEqual(prov_dirty["tool"], "git")
+      self.assertTrue(prov_dirty["dirty"])
+
+      # Host toolchain classification handles Ubuntu 24.04 / Debian 13 (GRUB
+      # 2.12 + GCC 13/14) as "host" and Debian bookworm (GRUB 2.06 + Debian 12)
+      # as "docker".
+      build_dir = repo / "build"
+      build_dir.mkdir()
+      (build_dir / "kernel.bin").write_bytes(b"FAKEKERNELBIN")
+      (build_dir / "kernel.o").write_bytes(
+          b"\x00GCC: (Ubuntu 13.3.0-6ubuntu2~24.04) 13.3.0\x00"
+      )
+      (build_dir / ".kernel-config").write_text(
+          "g++ -DPROTOS_SELFTEST=1 | as | build/kernel.o | g++ | ld\n",
+          encoding="utf-8",
+      )
+      host_iso = build_dir / "kernel.iso"
+      host_iso.write_bytes(b"ISO-FAKEKERNELBIN-GRUB 2.12-1ubuntu7-END")
+      b_host = deflake.build_identity(host_iso, host_iso, repo)
+      self.assertEqual(b_host["toolchain"], "host")
+      self.assertEqual(b_host["vcs"]["tool"], "git")
+
+      summary = deflake.aggregate(
+          records=[],
+          configs=[deflake._make_builtin_config("kvm24")],
+          builds={b_host["build_id"]: b_host},
+          registry=("pmm_memory_map_init",),
+          session_meta={"stop_reason": "runs"},
+      )
+      rendered = deflake.render_text(summary, ("pmm_memory_map_init",))
+      self.assertIn(f"git {prov_dirty['commit_id'][:8]} (dirty)", rendered)
+
+      (build_dir / "kernel.o").write_bytes(
+          b"\x00GCC: (Debian 12.2.0-14+deb12u1) 12.2.0\x00"
+      )
+      docker_iso = build_dir / "docker.iso"
+      docker_iso.write_bytes(b"ISO-FAKEKERNELBIN-GRUB 2.06-13+deb12u1-END")
+      b_docker = deflake.build_identity(docker_iso, docker_iso, repo)
+      self.assertEqual(b_docker["toolchain"], "docker")
+
+  def test_docker_env_and_kvm_forwarding(self) -> None:
+    self.assertEqual(deflake.docker_kvm_args({}, kvm_gid=lambda: 108), ())
+    self.assertEqual(
+        deflake.docker_kvm_args({"KVM": "1"}, kvm_gid=lambda: 108),
+        ("--device", "/dev/kvm", "-e", "KVM=1", "--group-add", "108"),
+    )
+    self.assertEqual(
+        deflake.docker_kvm_args({"KVM": "1"}, kvm_gid=lambda: None),
+        ("--device", "/dev/kvm", "-e", "KVM=1"),
+    )
+    args = deflake.build_arg_parser().parse_args([
+        "--config", "docker:bios", "--dry-run", "--iso", "k.iso",
+        "--mb1-iso", "mb1.iso",
+    ])
+    env = {
+        "DOCKER": "podman",
+        "DOCKER_IMAGE": "custom-kernel-img",
+        "KVM": "1",
+        "HOST_UID": "0",
+        "HOST_GID": "0",
+        "DOCKER_VOLUME_OPTS": "",
+    }
+    buf = io.StringIO()
+    with mock.patch.dict(os.environ, env, clear=False):
+      with contextlib.redirect_stdout(buf):
+        rc = deflake.run_session(args, repo=REPO_ROOT)
+    self.assertEqual(rc, 0)
+    out = buf.getvalue()
+    self.assertIn("podman run --rm", out)
+    self.assertIn("custom-kernel-img", out)
+    self.assertIn("--device /dev/kvm -e KVM=1", out)
+
   def test_run_qemu_boot_with_fake_qemu(self) -> None:
     with tempfile.TemporaryDirectory() as tmp:
       tmp_path = Path(tmp)
@@ -1682,6 +1838,51 @@ class LockAndRunnersTest(unittest.TestCase):
         self.assertEqual(serial.count("Hello, x86-64 Kernel World!"), 1, out)
         self.assertIn(f"[TEST] run_{token}: FAIL", serial)
         self.assertNotIn(f"run_{other}", serial + out)
+      self.assertEqual(sorted(os.listdir(tmp_path / "build")), [])
+
+  def test_test_boot_sh_signal_cleanup_kills_parallel_qemus(self) -> None:
+    fake_qemu = """\
+        #!/usr/bin/env python3
+        import os, pathlib, sys, time
+        pid_dir = pathlib.Path(os.environ["FAKE_PID_DIR"])
+        tmp = pid_dir / f"{os.getpid()}.tmp"
+        dst = pid_dir / f"{os.getpid()}.pid"
+        tmp.write_text(str(os.getpid()))
+        tmp.replace(dst)
+        time.sleep(120)
+        """
+    with tempfile.TemporaryDirectory() as tmp:
+      tmp_path = Path(tmp)
+      env = make_test_boot_repo(tmp_path, fake_qemu)
+      pid_dir = tmp_path / "pids"
+      pid_dir.mkdir()
+      env["FAKE_PID_DIR"] = str(pid_dir)
+      env["BOOT_TEST_JOBS"] = "2"
+      env["BOOT_TEST_USB"] = "0"
+      proc = subprocess.Popen(
+          [str(tmp_path / "test_boot.sh"), "--passes=bios,max", "kernel.iso",
+           "kernel-mb1.iso"],
+          cwd=tmp_path,
+          env=env,
+          stdout=subprocess.PIPE,
+          stderr=subprocess.STDOUT,
+          text=True,
+      )
+      try:
+        deadline = time.monotonic() + 20.0
+        while len(list(pid_dir.glob("*.pid"))) < 2:
+          self.assertLess(time.monotonic(), deadline)
+          time.sleep(0.05)
+        qemu_pids = [int(p.read_text()) for p in pid_dir.glob("*.pid")]
+        proc.send_signal(signal.SIGTERM)
+        proc.communicate(timeout=30)
+      finally:
+        if proc.poll() is None:
+          proc.kill()
+          proc.wait()
+      self.assertEqual(proc.returncode, 143)
+      for qpid in qemu_pids:
+        self.assertTrue(process_gone(qpid), qpid)
       self.assertEqual(sorted(os.listdir(tmp_path / "build")), [])
 
   def test_test_boot_sh_reports_qemu_errors(self) -> None:
@@ -2351,7 +2552,7 @@ class UsbHarnessTest(unittest.TestCase):
       scenarios = {
           "bios": ("usb_serial_sync", "usb_token", "usb_shift_backspace",
                    "usb_editing_edges", "usb_serial_mixed", "usb_unplug",
-                   "usb_no_keyboard", "usb_hotplug_add", "usb_replug",
+                   "ps2_typing", "ps2_caps", "usb_hotplug_add", "usb_replug",
                    "usb_second_keyboard", "usb_long_line", "usb_hub_single",
                    "usb_hub_chained", "usb_hub_hotplug", "usb_hub_replug",
                    "usb_commands"),
@@ -2360,7 +2561,7 @@ class UsbHarnessTest(unittest.TestCase):
                    "usb_editing_edges", "usb_serial_after_usb", "usb_replug",
                    "usb_bridged_controller", "usb_hotplug_add",
                    "usb_hub_chained", "usb_hub_hotplug", "usb_hub_replug",
-                   "usb_commands"),
+                   "usb_commands", "ps2_typing"),
       }
       for p, names in scenarios.items():
         output = (art_dir / p / "output.log").read_text(encoding="utf-8")
@@ -2396,6 +2597,12 @@ class UsbHarnessTest(unittest.TestCase):
           output[:2000],
       )
       self.assertLess(elapsed, 30)
+      # 4. A shell prompt ('sh> ') interleaved before '[PS2KBD] controller
+      # i8042 ready (irq1)' on the same serial line still matches PS2_READY_RE.
+      proc, _, _ = self.run_test_boot(tmp_path, "bios", "ps2_prefixed")
+      self.assertEqual(
+          proc.returncode, 0, (proc.stdout + proc.stderr)[-3000:]
+      )
 
 
 if __name__ == "__main__":

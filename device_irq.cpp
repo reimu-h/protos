@@ -7,6 +7,7 @@
 
 #include "check.h"
 #include "idt.h"
+#include "ioapic.h"
 #include "pci.h"
 #include "spinlock.h"
 #include "syscall_abi.h"
@@ -26,20 +27,53 @@ constexpr uint32_t kMsixVectorControlMaskBit = 1U << 0;
 struct VectorSlot {
   uintptr_t owner = kPciNoOwner;
   int device_index = -1;
+  int level_isa_irq = -1;
   std::atomic<uint64_t>* pending = nullptr;
   uint64_t bit = 0;
   Task* task = nullptr;
 };
 
-// Guards `g_slots`, `g_next_slot`, `g_device_configured`, and `g_msix_tables`.
-// Leaf lock with respect to PCI and everything except the scheduler runqueue
-// lock taken inside `DeviceIrqEnvironment::Wake()`.
+// Guards `g_slots`, `g_next_slot`, `g_device_configured`,
+// `g_isa_device_configured`, and `g_msix_tables`. Leaf lock with respect to PCI
+// and everything except `g_ioapic_lock` and the scheduler runqueue lock taken
+// inside `DeviceIrqEnvironment::Wake()`.
 IrqSpinLock g_device_irq_lock;
 std::shared_ptr<DeviceIrqEnvironment> g_env;
 VectorSlot g_slots[kDeviceIrqVectorCount] = {};
 int g_next_slot = 0;
 bool g_device_configured[kPciMaxDevices] = {};
+bool g_isa_device_configured[kIsaDeviceCount] = {};
+std::atomic<int> g_level_isa_slot_count{0};
 volatile uint32_t* g_msix_tables[kPciMaxDevices] = {};
+
+static constexpr int SlotIdToIsaDevice(const int slot_id) {
+  const int isa_device = -2 - slot_id;
+  return (isa_device >= 0 && isa_device < kIsaDeviceCount) ? isa_device : -1;
+}
+
+static void ClearVectorSlotLocked(const int slot_index) {
+  if (g_slots[slot_index].level_isa_irq >= 0) {
+    g_level_isa_slot_count.fetch_sub(1, std::memory_order_release);
+  }
+  g_slots[slot_index] = VectorSlot{};
+}
+
+static void UnmaskWatchedLevelIrqs(std::atomic<uint64_t>* const pending,
+                                   const uint64_t mask) {
+  if (mask == 0 ||
+      g_level_isa_slot_count.load(std::memory_order_acquire) <= 0) {
+    return;
+  }
+  const IrqSpinLockGuard guard(g_device_irq_lock);
+  for (int i = 0; i < kDeviceIrqVectorCount; ++i) {
+    const VectorSlot& slot = g_slots[i];
+    if (slot.owner != kPciNoOwner && slot.pending == pending &&
+        (slot.bit & mask) != 0 && slot.level_isa_irq >= 0 &&
+        (pending->load(std::memory_order_acquire) & slot.bit) == 0) {
+      IoApicSetIsaIrqMasked(slot.level_isa_irq, false);
+    }
+  }
+}
 
 static void DeviceIrqInterruptHandler(InterruptFrame* const frame) {
   DCHECK(frame != nullptr);
@@ -217,9 +251,13 @@ void DeviceIrqInit(std::shared_ptr<DeviceIrqEnvironment> env) {
   }
   g_env = std::move(env);
   g_next_slot = 0;
+  g_level_isa_slot_count.store(0, std::memory_order_release);
   for (int i = 0; i < kPciMaxDevices; ++i) {
     g_device_configured[i] = false;
     g_msix_tables[i] = nullptr;
+  }
+  for (int i = 0; i < kIsaDeviceCount; ++i) {
+    g_isa_device_configured[i] = false;
   }
 }
 
@@ -248,6 +286,10 @@ DeviceIrqStatus DeviceIrqAllocateVectors(
   const IrqSpinLockGuard guard(g_device_irq_lock);
   if (device_index >= 0 && device_index < kPciMaxDevices &&
       g_device_configured[device_index]) {
+    return DeviceIrqStatus::kBusy;
+  }
+  const int isa_device = SlotIdToIsaDevice(device_index);
+  if (isa_device >= 0 && g_isa_device_configured[isa_device]) {
     return DeviceIrqStatus::kBusy;
   }
   int free_count = 0;
@@ -397,13 +439,96 @@ void DeviceIrqResetDevice(const int device_index) {
   g_msix_tables[device_index] = nullptr;
 }
 
+DeviceIrqStatus DeviceIrqProgramIsaDevice(const int isa_device,
+                                          const int vector) {
+  CHECK(g_env != nullptr);
+  if (isa_device < 0 || isa_device >= kIsaDeviceCount) {
+    return DeviceIrqStatus::kNoDevice;
+  }
+  if (vector < kDeviceIrqVectorFirst || vector > kDeviceIrqVectorLast) {
+    return DeviceIrqStatus::kInvalid;
+  }
+  const int isa_irq = IsaDeviceIrq(isa_device);
+  if (isa_irq < 0 || !IoApicHasIsaIrq(isa_irq)) {
+    return DeviceIrqStatus::kNoDevice;
+  }
+  const int destination = g_env->MsiDestinationApicId();
+  if (destination < 0 ||
+      !DeviceIrqMsiCanTarget(static_cast<uint32_t>(destination))) {
+    return DeviceIrqStatus::kInvalid;
+  }
+
+  {
+    const IrqSpinLockGuard guard(g_device_irq_lock);
+    const VectorSlot& slot = g_slots[vector - kDeviceIrqVectorFirst];
+    if (slot.owner == kPciNoOwner ||
+        slot.device_index != DeviceIrqIsaSlotId(isa_device)) {
+      return DeviceIrqStatus::kInvalid;
+    }
+    if (g_isa_device_configured[isa_device]) {
+      return DeviceIrqStatus::kBusy;
+    }
+    g_isa_device_configured[isa_device] = true;
+  }
+
+  bool level_triggered = false;
+  const IoApicStatus status =
+      IoApicProgramIsaIrq(isa_irq,                            //
+                          vector,                             //
+                          static_cast<uint8_t>(destination),  //
+                          &level_triggered);
+  if (status != IoApicStatus::kOk) {
+    const IrqSpinLockGuard guard(g_device_irq_lock);
+    g_isa_device_configured[isa_device] = false;
+    return status == IoApicStatus::kNoDevice ? DeviceIrqStatus::kNoDevice
+                                             : DeviceIrqStatus::kInvalid;
+  }
+
+  if (level_triggered) {
+    const IrqSpinLockGuard guard(g_device_irq_lock);
+    VectorSlot& slot = g_slots[vector - kDeviceIrqVectorFirst];
+    if (slot.owner != kPciNoOwner && slot.level_isa_irq < 0) {
+      slot.level_isa_irq = isa_irq;
+      g_level_isa_slot_count.fetch_add(1, std::memory_order_release);
+    }
+  }
+  return DeviceIrqStatus::kOk;
+}
+
+void DeviceIrqReleaseIsaDevice(const int isa_device) {
+  if (isa_device < 0 || isa_device >= kIsaDeviceCount) {
+    return;
+  }
+  bool was_configured = false;
+  {
+    const IrqSpinLockGuard guard(g_device_irq_lock);
+    was_configured = g_isa_device_configured[isa_device];
+    g_isa_device_configured[isa_device] = false;
+  }
+  if (!was_configured) {
+    return;
+  }
+  const int isa_irq = IsaDeviceIrq(isa_device);
+  if (isa_irq >= 0) {
+    IoApicSetIsaIrqMasked(isa_irq, true);
+  }
+}
+
+void DeviceIrqResetIsaDevice(const int isa_device) {
+  if (isa_device < 0 || isa_device >= kIsaDeviceCount) {
+    return;
+  }
+  const IrqSpinLockGuard guard(g_device_irq_lock);
+  g_isa_device_configured[isa_device] = false;
+}
+
 int DeviceIrqFreeVectors(const uintptr_t owner) {
   CHECK(owner != kPciNoOwner);
   const IrqSpinLockGuard guard(g_device_irq_lock);
   int freed = 0;
   for (int i = 0; i < kDeviceIrqVectorCount; ++i) {
     if (g_slots[i].owner == owner) {
-      g_slots[i] = VectorSlot{};
+      ClearVectorSlotLocked(i);
       if (g_env != nullptr) {
         g_env->UnregisterIdtHandler(kDeviceIrqVectorFirst + i);
       }
@@ -419,7 +544,7 @@ int DeviceIrqFreeDeviceVectors(const uintptr_t owner, const int device_index) {
   int freed = 0;
   for (int i = 0; i < kDeviceIrqVectorCount; ++i) {
     if (g_slots[i].owner == owner && g_slots[i].device_index == device_index) {
-      g_slots[i] = VectorSlot{};
+      ClearVectorSlotLocked(i);
       if (g_env != nullptr) {
         g_env->UnregisterIdtHandler(kDeviceIrqVectorFirst + i);
       }
@@ -486,6 +611,9 @@ bool DeviceIrqDispatch(const int vector) {
   if (slot.owner == kPciNoOwner || slot.pending == nullptr) {
     return false;
   }
+  if (slot.level_isa_irq >= 0) {
+    IoApicSetIsaIrqMasked(slot.level_isa_irq, true);
+  }
   slot.pending->fetch_or(slot.bit, std::memory_order_release);
   if (slot.task != nullptr && g_env != nullptr) {
     g_env->Wake(slot.task);
@@ -510,7 +638,8 @@ int64_t DeviceIrqWait(std::atomic<uint64_t>* const pending,       //
     return static_cast<int64_t>(immediate);
   }
   if (mask != 0 && timeout_ticks == 0) {
-    return 0;
+    UnmaskWatchedLevelIrqs(pending, mask);
+    return static_cast<int64_t>(TryConsumePending(pending, mask));
   }
 
   const bool has_deadline = timeout_ticks > 0;
@@ -528,6 +657,7 @@ int64_t DeviceIrqWait(std::atomic<uint64_t>* const pending,       //
     if (has_deadline && g_env->NowTicks() >= deadline) {
       return static_cast<int64_t>(TryConsumePending(pending, mask));
     }
+    UnmaskWatchedLevelIrqs(pending, mask);
     if ((pending->load(std::memory_order_acquire) & mask) != 0) {
       continue;
     }
@@ -550,9 +680,13 @@ void DeviceIrqResetForTest() {
       g_slots[i] = VectorSlot{};
     }
     g_next_slot = 0;
+    g_level_isa_slot_count.store(0, std::memory_order_release);
     for (int i = 0; i < kPciMaxDevices; ++i) {
       g_device_configured[i] = false;
       g_msix_tables[i] = nullptr;
+    }
+    for (int i = 0; i < kIsaDeviceCount; ++i) {
+      g_isa_device_configured[i] = false;
     }
   }
   g_env.reset();

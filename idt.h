@@ -280,17 +280,22 @@ FaultProbeResult RunFaultProbe(void (*fn)(uintptr_t arg), uintptr_t arg);
 
 // C++ interrupt and exception dispatch entry point invoked by `isr_common_stub`
 // in `boot.S` with `rdi = rsp` (`InterruptFrame*`). It starts with interrupts
-// disabled (every gate is an interrupt gate). The handlers of vectors that
-// interrupt user code may enable interrupts and switch tasks; the system call
-// handler does (user_mode.h). Before such a frame returns to user code, which
-// may then happen on another CPU than the one that took the interrupt,
-// `IdtDispatch` disables interrupts again, points that CPU's `TSS.rsp0` back
-// at the top of the task's interrupt frame (`GdtSetKernelStack()`), and runs
-// the return-to-user handler (`IdtSetUserReturnHandler()`). Interrupts stay
-// disabled from there until `iretq`. Frames of interrupted kernel code, and of
-// the IST vectors (NMI, #DF, #MC), return with the interrupt flag as their
-// handlers left it. Unhandled CPU exceptions of kernel code panic, except a
-// page fault that ends the fault probe armed on the CPU (RunFaultProbe()).
+// disabled (every gate is an interrupt gate). The system call handler enables
+// interrupts (user_mode.h), and it and the timer and wakeup IPI handlers may
+// switch tasks: system calls need no Local APIC EOI, and the timer and wakeup
+// IPI get theirs before their handlers run. The other vectors that need an EOI
+// get it after their handlers return, so that a level-triggered I/O APIC line
+// can be masked first (device_irq.cpp); their handlers must neither enable
+// interrupts nor block or switch tasks. Before a frame that interrupted user
+// code returns to it, which may then happen on another CPU than the one that
+// took the interrupt, `IdtDispatch` disables interrupts again, points that
+// CPU's `TSS.rsp0` back at the top of the task's interrupt frame
+// (`GdtSetKernelStack()`), and runs the return-to-user handler
+// (`IdtSetUserReturnHandler()`). Interrupts stay disabled from there until
+// `iretq`. Frames of interrupted kernel code, and of the IST vectors (NMI,
+// #DF, #MC), return with the interrupt flag as their handlers left it.
+// Unhandled CPU exceptions of kernel code panic, except a page fault that ends
+// the fault probe armed on the CPU (RunFaultProbe()).
 extern "C" void IdtDispatch(InterruptFrame* frame);
 
 #if __STDC_HOSTED__

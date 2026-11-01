@@ -70,6 +70,10 @@ class DriverEnvironment {
   // Writes `text`, one line ending with '\n', to the kernel console, which
   // shows it also on a machine without a serial port.
   virtual void Log(const char* text) = 0;
+
+  // Executes an 8-bit x86 I/O-port read or write on `port` (`IsaPortIo`).
+  virtual uint8_t PortRead8(uint16_t port) = 0;
+  virtual void PortWrite8(uint16_t port, uint8_t value) = 0;
 };
 
 #if !__STDC_HOSTED__
@@ -169,18 +173,23 @@ class DriverContext {
                   int64_t timeout_ticks,           //
                   bool (*should_stop)(void* ctx),  //
                   void* stop_ctx);
+  int64_t IsaClaim(int64_t device);
+  int64_t IsaPortIo(int64_t op, uint64_t port, uint64_t value);
+  int64_t IsaIrqAlloc(int64_t device, Task* owner_task);
   bool BindVectorsForSelftest(int device_index, int count, Task* owner_task);
 
-  // Quiesces all claimed devices, masks and unmaps any MSI-X tables, frees all
-  // allocated IDT vectors, and releases all PCI claims in strict hardware-safe
-  // order. Idempotent; `UserProcess::Run()` calls this while `address_space_`
-  // is still alive (before DMA frames are freed).
+  // Quiesces all claimed devices, masks and unmaps any MSI-X tables, masks any
+  // claimed ISA I/O APIC redirection entries, frees all allocated IDT vectors,
+  // and releases all PCI and ISA claims in strict hardware-safe order.
+  // Idempotent; `UserProcess::Run()` calls this while `address_space_` is still
+  // alive (before DMA frames are freed).
   DriverReleaseRecord Release(bool address_space_alive = true);
 
   bool IsClaimed(int index) const;
+  bool IsIsaClaimed(int device) const;
   int ClaimedCount() const {
     const IrqSpinLockGuard guard(lock_);
-    return claimed_count_;
+    return claimed_count_ + isa_claimed_count_;
   }
   int NextIrqBit() const {
     const IrqSpinLockGuard guard(lock_);
@@ -208,6 +217,9 @@ class DriverContext {
   // Whether the device in the same slot of `claimed_` has vectors.
   bool irq_allocated_[kSyscallMaxClaims] = {};
   int claimed_count_ = 0;
+  bool isa_claimed_[kIsaDeviceCount] = {};
+  bool isa_irq_allocated_[kIsaDeviceCount] = {};
+  int isa_claimed_count_ = 0;
   uintptr_t next_mmio_addr_ = kDriverMmioWindowBase;
   uintptr_t next_dma_addr_ = kDriverDmaWindowBase;
   int64_t dma_total_bytes_ = 0;

@@ -73,8 +73,16 @@ UserModeEnter:
     xor r13d, r13d
     xor r14d, r14d
     xor r15d, r15d
-    /* Load the user GS base (see the ISR stubs in boot.S). */
+    /* Load the user GS base and user data segment selectors (see boot.S).
+     * Loading GS after swapgs sets IA32_GS_BASE (0) without disturbing
+     * IA32_KERNEL_GS_BASE (CpuLocal). */
     swapgs
+    mov eax, USER_DATA_SELECTOR
+    mov ds, ax
+    mov es, ax
+    mov fs, ax
+    mov gs, ax
+    xor eax, eax
     iretq
 .size UserModeEnter, . - UserModeEnter
 
@@ -90,6 +98,10 @@ UserModeEnter:
 .global UserModeExit
 .type UserModeExit, @function
 UserModeExit:
+    xor eax, eax
+    mov ds, ax
+    mov es, ax
+    mov fs, ax
     lea rsp, [rdi + 16]
     popfq
     pop r15

@@ -311,6 +311,7 @@ class UserProcess {
   // single innermost runqueue lock) may be called while holding it.
   mutable IrqSpinLock kill_lock_;
   bool task_reclaimed_ = false;
+  Task* exit_waiter_task_ = nullptr;
   // Written by the first Kill() before Wait() under `kill_lock_`, before it
   // publishes the request (`kill_requested_`); `kill_tick_` (stored last, with
   // release) publishes the other two.

@@ -141,20 +141,22 @@ enum class Mode : uint8_t {
   //   3 (`kOrphanOnFault`): spawns a spinning child and faults (#UD) without
   //     waiting for it.
   kSpawnAndWait,
-  // Calls every privileged system call (`7..16`) from an unprivileged process
-  // (`kUserCapNone`), checks that each returns `kSyscallErrorPermission`, that
-  // out-of-range system calls (`17`, `-1`) return `kSyscallErrorNoSys`, and
+  // Calls every privileged system call (`7..15`, `17..19`) from an unprivileged
+  // process (`kUserCapNone`), checks that each returns
+  // `kSyscallErrorPermission`, that `kSyscallGetTicks` (`16`) succeeds, that
+  // out-of-range system calls (`20`, `-1`) return `kSyscallErrorNoSys`, and
   // that a child spawned via `spawn()` also gets `kSyscallErrorPermission`.
   kDriverDenied,
   // Probes capability separation (`DriverSubmode(arg)`):
-  //   0 (`kProbeDriverRole`): run as `kUserCapDriver`; checks `pci_info` works,
-  //     `spawn_driver` returns `kSyscallErrorPermission`, reserved syscall `16`
-  //     returns `kSyscallErrorNoSys`, and a child spawned via `spawn()` runs
+  //   0 (`kProbeDriverRole`): run as `kUserCapDriver`; checks `pci_info`,
+  //     `get_ticks`, and unclaimed `isa_*` validation work, `spawn_driver`
+  //     returns `kSyscallErrorPermission`, out-of-range syscall `20` returns
+  //     `kSyscallErrorNoSys`, and a child spawned via `spawn()` runs
   //     `kDriverDenied` with `kUserCapNone` and exits with 0.
   //   1 (`kProbeSpawnerRole`): run as `kUserCapSpawnDrivers`; checks driver
-  //     syscalls `8..16` return `kSyscallErrorPermission`, then calls
-  //     `spawn_driver("usertest", ...)` with `kProbeDriverRole` and waits for
-  //     the driver child to exit with 0.
+  //     syscalls `8..15` and `17..19` return `kSyscallErrorPermission`, then
+  //     calls `spawn_driver("usertest", ...)` with `kProbeDriverRole` and waits
+  //     for the driver child to exit with 0.
   kDriverCapProbe,
   // Claims PCI device `DriverDeviceIndex(arg)`, enables Bus Master, maps BAR
   // `DriverBarIndex(arg)`, and according to `DriverSubmode(arg)`

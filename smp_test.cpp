@@ -30,6 +30,14 @@
 #include "uart.h"
 #include "vga.h"
 
+// GCC (13 and newer) reports -Wdangling-reference when a reference is
+// initialized from a call that binds a temporary to a reference parameter, as
+// in `const FakeSmpHardware& hw = InitSmp(LapicRecords(2));`. ResetState() and
+// InitSmp() return the fake machine, which outlives such temporaries.
+#if defined(__GNUC__) && !defined(__clang__) && __GNUC__ >= 13
+#pragma GCC diagnostic ignored "-Wdangling-reference"
+#endif
+
 namespace protos {
 namespace {
 
@@ -110,6 +118,24 @@ struct [[gnu::packed]] RawMadtLapic {
   uint8_t acpi_processor_id;
   uint8_t apic_id;
   uint32_t flags;
+};
+
+struct [[gnu::packed]] RawMadtIoApic {
+  uint8_t type;
+  uint8_t length;
+  uint8_t ioapic_id;
+  uint8_t reserved;
+  uint32_t ioapic_address;
+  uint32_t gsi_base;
+};
+
+struct [[gnu::packed]] RawMadtIso {
+  uint8_t type;
+  uint8_t length;
+  uint8_t bus;
+  uint8_t source;
+  uint32_t gsi;
+  uint16_t flags;
 };
 
 struct [[gnu::packed]] RawMadtLapicOverride {
@@ -369,6 +395,36 @@ static void AppendLapicRecord(std::vector<uint8_t>* const out,  //
   rec.length = sizeof(RawMadtLapic);
   rec.acpi_processor_id = acpi_id;
   rec.apic_id = apic_id;
+  rec.flags = flags;
+  const uint8_t* const bytes = reinterpret_cast<const uint8_t*>(&rec);
+  out->insert(out->end(), bytes, bytes + sizeof(rec));
+}
+
+static void AppendIoApicRecord(std::vector<uint8_t>* const out,  //
+                               const uint8_t ioapic_id,          //
+                               const uint32_t ioapic_addr,       //
+                               const uint32_t gsi_base) {
+  RawMadtIoApic rec = {};
+  rec.type = 1;
+  rec.length = sizeof(RawMadtIoApic);
+  rec.ioapic_id = ioapic_id;
+  rec.ioapic_address = ioapic_addr;
+  rec.gsi_base = gsi_base;
+  const uint8_t* const bytes = reinterpret_cast<const uint8_t*>(&rec);
+  out->insert(out->end(), bytes, bytes + sizeof(rec));
+}
+
+static void AppendIsoRecord(std::vector<uint8_t>* const out,  //
+                            const uint8_t bus,                //
+                            const uint8_t source,             //
+                            const uint32_t gsi,               //
+                            const uint16_t flags) {
+  RawMadtIso rec = {};
+  rec.type = 2;
+  rec.length = sizeof(RawMadtIso);
+  rec.bus = bus;
+  rec.source = source;
+  rec.gsi = gsi;
   rec.flags = flags;
   const uint8_t* const bytes = reinterpret_cast<const uint8_t*>(&rec);
   out->insert(out->end(), bytes, bytes + sizeof(rec));
@@ -959,6 +1015,215 @@ TEST_F(SmpTest, ParseMadtKeeps32BitX2ApicIdsAndProcessorUids) {
   EXPECT_THAT(topo.cpus[3].acpi_processor_id, t::Eq(0x40000004u));
   EXPECT_THAT(topo.cpus[4].apic_id, t::Eq(0x200u));
   EXPECT_THAT(topo.cpus[4].acpi_processor_id, t::Eq(0x60000006u));
+}
+
+TEST_F(SmpTest, ParseMadtAndSmpInitPopulateIoApicsAndIsaIrqOverrides) {
+  ResetState();
+  constexpr uintptr_t kMadtAddr = 0x6800;
+
+  std::vector<uint8_t> recs;
+  AppendLapicRecord(&recs, 0, 0, 1);
+  // Valid primary and secondary IOAPICs (including 1 KiB-aligned offset).
+  AppendIoApicRecord(&recs, 2, 0xFEC00000u, 0);
+  AppendIoApicRecord(&recs, 3, 0xFEC00400u, 24);
+  // Duplicate physical address, null-page address, misaligned address, and
+  // page-straddling address must be ignored.
+  AppendIoApicRecord(&recs, 9, 0xFEC00000u, 48);
+  AppendIoApicRecord(&recs, 4, 0x00000400u, 48);
+  AppendIoApicRecord(&recs, 5, 0xFEC01002u, 48);
+  AppendIoApicRecord(&recs, 6, 0xFEC01FF0u, 48);
+
+  // Classic PIT override: ISA IRQ 0 -> GSI 2, bus-conforming (edge, high).
+  AppendIsoRecord(&recs, 0, 0, 2, 0x0000);
+  // ISA IRQ 1 -> GSI 18, explicit active-low (0b11) + edge-triggered (0b01).
+  AppendIsoRecord(&recs, 0, 1, 18, 0x0007);
+  // ACPI SCI: ISA IRQ 9 -> GSI 9, explicit active-high (0b01) + level (0b11).
+  AppendIsoRecord(&recs, 0, 9, 9, 0x000D);
+  // Bus-conforming polarity (0b00) + level-triggered (0b11) -> active-low.
+  AppendIsoRecord(&recs, 0, 11, 21, 0x000C);
+  // Non-ISA bus (bus != 0), source >= 16, and reserved polarity/trigger (0b10)
+  // must be ignored.
+  AppendIsoRecord(&recs, 1, 4, 30, 0x000F);
+  AppendIsoRecord(&recs, 0, 16, 31, 0x000F);
+  AppendIsoRecord(&recs, 0, 5, 32, 0x0002);
+  AppendIsoRecord(&recs, 0, 6, 33, 0x0008);
+
+  // Fill remaining IOAPIC slots up to kMaxSupportedIoApics and verify overflow
+  // entries are ignored cleanly.
+  for (int i = 0; i < kMaxSupportedIoApics; ++i) {
+    AppendIoApicRecord(&recs, static_cast<uint8_t>(10 + i),
+                       0xFEC10000u + static_cast<uint32_t>(i) * 0x1000u,
+                       static_cast<uint32_t>(48 + i * 24));
+  }
+
+  WriteBiosAcpiTables(recs);
+  IdtInit();
+  SmpInit(kMultiboot1Magic, 0);
+
+  ASSERT_THAT(SmpIoApicCount(), t::Eq(kMaxSupportedIoApics));
+  EXPECT_THAT(SmpGetIoApicInfo(0)->ioapic_id, t::Eq(2u));
+  EXPECT_THAT(SmpGetIoApicInfo(0)->phys_addr, t::Eq(0xFEC00000u));
+  EXPECT_THAT(SmpGetIoApicInfo(0)->gsi_base, t::Eq(0u));
+  EXPECT_THAT(SmpGetIoApicInfo(1)->ioapic_id, t::Eq(3u));
+  EXPECT_THAT(SmpGetIoApicInfo(1)->phys_addr, t::Eq(0xFEC00400u));
+  EXPECT_THAT(SmpGetIoApicInfo(1)->gsi_base, t::Eq(24u));
+  EXPECT_THAT(SmpIoApicInfos(), t::Eq(SmpGetIoApicInfo(0)));
+
+  const IsaIrqRoute irq0 = SmpGetIsaIrqRoute(0);
+  EXPECT_THAT(irq0.gsi, t::Eq(2u));
+  EXPECT_FALSE(irq0.active_low);
+  EXPECT_FALSE(irq0.level_triggered);
+
+  const IsaIrqRoute irq1 = SmpGetIsaIrqRoute(1);
+  EXPECT_THAT(irq1.gsi, t::Eq(18u));
+  EXPECT_TRUE(irq1.active_low);
+  EXPECT_FALSE(irq1.level_triggered);
+
+  const IsaIrqRoute irq9 = SmpGetIsaIrqRoute(9);
+  EXPECT_THAT(irq9.gsi, t::Eq(9u));
+  EXPECT_FALSE(irq9.active_low);
+  EXPECT_TRUE(irq9.level_triggered);
+
+  const IsaIrqRoute irq11 = SmpGetIsaIrqRoute(11);
+  EXPECT_THAT(irq11.gsi, t::Eq(21u));
+  EXPECT_TRUE(irq11.active_low);
+  EXPECT_TRUE(irq11.level_triggered);
+
+  // Unoverridden and rejected ISA IRQs keep identity active-high edge routing.
+  for (const int irq : {2, 4, 5, 6, 15}) {
+    const IsaIrqRoute route = SmpGetIsaIrqRoute(irq);
+    EXPECT_THAT(route.gsi, t::Eq(static_cast<uint32_t>(irq)));
+    EXPECT_FALSE(route.active_low);
+    EXPECT_FALSE(route.level_triggered);
+  }
+  EXPECT_THAT(SmpIsaIrqRoutes()[1].gsi, t::Eq(18u));
+
+  // Truncated Type 1 or Type 2 entry stops MADT parsing cleanly.
+  ResetState();
+  recs.clear();
+  AppendLapicRecord(&recs, 0, 0, 1);
+  const uint8_t short_ioapic[6] = {1, 6, 2, 0, 0, 0};
+  recs.insert(recs.end(), short_ioapic, short_ioapic + sizeof(short_ioapic));
+  AppendLapicRecord(&recs, 1, 1, 1);
+  WriteMadt(kMadtAddr, kDefaultLocalApicPhysAddr, recs);
+  const StatusOr<SmpTopology> truncated =
+      SmpParseMadt(kMadtAddr, kIdentityMapLimit, 0);
+  ASSERT_TRUE(truncated.ok());
+  EXPECT_THAT(truncated->cpu_count, t::Eq(1));
+  EXPECT_THAT(truncated->ioapic_count, t::Eq(0));
+
+  // Fallback BSP-only topology (no MADT) still initializes identity ISA routes
+  // and 0 IOAPICs, and defaults `SmpHas8042()` to true.
+  ResetState();
+  IdtInit();
+  SmpInit(kMultiboot1Magic, 0);
+  EXPECT_THAT(SmpIoApicCount(), t::Eq(0));
+  EXPECT_TRUE(SmpHas8042());
+  for (int irq = 0; irq < kIsaIrqCount; ++irq) {
+    const IsaIrqRoute route = SmpGetIsaIrqRoute(irq);
+    EXPECT_THAT(route.gsi, t::Eq(static_cast<uint32_t>(irq)));
+    EXPECT_FALSE(route.active_low);
+    EXPECT_FALSE(route.level_triggered);
+  }
+}
+
+TEST_F(SmpTest, FadtBootArch8042ControlsHas8042AndSVRBit12IsCleared) {
+  constexpr uintptr_t kRsdtAddr = 0x6100;
+  constexpr uintptr_t kXsdtAddr = 0x6200;
+  constexpr uintptr_t kMadtAddr = 0x6400;
+  constexpr uintptr_t kFadtAddr = 0x6800;
+
+  auto write_fadt = [](const uintptr_t addr, const uint8_t revision,
+                       const int64_t total_len, const uint16_t iapc_boot_arch,
+                       const bool corrupt_checksum = false) {
+    uint8_t* const bytes = At(addr);
+    std::memset(bytes, 0, total_len);
+    if (total_len >= 111) {
+      bytes[109] = static_cast<uint8_t>(iapc_boot_arch & 0xFFu);
+      bytes[110] = static_cast<uint8_t>((iapc_boot_arch >> 8) & 0xFFu);
+    }
+    RawSdtHeader* const sdt = At<RawSdtHeader>(addr);
+    FinalizeSdt(sdt, "FACP", total_len);
+    sdt->revision = revision;
+    sdt->checksum = 0;
+    sdt->checksum = ComputeChecksumByte(sdt, total_len);
+    if (corrupt_checksum) {
+      sdt->checksum = static_cast<uint8_t>(sdt->checksum ^ 0xFFu);
+    }
+  };
+
+  // 1. No FADT in RSDT -> `has_i8042` defaults to true; SVR bit 12 (`0x1000`)
+  // pre-set by firmware is cleared on both BSP and APs.
+  {
+    FakeSmpHardware::Options options = DefaultOptions();
+    options.initial_lapic_svr = 0x12FFu;
+    const FakeSmpHardware& hw = InitSmp(LapicRecords(2), options);
+    EXPECT_TRUE(SmpHas8042());
+    for (uint32_t apic_id = 0; apic_id < 2; ++apic_id) {
+      bool saw_svr_write = false;
+      for (const RegisterWrite& write : RegisterWrites(hw, apic_id)) {
+        if (write.first == kLapicSvr) {
+          saw_svr_write = true;
+          EXPECT_THAT(write.second & (1u << 12), t::Eq(0u));
+          EXPECT_THAT(write.second, t::Eq(0x03FFu));
+        }
+      }
+      EXPECT_TRUE(saw_svr_write);
+    }
+  }
+
+  // 2. FADT revision 1 (ACPI 1.0 PC) with `iapc_boot_arch == 0` -> true.
+  {
+    ResetState();
+    WriteMadt(kMadtAddr, kDefaultLocalApicPhysAddr, LapicRecords(1));
+    write_fadt(kFadtAddr, /*revision=*/1, /*total_len=*/116,
+               /*iapc_boot_arch=*/0x0000u);
+    WriteRsdt(kRsdtAddr, {static_cast<uint32_t>(kFadtAddr),
+                          static_cast<uint32_t>(kMadtAddr)});
+    WriteRsdpV1(kBiosRomRsdpAddr, static_cast<uint32_t>(kRsdtAddr));
+    IdtInit();
+    SmpInit(kMultiboot1Magic, 0);
+    EXPECT_TRUE(SmpHas8042());
+  }
+
+  // 3. FADT revision 3 (ACPI 2.0+) with bit 1 (`0x0002`) cleared -> false.
+  {
+    ResetState();
+    WriteMadt(kMadtAddr, kDefaultLocalApicPhysAddr, LapicRecords(1));
+    write_fadt(kFadtAddr, /*revision=*/3, /*total_len=*/244,
+               /*iapc_boot_arch=*/0x0001u);
+    WriteXsdt(kXsdtAddr, {kFadtAddr, kMadtAddr});
+    WriteRsdpV2(kBiosRomRsdpAddr, 0, kXsdtAddr);
+    IdtInit();
+    SmpInit(kMultiboot1Magic, 0);
+    EXPECT_FALSE(SmpHas8042());
+  }
+
+  // 4. FADT revision 3 with bit 1 (`0x0002`) set -> true.
+  {
+    ResetState();
+    WriteMadt(kMadtAddr, kDefaultLocalApicPhysAddr, LapicRecords(1));
+    write_fadt(kFadtAddr, /*revision=*/3, /*total_len=*/244,
+               /*iapc_boot_arch=*/0x0003u);
+    WriteXsdt(kXsdtAddr, {kFadtAddr, kMadtAddr});
+    WriteRsdpV2(kBiosRomRsdpAddr, 0, kXsdtAddr);
+    IdtInit();
+    SmpInit(kMultiboot1Magic, 0);
+    EXPECT_TRUE(SmpHas8042());
+  }
+
+  // 5. FADT revision 3 with corrupt checksum -> ignored, defaults to true.
+  {
+    ResetState();
+    WriteMadt(kMadtAddr, kDefaultLocalApicPhysAddr, LapicRecords(1));
+    write_fadt(kFadtAddr, /*revision=*/3, /*total_len=*/244,
+               /*iapc_boot_arch=*/0x0000u, /*corrupt_checksum=*/true);
+    WriteXsdt(kXsdtAddr, {kFadtAddr, kMadtAddr});
+    WriteRsdpV2(kBiosRomRsdpAddr, 0, kXsdtAddr);
+    IdtInit();
+    SmpInit(kMultiboot1Magic, 0);
+    EXPECT_TRUE(SmpHas8042());
+  }
 }
 
 TEST_F(SmpTest, CpuidInitialApicIdComesFromLeaf0BWhenX2ApicIsAvailable) {

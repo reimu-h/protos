@@ -115,7 +115,16 @@ FORBIDDEN_OVERRIDE_OPTIONS: frozenset[str] = frozenset({
     "-daemonize",
 })
 
-DEFAULT_LOCK_PATH = Path("/tmp/protos_deflake/host.lock")
+def default_lock_path(env: Mapping[str, str] | None = None) -> Path:
+    """Returns a per-user lock path under XDG_RUNTIME_DIR or /tmp."""
+    src_env = os.environ if env is None else env
+    runtime_dir = src_env.get("XDG_RUNTIME_DIR")
+    if runtime_dir:
+        return Path(runtime_dir) / "protos_deflake" / "host.lock"
+    return Path(f"/tmp/protos_deflake-{os.getuid()}") / "host.lock"
+
+
+DEFAULT_LOCK_PATH = default_lock_path()
 
 GREETING = "Hello, x86-64 Kernel World!"
 SUITE_PASSED_MARKER = "[TEST] ALL BOOT SELF-TESTS PASSED"
@@ -1185,8 +1194,28 @@ def archive_iso(path: Path, store: Path) -> tuple[Path, str]:
     return dest.resolve(), digest
 
 
+def _git_dirty(repo: Path) -> bool | None:
+    """Returns whether `git status --porcelain` sees uncommitted changes, or None."""
+    if not (repo / ".git").exists():
+        return None
+    try:
+        res = subprocess.run(
+            ["git", "--no-optional-locks", "status", "--porcelain"],
+            cwd=repo,
+            capture_output=True,
+            text=True,
+            timeout=10,
+            check=False,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if res.returncode != 0:
+        return None
+    return bool(res.stdout.strip())
+
+
 def vcs_provenance(repo: Path) -> dict[str, Any]:
-    """Queries read-only jj working copy provenance without snapshotting."""
+    """Queries read-only jj or git working-copy provenance without mutating VCS state."""
     if (repo / ".jj").is_dir():
         try:
             log_res = subprocess.run(
@@ -1218,15 +1247,55 @@ def vcs_provenance(repo: Path) -> dict[str, Any]:
                 change_id = parts[0] if len(parts) >= 1 else ""
                 commit_id = parts[1] if len(parts) >= 2 else ""
                 diff_bytes = diff_res.stdout or b""
+                git_dirty = _git_dirty(repo)
                 return {
                     "tool": "jj",
                     "workspace": str(repo),
                     "change_id": change_id,
                     "commit_id": commit_id,
                     "diff_sha256": hashlib.sha256(diff_bytes).hexdigest(),
-                    "dirty": bool(diff_bytes.strip()),
+                    "dirty": bool(diff_bytes.strip()) or bool(git_dirty),
                 }
-        except OSError:
+        except (OSError, subprocess.SubprocessError):
+            pass
+
+    if (repo / ".git").exists():
+        try:
+            head_res = subprocess.run(
+                ["git", "--no-optional-locks", "rev-parse", "HEAD"],
+                cwd=repo,
+                capture_output=True,
+                text=True,
+                timeout=10,
+                check=False,
+            )
+            status_res = subprocess.run(
+                ["git", "--no-optional-locks", "status", "--porcelain"],
+                cwd=repo,
+                capture_output=True,
+                text=True,
+                timeout=10,
+                check=False,
+            )
+            diff_res = subprocess.run(
+                ["git", "--no-optional-locks", "diff", "HEAD"],
+                cwd=repo,
+                capture_output=True,
+                timeout=10,
+                check=False,
+            )
+            if head_res.returncode == 0 and status_res.returncode == 0:
+                commit_id = head_res.stdout.strip()
+                diff_bytes = diff_res.stdout or b""
+                return {
+                    "tool": "git",
+                    "workspace": str(repo),
+                    "change_id": None,
+                    "commit_id": commit_id,
+                    "diff_sha256": hashlib.sha256(diff_bytes).hexdigest(),
+                    "dirty": bool(status_res.stdout.strip()),
+                }
+        except (OSError, subprocess.SubprocessError):
             pass
 
     return {
@@ -1306,11 +1375,14 @@ def build_identity(
     if not defines:
         defines = ["-DPROTOS_SELFTEST=1"]
 
+    # The Docker image (Dockerfile) pins Debian bookworm: GRUB 2.06 and
+    # GCC 12 ("GCC: (Debian 12.2.0-...) 12.2.0"). Any other GRUB or GCC build
+    # comes from a host toolchain.
     toolchain = "unknown"
-    is_host_grub = bool(grub_version and "2.14" in grub_version)
     is_docker_grub = bool(grub_version and "2.06" in grub_version)
-    is_host_gcc = any("15." in c for c in compilers)
-    is_docker_gcc = any("12." in c for c in compilers)
+    is_host_grub = bool(grub_version and not is_docker_grub)
+    is_docker_gcc = any("Debian 12." in c for c in compilers)
+    is_host_gcc = any("Debian 12." not in c for c in compilers)
 
     if (is_host_grub or is_host_gcc) and not (is_docker_grub or is_docker_gcc):
         toolchain = "host"
@@ -1420,9 +1492,13 @@ class HostLock:
         if self.path is None:
             self.wait_s = 0.0
             return self
-        self.path.parent.mkdir(parents=True, exist_ok=True)
+        parent = self.path.parent
+        if parent.is_symlink():
+            raise OSError(f"Refusing symlinked lock directory: {parent}")
+        parent.mkdir(mode=0o700, parents=True, exist_ok=True)
         t0 = time.monotonic()
-        fd = os.open(str(self.path), os.O_CREAT | os.O_RDWR, 0o666)
+        flags = os.O_CREAT | os.O_RDWR | getattr(os, "O_NOFOLLOW", 0)
+        fd = os.open(str(self.path), flags, 0o600)
         try:
             fcntl.flock(fd, fcntl.LOCK_EX)
         except BaseException:
@@ -1442,7 +1518,9 @@ class HostLock:
 
 
 def stop_process_group(
-    proc: subprocess.Popen[Any], docker_name: str | None = None
+    proc: subprocess.Popen[Any],
+    docker_name: str | None = None,
+    docker_bin: str = "docker",
 ) -> None:
     """Terminates a process group (and optional Docker container) cleanly."""
     if proc.poll() is None:
@@ -1470,7 +1548,7 @@ def stop_process_group(
     if docker_name:
         try:
             subprocess.run(
-                ["docker", "kill", docker_name],
+                [docker_bin, "kill", docker_name],
                 stdout=subprocess.DEVNULL,
                 stderr=subprocess.DEVNULL,
                 timeout=10,
@@ -1831,6 +1909,28 @@ def docker_run_identity(
     return f"{uid}:{gid}", volume_opts
 
 
+def _default_kvm_gid() -> int | None:
+    try:
+        return os.stat("/dev/kvm").st_gid
+    except OSError:
+        return None
+
+
+def docker_kvm_args(
+    env: Mapping[str, str],
+    *,
+    kvm_gid: Callable[[], int | None] = _default_kvm_gid,
+) -> tuple[str, ...]:
+    """Returns Docker arguments for KVM=1 mirroring Makefile's DOCKER_KVM_ARGS."""
+    if env.get("KVM") != "1":
+        return ()
+    args: list[str] = ["--device", "/dev/kvm", "-e", "KVM=1"]
+    gid = kvm_gid()
+    if gid is not None:
+        args.extend(["--group-add", str(gid)])
+    return tuple(args)
+
+
 def build_docker_test_boot_argv(
     repo: Path,
     pass_name: str,
@@ -1845,6 +1945,7 @@ def build_docker_test_boot_argv(
     gid: int | None = None,
     user: str | None = None,
     volume_opts: str = "",
+    kvm_args: Sequence[str] = (),
 ) -> tuple[str, ...]:
     """Builds the exact docker run command mirroring Makefile's DOCKER_RUN.
 
@@ -1865,6 +1966,7 @@ def build_docker_test_boot_argv(
     ])
     for var in BOOT_TEST_ENV_VARS:
         cmd.extend(["-e", var])
+    cmd.extend(kvm_args)
     cmd.extend([
         "-v",
         f"{repo}:/workspace{volume_opts}",
@@ -1898,6 +2000,7 @@ def run_test_boot_pass(
     docker_image: str = DEFAULT_DOCKER_IMAGE,
     docker_user: str | None = None,
     docker_volume_opts: str = "",
+    docker_kvm_extra: Sequence[str] = (),
 ) -> RunRecord:
     """Executes one pass of test_boot.sh (host or docker) and reads its verdict."""
     run_dir.mkdir(parents=True, exist_ok=True)
@@ -1954,6 +2057,7 @@ def run_test_boot_pass(
             docker_image=docker_image,
             user=docker_user,
             volume_opts=docker_volume_opts,
+            kvm_args=docker_kvm_extra,
         )
     else:
         container_name = None
@@ -1993,13 +2097,17 @@ def run_test_boot_pass(
                 exit_code = proc.wait(timeout=watchdog_s)
             except subprocess.TimeoutExpired:
                 watchdog_fired = True
-                stop_process_group(proc, docker_name=container_name)
+                stop_process_group(
+                    proc, docker_name=container_name, docker_bin=docker_bin
+                )
                 exit_code = proc.returncode
             except BaseException:
                 # Ctrl-C, SIGTERM or SIGHUP (see stop_signals_raise), which
                 # don't reach test_boot.sh's session: stop it, its QEMU and
                 # its container before the caller releases the host lock.
-                stop_process_group(proc, docker_name=container_name)
+                stop_process_group(
+                    proc, docker_name=container_name, docker_bin=docker_bin
+                )
                 raise
     except OSError as e:
         test_boot_log_path.write_text(f"Spawn error: {e}\n", encoding="utf-8")
@@ -2223,6 +2331,11 @@ def render_rerun_script(
                     )
         if qemu_argv:
             # The user and the bind mount options of the harness's container.
+            docker_bin = (
+                record.harness_argv[0]
+                if record.harness_argv
+                else (os.environ.get("DOCKER") or "docker")
+            )
             user = _docker_run_option(record.harness_argv, "--user") or (
                 f"{os.getuid()}:{os.getgid()}"
             )
@@ -2231,10 +2344,18 @@ def render_rerun_script(
                 _docker_run_option(record.harness_argv, "-v", workspace) or workspace
             )
             volume_opts = workspace_mount[len(workspace) :].replace(":", ",", 1)
-            image = docker_image_id or DEFAULT_DOCKER_IMAGE
+            extra_docker_opts: list[str] = []
+            for i in range(len(record.harness_argv) - 1):
+                if record.harness_argv[i] in ("--device", "--group-add"):
+                    extra_docker_opts.extend(record.harness_argv[i : i + 2])
+            image = (
+                docker_image_id
+                or os.environ.get("DOCKER_IMAGE")
+                or DEFAULT_DOCKER_IMAGE
+            )
             iso_store = str(Path(record.iso_snapshot).parent)
             docker_cmd = [
-                "docker",
+                docker_bin,
                 "run",
                 "--rm",
                 "--platform=linux/amd64",
@@ -2242,6 +2363,7 @@ def render_rerun_script(
                 user,
                 "-e",
                 "HOME=/tmp",
+                *extra_docker_opts,
                 "-v",
                 workspace_mount,
                 "-v",
@@ -2558,11 +2680,15 @@ def render_text(summary: dict[str, Any], registry: Sequence[str]) -> str:
         tc = b_info.get("toolchain", "unknown")
         defs = " ".join(b_info.get("defines", []))
         vcs = b_info.get("vcs") or {}
-        vcs_str = (
-            f"jj {vcs.get('change_id', '')[:8]} {vcs.get('commit_id', '')[:8]}"
-            if vcs.get("tool") == "jj"
-            else "no-vcs"
-        )
+        if vcs.get("tool") == "jj":
+            vcs_str = (
+                f"jj {vcs.get('change_id', '')[:8]} {vcs.get('commit_id', '')[:8]}"
+            )
+        elif vcs.get("tool") == "git":
+            dirty_suffix = " (dirty)" if vcs.get("dirty") else ""
+            vcs_str = f"git {(vcs.get('commit_id') or '')[:8]}{dirty_suffix}"
+        else:
+            vcs_str = "no-vcs"
         lines.append(
             f"build: {b_id} sha256={iso_sha}... ({grub}, toolchain={tc}, {defs}) {vcs_str}"
         )
@@ -2757,8 +2883,11 @@ def build_arg_parser() -> argparse.ArgumentParser:
     p.add_argument(
         "--lock",
         type=str,
-        default=str(DEFAULT_LOCK_PATH),
-        help="Per-boot flock file path (default: /tmp/protos_deflake/host.lock; '' or 'none' to disable).",
+        default=str(default_lock_path()),
+        help=(
+            "Per-boot flock file path (default: $XDG_RUNTIME_DIR/protos_deflake/host.lock"
+            " or /tmp/protos_deflake-$UID/host.lock; '' or 'none' to disable)."
+        ),
     )
     p.add_argument(
         "--no-lock",
@@ -2850,10 +2979,18 @@ def run_session(
         return 0
 
     uses_docker = any(c.engine == "test_boot" and c.mode == "docker" for c in configs)
+    docker_bin = os.environ.get("DOCKER") or "docker"
+    configured_docker_image = (
+        os.environ.get("DOCKER_IMAGE") or DEFAULT_DOCKER_IMAGE
+    )
     docker_user: str | None = None
     docker_volume_opts = ""
+    kvm_docker_args: tuple[str, ...] = ()
     if uses_docker:
-        docker_user, docker_volume_opts = docker_run_identity(os.environ)
+        docker_user, docker_volume_opts = docker_run_identity(
+            os.environ, docker_bin=docker_bin
+        )
+        kvm_docker_args = docker_kvm_args(os.environ)
 
     if args.dry_run:
         iso_preview = args.iso or str(repo_root / "build" / "kernel.iso")
@@ -2872,8 +3009,11 @@ def run_session(
                     f"build/deflake/dry/{c.pass_name}",
                     iso_preview,
                     mb1_preview,
+                    docker_bin=docker_bin,
+                    docker_image=configured_docker_image,
                     user=docker_user,
                     volume_opts=docker_volume_opts,
+                    kvm_args=kvm_docker_args,
                 )
                 print(f"[{c.name}] {shlex.join(d_argv)}")
             else:
@@ -2962,12 +3102,16 @@ def run_session(
 
     lock_path: Path | None = None
     if not args.no_lock and args.lock and args.lock.lower() != "none":
-        lock_path = Path(args.lock).resolve()
+        lock_path = Path(os.path.abspath(args.lock))
 
     # The docker:<pass> runs use (and record) the image that the tag names now,
     # also if the tag moves on during the session (when make rebuilds the
     # image from another checkout's Dockerfile, for example).
-    image_id = docker_image_id(DEFAULT_DOCKER_IMAGE) if uses_docker else None
+    image_id = (
+        docker_image_id(configured_docker_image, docker_bin=docker_bin)
+        if uses_docker
+        else None
+    )
 
     records: list[RunRecord] = []
     per_cfg_count: dict[str, int] = {c.name: 0 for c in configs}
@@ -3032,9 +3176,11 @@ def run_session(
                         build_id=b_id,
                         session_id=session_id,
                         lock_wait_s=lk.wait_s,
-                        docker_image=image_id or DEFAULT_DOCKER_IMAGE,
+                        docker_bin=docker_bin,
+                        docker_image=image_id or configured_docker_image,
                         docker_user=docker_user,
                         docker_volume_opts=docker_volume_opts,
+                        docker_kvm_extra=kvm_docker_args,
                     )
         except KeyboardInterrupt as e:
             interrupted = True
