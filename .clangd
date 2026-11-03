@@ -15,6 +15,7 @@ If:
 CompileFlags:
   Add:
     - -masm=intel
+    - -march=x86-64
     - -ffreestanding
     - -fno-builtin
     - -fno-exceptions

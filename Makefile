@@ -44,8 +44,14 @@ PROJECT_INCLUDE_FLAGS := -iquote .
 # libstdc++ assertions call std::__glibcxx_assert_fail, which neither the
 # kernel nor the user programs define, and CET adds endbr64 instructions and
 # GNU property notes, which they don't use.
+# -march=x86-64 (also for the user programs) targets the baseline x86-64 ISA
+# whatever the compiler's default: Ubuntu's GCC for the amd64v3 architecture
+# variant (as on GitHub's ubuntu-26.04 runners) defaults to -march=x86-64-v3,
+# whose BMI1/BMI2/LZCNT/MOVBE/POPCNT instructions raise #UD on CPUs without
+# them, such as QEMU's default qemu64 CPU that the boot tests use.
+ARCH_CXXFLAGS := -march=x86-64
 CXXFLAGS := -m64 -masm=intel -std=c++20 -O2 -Wall -Wextra $(WERROR_FLAG) \
-            -ffreestanding -nostdlib -fno-builtin \
+            $(ARCH_CXXFLAGS) -ffreestanding -nostdlib -fno-builtin \
             -fno-exceptions -fno-rtti -mno-red-zone \
             -mgeneral-regs-only -fno-stack-protector -fno-pie \
             -fstack-clash-protection \
@@ -77,7 +83,7 @@ TEST_COMMON_LDFLAGS := -lgmock_main -lgmock -lgtest -pthread
 # memory functions that user/crt.cpp defines with such loops.
 USER_PROGRAMS := init sh usertest usbkbd ps2kbd
 USER_CXXFLAGS := -m64 -masm=intel -std=c++20 -O2 -Wall -Wextra $(WERROR_FLAG) \
-                 -ffreestanding -nostdlib -fno-builtin \
+                 $(ARCH_CXXFLAGS) -ffreestanding -nostdlib -fno-builtin \
                  -fno-exceptions -fno-rtti -mno-red-zone \
                  -fno-stack-protector -fno-pie \
                  -mcmodel=kernel -fno-asynchronous-unwind-tables \
