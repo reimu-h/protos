@@ -378,6 +378,9 @@ REQUIRED_MARKERS=(
   "[TEST] driver_teardown: PASS"
   "[TEST] usbkbd_driver_lifecycle: PASS"
   "[TEST] ps2kbd_driver_lifecycle: PASS"
+  "[TEST] ipc_subsystem: PASS"
+  "[TEST] ramfs_driver_lifecycle: PASS"
+  "[TEST] filesystem_end_to_end: PASS"
   "[TEST] user_mode_kill_edge_cases: PASS"
   "[TEST] user_mode_syscall_buffer_checks: PASS"
   "[TEST] user_mode_fpu_lifecycle: PASS"
@@ -408,6 +411,15 @@ USB_MULTI_ARGS=(
   -device usb-kbd,bus=xhci1.0,port=2.1,id=hkbd0,usb_version=1
   -device usb-kbd,bus=xhci1.0,port=1,id=kbd1,usb_version=1
 )
+
+# init's greeting and the kernel's report of its end, the marker of the ramfs
+# filesystem server, and init's report that ramfs did not get ready
+# (verify_init_ramfs).
+INIT_HELLO_MARKER="[INIT] hello from ring 3"
+INIT_EXITED_MARKER="[INIT] exited with status"
+RAMFS_READY_MARKER="[RAMFS] ready"
+RAMFS_NOT_READY_MARKER="[INIT] ramfs not ready"
+
 # Markers that the USB passes require besides REQUIRED_MARKERS: the driver's
 # (which run_usb_session checks in detail) and the kernel's verdict that the
 # driver released everything after the init session.
@@ -663,7 +675,7 @@ RUN_DIR="$(mktemp -d "${BUILD_DIR}/test_boot.XXXXXX")"
 
 # Prints the number of lines in file $1 that contain the fixed string $2.
 count_matches() {
-  grep -Fc -- "$2" "$1" 2>/dev/null || true
+  grep -aFc -- "$2" "$1" 2>/dev/null || true
 }
 
 # Waits until the serial log $1 of QEMU process $2 shows a completed boot (the
@@ -675,12 +687,12 @@ wait_for_boot() {
   local deadline=$((SECONDS + timeout_secs))
   while ((SECONDS < deadline)); do
     if [[ -f "${log}" ]]; then
-      if grep -Eq -- "${FAILURE_PATTERN}" "${log}"; then
+      if grep -aEq -- "${FAILURE_PATTERN}" "${log}"; then
         drain_after_failure "${log}" "${pid}" "${deadline}"
         return 1
       fi
-      if grep -Fq -- "${EXPECTED_STRING}" "${log}" &&
-         grep -Fq -- "${COMPLETION_MARKER}" "${log}" &&
+      if grep -aFq -- "${EXPECTED_STRING}" "${log}" &&
+         grep -aFq -- "${COMPLETION_MARKER}" "${log}" &&
          (($(count_matches "${log}" "${STRESS_MARKER}") >= MIN_STRESS_PASSES)); then
         return 0
       fi
@@ -704,7 +716,7 @@ drain_after_failure() {
     return 0
   fi
   while ((SECONDS < deadline)) && kill -0 "${pid}" 2>/dev/null; do
-    if grep -Eq -- "${SUITE_END_OR_PANIC_PATTERN}" "${log}"; then
+    if grep -aEq -- "${SUITE_END_OR_PANIC_PATTERN}" "${log}"; then
       sleep 1
       return 0
     fi
@@ -721,7 +733,7 @@ verify_serial_log() {
   shift 2
   local marker
   for marker in "${REQUIRED_MARKERS[@]}" "$@"; do
-    if ! grep -Fq -- "${marker}" "${log}"; then
+    if ! grep -aFq -- "${marker}" "${log}"; then
       echo "FAIL: Missing required marker '${marker}' in serial output." >&2
       return 1
     fi
@@ -729,9 +741,9 @@ verify_serial_log() {
 
   # Give a late panic or triple fault a moment to show up.
   sleep 0.5
-  if grep -Eq -- "${FAILURE_PATTERN}" "${log}"; then
+  if grep -aEq -- "${FAILURE_PATTERN}" "${log}"; then
     echo "FAIL: Found a failure line in serial output:" >&2
-    grep -E -- "${FAILURE_PATTERN}" "${log}" >&2
+    grep -aE -- "${FAILURE_PATTERN}" "${log}" >&2
     return 1
   fi
   if ! kill -0 "${pid}" 2>/dev/null; then
@@ -747,6 +759,31 @@ verify_serial_log() {
   fi
 }
 
+# Checks init's ramfs in the serial log $1: init never reported that ramfs did
+# not get ready, and in a boot without the interactive session ($2 is 0),
+# where init runs before the boot self-tests (which run ramfs again and print
+# its marker several times), ramfs reported ready between init's greeting and
+# init's end. (The USB session checks the marker of the interactive session.)
+verify_init_ramfs() {
+  local log="$1" interactive="$2"
+  if grep -aFq -- "${RAMFS_NOT_READY_MARKER}" "${log}"; then
+    echo "FAIL: init reported that ramfs did not get ready ('${RAMFS_NOT_READY_MARKER}')." >&2
+    return 1
+  fi
+  if [[ "${interactive}" == "1" ]]; then
+    return 0
+  fi
+  local hello ready exited
+  hello="$(grep -an -m1 -F -- "${INIT_HELLO_MARKER}" "${log}" | cut -d: -f1 || true)"
+  ready="$(grep -an -m1 -F -- "${RAMFS_READY_MARKER}" "${log}" | cut -d: -f1 || true)"
+  exited="$(grep -an -m1 -F -- "${INIT_EXITED_MARKER}" "${log}" | cut -d: -f1 || true)"
+  if [[ -z "${hello}" || -z "${ready}" || -z "${exited}" ]] ||
+     ((ready < hello || ready > exited)); then
+    echo "FAIL: Missing '${RAMFS_READY_MARKER}' of init's ramfs between '${INIT_HELLO_MARKER}' and '${INIT_EXITED_MARKER}' in serial output." >&2
+    return 1
+  fi
+}
+
 # Checks that the serial log $1 contains none of the markers $2...: lines that
 # would contradict the CPU model of the pass. Reports the first one found on
 # stderr (the pass output, not the serial log).
@@ -755,7 +792,7 @@ verify_absent_markers() {
   shift
   local marker
   for marker in "$@"; do
-    if grep -Fq -- "${marker}" "${log}"; then
+    if grep -aFq -- "${marker}" "${log}"; then
       echo "FAIL: Unexpected marker '${marker}' in serial output." >&2
       return 1
     fi
@@ -770,7 +807,7 @@ verify_consistent_reports() {
   shift
   local prefix count
   for prefix in "$@"; do
-    count="$(grep -F -- "${prefix}" "${log}" | sort -u | wc -l || true)"
+    count="$(grep -aF -- "${prefix}" "${log}" | sort -u | wc -l || true)"
     if [[ "${count}" -ne 1 ]]; then
       echo "FAIL: Expected one distinct '${prefix}' line in serial output, found ${count}." >&2
       return 1
@@ -895,11 +932,11 @@ verify_x87_pointer_reset() {
   fi
   local cpus="QEMU reports ${VCPUS_PER_PASS} vCPUs ${vendor} with XSAVEERPTR=${xsaveerptr}"
   local reason="${cpus}, so the kernel must report '[CPU] x87 pointer reset: ${expected}' (it resets the x87 pointers exactly on AMD CPUs without XSAVEERPTR)"
-  if grep -Fq -- "[CPU] x87 pointer reset: ${unexpected}" "${log}"; then
+  if grep -aFq -- "[CPU] x87 pointer reset: ${unexpected}" "${log}"; then
     echo "FAIL: Unexpected marker '[CPU] x87 pointer reset: ${unexpected}' in serial output: ${reason}." >&2
     return 1
   fi
-  if ! grep -Fq -- "[CPU] x87 pointer reset: ${expected}" "${log}"; then
+  if ! grep -aFq -- "[CPU] x87 pointer reset: ${expected}" "${log}"; then
     echo "FAIL: Missing required marker '[CPU] x87 pointer reset: ${expected}' in serial output: ${reason}." >&2
     return 1
   fi
@@ -1163,9 +1200,9 @@ stop_qemu_and_recheck_log() {
     return 1
   fi
   kill_qemu
-  if grep -Eq -- "${FAILURE_PATTERN}" "${log}"; then
+  if grep -aEq -- "${FAILURE_PATTERN}" "${log}"; then
     echo "FAIL: Found a failure line in serial output:" >&2
-    grep -E -- "${FAILURE_PATTERN}" "${log}" >&2
+    grep -aE -- "${FAILURE_PATTERN}" "${log}" >&2
     return 1
   fi
 }
@@ -1179,10 +1216,10 @@ stop_qemu_and_recheck_log() {
 # through the serial console socket. Every line's random parts are generated
 # right before it is typed, and the shell's output must match the edited line
 # exactly. Order (the kernel's interactive boot session): the boot self-tests,
-# the init session's scripted commands and the driver's markers, a serial
-# echo command, the scenarios of the pass, then 'exit 0' typed over USB, after
-# which init must exit with status 0 and the kernel report that the driver
-# released everything ('[TEST] driver_session_cleanup: PASS').
+# the init session's scripted commands and the markers of the drivers and of
+# ramfs, a serial echo command, the scenarios of the pass, then 'exit 0' typed
+# over USB, after which init must exit with status 0 and the kernel report
+# that the driver released everything ('[TEST] driver_session_cleanup: PASS').
 # bios: a random token; Shift (both keys) with Backspace corrections; an empty
 # line, Backspace on an empty line and Caps Lock (with Shift); a line typed
 # partly over USB and partly into the serial console; the keyboard unplugged
@@ -1251,10 +1288,14 @@ CLEANUP_PASS = "[TEST] driver_session_cleanup: PASS"
 NO_CONTROLLERS = "[USBKBD] no xHCI controllers found"
 PS2_READY = "[PS2KBD] controller i8042 ready (irq1)"
 NO_PS2 = "[PS2KBD] no i8042 controller found"
+RAMFS_READY = "[RAMFS] ready"
+RAMFS_NOT_READY = "[INIT] ramfs not ready"
 STRESS = "[STRESS]"
 PROMPT = "sh> "
-HELP_LINES = ("built-in commands: help echo cpu programs run exit",
-              "user programs: init sh usertest")
+HELP_LINES = (
+    "built-in commands: help echo cpu ls cat mkdir rm touch programs run exit",
+    "user programs: init sh usertest",
+)
 SCRIPTED_ECHO = "boot_sh_ok"
 USERTEST_RE = re.compile(r"sh: usertest exited with status -?[0-9]+")
 FAILURE_RE = re.compile(r"FAIL|\[FATAL\]")
@@ -1266,14 +1307,15 @@ ATTACHED_RE = re.compile(r"\[USBKBD\] keyboard attached: (%s) port (%s) "
 DETACHED_RE = re.compile(r"\[USBKBD\] keyboard detached: (%s) port (%s)$" %
                          (BDF, PORT_PATH))
 PS2_READY_RE = re.compile(re.escape(PS2_READY) + r"$")
+RAMFS_READY_RE = re.compile(re.escape(RAMFS_READY) + r"$")
 # A kernel or driver log line. Typed text never has "[" before a letter.
 LOG_LINE_RE = re.compile(r"\[[A-Z][A-Za-z0-9_]*\][^\n]*\n")
 # Text that typed lines must not contain: what test_boot.sh and deflake.py
 # read as failures, test results, tags, seeds, CPU reports or the greeting,
 # and the harness's own sync words.
 FORBIDDEN_RE = re.compile(
-    r"FAIL|FATAL|PASS|TEST|BOOT|INIT|STRESS|USBKBD|PS2KBD|Hello|XSAVE|SMEP|"
-    r"SMAP|smep|smap|seed=|sh>|ser_|boot_sh_ok|\[[A-Za-z_]")
+    r"FAIL|FATAL|PASS|TEST|BOOT|INIT|STRESS|USBKBD|PS2KBD|RAMFS|Hello|XSAVE|"
+    r"SMEP|SMAP|smep|smap|seed=|sh>|ser_|boot_sh_ok|\[[A-Za-z_]")
 
 LETTERS = "abcdefghijklmnopqrstuvwxyz"
 DIGITS = "0123456789"
@@ -1641,7 +1683,7 @@ class Session:
         """Fails on what ends the scenarios early: a failure line in the
         serial log, the init session ending or the stress test starting
         before the harness typed 'exit 0', the driver finding no controller,
-        or QEMU exiting."""
+        init reporting that ramfs did not get ready, or QEMU exiting."""
         t = self.text()
         if FAILURE_RE.search(t, max(0, self.failure_scan - 6)):
             raise SerialFailureLine()
@@ -1660,6 +1702,9 @@ class Session:
             if t.find(NO_PS2, start) >= 0:
                 raise Failure("usb_ready", "ps2kbd reported that it "
                               "found no i8042 controller")
+            if t.find(RAMFS_NOT_READY, start) >= 0:
+                raise Failure("usb_ready", "init reported that ramfs did not "
+                              "get ready")
             self.session_scan = len(t)
         if not qemu_alive():
             raise Failure(self.scenario, "QEMU exited unexpectedly")
@@ -1694,11 +1739,13 @@ class Session:
 
     def log_line(self, line):
         """A kernel or driver log line in the middle of shell output: an
-        unexpected keyboard or controller marker fails, others are noted."""
+        unexpected keyboard, controller or ramfs marker fails, others are
+        noted."""
         s = line.rstrip("\r\n")
         if (READY_RE.search(s) or ATTACHED_RE.search(s) or
                 DETACHED_RE.search(s) or NO_CONTROLLERS in s or
-                PS2_READY_RE.search(s) or NO_PS2 in s):
+                PS2_READY_RE.search(s) or NO_PS2 in s or
+                RAMFS_READY_RE.search(s)):
             raise Failure(self.scenario, "unexpected driver marker in the "
                           "serial log", ["line: %r" % s])
         say("USB note: log line during the session: %r" % s)
@@ -2043,7 +2090,8 @@ class Session:
     def wait_session(self):
         """Waits for the interactive boot session: the boot self-tests
         first, then the init session with its scripted commands (help,
-        echo boot_sh_ok, usertest 0) and the driver's markers."""
+        echo boot_sh_ok, usertest 0) and the markers of the drivers and of
+        ramfs."""
         self.scenario = "usb_session"
 
         def started(t):
@@ -2085,8 +2133,9 @@ class Session:
             scripted)
 
     def check_ready(self):
-        """Checks the driver's markers of the init session against the
-        controllers and cold-plugged keyboards of the pass."""
+        """Checks the markers of the drivers and of ramfs in the init session
+        against the controllers and cold-plugged keyboards of the pass, and
+        that ramfs reported ready once."""
         self.scenario = "usb_ready"
         ready_count = 2 if MULTI else 1
         kbd_count = 3 if MULTI else 1
@@ -2096,15 +2145,18 @@ class Session:
             ready = [m for m in map(READY_RE.search, lines) if m]
             ps2_ready = [m.group(0) for m in map(PS2_READY_RE.search, lines)
                          if m]
+            ramfs_ready = [m.group(0) for m in map(RAMFS_READY_RE.search, lines)
+                           if m]
             attached = [m for m in map(ATTACHED_RE.search, lines) if m]
             if (len(ready) >= ready_count and len(ps2_ready) >= 1 and
-                    len(attached) >= kbd_count):
-                return ready, ps2_ready, attached
+                    len(ramfs_ready) >= 1 and len(attached) >= kbd_count):
+                return ready, ps2_ready, ramfs_ready, attached
             return None
 
-        ready, ps2_ready, attached = self.wait_for(
+        ready, ps2_ready, ramfs_ready, attached = self.wait_for(
             "the drivers' 'controller ... ready' and 'keyboard attached' "
-            "markers in the init session", SESSION_READY_TIMEOUT, markers)
+            "markers and '%s' in the init session" % RAMFS_READY,
+            SESSION_READY_TIMEOUT, markers)
         try:
             self.qmp = Qmp(QMP_PATH)
             pci = self.qmp.execute("query-pci")
@@ -2129,7 +2181,7 @@ class Session:
         got_ready = sorted(m.groups() for m in ready)
         got_attached = [m.groups() for m in attached]
         ok = (len(got_ready) == ready_count and len(ps2_ready) == 1 and
-              len(got_attached) == kbd_count)
+              len(ramfs_ready) == 1 and len(got_attached) == kbd_count)
         if ok:
             bdf0 = self.bdf["xhci0"]
             r0 = [g for g in got_ready if g[0] == bdf0]
@@ -2166,10 +2218,11 @@ class Session:
                                   c: self.bdf[c] for c in controllers},
                               "ready markers: %r" % [m.group(0) for m in ready],
                               "ps2 ready markers: %r" % ps2_ready,
+                              "ramfs ready markers: %r" % ramfs_ready,
                               "attached markers: %r" % [m.group(0)
                                                         for m in attached]])
         self.initial_markers = ([m.group(0) for m in ready] + ps2_ready +
-                                [m.group(0) for m in attached])
+                                ramfs_ready + [m.group(0) for m in attached])
         say("USB session: %s." % "; ".join(self.initial_markers))
 
     def settle(self):
@@ -2212,6 +2265,7 @@ class Session:
         markers = []
         for line in complete_lines(self.log[:end_of_session], self.s0):
             match = (READY_RE.search(line) or PS2_READY_RE.search(line) or
+                     RAMFS_READY_RE.search(line) or
                      ATTACHED_RE.search(line) or DETACHED_RE.search(line))
             if match:
                 markers.append(match.group(0))
@@ -2658,6 +2712,7 @@ run_bios_pass() {
     return 1
   fi
   if ! verify_serial_log "${log}" "${QEMU_PID}" "$@" ${usb_markers[@]+"${usb_markers[@]}"} ||
+     ! verify_init_ramfs "${log}" "${USB_SESSION}" ||
      ! verify_pass_absent_markers "${name}" "${log}" ||
      ! verify_x87_pointer_reset "${log}" "${RUN_DIR}/qemu_${name}_qmp.sock" ||
      ! verify_vga_text "${RUN_DIR}/qemu_${name}_monitor.sock" "${RUN_DIR}/vga_${name}_dump.bin" ||
@@ -2726,6 +2781,7 @@ run_uefi_pass() {
   if ! verify_serial_log "${log}" "${QEMU_PID}" \
          "[PMM] mmap entry: base=0x100000000" "[PMM] Framebuffer: addr=" \
          "${QEMU64_MARKERS[@]}" ${usb_markers[@]+"${usb_markers[@]}"} ||
+     ! verify_init_ramfs "${log}" "${USB_SESSION}" ||
      ! verify_pass_absent_markers "${name}" "${log}" ||
      ! verify_x87_pointer_reset "${log}" "${RUN_DIR}/qemu_${name}_qmp.sock" ||
      ! verify_framebuffer "${log}" "${RUN_DIR}/qemu_${name}_monitor.sock" "${RUN_DIR}/vga_${name}_dump.bin" ||

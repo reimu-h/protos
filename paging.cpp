@@ -825,6 +825,39 @@ uintptr_t PagingCreateUserRoot() {
   return root;
 }
 
+bool PagingReserveUserRange(const uintptr_t root,       //
+                            const uintptr_t user_addr,  //
+                            const int64_t size) {
+  if (!IsUserRoot(root) || !IsUserPage(user_addr) || size <= 0 ||
+      (static_cast<uint64_t>(size) & (static_cast<uint64_t>(kPageSize) - 1)) !=
+          0 ||
+      !IsUserRange(user_addr, size)) {
+    return false;
+  }
+  const IrqSpinLockGuard lock_guard(g_paging_lock);
+  uint64_t* const pml4 = reinterpret_cast<uint64_t*>(root);
+  const uintptr_t last_addr = user_addr + static_cast<uintptr_t>(size - 1);
+  // One PT maps a 2 MiB region; stepping by regions from the one that
+  // contains `user_addr` visits every PT of the range.
+  for (uintptr_t addr = user_addr & ~(kHugePageSize - 1);;
+       addr += kHugePageSize) {
+    uint64_t* const pdpt = EnsureUserTableLocked(&pml4[(addr >> 39) & 0x1FF]);
+    if (pdpt == nullptr) {
+      return false;
+    }
+    uint64_t* const pd = EnsureUserTableLocked(&pdpt[(addr >> 30) & 0x1FF]);
+    if (pd == nullptr) {
+      return false;
+    }
+    if (EnsureUserTableLocked(&pd[(addr >> 21) & 0x1FF]) == nullptr) {
+      return false;
+    }
+    if (last_addr - addr < kHugePageSize) {
+      return true;
+    }
+  }
+}
+
 bool PagingMapUserPage(const uintptr_t root,       //
                        const uintptr_t user_addr,  //
                        const uintptr_t phys_addr,  //

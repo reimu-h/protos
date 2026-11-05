@@ -47,6 +47,11 @@ class AddressSpace {
   // to the PMM.
   bool MapDevicePage(uintptr_t user_addr, uintptr_t phys_addr);
 
+  // Allocates the missing page tables for `[user_addr, user_addr + size)` and
+  // leaves its pages unmapped (`PagingReserveUserRange()`), so that subsequent
+  // `MapOwnedFrame()` calls in that range never run out of page tables.
+  bool ReserveRange(uintptr_t user_addr, int64_t size);
+
   // Maps the PMM-owned frame at `frame_phys` at page-aligned `user_addr` with
   // `access`; on success, the address space takes over `frame_phys` and frees
   // it in `~AddressSpace()`.

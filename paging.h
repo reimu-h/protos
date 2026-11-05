@@ -247,6 +247,16 @@ struct UserPageInfo {
   bool owned = false;
 };
 
+// Allocates the missing user page tables (PDPT, PD and PT levels) in `root`
+// (from `PagingCreateUserRoot()`) for the 4 KiB pages of
+// `[user_addr, user_addr + size)` and leaves every page unmapped, so that
+// later `PagingMapUserPage()` calls in that range never allocate page tables.
+// `user_addr` must be page-aligned, `size` a positive multiple of the page
+// size, and the range must lie in user space (`IsUserRange()`). Returns false
+// if an argument is invalid or a page table can't be allocated (the tables
+// allocated so far stay in `root` and are freed with it).
+bool PagingReserveUserRange(uintptr_t root, uintptr_t user_addr, int64_t size);
+
 // Maps the user page at page-aligned `user_addr`, in
 // `[kUserSpaceBase, kUserSpaceEnd)`, in `root` (from `PagingCreateUserRoot()`)
 // to the frame at non-zero page-aligned `phys_addr`, allocating missing page

@@ -1904,7 +1904,10 @@ static int64_t RunDriverDenied() {
   if (IsaIrqAlloc(kIsaDeviceI8042) != kSyscallErrorPermission) {
     return 15;
   }
-  if (Syscall(kSyscallIsaIrqAlloc + 1, 0, 0, 0) != kSyscallErrorNoSys) {
+  if (IpcListen(kIpcPortFs) != kSyscallErrorPermission) {
+    return 16;
+  }
+  if (Syscall(kSyscallCount, 0, 0, 0) != kSyscallErrorNoSys) {
     return 11;
   }
   if (Syscall(-1, 0, 0, 0) != kSyscallErrorNoSys) {
@@ -1934,7 +1937,7 @@ static int64_t RunDriverCapProbe(const uint64_t arg) {
         IsaPortIo(kSyscallPortIoRead8, 0x3F8, 0) != kSyscallErrorAccess ||
         IsaPortIo(kSyscallPortIoRead8, 0x60, 0) != kSyscallErrorAccess ||
         IsaIrqAlloc(kIsaDeviceI8042) != kSyscallErrorAccess ||
-        Syscall(kSyscallIsaIrqAlloc + 1, 0, 0, 0) != kSyscallErrorNoSys) {
+        Syscall(kSyscallCount, 0, 0, 0) != kSyscallErrorNoSys) {
       return 6;
     }
     const int64_t child_pid =
@@ -1963,7 +1966,7 @@ static int64_t RunDriverCapProbe(const uint64_t arg) {
       IsaClaim(kIsaDeviceI8042) != kSyscallErrorPermission ||
       IsaPortIo(kSyscallPortIoRead8, 0x60, 0) != kSyscallErrorPermission ||
       IsaIrqAlloc(kIsaDeviceI8042) != kSyscallErrorPermission ||
-      GetTicks() < 0) {
+      IpcListen(kIpcPortFs) != kSyscallErrorPermission || GetTicks() < 0) {
     return 10;
   }
   if (SpawnDriver(nullptr, 0, 0) != kSyscallErrorInvalid ||
@@ -2728,6 +2731,984 @@ static int64_t RunDriverXhciReset(const uint64_t arg) {
   return HaltAndResetXhci(mmio, *caps);
 }
 
+// The buffers of `Mode::kIpcChecks` and `Mode::kFsChecks`, which are too big
+// for the 16 KiB stack: requests and data to write go in `g_ipc_buf_a`,
+// replies and data read in `g_ipc_buf_b`. Each process has its own copy.
+alignas(8) uint8_t g_ipc_buf_a[kIpcMaxMessageSize];
+alignas(8) uint8_t g_ipc_buf_b[kIpcMaxMessageSize];
+
+// How long the servers of `Mode::kIpcChecks` wait for a message that should
+// come: far longer than starting a process takes, and no longer than the boot
+// self-tests wait for a process to end (at least 2 s), so that a message that
+// doesn't come shows in the server's exit status.
+constexpr int64_t kIpcTestTimeoutTicks = 2 * kSyscallTicksPerSecond;
+
+// The calls of `IpcTestSubmode::kClient`, which `kEndToEnd` serves: a small
+// request, answered with its bytes XORed with `kIpcSmallReplyXor` and status
+// `kIpcSmallReplyStatus`; the longest request, answered with its bytes XORed
+// with `kIpcLongReplyXor`; a request answered with `kSyscallErrorNoEntry`;
+// and a request whose reply may have at most `kIpcCappedReplySize` bytes,
+// answered with that many `kIpcCappedReplyByte` bytes. `kClientCallOnce`
+// sends the small request too.
+constexpr char kIpcSmallRequest[] = "ipc-hello-world";
+constexpr int64_t kIpcSmallRequestSize =
+    static_cast<int64_t>(sizeof(kIpcSmallRequest) - 1);
+constexpr uint8_t kIpcSmallReplyXor = 0x20;
+constexpr int64_t kIpcSmallReplyStatus = 123;
+constexpr uint8_t kIpcLongReplyXor = 0xA5;
+constexpr char kIpcErrorRequest[] = "err";
+constexpr int64_t kIpcErrorRequestSize =
+    static_cast<int64_t>(sizeof(kIpcErrorRequest) - 1);
+constexpr char kIpcCappedRequest[] = "cap";
+constexpr int64_t kIpcCappedRequestSize =
+    static_cast<int64_t>(sizeof(kIpcCappedRequest) - 1);
+constexpr int64_t kIpcCappedReplySize = 8;
+constexpr uint8_t kIpcCappedReplyByte = 0x5C;
+
+// The vector of #UD (`kVectorInvalidOpcode` in idt.h).
+constexpr int kInvalidOpcodeVector = 6;
+
+using usertest::FsTestSubmode;
+using usertest::IpcTestSubmode;
+
+// Returns read-only data as a `T*`, for system calls that must fail to write
+// to it.
+template <typename T>
+static T* ReadOnlyAs() {
+  return reinterpret_cast<T*>(const_cast<uint64_t*>(&kReadOnlyWord));
+}
+
+// Returns true if the `size` bytes at `a` and at `b` are the same.
+static bool BytesEqual(const void* const a,  //
+                       const void* const b,  //
+                       const int64_t size) {
+  const uint8_t* const a_bytes = static_cast<const uint8_t*>(a);
+  const uint8_t* const b_bytes = static_cast<const uint8_t*>(b);
+  for (int64_t i = 0; i < size; ++i) {
+    if (a_bytes[i] != b_bytes[i]) {
+      return false;
+    }
+  }
+  return true;
+}
+
+// Waits for child process `pid` and returns how it ended as an exit status of
+// its parent: `kChildStatusBase` plus its exit status if it exited, else
+// `kChildCrashedStatus`.
+static int64_t ChildStatus(const int64_t pid) {
+  const StatusOr<UserProgramResult> result = Wait(pid);
+  if (!result.ok() || result->outcome != UserProgramOutcome::kExited) {
+    return usertest::kChildCrashedStatus;
+  }
+  return usertest::kChildStatusBase + result->exit_status;
+}
+
+// Waits at most `kIpcTestTimeoutTicks` for the next message on `port`, writes
+// it to `*msg` (and the request of a call to `g_ipc_buf_a`), and returns true
+// if it is a call.
+static bool ReceiveCall(const int port, IpcReceivedMessage* const msg) {
+  return IpcRecv(port,                //
+                 g_ipc_buf_a,         //
+                 kIpcMaxMessageSize,  //
+                 msg,                 //
+                 kIpcTestTimeoutTicks) == 1 &&
+         msg->kind == IpcMessageKind::kCall;
+}
+
+// `IpcTestSubmode::kEndToEnd` on `port`.
+static int64_t RunIpcEndToEnd(const int port) {
+  // MemMap(): its argument errors, then two mappings of zeroed, writable
+  // memory, each followed by an unmapped guard page.
+  if (MemMap(0).status() != kSyscallErrorInvalid ||
+      MemMap(-kPageSize).status() != kSyscallErrorInvalid ||
+      MemMap(kPageSize + 1).status() != kSyscallErrorInvalid ||
+      MemMap(kSyscallMemMapMaxSize + kPageSize).status() !=
+          kSyscallErrorInvalid) {
+    return 1;
+  }
+  const StatusOr<uintptr_t> map1 = MemMap(2 * kPageSize);
+  const StatusOr<uintptr_t> map2 = MemMap(kPageSize);
+  if (!map1.ok() || !map2.ok() || *map1 % kPageSize != 0 ||
+      *map2 % kPageSize != 0 || *map2 < *map1 + 3 * kPageSize) {
+    return 2;
+  }
+  uint8_t* const p1 = reinterpret_cast<uint8_t*>(*map1);
+  for (int64_t i = 0; i < 2 * kPageSize; ++i) {
+    if (p1[i] != 0) {
+      return 3;
+    }
+    p1[i] = static_cast<uint8_t>(i & 0xFF);
+  }
+
+  // Bad ports, `kIpcPortFs` without driver capability, a port that no process
+  // owns, and one that the caller doesn't.
+  IpcReceivedMessage msg{};
+  if (IpcListen(-1) != kSyscallErrorInvalid ||
+      IpcListen(kIpcPortCount) != kSyscallErrorInvalid ||
+      IpcListen(kIpcPortFs) != kSyscallErrorPermission ||
+      IpcRecv(port, g_ipc_buf_a, kIpcMaxMessageSize, &msg, 0) !=
+          kSyscallErrorAccess ||
+      IpcCall(port, "x", 1, nullptr, 0) != kSyscallErrorNoDevice) {
+    return 4;
+  }
+  // Claiming the port again succeeds.
+  if (IpcListen(port) != 0 || IpcListen(port) != 0) {
+    return 5;
+  }
+  // A call to a port that the caller owns fails instead of waiting forever.
+  if (IpcCall(port, nullptr, 0, nullptr, 0) != kSyscallErrorDeadlock) {
+    return 6;
+  }
+  // A poll of an empty port returns 0, and bad user buffers fail.
+  if (IpcRecv(port, g_ipc_buf_a, kIpcMaxMessageSize, &msg, 0) != 0 ||
+      IpcRecv(port, nullptr, 16, &msg, 0) != kSyscallErrorFault ||
+      IpcRecv(port, g_ipc_buf_a, 16, ReadOnlyAs<IpcReceivedMessage>(), 0) !=
+          kSyscallErrorFault) {
+    return 7;
+  }
+
+  const int64_t child_pid =
+      Spawn("usertest", usertest::IpcChecksArg(IpcTestSubmode::kClient, port));
+  if (child_pid < 1) {
+    return 8;
+  }
+  // The child's calls. One that doesn't come means that the child failed.
+  // An empty request, with no room for a reply.
+  if (!ReceiveCall(port, &msg)) {
+    return ChildStatus(child_pid);
+  }
+  const uint64_t client_id = msg.client_id;
+  if (client_id == 0 || msg.size != 0 || msg.reply_cap != 0 ||
+      IpcReply(port, msg.token, nullptr, 0, 0) != 0) {
+    return 20;
+  }
+  // The small request.
+  if (!ReceiveCall(port, &msg)) {
+    return ChildStatus(child_pid);
+  }
+  if (msg.client_id != client_id || msg.size != kIpcSmallRequestSize ||
+      msg.reply_cap != kIpcMaxMessageSize) {
+    return 21;
+  }
+  for (int64_t i = 0; i < msg.size; ++i) {
+    g_ipc_buf_b[i] = static_cast<uint8_t>(g_ipc_buf_a[i] ^ kIpcSmallReplyXor);
+  }
+  if (IpcReply(port,         //
+               msg.token,    //
+               g_ipc_buf_b,  //
+               msg.size,     //
+               kIpcSmallReplyStatus) != 0) {
+    return 22;
+  }
+  // The longest request and reply, with the reply's size as the status.
+  if (!ReceiveCall(port, &msg)) {
+    return ChildStatus(child_pid);
+  }
+  if (msg.client_id != client_id || msg.size != kIpcMaxMessageSize ||
+      msg.reply_cap != kIpcMaxMessageSize) {
+    return 23;
+  }
+  for (int64_t i = 0; i < msg.size; ++i) {
+    g_ipc_buf_b[i] = static_cast<uint8_t>(g_ipc_buf_a[i] ^ kIpcLongReplyXor);
+  }
+  if (IpcReply(port, msg.token, g_ipc_buf_b, msg.size, msg.size) != 0) {
+    return 24;
+  }
+  // An error status.
+  if (!ReceiveCall(port, &msg)) {
+    return ChildStatus(child_pid);
+  }
+  if (msg.client_id != client_id || msg.size != kIpcErrorRequestSize ||
+      IpcReply(port, msg.token, nullptr, 0, kSyscallErrorNoEntry) != 0) {
+    return 25;
+  }
+  // A reply longer than the client accepts fails, and the call stays in
+  // service for one that fits.
+  if (!ReceiveCall(port, &msg)) {
+    return ChildStatus(child_pid);
+  }
+  if (msg.client_id != client_id || msg.size != kIpcCappedRequestSize ||
+      msg.reply_cap != kIpcCappedReplySize) {
+    return 26;
+  }
+  for (int64_t i = 0; i <= kIpcCappedReplySize; ++i) {
+    g_ipc_buf_b[i] = kIpcCappedReplyByte;
+  }
+  if (IpcReply(port,                     //
+               msg.token,                //
+               g_ipc_buf_b,              //
+               kIpcCappedReplySize + 1,  //
+               kIpcCappedReplySize + 1) != kSyscallErrorInvalid) {
+    return 27;
+  }
+  if (IpcReply(port,                 //
+               msg.token,            //
+               g_ipc_buf_b,          //
+               kIpcCappedReplySize,  //
+               kIpcCappedReplySize) != 0) {
+    return 28;
+  }
+
+  // Once the child has ended, the server, which received its calls, gets one
+  // notification that it disconnected.
+  const int64_t child_status = ChildStatus(child_pid);
+  if (child_status != usertest::kChildStatusBase) {
+    return child_status;
+  }
+  if (IpcRecv(port, g_ipc_buf_a, kIpcMaxMessageSize, &msg, 0) != 1 ||
+      msg.kind != IpcMessageKind::kClientDisconnect ||
+      msg.client_id != client_id || msg.token != 0 || msg.size != 0 ||
+      msg.reply_cap != 0) {
+    return 29;
+  }
+  if (IpcRecv(port, g_ipc_buf_a, kIpcMaxMessageSize, &msg, 0) != 0) {
+    return 30;
+  }
+  return 0;
+}
+
+// `IpcTestSubmode::kClient` on `port`: the calls that `RunIpcEndToEnd()`
+// serves.
+static int64_t RunIpcClient(const int port) {
+  // The parent owns the port.
+  if (IpcListen(port) != kSyscallErrorBusy) {
+    return 9;
+  }
+  int64_t reply_size = -1;
+  if (IpcCall(port, nullptr, 0, nullptr, 0, &reply_size) != 0 ||
+      reply_size != 0) {
+    return 10;
+  }
+  if (IpcCall(port,                  //
+              kIpcSmallRequest,      //
+              kIpcSmallRequestSize,  //
+              g_ipc_buf_b,           //
+              kIpcMaxMessageSize,    //
+              &reply_size) != kIpcSmallReplyStatus ||
+      reply_size != kIpcSmallRequestSize) {
+    return 11;
+  }
+  for (int64_t i = 0; i < kIpcSmallRequestSize; ++i) {
+    if (g_ipc_buf_b[i] !=
+        static_cast<uint8_t>(kIpcSmallRequest[i] ^ kIpcSmallReplyXor)) {
+      return 12;
+    }
+  }
+  for (int64_t i = 0; i < kIpcMaxMessageSize; ++i) {
+    g_ipc_buf_a[i] = static_cast<uint8_t>((i * 17 + 5) & 0xFF);
+  }
+  if (IpcCall(port,                //
+              g_ipc_buf_a,         //
+              kIpcMaxMessageSize,  //
+              g_ipc_buf_b,         //
+              kIpcMaxMessageSize,  //
+              &reply_size) != kIpcMaxMessageSize ||
+      reply_size != kIpcMaxMessageSize) {
+    return 13;
+  }
+  for (int64_t i = 0; i < kIpcMaxMessageSize; ++i) {
+    if (g_ipc_buf_b[i] !=
+        static_cast<uint8_t>(g_ipc_buf_a[i] ^ kIpcLongReplyXor)) {
+      return 14;
+    }
+  }
+  if (IpcCall(port,                  //
+              kIpcErrorRequest,      //
+              kIpcErrorRequestSize,  //
+              g_ipc_buf_b,           //
+              kIpcMaxMessageSize) != kSyscallErrorNoEntry) {
+    return 15;
+  }
+  // The byte after the room for the reply stays as it is.
+  g_ipc_buf_b[kIpcCappedReplySize] = 0;
+  if (IpcCall(port,                   //
+              kIpcCappedRequest,      //
+              kIpcCappedRequestSize,  //
+              g_ipc_buf_b,            //
+              kIpcCappedReplySize,    //
+              &reply_size) != kIpcCappedReplySize ||
+      reply_size != kIpcCappedReplySize) {
+    return 16;
+  }
+  for (int64_t i = 0; i < kIpcCappedReplySize; ++i) {
+    if (g_ipc_buf_b[i] != kIpcCappedReplyByte) {
+      return 17;
+    }
+  }
+  if (g_ipc_buf_b[kIpcCappedReplySize] != 0) {
+    return 17;
+  }
+  return 0;
+}
+
+// `IpcTestSubmode::kServerPark` on `port`.
+static int64_t RunIpcServerPark(const int port) {
+  if (IpcListen(port) != 0) {
+    return 1;
+  }
+  IpcReceivedMessage msg{};
+  // Waits until the program is killed.
+  (void)IpcRecv(port, g_ipc_buf_a, kIpcMaxMessageSize, &msg, -1);
+  return 2;
+}
+
+// `IpcTestSubmode::kServerFaultMidRpc` on `port`.
+static int64_t RunIpcServerFaultMidRpc(const int port) {
+  if (IpcListen(port) != 0) {
+    return 1;
+  }
+  IpcReceivedMessage msg{};
+  if (!ReceiveCall(port, &msg)) {
+    return 2;
+  }
+  asm volatile("ud2");
+  return 3;
+}
+
+// `IpcTestSubmode::kClientCallOnce` on `port`.
+static int64_t RunIpcClientCallOnce(const int port) {
+  const int64_t rc = IpcCall(port,                  //
+                             kIpcSmallRequest,      //
+                             kIpcSmallRequestSize,  //
+                             g_ipc_buf_b,           //
+                             kIpcSmallRequestSize);
+  return rc < 0 ? -rc : usertest::kIpcCallAnsweredStatus;
+}
+
+// `IpcTestSubmode::kMemMapGuardFault`.
+static int64_t RunMemMapGuardFault() {
+  const StatusOr<uintptr_t> mapped = MemMap(kPageSize);
+  if (!mapped.ok()) {
+    return 1;
+  }
+  *Launder(reinterpret_cast<volatile uint8_t*>(*mapped + kPageSize)) = 0x42;
+  return 2;
+}
+
+// `IpcTestSubmode::kServerHoldCall` on `port` and `port + 1`.
+static int64_t RunIpcServerHoldCall(const int port) {
+  // System calls 1 and 2.
+  if (IpcListen(port) != 0 || IpcListen(port + 1) != 0) {
+    return 1;
+  }
+  // System call 3.
+  IpcReceivedMessage msg{};
+  if (!ReceiveCall(port, &msg)) {
+    return 2;
+  }
+  // System call 4 (`kServerHoldCallParkedSyscall`): waits, with the call
+  // unanswered, until the program is killed.
+  (void)IpcRecv(port + 1, g_ipc_buf_a, kIpcMaxMessageSize, &msg, -1);
+  return 3;
+}
+
+// `IpcTestSubmode::kServerLateReply` on `port`.
+static int64_t RunIpcServerLateReply(const int port) {
+  // System calls 1 and 2.
+  if (IpcListen(port) != 0) {
+    return 1;
+  }
+  IpcReceivedMessage call{};
+  if (!ReceiveCall(port, &call)) {
+    return 2;
+  }
+  // System call 3 (`kServerLateReplyWaitSyscall`): the caller ends instead of
+  // getting a reply.
+  IpcReceivedMessage msg{};
+  if (IpcRecv(port,                //
+              g_ipc_buf_a,         //
+              kIpcMaxMessageSize,  //
+              &msg,                //
+              kIpcTestTimeoutTicks) != 1 ||
+      msg.kind != IpcMessageKind::kClientDisconnect ||
+      msg.client_id != call.client_id) {
+    return 3;
+  }
+  // A reply longer than `reply_cap` fails without consuming the canceled call;
+  // a reply that fits is dropped and ends the call.
+  if (call.reply_cap != kIpcSmallRequestSize ||
+      IpcReply(port,                //
+               call.token,          //
+               g_ipc_buf_b,         //
+               call.reply_cap + 1,  //
+               0) != kSyscallErrorInvalid ||
+      IpcReply(port,                  //
+               call.token,            //
+               kIpcSmallRequest,      //
+               kIpcSmallRequestSize,  //
+               0) != 0) {
+    return 4;
+  }
+  if (IpcReply(port, call.token, nullptr, 0, 0) != kSyscallErrorInvalid) {
+    return 5;
+  }
+  return 0;
+}
+
+// Runs `Mode::kIpcChecks` as `arg` says.
+static int64_t RunIpcChecks(const uint64_t arg) {
+  const IpcTestSubmode submode =
+      static_cast<IpcTestSubmode>(usertest::DriverSubmode(arg));
+  const int port = usertest::DriverDeviceIndex(arg);
+  // The ports that the submode uses: none, `port`, or `port` and `port + 1`.
+  const int ports = (submode == IpcTestSubmode::kMemMapGuardFault) ? 0
+                    : (submode == IpcTestSubmode::kServerHoldCall) ? 2
+                                                                   : 1;
+  if (ports > 0 && (port < kIpcFirstUserPort || port + ports > kIpcPortCount)) {
+    return usertest::kBadSubmodeStatus;
+  }
+  switch (submode) {
+    case IpcTestSubmode::kEndToEnd:
+      return RunIpcEndToEnd(port);
+    case IpcTestSubmode::kClient:
+      return RunIpcClient(port);
+    case IpcTestSubmode::kServerPark:
+      return RunIpcServerPark(port);
+    case IpcTestSubmode::kServerFaultMidRpc:
+      return RunIpcServerFaultMidRpc(port);
+    case IpcTestSubmode::kClientCallOnce:
+      return RunIpcClientCallOnce(port);
+    case IpcTestSubmode::kMemMapGuardFault:
+      return RunMemMapGuardFault();
+    case IpcTestSubmode::kServerHoldCall:
+      return RunIpcServerHoldCall(port);
+    case IpcTestSubmode::kServerLateReply:
+      return RunIpcServerLateReply(port);
+  }
+  return usertest::kBadSubmodeStatus;
+}
+
+// The file data of `FsTestSubmode::kFullSuite`: `kFsDataBlocks` blocks of
+// `FsPatternByte()` bytes, which fill ramfs's direct blocks
+// (`kFsDirectBlocks`, ramfs::kDirectBlocks) and go on into its first
+// single-indirect block, and `kFsSparseData` at `kFsSparseOffset`, in the
+// range of its double-indirect blocks, after a hole.
+constexpr int64_t kFsDirectBlocks = 12;
+constexpr int64_t kFsDataBlocks = kFsDirectBlocks + 2;
+constexpr int64_t kFsSparseOffset = int64_t{8} << 20;
+constexpr char kFsSparseData[] = "sparse tail";
+constexpr int64_t kFsSparseDataSize =
+    static_cast<int64_t>(sizeof(kFsSparseData) - 1);
+// The bytes of a read across the boundary of the direct and indirect blocks.
+constexpr int64_t kFsStraddleSize = 200;
+// Open() flags that create a file that must not exist yet, for reading and
+// writing.
+constexpr uint64_t kFsCreateNewFlags =
+    kFsOpenReadWrite | kFsOpenCreate | kFsOpenExclusive;
+// The `kLeakAndFault` children of `kFullSuite`, which open 512 files in all
+// (`kMaxOpenFiles` each): twice as many as ramfs has handles and inodes for
+// (ramfs::kMaxOpenHandles and ramfs::kMaxInodes), so that ramfs runs out of
+// them unless it frees the files of each child when the child ends.
+constexpr int kFsLeakRounds = 16;
+static_assert(kMaxOpenFiles < 100, "kLeakAndFault names files with 2 digits");
+
+// The byte at `offset` of the data that `kFullSuite` writes.
+static uint8_t FsPatternByte(const int64_t offset) {
+  return static_cast<uint8_t>((offset / kPageSize * 29 + offset % kPageSize) &
+                              0xFF);
+}
+
+// Returns true if `entry`, which ReadDir() wrote, describes the regular file
+// `name` (null-terminated) with inode number `ino`, with zeros after the name
+// and in the reserved bytes.
+static bool IsFileEntry(const FsDirEntry& entry,  //
+                        const char* const name,   //
+                        const uint64_t ino) {
+  const int64_t name_len = StringLength(name);
+  if (entry.ino != ino || entry.type != FsNodeType::kRegular ||
+      entry.name_len != name_len) {
+    return false;
+  }
+  for (int64_t i = 0; i <= kFsMaxNameLength; ++i) {
+    if (entry.name[i] != (i < name_len ? name[i] : '\0')) {
+      return false;
+    }
+  }
+  for (const uint8_t byte : entry.reserved) {
+    if (byte != 0) {
+      return false;
+    }
+  }
+  return true;
+}
+
+// The checks of `kFullSuite` that need no file: arguments that the kernel
+// rejects before it calls the server, and calls of the server's port.
+static int64_t CheckFsArguments() {
+  // Buffers that user code may not access.
+  FsStat st{};
+  if (Open(nullptr, 4, kFsOpenRead) != kSyscallErrorFault ||
+      Open(reinterpret_cast<const char*>(usertest::kKernelAddress),  //
+           4,                                                        //
+           kFsOpenRead) != kSyscallErrorFault ||
+      Stat(nullptr, 4, &st) != kSyscallErrorFault ||
+      Stat("/", 1, ReadOnlyAs<FsStat>()) != kSyscallErrorFault ||
+      MkDir(nullptr, 4) != kSyscallErrorFault ||
+      Unlink(nullptr, 4) != kSyscallErrorFault ||
+      Rename(nullptr, 4, "/b", 2) != kSyscallErrorFault ||
+      Rename("/a", 2, nullptr, 4) != kSyscallErrorFault) {
+    return 1;
+  }
+  // Invalid flags: an unknown bit, access mode 3, kFsOpenExclusive without
+  // kFsOpenCreate, and kFsOpenTruncate without write access.
+  constexpr uint64_t kInvalidFlags[] = {
+      kFsOpenFlagsMask + 1,
+      kFsOpenAccessMask,
+      kFsOpenReadWrite | kFsOpenExclusive,
+      kFsOpenRead | kFsOpenTruncate,
+  };
+  for (const uint64_t flags : kInvalidFlags) {
+    if (Open("/", flags) != kSyscallErrorInvalid) {
+      return 2;
+    }
+  }
+  // Path lengths of 0, kFsMaxPathLength (which the kernel passes on: the
+  // server finds no "a"), kFsMaxPathLength + 1 and -1, and a NUL byte in a
+  // path.
+  for (int64_t i = 0; i <= kFsMaxPathLength; ++i) {
+    g_ipc_buf_a[i] = static_cast<uint8_t>(i % 2 == 0 ? '/' : 'a');
+  }
+  const char* const long_path = reinterpret_cast<const char*>(g_ipc_buf_a);
+  if (Stat(long_path, 0, &st) != kSyscallErrorNoEntry ||
+      Stat(nullptr, 0, &st) != kSyscallErrorNoEntry ||
+      Open(nullptr, 0, kFsOpenRead) != kSyscallErrorNoEntry ||
+      MkDir(nullptr, 0) != kSyscallErrorNoEntry ||
+      Unlink(nullptr, 0) != kSyscallErrorNoEntry ||
+      Rename(nullptr, 0, "/b", 2) != kSyscallErrorNoEntry ||
+      Rename("/a", 2, nullptr, 0) != kSyscallErrorNoEntry ||
+      Stat(long_path, kFsMaxPathLength, &st) != kSyscallErrorNoEntry ||
+      Open(long_path, kFsMaxPathLength + 1, kFsOpenRead) !=
+          kSyscallErrorNameTooLong ||
+      Rename("/a", 2, long_path, kFsMaxPathLength + 1) !=
+          kSyscallErrorNameTooLong ||
+      MkDir(long_path, -1) != kSyscallErrorInvalid ||
+      Unlink("/a\0b", 4) != kSyscallErrorInvalid) {
+    return 3;
+  }
+  // Only the kernel's filesystem system calls call the filesystem server.
+  if (IpcCall(kIpcPortFs, g_ipc_buf_a, 1, g_ipc_buf_b, kIpcMaxMessageSize) !=
+      kSyscallErrorPermission) {
+    return 4;
+  }
+  return 0;
+}
+
+// The checks of `kFullSuite` of bad descriptors and of the per-process limit
+// of `kMaxOpenFiles` descriptors, which Open() assigns lowest first.
+static int64_t CheckFsDescriptorLimit() {
+  if (Close(-1) != kSyscallErrorBadFd ||
+      Close(kMaxOpenFiles) != kSyscallErrorBadFd ||
+      Close(0) != kSyscallErrorBadFd ||
+      FileRead(0, g_ipc_buf_b, 4) != kSyscallErrorBadFd ||
+      FileWrite(0, "x", 1) != kSyscallErrorBadFd ||
+      Seek(0, 0, kFsSeekSet) != kSyscallErrorBadFd ||
+      ReadDir(0, nullptr, 0) != kSyscallErrorBadFd) {
+    return 5;
+  }
+  for (int fd = 0; fd < kMaxOpenFiles; ++fd) {
+    if (Open("/", kFsOpenRead | kFsOpenDirectory) != fd) {
+      return 6;
+    }
+  }
+  if (Open("/", kFsOpenRead | kFsOpenDirectory) != kSyscallErrorTooManyFiles) {
+    return 7;
+  }
+  for (int fd = 0; fd < kMaxOpenFiles; ++fd) {
+    if (Close(fd) != 0) {
+      return 8;
+    }
+  }
+  return 0;
+}
+
+// The checks of `kFullSuite` of arguments that need descriptors: of a
+// regular file, read-write and read-only, and of a directory.
+static int64_t CheckFsDescriptorArguments() {
+  if (MkDir("/suite") != 0 || MkDir("/suite/sub") != 0) {
+    return 9;
+  }
+  const int64_t file_fd = Open("/suite/args", kFsCreateNewFlags);
+  const int64_t read_only_fd = Open("/suite/args", kFsOpenRead);
+  const int64_t dir_fd = Open("/suite", kFsOpenRead | kFsOpenDirectory);
+  if (file_fd < 0 || read_only_fd < 0 || dir_fd < 0) {
+    return 10;
+  }
+  // Sizes beyond kSyscallFsMaxIoSize, and buffers that user code may not
+  // access.
+  if (FileRead(file_fd, g_ipc_buf_b, kSyscallFsMaxIoSize + 1) !=
+          kSyscallErrorInvalid ||
+      FileWrite(file_fd, g_ipc_buf_a, kSyscallFsMaxIoSize + 1) !=
+          kSyscallErrorInvalid ||
+      FileRead(file_fd, g_ipc_buf_b, -1) != kSyscallErrorInvalid ||
+      FileRead(file_fd, ReadOnlyAs<void>(), 8) != kSyscallErrorFault ||
+      FileWrite(file_fd,                                                  //
+                reinterpret_cast<const void*>(usertest::kKernelAddress),  //
+                8) != kSyscallErrorFault ||
+      FileWrite(file_fd, nullptr, 1) != kSyscallErrorFault) {
+    return 11;
+  }
+  // ReadDir() of more than kSyscallFsMaxDirEntries entries or into a buffer
+  // that user code may not write fails, and of no entries returns 0 without
+  // moving on: the directory's two entries come next.
+  FsDirEntry entries[2];
+  if (ReadDir(dir_fd, entries, kSyscallFsMaxDirEntries + 1) !=
+          kSyscallErrorInvalid ||
+      ReadDir(dir_fd, ReadOnlyAs<FsDirEntry>(), 1) != kSyscallErrorFault ||
+      ReadDir(dir_fd, nullptr, 0) != 0 || ReadDir(dir_fd, entries, 2) != 2 ||
+      ReadDir(dir_fd, entries, 2) != 0) {
+    return 12;
+  }
+  // Seek() with an invalid whence or to an offset out of range.
+  if (Seek(file_fd, 0, kFsSeekEnd + 1) != kSyscallErrorInvalid ||
+      Seek(file_fd, 0, -1) != kSyscallErrorInvalid ||
+      Seek(file_fd, -1, kFsSeekSet) != kSyscallErrorInvalid ||
+      Seek(file_fd, kFsMaxFileSize + 1, kFsSeekSet) != kSyscallErrorInvalid) {
+    return 13;
+  }
+  // Descriptors of the wrong kind, or without the access needed.
+  if (FileRead(dir_fd, g_ipc_buf_b, 1) != kSyscallErrorIsDir ||
+      ReadDir(file_fd, entries, 1) != kSyscallErrorNotDir ||
+      FileWrite(read_only_fd, "x", 1) != kSyscallErrorBadFd) {
+    return 14;
+  }
+  // At kFsMaxFileSize, an empty write returns 0 and a longer one fails; the
+  // file stays empty.
+  FsStat st{};
+  if (Seek(file_fd, kFsMaxFileSize, kFsSeekSet) != kFsMaxFileSize ||
+      FileWrite(file_fd, "x", 0) != 0 ||
+      FileWrite(file_fd, "x", 1) != kSyscallErrorFileTooBig ||
+      Stat("/suite/args", &st) != 0 || st.size != 0) {
+    return 15;
+  }
+  if (Close(file_fd) != 0 || Close(read_only_fd) != 0 || Close(dir_fd) != 0 ||
+      Unlink("/suite/args") != 0) {
+    return 16;
+  }
+  return 0;
+}
+
+// The checks of `kFullSuite` of file data: written, then read back whole and
+// across the boundary of the direct and indirect blocks, and a hole.
+static int64_t CheckFsFileData() {
+  const int64_t fd =
+      Open("/suite/sub/../data.bin", kFsOpenReadWrite | kFsOpenCreate);
+  if (fd < 0) {
+    return 17;
+  }
+  for (int64_t block = 0; block < kFsDataBlocks; ++block) {
+    for (int64_t i = 0; i < kPageSize; ++i) {
+      g_ipc_buf_a[i] = FsPatternByte(block * kPageSize + i);
+    }
+    if (FileWrite(fd, g_ipc_buf_a, kPageSize) != kPageSize) {
+      return 18;
+    }
+  }
+  // At the end of the file, a read returns 0.
+  if (FileRead(fd, g_ipc_buf_b, 1) != 0 || Seek(fd, 0, kFsSeekSet) != 0) {
+    return 19;
+  }
+  for (int64_t block = 0; block < kFsDataBlocks; ++block) {
+    if (FileRead(fd, g_ipc_buf_b, kPageSize) != kPageSize) {
+      return 20;
+    }
+    for (int64_t i = 0; i < kPageSize; ++i) {
+      if (g_ipc_buf_b[i] != FsPatternByte(block * kPageSize + i)) {
+        return 20;
+      }
+    }
+  }
+  constexpr int64_t kStraddleOffset =
+      kFsDirectBlocks * kPageSize - kFsStraddleSize / 2;
+  if (Seek(fd, kStraddleOffset, kFsSeekSet) != kStraddleOffset ||
+      FileRead(fd, g_ipc_buf_b, kFsStraddleSize) != kFsStraddleSize) {
+    return 21;
+  }
+  for (int64_t i = 0; i < kFsStraddleSize; ++i) {
+    if (g_ipc_buf_b[i] != FsPatternByte(kStraddleOffset + i)) {
+      return 21;
+    }
+  }
+  if (Seek(fd, kFsSparseOffset, kFsSeekSet) != kFsSparseOffset ||
+      FileWrite(fd, kFsSparseData, kFsSparseDataSize) != kFsSparseDataSize) {
+    return 22;
+  }
+  FsStat st{};
+  if (Stat("/suite/data.bin", &st) != 0 || st.type != FsNodeType::kRegular ||
+      st.size != kFsSparseOffset + kFsSparseDataSize) {
+    return 23;
+  }
+  // The hole before the data reads as zeros.
+  constexpr int64_t kHoleBytes = 4;
+  if (Seek(fd, kFsSparseOffset - kHoleBytes, kFsSeekSet) !=
+          kFsSparseOffset - kHoleBytes ||
+      FileRead(fd, g_ipc_buf_b, kHoleBytes + kFsSparseDataSize) !=
+          kHoleBytes + kFsSparseDataSize) {
+    return 24;
+  }
+  for (int64_t i = 0; i < kHoleBytes; ++i) {
+    if (g_ipc_buf_b[i] != 0) {
+      return 24;
+    }
+  }
+  if (!BytesEqual(g_ipc_buf_b + kHoleBytes, kFsSparseData, kFsSparseDataSize)) {
+    return 24;
+  }
+  if (Close(fd) != 0) {
+    return 25;
+  }
+  return 0;
+}
+
+// The checks of `kFullSuite` of Rename(), of ReadDir() entries (read twice,
+// with a rewind in between), and of reading a file that was unlinked while
+// open.
+static int64_t CheckFsRenameAndUnlink() {
+  constexpr char kMovedPath[] = "/suite/sub/moved.bin";
+  FsStat st{};
+  if (Rename("/suite/data.bin", kMovedPath) != 0 ||
+      Stat(kMovedPath, &st) != 0) {
+    return 26;
+  }
+  const int64_t dir_fd = Open("/suite/sub", kFsOpenRead | kFsOpenDirectory);
+  if (dir_fd < 0) {
+    return 27;
+  }
+  for (int pass = 0; pass < 2; ++pass) {
+    // The kernel writes every byte of the entry.
+    FsDirEntry entry;
+    __builtin_memset(static_cast<void*>(&entry), 0xA5, sizeof(entry));
+    if (ReadDir(dir_fd, &entry, 1) != 1 ||
+        !IsFileEntry(entry, "moved.bin", st.ino) ||
+        ReadDir(dir_fd, &entry, 1) != 0 || Seek(dir_fd, 0, kFsSeekSet) != 0) {
+      return 28;
+    }
+  }
+  if (Close(dir_fd) != 0) {
+    return 29;
+  }
+  const int64_t fd = Open(kMovedPath, kFsOpenRead);
+  if (fd < 0 || Unlink(kMovedPath) != 0 ||
+      Stat(kMovedPath, &st) != kSyscallErrorNoEntry) {
+    return 30;
+  }
+  // The data is still there.
+  if (FileRead(fd, g_ipc_buf_b, kPageSize) != kPageSize) {
+    return 31;
+  }
+  for (int64_t i = 0; i < kPageSize; ++i) {
+    if (g_ipc_buf_b[i] != FsPatternByte(i)) {
+      return 31;
+    }
+  }
+  if (Seek(fd, kFsSparseOffset, kFsSeekSet) != kFsSparseOffset ||
+      FileRead(fd, g_ipc_buf_b, kFsSparseDataSize) != kFsSparseDataSize ||
+      !BytesEqual(g_ipc_buf_b, kFsSparseData, kFsSparseDataSize) ||
+      Close(fd) != 0) {
+    return 31;
+  }
+  return 0;
+}
+
+// The check of `kFullSuite` that ramfs frees the files of processes that end
+// with files open: `kFsLeakRounds` `kLeakAndFault` children, one after the
+// other, which a ramfs that keeps their files can't all serve.
+static int64_t CheckFsCrashReclamation() {
+  for (int round = 0; round < kFsLeakRounds; ++round) {
+    const int64_t pid =
+        Spawn("usertest", usertest::FsChecksArg(FsTestSubmode::kLeakAndFault));
+    if (pid < 1) {
+      return 32;
+    }
+    const StatusOr<UserProgramResult> result = Wait(pid);
+    if (!result.ok()) {
+      return 32;
+    }
+    if (result->outcome == UserProgramOutcome::kExited) {
+      return usertest::kChildStatusBase + result->exit_status;
+    }
+    if (result->outcome != UserProgramOutcome::kFaulted ||
+        result->fault_vector != kInvalidOpcodeVector) {
+      return usertest::kChildCrashedStatus;
+    }
+  }
+  return 0;
+}
+
+// `FsTestSubmode::kFullSuite`.
+static int64_t RunFsFullSuite() {
+  constexpr int64_t (*const kSteps[])() = {
+      CheckFsArguments, CheckFsDescriptorLimit, CheckFsDescriptorArguments,
+      CheckFsFileData,  CheckFsRenameAndUnlink, CheckFsCrashReclamation,
+  };
+  for (int64_t (*const step)() : kSteps) {
+    const int64_t status = step();
+    if (status != 0) {
+      return status;
+    }
+  }
+  if (Unlink("/suite/sub") != 0 || Unlink("/suite") != 0) {
+    return 33;
+  }
+  return 0;
+}
+
+// `FsTestSubmode::kLeakAndFault`.
+static int64_t RunFsLeakAndFault() {
+  for (int i = 0; i < kMaxOpenFiles; ++i) {
+    char path[] = "/leak00";
+    path[5] = static_cast<char>('0' + i / 10);
+    path[6] = static_cast<char>('0' + i % 10);
+    const int64_t fd = Open(path, kFsCreateNewFlags);
+    if (fd < 0) {
+      return 1;
+    }
+    if (FileWrite(fd, path, 1) != 1) {
+      return 2;
+    }
+    if (Unlink(path) != 0) {
+      return 3;
+    }
+  }
+  asm volatile("ud2");
+  return 4;
+}
+
+// `FsTestSubmode::kSeedDocs`.
+static int64_t RunFsSeedDocs() {
+  if (MkDir("/docs") != 0) {
+    return 1;
+  }
+  const int64_t fd =
+      Open("/docs/readme.txt", kFsOpenWrite | kFsOpenCreate | kFsOpenTruncate);
+  if (fd < 0) {
+    return 2;
+  }
+  constexpr char kText[] = "hello from ramfs\n";
+  constexpr int64_t kTextSize = static_cast<int64_t>(sizeof(kText) - 1);
+  if (FileWrite(fd, kText, kTextSize) != kTextSize) {
+    return 3;
+  }
+  if (Close(fd) != 0) {
+    return 4;
+  }
+  return 0;
+}
+
+// `FsTestSubmode::kStaleFd`.
+static int64_t RunFsStaleFd() {
+  constexpr char kPath[] = "/stale";
+  constexpr char kData[] = "data";
+  constexpr int64_t kDataSize = static_cast<int64_t>(sizeof(kData) - 1);
+  // System calls 1 and 2.
+  const int64_t fd = Open(kPath, kFsCreateNewFlags);
+  if (fd < 0 || FileWrite(fd, kData, kDataSize) != kDataSize) {
+    return 1;
+  }
+  // System call 3 (`kStaleFdReadSyscall`): the boot self-test replaces ramfs,
+  // then types a byte.
+  char byte = 0;
+  if (Read(&byte, 1) != 1) {
+    return 2;
+  }
+  // The file belonged to the ramfs that ended.
+  if (Seek(fd, 0, kFsSeekSet) != kSyscallErrorStale ||
+      FileRead(fd, g_ipc_buf_b, kDataSize) != kSyscallErrorStale ||
+      FileWrite(fd, kData, kDataSize) != kSyscallErrorStale ||
+      ReadDir(fd, nullptr, 0) != kSyscallErrorStale) {
+    return 3;
+  }
+  // Close() frees the descriptor all the same.
+  if (Close(fd) != 0) {
+    return 4;
+  }
+  if (Close(fd) != kSyscallErrorBadFd) {
+    return 5;
+  }
+  // The new ramfs has no files, and serves new ones with the freed
+  // descriptor.
+  FsStat st{};
+  if (Stat(kPath, &st) != kSyscallErrorNoEntry) {
+    return 6;
+  }
+  const int64_t new_fd = Open(kPath, kFsCreateNewFlags);
+  if (new_fd != fd) {
+    return 7;
+  }
+  if (FileWrite(new_fd, kData, kDataSize) != kDataSize ||
+      Seek(new_fd, 0, kFsSeekSet) != 0 ||
+      FileRead(new_fd, g_ipc_buf_b, kDataSize) != kDataSize ||
+      !BytesEqual(g_ipc_buf_b, kData, kDataSize)) {
+    return 8;
+  }
+  if (Close(new_fd) != 0 || Unlink(kPath) != 0) {
+    return 9;
+  }
+  return 0;
+}
+
+// `FsTestSubmode::kFailedOpenOnly`.
+static int64_t RunFsFailedOpenOnly() {
+  return Open("/missing", kFsOpenRead) == kSyscallErrorNoEntry ? 0 : 1;
+}
+
+// `FsTestSubmode::kMalformedServer`.
+static int64_t RunFsMalformedServer() {
+  // System calls 1 and 2: malformed FsOpenReply (type kNone and handle 0).
+  if (Open("/bad_type", kFsOpenRead) != kSyscallErrorIo) {
+    return 1;
+  }
+  if (Open("/zero_handle", kFsOpenRead) != kSyscallErrorIo) {
+    return 2;
+  }
+  // System calls 3..6: malformed FsStat (type kNone, ino 0, size -1, nlink 0).
+  FsStat st{};
+  for (int i = 0; i < 4; ++i) {
+    if (Stat("/s", &st) != kSyscallErrorIo) {
+      return 3;
+    }
+  }
+  // System call 7: open a directory on the initial server.
+  const int64_t dir_fd = Open("/dir", kFsOpenRead | kFsOpenDirectory);
+  if (dir_fd != 0) {
+    return 4;
+  }
+  // System calls 8..13: malformed FsDirEntry (ino 0, type kNone, ".", "..",
+  // '/' in name, and NUL in name).
+  FsDirEntry entry{};
+  for (int i = 0; i < 6; ++i) {
+    if (ReadDir(dir_fd, &entry, 1) != kSyscallErrorIo) {
+      return 5;
+    }
+  }
+  // System call 14 (`kMalformedServerReadSyscall`): wait until the boot
+  // self-test replaces the server and types a byte, then exit with `dir_fd`
+  // still open.
+  char byte = 0;
+  if (Read(&byte, 1) != 1) {
+    return 6;
+  }
+  return 0;
+}
+
+// Runs `Mode::kFsChecks` as `arg` says.
+static int64_t RunFsChecks(const uint64_t arg) {
+  switch (static_cast<FsTestSubmode>(usertest::DriverSubmode(arg))) {
+    case FsTestSubmode::kFullSuite:
+      return RunFsFullSuite();
+    case FsTestSubmode::kLeakAndFault:
+      return RunFsLeakAndFault();
+    case FsTestSubmode::kSeedDocs:
+      return RunFsSeedDocs();
+    case FsTestSubmode::kStaleFd:
+      return RunFsStaleFd();
+    case FsTestSubmode::kFailedOpenOnly:
+      return RunFsFailedOpenOnly();
+    case FsTestSubmode::kMalformedServer:
+      return RunFsMalformedServer();
+  }
+  return usertest::kBadSubmodeStatus;
+}
+
 }  // namespace
 
 int64_t Main(const uint64_t arg) {
@@ -2810,6 +3791,10 @@ int64_t Main(const uint64_t arg) {
       return RunDriverIrqWait(arg);
     case Mode::kDriverXhciReset:
       return RunDriverXhciReset(arg);
+    case Mode::kIpcChecks:
+      return RunIpcChecks(arg);
+    case Mode::kFsChecks:
+      return RunFsChecks(arg);
   }
   // The mode should have faulted, or it is unknown.
   return -1;

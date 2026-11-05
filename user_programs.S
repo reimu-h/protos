@@ -40,5 +40,12 @@ g_ps2kbd_elf_start:
     .incbin "user/ps2kbd.elf"
 g_ps2kbd_elf_end:
 
+.balign 16
+.global g_ramfs_elf_start
+.global g_ramfs_elf_end
+g_ramfs_elf_start:
+    .incbin "user/ramfs.elf"
+g_ramfs_elf_end:
+
 .section .note.GNU-stack,"",@progbits
 

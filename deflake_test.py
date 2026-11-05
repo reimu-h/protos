@@ -201,9 +201,11 @@ def make_serial_log(
 # up (like QEMU). FAKE_BOOT_LINES names a file of lines to print before the
 # self-tests end; FAKE_BUG injects one bug: "noninteractive" (the kernel
 # ignores the fw_cfg opt-in), "symbols_unshifted" (Shift does not change
-# digits and symbols) or "late_failure" (the stress test fails while the
+# digits and symbols), "late_failure" (the stress test fails while the
 # harness dumps the VGA text buffer or framebuffer, after its last serial log
-# check before that dump).
+# check before that dump), "no_ramfs" (init's ramfs never reports
+# '[RAMFS] ready'), or "ramfs_not_ready" (init reports that ramfs did not get
+# ready, as it does when ramfs doesn't start in time).
 FAKE_GUEST_QEMU = r'''#!/usr/bin/env python3
 import json, os, queue, select, socket, sys, threading, time
 
@@ -356,7 +358,8 @@ def shell():
             if words[:1] == ["echo"]:
                 log(" ".join(words[1:16]) + "\n")
             elif words == ["help"]:
-                log("built-in commands: help echo cpu programs run exit\n"
+                log("built-in commands: help echo cpu ls cat mkdir rm touch "
+                    "programs run exit\n"
                     "user programs: init sh usertest\n")
             elif words == ["usertest", "0"]:
                 log("sh: usertest exited with status -1250999896491\n")
@@ -405,8 +408,13 @@ def boot():
             "height=800 bpp=32\n")
     script = "help\necho boot_sh_ok\nusertest 0\n"
     stress = "[STRESS] random_multicpu_stress: PASS\n" * 3
+    # Like the real init, which starts the shell only once ramfs is ready (or
+    # it gave up on it).
+    ramfs = {"no_ramfs": "",
+             "ramfs_not_ready": "[INIT] ramfs not ready; continuing without a "
+                                "filesystem\n"}.get(BUG, "[RAMFS] ready\n")
     if not interactive:
-        log("[INIT] hello from ring 3\n")
+        log("[INIT] hello from ring 3\n" + ramfs)
         for ch in script + "exit 0\n":
             shell_input.put(ch)
         shell()
@@ -419,6 +427,7 @@ def boot():
     for bdf, mode in controllers.values():
         if mode:
             log("[USBKBD] controller %s ready (%s)\n" % (bdf, mode))
+    log(ramfs)
     if BUG == "ps2_prefixed":
         log("sh> [PS2KBD] controller i8042 ready (irq1)\n")
     else:
@@ -559,9 +568,12 @@ time.sleep(600)
 
 
 def qemu64_boot_lines(script: str) -> list[str]:
-  """Lines with every marker that test_boot.sh requires in a qemu64 pass
-  (REQUIRED_MARKERS and the non-KVM QEMU64_MARKERS), except those that a
-  boot prints at fixed points of its flow (init, self-test end, stress)."""
+  """The lines that FAKE_GUEST_QEMU prints first, so that a qemu64 pass finds
+  the markers that test_boot.sh requires: the greeting, the x87 pointer
+  report, and those of REQUIRED_MARKERS and the non-KVM QEMU64_MARKERS that
+  don't start with "[INIT]", "[STRESS]" or "[TEST] ALL BOOT", which the fake
+  prints where a real boot does (around the init session, at the end of the
+  self-tests and after them)."""
   values = dict(re.findall(r'^\s*([A-Z0-9_]+)="([^"$]*)"$', script, re.M))
   lines = ["Hello, x86-64 Kernel World!", "[CPU] x87 pointer reset: enabled"]
   for array in ("REQUIRED_MARKERS", "QEMU64_MARKERS"):
@@ -2602,6 +2614,58 @@ class UsbHarnessTest(unittest.TestCase):
       proc, _, _ = self.run_test_boot(tmp_path, "bios", "ps2_prefixed")
       self.assertEqual(
           proc.returncode, 0, (proc.stdout + proc.stderr)[-3000:]
+      )
+
+  def test_test_boot_sh_requires_init_ramfs(self) -> None:
+    with tempfile.TemporaryDirectory() as tmp:
+      tmp_path = Path(tmp)
+      self.setup_fake_guest(tmp_path)
+
+      def first_failure(art_dir: Path) -> str:
+        output = (art_dir / "bios" / "output.log").read_text(encoding="utf-8")
+        return deflake.first_harness_failure(output) or output[-2000:]
+
+      # 1. Without the interactive session, init's ramfs must report ready
+      # between init's greeting and its end.
+      proc, art_dir, _ = self.run_test_boot(
+          tmp_path, "bios", "no_ramfs", extra_env={"BOOT_TEST_USB": "0"})
+      self.assertEqual(proc.returncode, 1, (proc.stdout + proc.stderr)[-3000:])
+      self.assertTrue(
+          first_failure(art_dir).startswith(
+              "FAIL: Missing '[RAMFS] ready' of init's ramfs"),
+          first_failure(art_dir),
+      )
+      # 2. In the interactive session too, where the USB session waits for
+      # the marker until the pass deadline (cut short here).
+      proc, art_dir, elapsed = self.run_test_boot(
+          tmp_path, "bios", "no_ramfs",
+          extra_env={"BIOS_TIMEOUT_SECS": "1", "USB_SESSION_TIMEOUT_SECS": "4"})
+      self.assertEqual(proc.returncode, 1, (proc.stdout + proc.stderr)[-3000:])
+      self.assertTrue(
+          first_failure(art_dir).startswith(
+              "FAIL: usb_ready: timed out waiting for the drivers' "),
+          first_failure(art_dir),
+      )
+      self.assertIn("'[RAMFS] ready'", first_failure(art_dir))
+      self.assertLess(elapsed, 30)
+      # 3. init's report that ramfs did not get ready fails the session at
+      # once, and a boot without the session.
+      proc, art_dir, elapsed = self.run_test_boot(
+          tmp_path, "bios", "ramfs_not_ready")
+      self.assertEqual(proc.returncode, 1, (proc.stdout + proc.stderr)[-3000:])
+      self.assertTrue(
+          first_failure(art_dir).startswith(
+              "FAIL: usb_ready: init reported that ramfs did not get ready"),
+          first_failure(art_dir),
+      )
+      self.assertLess(elapsed, 30)
+      proc, art_dir, _ = self.run_test_boot(
+          tmp_path, "bios", "ramfs_not_ready", extra_env={"BOOT_TEST_USB": "0"})
+      self.assertEqual(proc.returncode, 1, (proc.stdout + proc.stderr)[-3000:])
+      self.assertTrue(
+          first_failure(art_dir).startswith(
+              "FAIL: init reported that ramfs did not get ready"),
+          first_failure(art_dir),
       )
 
 

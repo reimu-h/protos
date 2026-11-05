@@ -81,7 +81,7 @@ TEST_COMMON_LDFLAGS := -lgmock_main -lgmock -lgtest -pthread
 # inline assembly, which the kernel keeps for each process (user_mode.h), so
 # GCC may use SSE in them. GCC must not turn their loops into calls of the
 # memory functions that user/crt.cpp defines with such loops.
-USER_PROGRAMS := init sh usertest usbkbd ps2kbd
+USER_PROGRAMS := init sh usertest usbkbd ps2kbd ramfs
 USER_CXXFLAGS := -m64 -masm=intel -std=c++20 -O2 -Wall -Wextra $(WERROR_FLAG) \
                  $(ARCH_CXXFLAGS) -ffreestanding -nostdlib -fno-builtin \
                  -fno-exceptions -fno-rtti -mno-red-zone \
@@ -92,12 +92,13 @@ USER_CXXFLAGS := -m64 -masm=intel -std=c++20 -O2 -Wall -Wextra $(WERROR_FLAG) \
                  $(PROJECT_INCLUDE_FLAGS) -I$(BUILD_DIR)/include
 USER_LDFLAGS := -m elf_x86_64 -z max-page-size=0x1000 -z noexecstack \
                 -static -nostdlib -T user/user.ld
-USER_HDRS := status_or.h syscall_abi.h user/syscall.h user/sh/sh_lib.h \
-             user/usertest/usertest.h user/usbkbd/usb_descriptors.h \
-             user/usbkbd/usb_hid.h user/usbkbd/xhci_context.h \
-             user/usbkbd/xhci_controller.h user/usbkbd/xhci_platform.h \
-             user/usbkbd/xhci_regs.h user/usbkbd/xhci_ring.h \
-             user/ps2kbd/ps2_scancode.h user/ps2kbd/i8042.h
+USER_HDRS := status_or.h syscall_abi.h fs_protocol.h user/syscall.h \
+             user/sh/sh_lib.h user/usertest/usertest.h \
+             user/usbkbd/usb_descriptors.h user/usbkbd/usb_hid.h \
+             user/usbkbd/xhci_context.h user/usbkbd/xhci_controller.h \
+             user/usbkbd/xhci_platform.h user/usbkbd/xhci_regs.h \
+             user/usbkbd/xhci_ring.h user/ps2kbd/ps2_scancode.h \
+             user/ps2kbd/i8042.h user/ramfs/ramfs.h
 USER_ELFS := $(patsubst %,$(BUILD_DIR)/user/%.elf,$(USER_PROGRAMS))
 
 TEST_BUILD_MODES := debug opt
@@ -181,6 +182,7 @@ TEST_EXTRA_SRCS_stress_test := selftest/stress.cpp random.cpp $(TASK_LAYER_SRCS)
 TEST_EXTRA_SRCS_ioapic_test := ioapic.cpp
 TEST_EXTRA_SRCS_device_irq_test := device_irq.cpp ioapic.cpp pci.cpp pci_config_fake.cpp $(TASK_LAYER_SRCS) context_switch.S task.cpp $(IDT_TEST_SRCS) $(SCHED_TEST_FAKES)
 TEST_EXTRA_SRCS_driver_test := driver.cpp device_irq.cpp ioapic.cpp pci.cpp pci_config_fake.cpp $(TASK_LAYER_SRCS) context_switch.S task.cpp $(IDT_TEST_SRCS) $(SCHED_TEST_FAKES)
+TEST_EXTRA_SRCS_ipc_test := ipc.cpp
 
 SELFTEST_SRCS := selftest/selftest.cpp selftest/boot_selftest.cpp selftest/stress.cpp
 
@@ -210,6 +212,7 @@ CXX_SRCS := \
     ioapic.cpp \
     device_irq.cpp \
     driver.cpp \
+    ipc.cpp \
     random.cpp \
     $(if $(filter 1,$(SELFTEST)),$(SELFTEST_SRCS)) \
     kernel.cpp
@@ -239,6 +242,7 @@ CXX_HDRS := \
     ioapic.h \
     device_irq.h \
     driver.h \
+    ipc.h \
     steal_time.h \
     kill_delay_injection.h \
     cpu_clock.h \

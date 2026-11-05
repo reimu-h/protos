@@ -30,10 +30,11 @@ namespace protos {
 // checks that the running program may access every page of it as owned user
 // RAM (PagingUserRangeAccessible() in its address space, which also rejects
 // device MMIO pages, as UserProcess::MayRead() does) and fails with
-// kSyscallErrorFault otherwise. A program's mappings don't change while one of
-// its system calls runs (only its own task maps and unmaps them, before it
-// enters user mode and after it has left), so a copy of a checked range can't
-// fault; if it does, the kernel panics as for any other fault of kernel code.
+// kSyscallErrorFault otherwise. No user page is ever unmapped or made less
+// accessible while the program runs (only its own task maps pages, and the
+// address space is torn down only after it has left user mode for good), so a
+// copy of a checked range can't fault; if it does, the kernel panics as for any
+// other fault of kernel code.
 // The contents of the pages can change, though: the program waits for its
 // system call, but a device may write a driver's DMA pages (owned RAM, which
 // passes the checks) at any time. So the kernel must not assume that two reads

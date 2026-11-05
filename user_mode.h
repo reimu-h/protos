@@ -6,7 +6,10 @@
 #include <memory>
 
 #include "driver.h"
+#include "fs_protocol.h"
+#include "ipc.h"
 #include "paging.h"
+#include "pmm.h"
 #include "spinlock.h"
 #include "syscall_abi.h"
 
@@ -58,6 +61,21 @@ struct Task;
 // page below the stack, which catches stack overflows.
 constexpr uintptr_t kUserStackTop = 0xFFFFFFFF7FFFF000ULL;
 constexpr int64_t kUserStackPages = 4;
+
+// Per-process user virtual address window for anonymous memory mappings
+// (`MemMap()`, `kSyscallMemMap`), placed above `kDriverMmioWindowBase` and
+// `kDriverDmaWindowBase` (driver.h) and below the ELF image and user stack.
+// Each mapping is followed by one unmapped 4 KiB guard page.
+constexpr uintptr_t kUserAnonWindowBase = 0xFFFFB00000000000ULL;
+constexpr uintptr_t kUserAnonWindowSize = 1ULL << 30;  // 1 GiB
+static_assert(kDriverMmioWindowBase + kDriverMmioWindowSize <=
+              kDriverDmaWindowBase);
+static_assert(kDriverDmaWindowBase + kDriverDmaWindowSize <=
+              kUserAnonWindowBase);
+// Below the stack's guard page.
+static_assert(kUserAnonWindowBase + kUserAnonWindowSize <=
+              kUserStackTop -
+                  static_cast<uintptr_t>((kUserStackPages + 1) * kPageSize));
 
 // The most pages that a program's segments may take.
 constexpr int64_t kUserProgramMaxPages = 4096;
@@ -136,11 +154,17 @@ struct UserProcessStats {
   int64_t kill_notice_tick = -1;
   int kill_end_cpu = -1;
   bool kill_same_cpu_no_switch = false;
-  // Whether the program is currently in the middle of kSyscallIrqWait, whether
-  // its task is parked (not running on any CPU) inside kSyscallIrqWait, and
-  // the total timer interrupts its task has taken so far (`TaskTimerTicks()`).
+  // Whether the program is currently in the middle of kSyscallIrqWait /
+  // kSyscallIpcRecv / an IPC call (kSyscallIpcCall or a filesystem system
+  // call), whether its task is parked (not running on any CPU) inside them,
+  // and the total timer interrupts its task has taken so far
+  // (`TaskTimerTicks()`).
   bool in_irq_wait = false;
   bool blocked_in_irq_wait = false;
+  bool in_ipc_recv = false;
+  bool blocked_in_ipc_recv = false;
+  bool in_ipc_call = false;
+  bool blocked_in_ipc_call = false;
   int64_t task_timer_ticks = 0;
 };
 
@@ -206,6 +230,9 @@ class UserProcess {
   // Returns the non-zero owner token used by this process when claiming PCI
   // devices and device IRQs.
   uintptr_t OwnerToken() const { return driver_.OwnerToken(); }
+  // Returns the token that names this process as the owner of IPC ports
+  // (`IpcPortOwner()`, ipc.h).
+  uintptr_t IpcOwnerToken() const { return ipc_.OwnerToken(); }
 
   // Looks up or queries `user_addr` in the process's live address space.
   // Intended for boot self-tests that inspect mapped pages while the process is
@@ -240,6 +267,8 @@ class UserProcess {
   static void OnUserFault(InterruptFrame* frame);
   static void OnReturnToUser(InterruptFrame* frame);
   static UserProcess* FromFrame(const InterruptFrame* frame);
+  // The stop condition of the blocking waits of process `ctx` (IrqWait() and
+  // the IPC and filesystem system calls): true once it is being killed.
   static bool ShouldStopIrqWait(void* ctx);
   // Returns true once `Kill()` has been called. Long system calls poll it and
   // return early; the program then ends on its way back to user mode.
@@ -250,8 +279,8 @@ class UserProcess {
   // `buffer`.
   bool MayRead(uintptr_t buffer, int64_t size) const;
   bool MayWrite(uintptr_t buffer, int64_t size) const;
-  // Serve write(), spin(), read(), spawn(), wait() and driver system calls
-  // (syscall_abi.h): return the result for rax.
+  // Serve write(), spin(), read(), spawn(), wait(), driver, IPC and filesystem
+  // system calls (syscall_abi.h): return the result for rax.
   // `meter` measures the system call from its start; spin() lasts until
   // `meter` has counted `ticks` timer interrupts that interrupted the task,
   // on whichever CPUs: other runnable tasks on its CPU make it last longer in
@@ -271,6 +300,69 @@ class UserProcess {
   int64_t DmaAlloc(int64_t size, uintptr_t phys_out_ptr, uint64_t flags);
   int64_t IrqWait(uint64_t mask, int64_t timeout_ticks);
   int64_t ConsolePush(uintptr_t buffer, int64_t size) const;
+  int64_t IpcListen(int64_t port);
+  int64_t IpcRecv(int64_t port,       //
+                  uintptr_t buf_ptr,  //
+                  int64_t buf_cap,    //
+                  uintptr_t msg_ptr,  //
+                  int64_t timeout_ticks);
+  int64_t IpcReply(int64_t port,         //
+                   uint64_t token,       //
+                   uintptr_t reply_ptr,  //
+                   int64_t reply_size,   //
+                   int64_t status);
+  int64_t IpcCallSyscall(int64_t port,         //
+                         uintptr_t req_ptr,    //
+                         int64_t req_size,     //
+                         uintptr_t reply_ptr,  //
+                         int64_t reply_cap,    //
+                         uintptr_t reply_size_ptr);
+  int64_t MemMap(int64_t size);
+  // The filesystem system calls (syscall_abi.h) and their helpers.
+  struct FsFdSlot;
+  // Returns the slot of open file descriptor `fd`, or nullptr.
+  FsFdSlot* OpenFdSlot(int64_t fd);
+  // Checks the path of `path_len` bytes at `path_ptr` and copies it to
+  // `out_path` (room for `kFsMaxPathLength` bytes).
+  int64_t ValidateAndReadFsPath(uintptr_t path_ptr,  //
+                                int64_t path_len,    //
+                                char* out_path) const;
+  // Sends the `req_size`-byte request at `req_buf` to the filesystem server,
+  // with room for `reply_cap` reply bytes at `reply_buf`, and returns the
+  // server's status. Fails with `kSyscallErrorStale` unless `server` is
+  // `kIpcNoOwner` or still owns `kIpcPortFs`. Writes the reply's size, whether
+  // the server received the request, and the owner token of the server that
+  // got it to the `out_*` pointers that aren't null.
+  int64_t CallFsServer(uintptr_t server,         //
+                       const void* req_buf,      //
+                       int64_t req_size,         //
+                       void* reply_buf,          //
+                       int64_t reply_cap,        //
+                       int64_t* out_reply_size,  //
+                       bool* out_was_popped,     //
+                       uintptr_t* out_server);
+  // Sends the `FsPathRequest` `op` for the path of `path_len` bytes at
+  // `path_ptr`, like `CallFsServer()`.
+  int64_t CallFsServerWithPath(FsRpcOp op,          //
+                               uintptr_t path_ptr,  //
+                               int64_t path_len,    //
+                               void* reply_buf,     //
+                               int64_t reply_cap,   //
+                               int64_t* out_reply_size);
+  int64_t FsOpen(uintptr_t path_ptr, int64_t path_len, uint64_t flags);
+  int64_t FsClose(int64_t fd);
+  int64_t FsRead(int64_t fd, uintptr_t buf_ptr, int64_t size);
+  int64_t FsWrite(int64_t fd, uintptr_t buf_ptr, int64_t size);
+  int64_t FsSeek(int64_t fd, int64_t offset, int64_t whence);
+  int64_t FsStatPath(uintptr_t path_ptr, int64_t path_len, uintptr_t stat_ptr);
+  int64_t FsReadDir(int64_t fd, uintptr_t entries_ptr, int64_t max_entries);
+  int64_t FsMkDir(uintptr_t path_ptr, int64_t path_len);
+  int64_t FsUnlink(uintptr_t path_ptr, int64_t path_len);
+  int64_t FsRename(uintptr_t old_ptr,  //
+                   int64_t old_len,    //
+                   uintptr_t new_ptr,  //
+                   int64_t new_len);
+  void RecordKillInterruptInSyscall();
   void CleanupChildren();
   // Adds a finished system call, which `meter` measured, to the counters.
   void RecordSyscall(const TickMeter& meter);
@@ -300,6 +392,38 @@ class UserProcess {
   mutable IrqSpinLock space_lock_;
   AddressSpace* space_ = nullptr;
   DriverContext driver_;
+  // The process's IPC ports, and `ipc_buf_`, the kernel buffer for the
+  // requests and replies of the ports that it serves (kIpcMaxMessageSize
+  // bytes, allocated by its first successful IpcListen(); one suffices since
+  // the process has a single task).
+  IpcContext ipc_;
+  std::unique_ptr<uint8_t[]> ipc_buf_;
+  // Identifies the process as an IPC client (`IpcReceivedMessage::client_id`);
+  // never reused.
+  const uint64_t ipc_client_id_;
+  // For each port in `kIpcFirstUserPort .. kIpcPortCount - 1`, the owner token
+  // of the latest server that received a call from this process (`kIpcNoOwner`
+  // if none): if that server still owns the port when the process ends, it gets
+  // a disconnect notification.
+  uintptr_t ipc_called_port_owners_[kIpcPortCount] = {};
+  // The anonymous memory window's next free address and the bytes mapped.
+  uintptr_t next_anon_addr_ = kUserAnonWindowBase;
+  int64_t anon_total_bytes_ = 0;
+  // An open file descriptor: the filesystem server's handle and the owner
+  // token of the server that issued it.
+  struct FsFdSlot {
+    bool open = false;
+    uint64_t handle = 0;
+    uintptr_t server = kIpcNoOwner;
+  };
+  FsFdSlot fds_[kMaxOpenFiles] = {};
+  int open_fd_count_ = 0;
+  // Owner token of a filesystem server that may hold an open file of this
+  // process that no descriptor names (an open or close was interrupted or
+  // failed after or before reaching the server), so that if that server still
+  // owns `kIpcPortFs` when the process ends, it gets a disconnect notification
+  // even with no descriptor open.
+  uintptr_t fs_cleanup_server_ = kIpcNoOwner;
   // Written by the task (and its interrupt handlers); read after `Join()`.
   UserProgramResult result_;
   std::atomic<bool> kill_requested_{false};
@@ -326,6 +450,8 @@ class UserProcess {
   std::atomic<int64_t> max_syscall_timer_ticks_{0};
   std::atomic<bool> in_syscall_{false};
   std::atomic<bool> in_irq_wait_{false};
+  std::atomic<bool> in_ipc_recv_{false};
+  std::atomic<bool> in_ipc_call_{false};
   std::atomic<int64_t> user_timer_ticks_{0};
   std::atomic<int> end_vector_{-1};
   std::atomic<int64_t> end_tick_{-1};

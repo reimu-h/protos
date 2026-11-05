@@ -24,6 +24,57 @@ inline int64_t Syscall(const int64_t number,     //
   return result;
 }
 
+// Make system call `number` with four, five or six arguments, which go in rdi,
+// rsi, rdx, r10, r8 and r9 (syscall_abi.h), and return its result.
+inline int64_t Syscall4(const int64_t number,  //
+                        const uint64_t arg0,   //
+                        const uint64_t arg1,   //
+                        const uint64_t arg2,   //
+                        const uint64_t arg3) {
+  int64_t result = 0;
+  register uint64_t r10 asm("r10") = arg3;
+  asm volatile("int 0x80"
+               : "=a"(result)
+               : "a"(number), "D"(arg0), "S"(arg1), "d"(arg2), "r"(r10)
+               : "memory");
+  return result;
+}
+
+inline int64_t Syscall5(const int64_t number,  //
+                        const uint64_t arg0,   //
+                        const uint64_t arg1,   //
+                        const uint64_t arg2,   //
+                        const uint64_t arg3,   //
+                        const uint64_t arg4) {
+  int64_t result = 0;
+  register uint64_t r10 asm("r10") = arg3;
+  register uint64_t r8 asm("r8") = arg4;
+  asm volatile("int 0x80"
+               : "=a"(result)
+               : "a"(number), "D"(arg0), "S"(arg1), "d"(arg2), "r"(r10), "r"(r8)
+               : "memory");
+  return result;
+}
+
+inline int64_t Syscall6(const int64_t number,  //
+                        const uint64_t arg0,   //
+                        const uint64_t arg1,   //
+                        const uint64_t arg2,   //
+                        const uint64_t arg3,   //
+                        const uint64_t arg4,   //
+                        const uint64_t arg5) {
+  int64_t result = 0;
+  register uint64_t r10 asm("r10") = arg3;
+  register uint64_t r8 asm("r8") = arg4;
+  register uint64_t r9 asm("r9") = arg5;
+  asm volatile("int 0x80"
+               : "=a"(result)
+               : "a"(number), "D"(arg0), "S"(arg1), "d"(arg2), "r"(r10),
+                 "r"(r8), "r"(r9)
+               : "memory");
+  return result;
+}
+
 [[noreturn]] inline void Exit(const int64_t status) {
   Syscall(kSyscallExit, static_cast<uint64_t>(status));
   // Exit() does not return; trap (#UD) if it ever did.
@@ -231,6 +282,199 @@ inline int64_t IsaPortOut8(const uint16_t port, const uint8_t value) {
 
 inline int64_t IsaIrqAlloc(const int64_t device) {
   return Syscall(kSyscallIsaIrqAlloc, static_cast<uint64_t>(device));
+}
+
+// IPC system calls (syscall_abi.h): IpcListen() claims a port, IpcRecv() and
+// IpcReply() serve its calls, and IpcCall() calls another process's port.
+inline int64_t IpcListen(const int64_t port) {
+  return Syscall(kSyscallIpcListen, static_cast<uint64_t>(port));
+}
+
+inline int64_t IpcRecv(const int64_t port,                 //
+                       void* const buffer,                 //
+                       const int64_t buffer_cap,           //
+                       IpcReceivedMessage* const out_msg,  //
+                       const int64_t timeout_ticks) {
+  return Syscall5(kSyscallIpcRecv,                       //
+                  static_cast<uint64_t>(port),           //
+                  reinterpret_cast<uintptr_t>(buffer),   //
+                  static_cast<uint64_t>(buffer_cap),     //
+                  reinterpret_cast<uintptr_t>(out_msg),  //
+                  static_cast<uint64_t>(timeout_ticks));
+}
+
+inline int64_t IpcReply(const int64_t port,           //
+                        const uint64_t token,         //
+                        const void* const reply_buf,  //
+                        const int64_t reply_size,     //
+                        const int64_t status) {
+  return Syscall5(kSyscallIpcReply,                        //
+                  static_cast<uint64_t>(port),             //
+                  token,                                   //
+                  reinterpret_cast<uintptr_t>(reply_buf),  //
+                  static_cast<uint64_t>(reply_size),       //
+                  static_cast<uint64_t>(status));
+}
+
+// Returns the owner's status; writes the reply's size to `*out_reply_size`
+// unless it is null.
+inline int64_t IpcCall(const int64_t port,         //
+                       const void* const req_buf,  //
+                       const int64_t req_size,     //
+                       void* const reply_buf,      //
+                       const int64_t reply_cap,    //
+                       int64_t* const out_reply_size = nullptr) {
+  return Syscall6(kSyscallIpcCall,                         //
+                  static_cast<uint64_t>(port),             //
+                  reinterpret_cast<uintptr_t>(req_buf),    //
+                  static_cast<uint64_t>(req_size),         //
+                  reinterpret_cast<uintptr_t>(reply_buf),  //
+                  static_cast<uint64_t>(reply_cap),        //
+                  reinterpret_cast<uintptr_t>(out_reply_size));
+}
+
+// Maps `size` bytes of zeroed anonymous memory and returns their address.
+inline StatusOr<uintptr_t> MemMap(const int64_t size) {
+  const int64_t rc = Syscall(kSyscallMemMap, static_cast<uint64_t>(size));
+  if (SyscallIsError(rc)) {
+    return Error(rc);
+  }
+  return static_cast<uintptr_t>(rc);
+}
+
+inline int64_t StringLength(const char* const text) {
+  int64_t length = 0;
+  while (text[length] != '\0') {
+    ++length;
+  }
+  return length;
+}
+
+// Filesystem system calls (syscall_abi.h). Each call that takes a path has an
+// overload for a null-terminated `path` (a null `path` makes the call fail
+// with `kSyscallErrorFault`). The deleted overloads catch calls that leave out
+// an argument and would otherwise convert a path length to flags or a null
+// pointer.
+inline int64_t Open(const char* const path,  //
+                    const int64_t path_len,  //
+                    const uint64_t flags) {
+  return Syscall(kSyscallOpen,                       //
+                 reinterpret_cast<uintptr_t>(path),  //
+                 static_cast<uint64_t>(path_len),    //
+                 flags);
+}
+
+inline int64_t Open(const char* const path, const uint64_t flags) {
+  if (path == nullptr) {
+    return Open(nullptr, 1, flags);
+  }
+  return Open(path, StringLength(path), flags);
+}
+
+int64_t Open(const char* path, int flags) = delete;
+int64_t Open(const char* path, int64_t path_len) = delete;
+
+inline int64_t Close(const int64_t fd) {
+  return Syscall(kSyscallClose, static_cast<uint64_t>(fd));
+}
+
+inline int64_t FileRead(const int64_t fd,    //
+                        void* const buffer,  //
+                        const int64_t size) {
+  return Syscall(kSyscallFileRead,                     //
+                 static_cast<uint64_t>(fd),            //
+                 reinterpret_cast<uintptr_t>(buffer),  //
+                 static_cast<uint64_t>(size));
+}
+
+inline int64_t FileWrite(const int64_t fd,          //
+                         const void* const buffer,  //
+                         const int64_t size) {
+  return Syscall(kSyscallFileWrite,                    //
+                 static_cast<uint64_t>(fd),            //
+                 reinterpret_cast<uintptr_t>(buffer),  //
+                 static_cast<uint64_t>(size));
+}
+
+inline int64_t Seek(const int64_t fd,      //
+                    const int64_t offset,  //
+                    const int64_t whence) {
+  return Syscall(kSyscallSeek,                   //
+                 static_cast<uint64_t>(fd),      //
+                 static_cast<uint64_t>(offset),  //
+                 static_cast<uint64_t>(whence));
+}
+
+inline int64_t Stat(const char* const path,  //
+                    const int64_t path_len,  //
+                    FsStat* const out_stat) {
+  return Syscall(kSyscallStat,                       //
+                 reinterpret_cast<uintptr_t>(path),  //
+                 static_cast<uint64_t>(path_len),    //
+                 reinterpret_cast<uintptr_t>(out_stat));
+}
+
+inline int64_t Stat(const char* const path, FsStat* const out_stat) {
+  if (path == nullptr) {
+    return Stat(nullptr, 1, out_stat);
+  }
+  return Stat(path, StringLength(path), out_stat);
+}
+
+int64_t Stat(const char* path, int64_t path_len) = delete;
+int64_t Stat(const char* path, int path_len) = delete;
+
+inline int64_t ReadDir(const int64_t fd,               //
+                       FsDirEntry* const out_entries,  //
+                       const int64_t max_entries) {
+  return Syscall(kSyscallReadDir,                           //
+                 static_cast<uint64_t>(fd),                 //
+                 reinterpret_cast<uintptr_t>(out_entries),  //
+                 static_cast<uint64_t>(max_entries));
+}
+
+inline int64_t MkDir(const char* const path, const int64_t path_len) {
+  return Syscall(kSyscallMkDir,                      //
+                 reinterpret_cast<uintptr_t>(path),  //
+                 static_cast<uint64_t>(path_len));
+}
+
+inline int64_t MkDir(const char* const path) {
+  if (path == nullptr) {
+    return MkDir(nullptr, 1);
+  }
+  return MkDir(path, StringLength(path));
+}
+
+inline int64_t Unlink(const char* const path, const int64_t path_len) {
+  return Syscall(kSyscallUnlink,                     //
+                 reinterpret_cast<uintptr_t>(path),  //
+                 static_cast<uint64_t>(path_len));
+}
+
+inline int64_t Unlink(const char* const path) {
+  if (path == nullptr) {
+    return Unlink(nullptr, 1);
+  }
+  return Unlink(path, StringLength(path));
+}
+
+inline int64_t Rename(const char* const old_path,  //
+                      const int64_t old_len,       //
+                      const char* const new_path,  //
+                      const int64_t new_len) {
+  return Syscall4(kSyscallRename,                         //
+                  reinterpret_cast<uintptr_t>(old_path),  //
+                  static_cast<uint64_t>(old_len),         //
+                  reinterpret_cast<uintptr_t>(new_path),  //
+                  static_cast<uint64_t>(new_len));
+}
+
+inline int64_t Rename(const char* const old_path, const char* const new_path) {
+  return Rename(old_path,                                          //
+                old_path == nullptr ? 1 : StringLength(old_path),  //
+                new_path,                                          //
+                new_path == nullptr ? 1 : StringLength(new_path));
 }
 
 // Each user program defines its main function, which the entry point

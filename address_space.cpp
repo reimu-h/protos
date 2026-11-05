@@ -64,6 +64,10 @@ bool AddressSpace::MapDevicePage(const uintptr_t user_addr,
   return PagingMapUserDevicePage(root_, user_addr, phys_addr);
 }
 
+bool AddressSpace::ReserveRange(const uintptr_t user_addr, const int64_t size) {
+  return PagingReserveUserRange(root_, user_addr, size);
+}
+
 bool AddressSpace::MapOwnedFrame(const uintptr_t user_addr,   //
                                  const uintptr_t frame_phys,  //
                                  const UserPageAccess access) {

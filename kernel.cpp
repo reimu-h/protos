@@ -10,6 +10,7 @@
 #include "heap.h"
 #include "idt.h"
 #include "ioapic.h"
+#include "ipc.h"
 #include "multiboot.h"
 #include "paging.h"
 #include "pci.h"
@@ -194,6 +195,7 @@ static void RunInteractiveBootSession() {
                           PciClaimedCount() == 0 &&                    //
                           IsaClaimedCount() == 0 &&                    //
                           DeviceIrqUsedVectorCount() == 0 &&           //
+                          IpcClaimedPortCount() == 0 &&                //
                           PmmFreeFrameCount() == pmm_free_before &&    //
                           HeapTotalFreeBytes() == heap_free_before;
   if (!cleanup_ok) {
@@ -250,6 +252,7 @@ extern "C" [[noreturn]] void kernel_main(const uint32_t multiboot_magic,
   PciWriteBootReport(UartWrite);
   IoApicInit();
   DriverInit();
+  IpcInit();
 
 #if PROTOS_SELFTEST
   if (IsInteractiveBootSession()) {

@@ -144,19 +144,21 @@ enum class Mode : uint8_t {
   // Calls every privileged system call (`7..15`, `17..19`) from an unprivileged
   // process (`kUserCapNone`), checks that each returns
   // `kSyscallErrorPermission`, that `kSyscallGetTicks` (`16`) succeeds, that
-  // out-of-range system calls (`20`, `-1`) return `kSyscallErrorNoSys`, and
-  // that a child spawned via `spawn()` also gets `kSyscallErrorPermission`.
+  // `IpcListen(kIpcPortFs)` returns `kSyscallErrorPermission`, and that
+  // out-of-range system calls (`kSyscallCount`, `-1`) return
+  // `kSyscallErrorNoSys`. `kDriverCapProbe` runs it in children that it starts
+  // with `spawn()`, which get `kUserCapNone`.
   kDriverDenied,
   // Probes capability separation (`DriverSubmode(arg)`):
   //   0 (`kProbeDriverRole`): run as `kUserCapDriver`; checks `pci_info`,
   //     `get_ticks`, and unclaimed `isa_*` validation work, `spawn_driver`
-  //     returns `kSyscallErrorPermission`, out-of-range syscall `20` returns
-  //     `kSyscallErrorNoSys`, and a child spawned via `spawn()` runs
-  //     `kDriverDenied` with `kUserCapNone` and exits with 0.
+  //     returns `kSyscallErrorPermission`, out-of-range syscall
+  //     `kSyscallCount` returns `kSyscallErrorNoSys`, and a child spawned via
+  //     `spawn()` runs `kDriverDenied` with `kUserCapNone` and exits with 0.
   //   1 (`kProbeSpawnerRole`): run as `kUserCapSpawnDrivers`; checks driver
-  //     syscalls `8..15` and `17..19` return `kSyscallErrorPermission`, then
-  //     calls `spawn_driver("usertest", ...)` with `kProbeDriverRole` and waits
-  //     for the driver child to exit with 0.
+  //     syscalls `8..15` and `17..19` and `IpcListen(kIpcPortFs)` return
+  //     `kSyscallErrorPermission`, then calls `spawn_driver("usertest", ...)`
+  //     with `kProbeDriverRole` and waits for the driver child to exit with 0.
   kDriverCapProbe,
   // Claims PCI device `DriverDeviceIndex(arg)`, enables Bus Master, maps BAR
   // `DriverBarIndex(arg)`, and according to `DriverSubmode(arg)`
@@ -208,6 +210,117 @@ enum class Mode : uint8_t {
   // `kXhciResetWasRunningStatus` if it ran and was halted, or with another
   // `kXhciReset*Status` if a step failed.
   kDriverXhciReset,
+  // Exercises synchronous IPC (`IpcListen()`, `IpcRecv()`, `IpcReply()` and
+  // `IpcCall()`) and anonymous memory mapping (`MemMap()`) as
+  // `DriverSubmode(arg)` (`IpcTestSubmode`) says, on IPC port
+  // `DriverDeviceIndex(arg)` (`IpcChecksArg()`).
+  kIpcChecks,
+  // Exercises the filesystem system calls (`Open()` through `Rename()`)
+  // against a running `ramfs` as `DriverSubmode(arg)` (`FsTestSubmode`) says
+  // (`FsChecksArg()`).
+  kFsChecks,
+};
+
+// The submodes of `Mode::kIpcChecks`. Each but `kMemMapGuardFault` uses IPC
+// port `port` (`DriverDeviceIndex(arg)`), which must be a user port
+// (`kIpcFirstUserPort <= port < kIpcPortCount`; `kServerHoldCall` also uses
+// `port + 1`), and exits with `kBadSubmodeStatus` if it isn't, as an unknown
+// submode does. A server waits at most 2 s for a message that should come.
+// `kEndToEnd` starts its `kClient` child itself; the boot self-tests pair
+// `kServerFaultMidRpc`, `kServerHoldCall` and `kServerLateReply` with
+// `kClientCallOnce` clients.
+enum class IpcTestSubmode : uint8_t {
+  // Checks MemMap() and the errors of the IPC system calls, claims `port`,
+  // starts a `kClient` child and serves its calls, checking each request and
+  // its `IpcReceivedMessage::reply_cap`, and that a reply longer than
+  // `reply_cap` fails with `kSyscallErrorInvalid` while one that fits then
+  // works. Then checks that the child's `kClientDisconnect` comes once the
+  // child has ended. Exits with 0, with the number of its first
+  // failed check (1-8, 20-30), or, if a call doesn't come or the child fails,
+  // with `kChildStatusBase` plus the child's exit status (or
+  // `kChildCrashedStatus` if the child didn't exit).
+  kEndToEnd = 0,
+  // The child of `kEndToEnd`: checks that `IpcListen(port)` fails with
+  // `kSyscallErrorBusy`, then makes calls with an empty request, a small one,
+  // the longest one, one that gets an error, and one whose reply may have at
+  // most 8 bytes, and checks each status, reply and reply size. Exits with 0
+  // or with the number of its first failed check (9-17).
+  kClient = 1,
+  // Claims `port` and blocks in IpcRecv() until it is killed. Exits with 1 if
+  // it can't claim the port, or with 2 if IpcRecv() returns.
+  kServerPark = 2,
+  // Claims `port`, receives one call and executes `ud2` (#UD) without
+  // answering it. Exits with 1 if it can't claim the port, with 2 if no call
+  // comes, or with 3 if `ud2` returns.
+  kServerFaultMidRpc = 3,
+  // Makes one call to `port` and exits with its negated error, such as 19
+  // (`kSyscallErrorNoDevice`) if the server ends first, or with
+  // `kIpcCallAnsweredStatus` if the call is answered.
+  kClientCallOnce = 4,
+  // Maps a page with MemMap() and writes to the unmapped guard page after it
+  // (#PF). Exits with 1 if MemMap() fails, or with 2 if the write returns.
+  kMemMapGuardFault = 5,
+  // Claims `port` and `port + 1`, receives one call on `port` and keeps it
+  // unanswered while it blocks in IpcRecv() on `port + 1` (in its system call
+  // `kServerHoldCallParkedSyscall`) until it is killed, so that later calls
+  // to `port` stay queued. Exits with 1 if it can't claim the ports, with 2 if
+  // no call comes, or with 3 if the second IpcRecv() returns.
+  kServerHoldCall = 6,
+  // Claims `port`, receives one call, and waits (in its system call
+  // `kServerLateReplyWaitSyscall`) for the `kClientDisconnect` of the caller,
+  // which the boot self-test kills meanwhile. Then checks that a reply longer
+  // than `reply_cap` fails with `kSyscallErrorInvalid` without consuming the
+  // call, answers the call within `reply_cap` (which returns 0), and answers
+  // it again, which must fail with `kSyscallErrorInvalid`. Exits with 0, or
+  // with 1 if it can't claim the port, 2 if no call comes, 3 if the disconnect
+  // doesn't come or is not the caller's, 4 if the oversized or valid late reply
+  // returns the wrong status, or 5 if the second valid reply doesn't fail.
+  kServerLateReply = 7,
+};
+
+// The submodes of `Mode::kFsChecks`, which need a filesystem server on
+// `kIpcPortFs`. An unknown submode exits with `kBadSubmodeStatus`.
+enum class FsTestSubmode : uint8_t {
+  // Checks the kernel's checks of filesystem system call arguments (pointers,
+  // flags, path lengths, sizes, descriptors of the wrong kind, writes at
+  // `kFsMaxFileSize`, and that IpcCall() to `kIpcPortFs` fails with
+  // `kSyscallErrorPermission`), the descriptor limit, multi-block, indirect
+  // and sparse file I/O with all data read back, ReadDir() entries, Rename()
+  // and reading a file that was unlinked while open. Then runs
+  // `kLeakAndFault` children one after the other, more than ramfs could hold
+  // the files of, and removes what it created. Exits with 0, with the number
+  // of its first failed check (1-33), or, for a child that didn't fault with
+  // #UD, with `kChildStatusBase` plus the child's exit status (or
+  // `kChildCrashedStatus` if the child didn't exit).
+  kFullSuite = 0,
+  // Opens `kMaxOpenFiles` files, each created, written and unlinked, and
+  // executes `ud2` (#UD) with all of them open, so that only the
+  // `kClientDisconnect` that the kernel sends ramfs when the process ends
+  // frees them. Exits with 1, 2 or 3 if an Open(), FileWrite() or Unlink()
+  // fails (Open() does once ramfs holds the files of earlier children), or
+  // with 4 if `ud2` returns.
+  kLeakAndFault = 1,
+  // Creates the directory `/docs` and in it the file `readme.txt`, which
+  // holds "hello from ramfs\n" (the boot self-test's shell session reads it).
+  // Exits with 0, or with 1-4 if a step fails.
+  kSeedDocs = 2,
+  // Creates and writes a file, then waits in a console Read() (its system
+  // call `kStaleFdReadSyscall`) until the boot self-test, which replaces
+  // ramfs meanwhile, types a byte. Then checks that the descriptor fails
+  // with `kSyscallErrorStale`, that Close() frees it and returns 0, and that
+  // the new ramfs, which has no files, serves new descriptors. Exits with 0,
+  // or with the number of its first failed check (1-9).
+  kStaleFd = 3,
+  // Calls Open("/missing", kFsOpenRead), checks that it fails with
+  // `kSyscallErrorNoEntry`, and exits with 0 (or 1 otherwise).
+  kFailedOpenOnly = 4,
+  // Checks that the kernel rejects malformed `FsOpenReply`, `FsStat` and
+  // `FsDirEntry` replies with `kSyscallErrorIo`, then waits in a console
+  // Read() (its system call `kMalformedServerReadSyscall`) with one directory
+  // descriptor open until the boot self-test replaces the server and types a
+  // byte, and exits with 0 without closing the descriptor (or with 1-6 if a
+  // step fails).
+  kMalformedServer = 5,
 };
 
 enum class SpawnTestSubmode : uint8_t {
@@ -258,6 +371,26 @@ constexpr int64_t kXhciResetNotDecodingStatus = 3;
 constexpr int64_t kXhciResetBadCapabilitiesStatus = 4;
 constexpr int64_t kXhciResetHaltTimeoutStatus = 5;
 constexpr int64_t kXhciResetTimeoutStatus = 6;
+
+// The exit statuses of `Mode::kIpcChecks` and `Mode::kFsChecks` besides those
+// that each submode lists: an unknown submode or an IPC port that the submode
+// can't use; a `kClientCallOnce` call that was answered; and, for a program
+// whose child failed, a child that didn't exit (it faulted, was killed or
+// didn't load), or `kChildStatusBase` plus the status of a child that exited.
+constexpr int64_t kBadSubmodeStatus = 90;
+constexpr int64_t kIpcCallAnsweredStatus = 91;
+constexpr int64_t kChildCrashedStatus = 92;
+constexpr int64_t kChildStatusBase = 100;
+
+// The system calls (counted from 1, like `UserProcessStats::syscalls`) in
+// which `IpcTestSubmode::kServerHoldCall` and `kServerLateReply` wait in
+// IpcRecv() after they received their call, and in which
+// `FsTestSubmode::kStaleFd` and `kMalformedServer` wait for console input: the
+// boot self-tests wait for them before their next step.
+constexpr int64_t kServerHoldCallParkedSyscall = 4;
+constexpr int64_t kServerLateReplyWaitSyscall = 3;
+constexpr int64_t kStaleFdReadSyscall = 3;
+constexpr int64_t kMalformedServerReadSyscall = 14;
 
 constexpr int64_t kExitStatus = -0x123456789AB;
 // The vector that `kKernelInterrupt` raises: the wakeup IPI's (idt.h), whose
@@ -458,6 +591,15 @@ constexpr int DriverBarIndex(const uint64_t arg) {
 static_assert(DriverSubmode(DriverArg(Mode::kDriverHold, 2, 5, 3)) == 2);
 static_assert(DriverDeviceIndex(DriverArg(Mode::kDriverHold, 2, 5, 3)) == 5);
 static_assert(DriverBarIndex(DriverArg(Mode::kDriverHold, 2, 5, 3)) == 3);
+
+// Return the argument that makes the program run `Mode::kIpcChecks` in
+// `submode` on IPC port `port`, and `Mode::kFsChecks` in `submode`.
+constexpr uint64_t IpcChecksArg(const IpcTestSubmode submode, const int port) {
+  return DriverArg(Mode::kIpcChecks, static_cast<uint8_t>(submode), port);
+}
+constexpr uint64_t FsChecksArg(const FsTestSubmode submode) {
+  return DriverArg(Mode::kFsChecks, static_cast<uint8_t>(submode));
+}
 
 }  // namespace protos::usertest
 

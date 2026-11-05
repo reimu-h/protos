@@ -13,9 +13,11 @@
 #include "elf.h"
 #include "format.h"
 #include "fpu.h"
+#include "fs_protocol.h"
 #include "gdt.h"
 #include "idt.h"
 #include "interrupts.h"
+#include "ipc.h"
 #include "kill_delay_injection.h"
 #include "paging.h"
 #include "pmm.h"
@@ -66,6 +68,15 @@ struct ConsoleReadWaiter {
 
 IrqSpinLock g_console_read_wait_lock;
 ConsoleReadWaiter* g_console_read_waiters = nullptr;
+std::atomic<uint64_t> g_next_ipc_client_id{1};
+
+static uint64_t AllocateIpcClientId() {
+  uint64_t id = g_next_ipc_client_id.fetch_add(1, std::memory_order_relaxed);
+  if (id == 0) {
+    id = g_next_ipc_client_id.fetch_add(1, std::memory_order_relaxed);
+  }
+  return id;
+}
 
 static void WakeConsoleReaders() {
   TaskScheduler* const scheduler = GetTaskScheduler();
@@ -205,7 +216,10 @@ std::unique_ptr<UserProcess> UserProcess::Start(const UserProgram& program,  //
 UserProcess::UserProcess(const UserProgram& program,  //
                          const uint64_t arg,          //
                          const uint64_t capabilities)
-    : program_(program), arg_(arg), capabilities_(capabilities) {}
+    : program_(program),
+      arg_(arg),
+      capabilities_(capabilities),
+      ipc_client_id_(AllocateIpcClientId()) {}
 
 UserProcess::~UserProcess() {
   if (!waited_) {
@@ -346,12 +360,16 @@ UserProcessStats UserProcess::stats() const {
         StealNsToTicks(excluded_ns, SmpTimerTickNsUpperBound());
   }
   snapshot.in_irq_wait = in_irq_wait_.load(std::memory_order_acquire);
+  snapshot.in_ipc_recv = in_ipc_recv_.load(std::memory_order_acquire);
+  snapshot.in_ipc_call = in_ipc_call_.load(std::memory_order_acquire);
   {
     const IrqSpinLockGuard guard(kill_lock_);
     if (!task_reclaimed_ && task_ != nullptr) {
       snapshot.task_timer_ticks = TaskTimerTicks(task_);
-      snapshot.blocked_in_irq_wait =
-          snapshot.in_irq_wait && TaskRunningCpu(task_) < 0;
+      const bool parked = TaskRunningCpu(task_) < 0;
+      snapshot.blocked_in_irq_wait = snapshot.in_irq_wait && parked;
+      snapshot.blocked_in_ipc_recv = snapshot.in_ipc_recv && parked;
+      snapshot.blocked_in_ipc_call = snapshot.in_ipc_call && parked;
     }
   }
   return snapshot;
@@ -407,8 +425,11 @@ void UserProcess::Run() {
   }
   // Quiesce any claimed PCI devices, disable MSI/MSI-X, and release vectors
   // and PCI claims while `space_` is still alive, before DMA frames are
-  // unmapped and returned to the PMM.
+  // unmapped and returned to the PMM, and release the process's IPC ports so
+  // any callers (including children) wake up before `CleanupChildren()`.
   driver_.Release(/*address_space_alive=*/space_ != nullptr);
+  ipc_.Release();
+  ipc_buf_.reset();
 #if PROTOS_INJECT_KILL_DELAY != 0
   if (result_.outcome == UserProgramOutcome::kKilled) {
     if (kActiveKillDelayInjection == KillDelayInjection::kTeardown) {
@@ -440,6 +461,26 @@ void UserProcess::Run() {
     space_ = nullptr;
   }
   CleanupChildren();
+  // Tell the servers that still own the ports this process used (after any
+  // child servers have ended) that it has ended.
+  if (fs_cleanup_server_ != kIpcNoOwner) {
+    IpcNotifyClientDisconnect(kIpcPortFs, ipc_client_id_, fs_cleanup_server_);
+  }
+  uintptr_t last_fd_server = fs_cleanup_server_;
+  for (int i = 0; i < kMaxOpenFiles; ++i) {
+    if (fds_[i].open && fds_[i].server != fs_cleanup_server_ &&
+        fds_[i].server != last_fd_server) {
+      last_fd_server = fds_[i].server;
+      IpcNotifyClientDisconnect(kIpcPortFs, ipc_client_id_, last_fd_server);
+    }
+  }
+  for (int port = kIpcFirstUserPort; port < kIpcPortCount; ++port) {
+    if (ipc_called_port_owners_[port] != kIpcNoOwner) {
+      IpcNotifyClientDisconnect(port,            //
+                                ipc_client_id_,  //
+                                ipc_called_port_owners_[port]);
+    }
+  }
 }
 
 bool UserProcess::Load(const ElfExecutable& executable,
@@ -608,6 +649,79 @@ void UserProcess::OnSyscall(InterruptFrame* const frame) {
       case kSyscallIsaIrqAlloc:
         ret = process->driver_.IsaIrqAlloc(static_cast<int64_t>(frame->rdi),
                                            GetTaskScheduler()->CurrentTask());
+        break;
+      case kSyscallIpcListen:
+        ret = process->IpcListen(static_cast<int64_t>(frame->rdi));
+        break;
+      case kSyscallIpcRecv:
+        ret = process->IpcRecv(static_cast<int64_t>(frame->rdi),  //
+                               frame->rsi,                        //
+                               static_cast<int64_t>(frame->rdx),  //
+                               frame->r10,                        //
+                               static_cast<int64_t>(frame->r8));
+        break;
+      case kSyscallIpcReply:
+        ret = process->IpcReply(static_cast<int64_t>(frame->rdi),  //
+                                frame->rsi,                        //
+                                frame->rdx,                        //
+                                static_cast<int64_t>(frame->r10),  //
+                                static_cast<int64_t>(frame->r8));
+        break;
+      case kSyscallIpcCall:
+        ret = process->IpcCallSyscall(static_cast<int64_t>(frame->rdi),  //
+                                      frame->rsi,                        //
+                                      static_cast<int64_t>(frame->rdx),  //
+                                      frame->r10,                        //
+                                      static_cast<int64_t>(frame->r8),   //
+                                      frame->r9);
+        break;
+      case kSyscallMemMap:
+        ret = process->MemMap(static_cast<int64_t>(frame->rdi));
+        break;
+      case kSyscallOpen:
+        ret = process->FsOpen(frame->rdi,                        //
+                              static_cast<int64_t>(frame->rsi),  //
+                              frame->rdx);
+        break;
+      case kSyscallClose:
+        ret = process->FsClose(static_cast<int64_t>(frame->rdi));
+        break;
+      case kSyscallFileRead:
+        ret = process->FsRead(static_cast<int64_t>(frame->rdi),  //
+                              frame->rsi,                        //
+                              static_cast<int64_t>(frame->rdx));
+        break;
+      case kSyscallFileWrite:
+        ret = process->FsWrite(static_cast<int64_t>(frame->rdi),  //
+                               frame->rsi,                        //
+                               static_cast<int64_t>(frame->rdx));
+        break;
+      case kSyscallSeek:
+        ret = process->FsSeek(static_cast<int64_t>(frame->rdi),  //
+                              static_cast<int64_t>(frame->rsi),  //
+                              static_cast<int64_t>(frame->rdx));
+        break;
+      case kSyscallStat:
+        ret = process->FsStatPath(frame->rdi,                        //
+                                  static_cast<int64_t>(frame->rsi),  //
+                                  frame->rdx);
+        break;
+      case kSyscallReadDir:
+        ret = process->FsReadDir(static_cast<int64_t>(frame->rdi),  //
+                                 frame->rsi,                        //
+                                 static_cast<int64_t>(frame->rdx));
+        break;
+      case kSyscallMkDir:
+        ret = process->FsMkDir(frame->rdi, static_cast<int64_t>(frame->rsi));
+        break;
+      case kSyscallUnlink:
+        ret = process->FsUnlink(frame->rdi, static_cast<int64_t>(frame->rsi));
+        break;
+      case kSyscallRename:
+        ret = process->FsRename(frame->rdi,                        //
+                                static_cast<int64_t>(frame->rsi),  //
+                                frame->rdx,                        //
+                                static_cast<int64_t>(frame->r10));
         break;
       default:
         break;
@@ -991,6 +1105,725 @@ int64_t UserProcess::ConsolePush(const uintptr_t buffer,
   ReadUserMemory(local, buffer, size);
   ConsolePushInput(local, size);
   return size;
+}
+
+void UserProcess::RecordKillInterruptInSyscall() {
+  if (!IsKillRequested()) {
+    return;
+  }
+  {
+    const ScopedIrqDisable irq_disable;
+    RecordKillNoticeIrqsOff();
+  }
+#if PROTOS_INJECT_KILL_DELAY != 0
+  if (kActiveKillDelayInjection == KillDelayInjection::kMidSyscall) {
+    const int64_t delay =
+        injected_kill_delay_ticks_.exchange(0, std::memory_order_acq_rel);
+    if (delay > 0) {
+      BusyWaitKillMeasureTicks(delay);
+    }
+  }
+#endif
+}
+
+int64_t UserProcess::IpcListen(const int64_t port) {
+  if (port < 0 || port >= kIpcPortCount) {
+    return kSyscallErrorInvalid;
+  }
+  if (port == kIpcPortFs && (capabilities_ & kUserCapDriver) == 0) {
+    return kSyscallErrorPermission;
+  }
+  const uintptr_t owner = IpcPortOwner(port);
+  if (owner == ipc_.OwnerToken()) {
+    return 0;
+  }
+  if (owner != kIpcNoOwner) {
+    return kSyscallErrorBusy;
+  }
+  // The ports that the process serves share `ipc_buf_`, so that IpcRecv() and
+  // IpcReply() never run out of memory.
+  const bool had_buffer = ipc_buf_ != nullptr;
+  if (!had_buffer) {
+    ipc_buf_.reset(new (std::nothrow) uint8_t[kIpcMaxMessageSize]);
+    if (ipc_buf_ == nullptr) {
+      return kSyscallErrorNoMemory;
+    }
+  }
+  const int64_t rc = ipc_.Listen(port, capabilities_);
+  if (rc != 0 && !had_buffer) {
+    ipc_buf_.reset();
+  }
+  return rc;
+}
+
+int64_t UserProcess::IpcRecv(const int64_t port,       //
+                             const uintptr_t buf_ptr,  //
+                             const int64_t buf_cap,    //
+                             const uintptr_t msg_ptr,  //
+                             const int64_t timeout_ticks) {
+  if (port < 0 || port >= kIpcPortCount || buf_cap < 0 ||
+      buf_cap > kIpcMaxMessageSize ||
+      timeout_ticks > kSyscallIpcTimeoutMaxTicks) {
+    return kSyscallErrorInvalid;
+  }
+  if (msg_ptr == 0 || !MayWrite(msg_ptr, sizeof(IpcReceivedMessage)) ||
+      (buf_cap > 0 && (buf_ptr == 0 || !MayWrite(buf_ptr, buf_cap)))) {
+    return kSyscallErrorFault;
+  }
+  if (ipc_buf_ == nullptr) {
+    // The process never claimed a port.
+    return kSyscallErrorAccess;
+  }
+  // Recv() fills in every byte (the struct has no padding).
+  IpcReceivedMessage msg{};
+  in_ipc_recv_.store(true, std::memory_order_release);
+  const int64_t rc = ipc_.Recv(port,                             //
+                               ipc_buf_.get(),                   //
+                               buf_cap,                          //
+                               &msg,                             //
+                               timeout_ticks,                    //
+                               &UserProcess::ShouldStopIrqWait,  //
+                               this);
+  in_ipc_recv_.store(false, std::memory_order_release);
+  RecordKillInterruptInSyscall();
+  if (rc == 1 && !IsKillRequested()) {
+    if (msg.kind == IpcMessageKind::kCall && msg.size > 0) {
+      WriteUserMemory(buf_ptr, ipc_buf_.get(), msg.size);
+    }
+    WriteUserMemory(msg_ptr, &msg, sizeof(msg));
+  }
+  return rc;
+}
+
+int64_t UserProcess::IpcReply(const int64_t port,         //
+                              const uint64_t token,       //
+                              const uintptr_t reply_ptr,  //
+                              const int64_t reply_size,   //
+                              const int64_t status) {
+  if (port < 0 || port >= kIpcPortCount || token == 0 || reply_size < 0 ||
+      reply_size > kIpcMaxMessageSize) {
+    return kSyscallErrorInvalid;
+  }
+  if (status < 0 && (!SyscallIsError(status) || reply_size != 0)) {
+    return kSyscallErrorInvalid;
+  }
+  if (reply_size > 0 && (reply_ptr == 0 || !MayRead(reply_ptr, reply_size))) {
+    return kSyscallErrorFault;
+  }
+  if (ipc_buf_ == nullptr) {
+    // The process never claimed a port.
+    return kSyscallErrorAccess;
+  }
+  if (reply_size > 0) {
+    ReadUserMemory(ipc_buf_.get(), reply_ptr, reply_size);
+  }
+  return ipc_.Reply(port, token, ipc_buf_.get(), reply_size, status);
+}
+
+int64_t UserProcess::IpcCallSyscall(const int64_t port,         //
+                                    const uintptr_t req_ptr,    //
+                                    const int64_t req_size,     //
+                                    const uintptr_t reply_ptr,  //
+                                    const int64_t reply_cap,    //
+                                    const uintptr_t reply_size_ptr) {
+  if (port < 0 || port >= kIpcPortCount || req_size < 0 ||
+      req_size > kIpcMaxMessageSize || reply_cap < 0 ||
+      reply_cap > kIpcMaxMessageSize) {
+    return kSyscallErrorInvalid;
+  }
+  if (port == kIpcPortFs) {
+    // Only the filesystem system calls call the filesystem server: its
+    // per-process limits (`kMaxOpenFiles`) rely on that.
+    return kSyscallErrorPermission;
+  }
+  if ((req_size > 0 && (req_ptr == 0 || !MayRead(req_ptr, req_size))) ||
+      (reply_cap > 0 && (reply_ptr == 0 || !MayWrite(reply_ptr, reply_cap))) ||
+      (reply_size_ptr != 0 && !MayWrite(reply_size_ptr, sizeof(int64_t)))) {
+    return kSyscallErrorFault;
+  }
+
+  std::unique_ptr<uint8_t[]> kreq;
+  if (req_size > 0) {
+    kreq.reset(new (std::nothrow) uint8_t[static_cast<size_t>(req_size)]);
+    if (kreq == nullptr) {
+      return kSyscallErrorNoMemory;
+    }
+    ReadUserMemory(kreq.get(), req_ptr, req_size);
+  }
+  std::unique_ptr<uint8_t[]> kreply;
+  if (reply_cap > 0) {
+    kreply.reset(new (std::nothrow) uint8_t[static_cast<size_t>(reply_cap)]);
+    if (kreply == nullptr) {
+      return kSyscallErrorNoMemory;
+    }
+  }
+
+  int64_t reply_size = 0;
+  bool was_popped = false;
+  uintptr_t server = kIpcNoOwner;
+  in_ipc_call_.store(true, std::memory_order_release);
+  const int64_t status = protos::IpcCall(port,                             //
+                                         ipc_client_id_,                   //
+                                         ipc_.OwnerToken(),                //
+                                         kIpcNoOwner,                      //
+                                         kreq.get(),                       //
+                                         req_size,                         //
+                                         kreply.get(),                     //
+                                         reply_cap,                        //
+                                         &reply_size,                      //
+                                         &was_popped,                      //
+                                         &server,                          //
+                                         &UserProcess::ShouldStopIrqWait,  //
+                                         this);
+  in_ipc_call_.store(false, std::memory_order_release);
+  if (was_popped) {
+    ipc_called_port_owners_[port] = server;
+  }
+  RecordKillInterruptInSyscall();
+  if (!IsKillRequested()) {
+    if (reply_size > 0) {
+      WriteUserMemory(reply_ptr, kreply.get(), reply_size);
+    }
+    if (reply_size_ptr != 0) {
+      WriteUserMemory(reply_size_ptr, &reply_size, sizeof(reply_size));
+    }
+  }
+  return status;
+}
+
+// Frees the physical frames of a list that is linked through the first word
+// of each frame.
+static void FreeFrameChain(uintptr_t frame) {
+  while (frame != 0) {
+    const uintptr_t next = *reinterpret_cast<const uintptr_t*>(frame);
+    PmmFreeFrame(frame);
+    frame = next;
+  }
+}
+
+int64_t UserProcess::MemMap(const int64_t size) {
+  if (size <= 0 || (static_cast<uint64_t>(size) & kPageMask) != 0 ||
+      size > kSyscallMemMapMaxSize) {
+    return kSyscallErrorInvalid;
+  }
+  if (anon_total_bytes_ + size > kSyscallMemMapMaxTotalSize) {
+    return kSyscallErrorNoMemory;
+  }
+  const int64_t pages = size / kPageSize;
+  // The pages and the guard page after them.
+  const uintptr_t span_bytes = static_cast<uintptr_t>(size + kPageSize);
+  const uintptr_t window_end = kUserAnonWindowBase + kUserAnonWindowSize;
+  if (span_bytes > window_end - next_anon_addr_) {
+    return kSyscallErrorNoMemory;
+  }
+
+  // Take every frame and page table first, so that running out of memory maps
+  // nothing. The frames are linked through their first word until they are
+  // mapped.
+  uintptr_t frames = 0;
+  for (int64_t i = 0; i < pages; ++i) {
+    const uintptr_t frame = PmmAllocFrame();
+    if (frame == 0) {
+      FreeFrameChain(frames);
+      return kSyscallErrorNoMemory;
+    }
+    *reinterpret_cast<uintptr_t*>(frame) = frames;
+    frames = frame;
+  }
+  const uintptr_t user_base = next_anon_addr_;
+  if (!space_->ReserveRange(user_base, size)) {
+    FreeFrameChain(frames);
+    return kSyscallErrorNoMemory;
+  }
+  for (int64_t mapped = 0; mapped < pages; ++mapped) {
+    DCHECK(frames != 0);
+    const uintptr_t frame = frames;
+    frames = *reinterpret_cast<const uintptr_t*>(frame);
+    __builtin_memset(reinterpret_cast<void*>(frame), 0,
+                     static_cast<size_t>(kPageSize));
+    const uintptr_t page =
+        user_base + static_cast<uintptr_t>(mapped * kPageSize);
+    const bool mapped_ok =
+        space_->MapOwnedFrame(page, frame, UserPageAccess::kReadWrite);
+    CHECK(mapped_ok);
+  }
+  DCHECK(frames == 0);
+  next_anon_addr_ = user_base + span_bytes;
+  anon_total_bytes_ += size;
+  return static_cast<int64_t>(user_base);
+}
+
+int64_t UserProcess::ValidateAndReadFsPath(const uintptr_t path_ptr,  //
+                                           const int64_t path_len,    //
+                                           char* const out_path) const {
+  if (path_len < 0) {
+    return kSyscallErrorInvalid;
+  }
+  if (path_len == 0) {
+    return kSyscallErrorNoEntry;
+  }
+  if (path_len > kFsMaxPathLength) {
+    if (!MayRead(path_ptr, 1)) {
+      return kSyscallErrorFault;
+    }
+    return kSyscallErrorNameTooLong;
+  }
+  if (!MayRead(path_ptr, path_len)) {
+    return kSyscallErrorFault;
+  }
+  ReadUserMemory(out_path, path_ptr, path_len);
+  for (int64_t i = 0; i < path_len; ++i) {
+    if (out_path[i] == '\0') {
+      return kSyscallErrorInvalid;
+    }
+  }
+  return 0;
+}
+
+UserProcess::FsFdSlot* UserProcess::OpenFdSlot(const int64_t fd) {
+  if (fd < 0 || fd >= kMaxOpenFiles || !fds_[fd].open) {
+    return nullptr;
+  }
+  return &fds_[fd];
+}
+
+int64_t UserProcess::CallFsServer(const uintptr_t server,         //
+                                  const void* const req_buf,      //
+                                  const int64_t req_size,         //
+                                  void* const reply_buf,          //
+                                  const int64_t reply_cap,        //
+                                  int64_t* const out_reply_size,  //
+                                  bool* const out_was_popped,     //
+                                  uintptr_t* const out_server) {
+  in_ipc_call_.store(true, std::memory_order_release);
+  const int64_t rc = protos::IpcCall(kIpcPortFs,                       //
+                                     ipc_client_id_,                   //
+                                     ipc_.OwnerToken(),                //
+                                     server,                           //
+                                     req_buf,                          //
+                                     req_size,                         //
+                                     reply_buf,                        //
+                                     reply_cap,                        //
+                                     out_reply_size,                   //
+                                     out_was_popped,                   //
+                                     out_server,                       //
+                                     &UserProcess::ShouldStopIrqWait,  //
+                                     this);
+  in_ipc_call_.store(false, std::memory_order_release);
+  RecordKillInterruptInSyscall();
+  return rc;
+}
+
+int64_t UserProcess::CallFsServerWithPath(const FsRpcOp op,          //
+                                          const uintptr_t path_ptr,  //
+                                          const int64_t path_len,    //
+                                          void* const reply_buf,     //
+                                          const int64_t reply_cap,   //
+                                          int64_t* const out_reply_size) {
+  // The path goes right after the header.
+  uint8_t req_buf[sizeof(FsPathRequest) + kFsMaxPathLength];
+  const int64_t path_rc = ValidateAndReadFsPath(
+      path_ptr, path_len,
+      reinterpret_cast<char*>(req_buf + sizeof(FsPathRequest)));
+  if (path_rc < 0) {
+    return path_rc;
+  }
+  FsPathRequest hdr{};
+  hdr.op = op;
+  hdr.path_len = static_cast<int32_t>(path_len);
+  __builtin_memcpy(req_buf, &hdr, sizeof(hdr));
+  return CallFsServer(kIpcNoOwner,                                   //
+                      req_buf,                                       //
+                      static_cast<int64_t>(sizeof(hdr)) + path_len,  //
+                      reply_buf,                                     //
+                      reply_cap,                                     //
+                      out_reply_size,                                //
+                      nullptr,                                       //
+                      nullptr);
+}
+
+static bool IsValidFsNodeType(const FsNodeType type) {
+  return type == FsNodeType::kRegular || type == FsNodeType::kDirectory;
+}
+
+static bool IsValidFsEntryName(const char* const name, const int64_t len) {
+  if (len <= 0 || len > kFsMaxNameLength) {
+    return false;
+  }
+  if ((len == 1 && name[0] == '.') ||
+      (len == 2 && name[0] == '.' && name[1] == '.')) {
+    return false;
+  }
+  for (int64_t i = 0; i < len; ++i) {
+    if (name[i] == '\0' || name[i] == '/') {
+      return false;
+    }
+  }
+  return true;
+}
+
+int64_t UserProcess::FsOpen(const uintptr_t path_ptr,  //
+                            const int64_t path_len,    //
+                            const uint64_t flags) {
+  if (!FsOpenFlagsValid(flags)) {
+    return kSyscallErrorInvalid;
+  }
+  // The path goes right after the header.
+  uint8_t req_buf[sizeof(FsOpenRequest) + kFsMaxPathLength];
+  const int64_t path_rc = ValidateAndReadFsPath(
+      path_ptr, path_len,
+      reinterpret_cast<char*>(req_buf + sizeof(FsOpenRequest)));
+  if (path_rc < 0) {
+    return path_rc;
+  }
+  int fd = -1;
+  for (int i = 0; i < kMaxOpenFiles; ++i) {
+    if (!fds_[i].open) {
+      fd = i;
+      break;
+    }
+  }
+  if (fd < 0) {
+    return kSyscallErrorTooManyFiles;
+  }
+  FsOpenRequest hdr{};
+  hdr.op = FsRpcOp::kOpen;
+  hdr.path_len = static_cast<int32_t>(path_len);
+  hdr.flags = flags;
+  __builtin_memcpy(req_buf, &hdr, sizeof(hdr));
+
+  FsOpenReply reply{};
+  int64_t reply_size = 0;
+  bool was_popped = false;
+  uintptr_t server = kIpcNoOwner;
+  const int64_t rc =
+      CallFsServer(kIpcNoOwner,                                   //
+                   req_buf,                                       //
+                   static_cast<int64_t>(sizeof(hdr)) + path_len,  //
+                   &reply,                                        //
+                   sizeof(reply),                                 //
+                   &reply_size,                                   //
+                   &was_popped,                                   //
+                   &server);
+  if (rc != 0 || reply_size != static_cast<int64_t>(sizeof(FsOpenReply)) ||
+      reply.handle == 0 || !IsValidFsNodeType(reply.type)) {
+    if (was_popped && (rc >= 0 || IsKillRequested())) {
+      // The server got the request, so it may have opened the file anyway
+      // (the program was killed meanwhile, or the reply is malformed).
+      fs_cleanup_server_ = server;
+    }
+    return rc < 0 ? rc : kSyscallErrorIo;
+  }
+  // Also if the program was killed meanwhile: it ends on its way back to user
+  // mode, and `Run()` then has the server close the file.
+  fds_[fd] = FsFdSlot{.open = true, .handle = reply.handle, .server = server};
+  ++open_fd_count_;
+  return fd;
+}
+
+int64_t UserProcess::FsClose(const int64_t fd) {
+  FsFdSlot* const slot = OpenFdSlot(fd);
+  if (slot == nullptr) {
+    return kSyscallErrorBadFd;
+  }
+  const FsFdSlot closed = *slot;
+  *slot = FsFdSlot{};
+  --open_fd_count_;
+
+  FsCloseRequest req{};
+  req.op = FsRpcOp::kClose;
+  req.handle = closed.handle;
+  bool was_popped = false;
+  const int64_t rc = CallFsServer(closed.server,  //
+                                  &req,           //
+                                  sizeof(req),    //
+                                  nullptr,        //
+                                  0,              //
+                                  nullptr,        //
+                                  &was_popped,    //
+                                  nullptr);
+  if (rc == kSyscallErrorNoDevice || rc == kSyscallErrorStale) {
+    // The server that opened the file has ended, and the open file with it.
+    return 0;
+  }
+  if (!was_popped || rc != 0) {
+    // The server didn't complete the close (the kernel ran out of memory, the
+    // program was killed, or the server returned an error): it closes the file
+    // when the process ends.
+    fs_cleanup_server_ = closed.server;
+  }
+  return rc <= 0 ? rc : kSyscallErrorIo;
+}
+
+int64_t UserProcess::FsRead(const int64_t fd,         //
+                            const uintptr_t buf_ptr,  //
+                            const int64_t size) {
+  const FsFdSlot* const slot = OpenFdSlot(fd);
+  if (slot == nullptr) {
+    return kSyscallErrorBadFd;
+  }
+  if (size < 0 || size > kSyscallFsMaxIoSize) {
+    return kSyscallErrorInvalid;
+  }
+  if (size > 0 && (buf_ptr == 0 || !MayWrite(buf_ptr, size))) {
+    return kSyscallErrorFault;
+  }
+
+  std::unique_ptr<uint8_t[]> kbuf;
+  if (size > 0) {
+    kbuf.reset(new (std::nothrow) uint8_t[static_cast<size_t>(size)]);
+    if (kbuf == nullptr) {
+      return kSyscallErrorNoMemory;
+    }
+  }
+  FsReadRequest req{};
+  req.op = FsRpcOp::kRead;
+  req.handle = slot->handle;
+  req.size = size;
+  int64_t reply_size = 0;
+  const int64_t rc = CallFsServer(slot->server,  //
+                                  &req,          //
+                                  sizeof(req),   //
+                                  kbuf.get(),    //
+                                  size,          //
+                                  &reply_size,   //
+                                  nullptr,       //
+                                  nullptr);
+  if (rc < 0) {
+    return rc;
+  }
+  if (reply_size != rc) {
+    return kSyscallErrorIo;
+  }
+  if (rc > 0 && !IsKillRequested()) {
+    WriteUserMemory(buf_ptr, kbuf.get(), rc);
+  }
+  return rc;
+}
+
+int64_t UserProcess::FsWrite(const int64_t fd,         //
+                             const uintptr_t buf_ptr,  //
+                             const int64_t size) {
+  const FsFdSlot* const slot = OpenFdSlot(fd);
+  if (slot == nullptr) {
+    return kSyscallErrorBadFd;
+  }
+  if (size < 0 || size > kSyscallFsMaxIoSize) {
+    return kSyscallErrorInvalid;
+  }
+  if (size > 0 && (buf_ptr == 0 || !MayRead(buf_ptr, size))) {
+    return kSyscallErrorFault;
+  }
+
+  const int64_t req_size = static_cast<int64_t>(sizeof(FsWriteRequest)) + size;
+  std::unique_ptr<uint8_t[]> req_buf(
+      new (std::nothrow) uint8_t[static_cast<size_t>(req_size)]);
+  if (req_buf == nullptr) {
+    return kSyscallErrorNoMemory;
+  }
+  FsWriteRequest hdr{};
+  hdr.op = FsRpcOp::kWrite;
+  hdr.handle = slot->handle;
+  hdr.size = size;
+  __builtin_memcpy(req_buf.get(), &hdr, sizeof(hdr));
+  if (size > 0) {
+    ReadUserMemory(req_buf.get() + sizeof(hdr), buf_ptr, size);
+  }
+
+  const int64_t rc = CallFsServer(slot->server,   //
+                                  req_buf.get(),  //
+                                  req_size,       //
+                                  nullptr,        //
+                                  0,              //
+                                  nullptr,        //
+                                  nullptr,        //
+                                  nullptr);
+  return rc <= size ? rc : kSyscallErrorIo;
+}
+
+int64_t UserProcess::FsSeek(const int64_t fd,      //
+                            const int64_t offset,  //
+                            const int64_t whence) {
+  const FsFdSlot* const slot = OpenFdSlot(fd);
+  if (slot == nullptr) {
+    return kSyscallErrorBadFd;
+  }
+  if (whence != kFsSeekSet && whence != kFsSeekCur && whence != kFsSeekEnd) {
+    return kSyscallErrorInvalid;
+  }
+  FsSeekRequest req{};
+  req.op = FsRpcOp::kSeek;
+  req.whence = static_cast<int32_t>(whence);
+  req.handle = slot->handle;
+  req.offset = offset;
+  return CallFsServer(slot->server,  //
+                      &req,          //
+                      sizeof(req),   //
+                      nullptr,       //
+                      0,             //
+                      nullptr,       //
+                      nullptr,       //
+                      nullptr);
+}
+
+int64_t UserProcess::FsStatPath(const uintptr_t path_ptr,  //
+                                const int64_t path_len,    //
+                                const uintptr_t stat_ptr) {
+  if (stat_ptr == 0 || !MayWrite(stat_ptr, sizeof(FsStat))) {
+    return kSyscallErrorFault;
+  }
+  FsStat server_stat{};
+  int64_t reply_size = 0;
+  const int64_t rc = CallFsServerWithPath(FsRpcOp::kStat,       //
+                                          path_ptr,             //
+                                          path_len,             //
+                                          &server_stat,         //
+                                          sizeof(server_stat),  //
+                                          &reply_size);
+  if (rc < 0) {
+    return rc;
+  }
+  if (rc != 0 || reply_size != static_cast<int64_t>(sizeof(FsStat)) ||
+      !IsValidFsNodeType(server_stat.type) || server_stat.ino == 0 ||
+      server_stat.size < 0 || server_stat.nlink <= 0) {
+    return kSyscallErrorIo;
+  }
+  if (!IsKillRequested()) {
+    // Only the fields reach the program; the reserved bytes are zero.
+    FsStat user_stat;
+    __builtin_memset(static_cast<void*>(&user_stat), 0, sizeof(user_stat));
+    user_stat.type = server_stat.type;
+    user_stat.ino = server_stat.ino;
+    user_stat.size = server_stat.size;
+    user_stat.nlink = server_stat.nlink;
+    WriteUserMemory(stat_ptr, &user_stat, sizeof(user_stat));
+  }
+  return 0;
+}
+
+int64_t UserProcess::FsReadDir(const int64_t fd,             //
+                               const uintptr_t entries_ptr,  //
+                               const int64_t max_entries) {
+  const FsFdSlot* const slot = OpenFdSlot(fd);
+  if (slot == nullptr) {
+    return kSyscallErrorBadFd;
+  }
+  if (max_entries < 0 || max_entries > kSyscallFsMaxDirEntries) {
+    return kSyscallErrorInvalid;
+  }
+  const int64_t byte_cap =
+      max_entries * static_cast<int64_t>(sizeof(FsDirEntry));
+  if (byte_cap > 0 && (entries_ptr == 0 || !MayWrite(entries_ptr, byte_cap))) {
+    return kSyscallErrorFault;
+  }
+
+  std::unique_ptr<FsDirEntry[]> entries;
+  if (max_entries > 0) {
+    entries.reset(new (std::nothrow)
+                      FsDirEntry[static_cast<size_t>(max_entries)]);
+    if (entries == nullptr) {
+      return kSyscallErrorNoMemory;
+    }
+  }
+  FsReadDirRequest req{};
+  req.op = FsRpcOp::kReadDir;
+  req.max_entries = static_cast<int32_t>(max_entries);
+  req.handle = slot->handle;
+  int64_t reply_size = 0;
+  const int64_t rc = CallFsServer(slot->server,   //
+                                  &req,           //
+                                  sizeof(req),    //
+                                  entries.get(),  //
+                                  byte_cap,       //
+                                  &reply_size,    //
+                                  nullptr,        //
+                                  nullptr);
+  if (rc < 0) {
+    return rc;
+  }
+  if (rc > max_entries ||
+      reply_size != rc * static_cast<int64_t>(sizeof(FsDirEntry))) {
+    return kSyscallErrorIo;
+  }
+  for (int64_t i = 0; i < rc; ++i) {
+    // Only the fields and the name's `name_len` bytes reach the program;
+    // the rest is zero.
+    FsDirEntry& entry = entries[static_cast<size_t>(i)];
+    if (entry.ino == 0 || !IsValidFsNodeType(entry.type) ||
+        !IsValidFsEntryName(entry.name, entry.name_len)) {
+      return kSyscallErrorIo;
+    }
+    FsDirEntry clean;
+    __builtin_memset(static_cast<void*>(&clean), 0, sizeof(clean));
+    clean.ino = entry.ino;
+    clean.type = entry.type;
+    clean.name_len = entry.name_len;
+    __builtin_memcpy(clean.name, entry.name,
+                     static_cast<size_t>(entry.name_len));
+    entry = clean;
+  }
+  if (rc > 0 && !IsKillRequested()) {
+    WriteUserMemory(entries_ptr,    //
+                    entries.get(),  //
+                    rc * static_cast<int64_t>(sizeof(FsDirEntry)));
+  }
+  return rc;
+}
+
+int64_t UserProcess::FsMkDir(const uintptr_t path_ptr, const int64_t path_len) {
+  const int64_t rc = CallFsServerWithPath(FsRpcOp::kMkDir,  //
+                                          path_ptr,         //
+                                          path_len,         //
+                                          nullptr,          //
+                                          0,                //
+                                          nullptr);
+  return rc <= 0 ? rc : kSyscallErrorIo;
+}
+
+int64_t UserProcess::FsUnlink(const uintptr_t path_ptr,
+                              const int64_t path_len) {
+  const int64_t rc = CallFsServerWithPath(FsRpcOp::kUnlink,  //
+                                          path_ptr,          //
+                                          path_len,          //
+                                          nullptr,           //
+                                          0,                 //
+                                          nullptr);
+  return rc <= 0 ? rc : kSyscallErrorIo;
+}
+
+int64_t UserProcess::FsRename(const uintptr_t old_ptr,  //
+                              const int64_t old_len,    //
+                              const uintptr_t new_ptr,  //
+                              const int64_t new_len) {
+  // The old path goes right after the header, and the new path right after
+  // the old one.
+  uint8_t req_buf[sizeof(FsRenameRequest) + 2 * kFsMaxPathLength];
+  char* const old_path =
+      reinterpret_cast<char*>(req_buf + sizeof(FsRenameRequest));
+  const int64_t old_rc = ValidateAndReadFsPath(old_ptr, old_len, old_path);
+  if (old_rc < 0) {
+    return old_rc;
+  }
+  const int64_t new_rc =
+      ValidateAndReadFsPath(new_ptr, new_len, old_path + old_len);
+  if (new_rc < 0) {
+    return new_rc;
+  }
+  FsRenameRequest hdr{};
+  hdr.op = FsRpcOp::kRename;
+  hdr.old_len = static_cast<int32_t>(old_len);
+  hdr.new_len = static_cast<int32_t>(new_len);
+  __builtin_memcpy(req_buf, &hdr, sizeof(hdr));
+  const int64_t rc =
+      CallFsServer(kIpcNoOwner,                                            //
+                   req_buf,                                                //
+                   static_cast<int64_t>(sizeof(hdr)) + old_len + new_len,  //
+                   nullptr,                                                //
+                   0,                                                      //
+                   nullptr,                                                //
+                   nullptr,                                                //
+                   nullptr);
+  return rc <= 0 ? rc : kSyscallErrorIo;
 }
 
 void UserProcess::CleanupChildren() {

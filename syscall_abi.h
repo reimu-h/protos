@@ -11,10 +11,11 @@ namespace protos {
 // (user_mode.h).
 //
 // User code makes a system call with `int 0x80` (`kVectorSyscall` in idt.h):
-// the system call number goes in rax and the arguments in rdi, rsi and rdx,
-// and the result comes back in rax. All other registers, including the
-// x87/MMX/SSE/AVX state with MXCSR and the x87 control word, and the flags are
-// preserved. Results from -4095 to -1 are errors (`kSyscallError*`).
+// the system call number goes in rax and up to six arguments go in rdi, rsi,
+// rdx, r10, r8 and r9, and the result comes back in rax. All other registers,
+// including the x87/MMX/SSE/AVX state with MXCSR and the x87 control word, and
+// the flags are preserved. Results from -4095 to -1 are errors
+// (`kSyscallError*`).
 //
 // The kernel serves system calls with interrupts enabled, like other kernel
 // code: the program may be switched out in the middle of one and continue on
@@ -140,6 +141,96 @@ static_assert(offsetof(PciDeviceInfo, parent_index) == 160);
 static_assert(offsetof(PciDeviceInfo, msi_masking) == 164);
 static_assert(std::has_unique_object_representations_v<PciDeviceInfo>);
 
+// Kind of message that `IpcRecv()` receives (`IpcReceivedMessage::kind`).
+enum class IpcMessageKind : uint32_t {
+  kNone = 0,
+  // A call from a client's `IpcCall()`: `token` (non-zero) names it in the
+  // server's `IpcReply()`, `client_id` identifies the calling process, `size`
+  // (`0 <= size <= kIpcMaxMessageSize`) is the number of request bytes written
+  // to the receive buffer, and `reply_cap` (`0 <= reply_cap <=
+  // kIpcMaxMessageSize`) is the longest reply that the client accepts.
+  kCall = 1,
+  // Notification that client process `client_id` ended after the server had
+  // received one of its calls (on `kIpcPortFs`: while it may have had files
+  // open), so that the server can drop what it keeps for the client. `token`,
+  // `size` and `reply_cap` are 0, and the server doesn't reply. It comes before
+  // the calls that are queued when it is posted.
+  kClientDisconnect = 2,
+};
+
+// What `IpcRecv()` writes to user memory when it returns 1 (it writes nothing
+// otherwise). `client_id` values are unique: the kernel never reuses one for
+// another process. Like `UserProgramResult`, it has no implicit padding.
+struct IpcReceivedMessage {
+  uint64_t token = 0;
+  uint64_t client_id = 0;
+  int64_t size = 0;
+  IpcMessageKind kind = IpcMessageKind::kNone;
+  int32_t reply_cap = 0;
+};
+static_assert(sizeof(IpcReceivedMessage) == 32);
+static_assert(alignof(IpcReceivedMessage) == 8);
+static_assert(offsetof(IpcReceivedMessage, token) == 0);
+static_assert(offsetof(IpcReceivedMessage, client_id) == 8);
+static_assert(offsetof(IpcReceivedMessage, size) == 16);
+static_assert(offsetof(IpcReceivedMessage, kind) == 24);
+static_assert(offsetof(IpcReceivedMessage, reply_cap) == 28);
+static_assert(std::has_unique_object_representations_v<IpcReceivedMessage>);
+
+// Type of a filesystem inode (`FsStat::type`, `FsDirEntry::type`).
+enum class FsNodeType : uint8_t {
+  kNone = 0,
+  kRegular = 1,
+  kDirectory = 2,
+};
+
+// Metadata of a file or directory, as `Stat()` writes it to user memory. Like
+// `UserProgramResult`, it has no implicit padding: `reserved` is always zero.
+struct FsStat {
+  FsNodeType type = FsNodeType::kNone;
+  uint8_t reserved[7] = {};
+  // Inode number, which no other file or directory of the same filesystem
+  // server has had (the root's is 1).
+  uint64_t ino = 0;
+  // Size in bytes; for a directory, `sizeof(FsDirEntry)` per entry.
+  int64_t size = 0;
+  // Number of links: 1 for a regular file, and 2 plus the number of
+  // subdirectories for a directory.
+  int64_t nlink = 0;
+};
+static_assert(sizeof(FsStat) == 32);
+static_assert(alignof(FsStat) == 8);
+static_assert(offsetof(FsStat, type) == 0);
+static_assert(offsetof(FsStat, reserved) == 1);
+static_assert(offsetof(FsStat, ino) == 8);
+static_assert(offsetof(FsStat, size) == 16);
+static_assert(offsetof(FsStat, nlink) == 24);
+static_assert(std::has_unique_object_representations_v<FsStat>);
+
+// Maximum length of a single directory entry name (excluding NUL) and of a
+// pathname passed to filesystem system calls.
+constexpr int64_t kFsMaxNameLength = 63;
+constexpr int64_t kFsMaxPathLength = 255;
+
+// One directory entry returned by `ReadDir()`, written to user memory with no
+// implicit padding. `name` holds `name_len` (`1 <= name_len <=
+// kFsMaxNameLength`) bytes followed by NUL bytes through the end of the array.
+struct FsDirEntry {
+  uint64_t ino = 0;
+  FsNodeType type = FsNodeType::kNone;
+  uint8_t reserved[3] = {};
+  int32_t name_len = 0;
+  char name[kFsMaxNameLength + 1] = {};
+};
+static_assert(sizeof(FsDirEntry) == 80);
+static_assert(alignof(FsDirEntry) == 8);
+static_assert(offsetof(FsDirEntry, ino) == 0);
+static_assert(offsetof(FsDirEntry, type) == 8);
+static_assert(offsetof(FsDirEntry, reserved) == 9);
+static_assert(offsetof(FsDirEntry, name_len) == 12);
+static_assert(offsetof(FsDirEntry, name) == 16);
+static_assert(std::has_unique_object_representations_v<FsDirEntry>);
+
 // Exit(status): ends the program with exit status `status` (rdi, int64_t).
 // Does not return.
 constexpr int64_t kSyscallExit = 0;
@@ -260,6 +351,189 @@ constexpr int64_t kSyscallIsaPortIo = 18;
 // `device`, `kSyscallErrorBusy` if already allocated during this claim, or
 // `kSyscallErrorNoMemory` if no vector or mask bit is free. Driver-only.
 constexpr int64_t kSyscallIsaIrqAlloc = 19;
+// IpcListen(port): claims IPC port `port` (rdi) for the calling process, which
+// then receives the port's calls with IpcRecv() and answers them with
+// IpcReply() until it ends, and returns 0 (also if the caller already owns
+// `port`). Fails with `kSyscallErrorInvalid` unless
+// `0 <= port < kIpcPortCount`, with `kSyscallErrorPermission` if `port` is
+// `kIpcPortFs` and the caller lacks `kUserCapDriver`, with `kSyscallErrorBusy`
+// if another process owns `port`, and with `kSyscallErrorNoMemory` if the
+// kernel can't allocate the caller's receive buffer.
+constexpr int64_t kSyscallIpcListen = 20;
+// IpcRecv(port, buf, buf_cap, out_msg, timeout_ticks): receives the next
+// message on port `port` (rdi), which the caller owns: a pending client
+// disconnect notification first, else the oldest queued call. On a message,
+// writes the call's request bytes to `buf` (rsi) and the message's
+// `IpcReceivedMessage` to `out_msg` (r10), and returns 1. Waits for a message
+// indefinitely if `timeout_ticks` (r8) is negative, for at most
+// `timeout_ticks` timer ticks if it is positive, and not at all if it is 0,
+// and returns 0 if none arrives in time. A queued call whose request is longer
+// than `buf_cap` (rdx) bytes fails with `kSyscallErrorInvalid` for its client
+// instead of being received. If the program is killed while waiting, the call
+// stops early and the program ends instead of getting a result. Fails with
+// `kSyscallErrorInvalid` unless `0 <= port < kIpcPortCount`,
+// `0 <= buf_cap <= kIpcMaxMessageSize` and
+// `timeout_ticks <= kSyscallIpcTimeoutMaxTicks`, with `kSyscallErrorFault` if
+// user code may not write all of `out_msg` and of the `buf_cap` bytes at
+// `buf`, and with `kSyscallErrorAccess` if the caller doesn't own `port`.
+constexpr int64_t kSyscallIpcRecv = 21;
+// IpcReply(port, token, reply_buf, reply_size, status): answers the call
+// `token` (rsi) that the caller received on port `port` (rdi): the client's
+// IpcCall() returns `status` (r8) with the `reply_size` (r10) bytes at
+// `reply_buf` (rdx) as its reply. `status` is either `>= 0` or a
+// `kSyscallError*` value with `reply_size == 0`. Returns 0, also if the client
+// was killed after the call was received (the reply is then dropped; the
+// kernel remembers the 64 most recent such calls of each port, and answering
+// an older one fails with `kSyscallErrorInvalid`). Fails with
+// `kSyscallErrorInvalid` unless `0 <= port < kIpcPortCount`, `token` names a
+// call received on `port` and not answered yet, `status` is valid and
+// `0 <= reply_size <=` the call's `IpcReceivedMessage::reply_cap` (the call
+// then stays unanswered), with `kSyscallErrorFault` if user code may not read
+// all of the reply, and with `kSyscallErrorAccess` if the caller doesn't own
+// `port`.
+constexpr int64_t kSyscallIpcReply = 22;
+// IpcCall(port, req_buf, req_size, reply_buf, reply_cap, out_reply_size):
+// sends the `req_size` (rdx) bytes at `req_buf` (rsi) as a call to the owner
+// of port `port` (rdi), waits until the owner answers it with IpcReply(),
+// writes the reply to `reply_buf` (r10) and its size to `*out_reply_size` (r9,
+// an `int64_t*`; skipped if 0), and returns the owner's `status`. The owner
+// sees `reply_cap` (r8) as `IpcReceivedMessage::reply_cap` and can't send a
+// longer reply. If the program is killed while waiting, the call stops early
+// and the program ends instead of getting a result. Fails with
+// `kSyscallErrorInvalid` unless `0 <= port < kIpcPortCount`,
+// `0 <= req_size <= kIpcMaxMessageSize` and
+// `0 <= reply_cap <= kIpcMaxMessageSize`, or if the request is longer than the
+// owner's receive buffer; with `kSyscallErrorPermission` for `kIpcPortFs`,
+// which only the kernel's filesystem system calls call; with
+// `kSyscallErrorFault` if user code may not read all of the request or write
+// all of the `reply_cap` bytes at `reply_buf` and of `*out_reply_size`; with
+// `kSyscallErrorNoDevice` if no process owns `port`, or if its owner ends
+// before answering; with `kSyscallErrorDeadlock` if the caller owns `port`;
+// and with `kSyscallErrorNoMemory` if the kernel runs out of memory.
+constexpr int64_t kSyscallIpcCall = 23;
+// MemMap(size): maps `size` (rdi) bytes of zeroed, writable, non-executable
+// memory into the calling process's anonymous memory window, followed by an
+// unmapped guard page, and returns its user virtual address. The memory stays
+// mapped until the program ends. Fails with `kSyscallErrorInvalid` unless
+// `size` is a positive multiple of 4096 and at most `kSyscallMemMapMaxSize`,
+// and with `kSyscallErrorNoMemory`, mapping nothing, if the process's
+// mappings would exceed `kSyscallMemMapMaxTotalSize` bytes or its window, or
+// if physical memory runs out.
+constexpr int64_t kSyscallMemMap = 24;
+// Filesystem system calls (Open() through Rename()). The user-space filesystem
+// server that owns `kIpcPortFs` (`ramfs`, which `init` starts) serves them; the
+// kernel checks their arguments and forwards them. A path is `path_len` bytes
+// (without a NUL terminator) of '/'-separated components, where `.` and `..`
+// work as usual; a path is resolved from the root `/` whether or not it starts
+// with '/'. Besides the errors listed for each call, they fail with:
+// - `kSyscallErrorFault` if user code may not read all of a path or access all
+//   of a buffer;
+// - `kSyscallErrorNoEntry` if `path_len == 0` or a path component doesn't
+//   exist;
+// - `kSyscallErrorNameTooLong` if `path_len > kFsMaxPathLength` or a component
+//   is longer than `kFsMaxNameLength` bytes;
+// - `kSyscallErrorInvalid` if `path_len < 0` or a path holds a NUL byte;
+// - `kSyscallErrorNotDir` if a component before the last is not a directory;
+// - `kSyscallErrorBadFd` unless `fd` is an open file descriptor;
+// - `kSyscallErrorStale` for a descriptor opened by a filesystem server that
+//   has ended since (and been replaced);
+// - `kSyscallErrorNoDevice` if no filesystem server runs;
+// - `kSyscallErrorDeadlock` if the caller is the filesystem server;
+// - `kSyscallErrorNoMemory` if the kernel runs out of memory;
+// - `kSyscallErrorIo` if the server's reply is malformed.
+// If the program is killed while the server works on its call, the call stops
+// early and the program ends instead of getting a result.
+//
+// Open(path, path_len, flags): opens the file or directory at the path of
+// `path_len` (rsi) bytes at `path` (rdi) with `flags` (rdx, `kFsOpen*`), and
+// returns the lowest free file descriptor (`0 <= fd < kMaxOpenFiles`), whose
+// offset starts at 0. With `kFsOpenCreate`, creates an empty regular file if
+// the path doesn't exist (Open() never creates directories; see MkDir()).
+// Fails with `kSyscallErrorInvalid` unless `FsOpenFlagsValid(flags)`; with
+// `kSyscallErrorNoEntry` if the path doesn't exist and `kFsOpenCreate` is
+// clear; with `kSyscallErrorExists` if it exists and `flags` has both
+// `kFsOpenCreate` and `kFsOpenExclusive`; with `kSyscallErrorIsDir` if it is a
+// directory and `flags` asks for write access, `kFsOpenCreate`,
+// `kFsOpenTruncate` or `kFsOpenAppend`, or if a file would be created for a
+// path that ends with '/' or with `kFsOpenDirectory`; with
+// `kSyscallErrorNotDir` if it is a regular file and the path ends with '/' or
+// `flags` has `kFsOpenDirectory`; with `kSyscallErrorTooManyFiles` if the
+// caller has `kMaxOpenFiles` open descriptors; with
+// `kSyscallErrorFileTableFull` if the server's table of open files is full;
+// and with `kSyscallErrorNoSpace` if the server has no room for a new file.
+constexpr int64_t kSyscallOpen = 25;
+// Close(fd): closes file descriptor `fd` (rdi) and returns 0. The descriptor
+// is free afterwards even if Close() fails with an error of the server or the
+// kernel, and Close() returns 0 if the server that opened it has ended.
+constexpr int64_t kSyscallClose = 26;
+// FileRead(fd, buf, size): reads up to `size` (rdx) bytes of regular file `fd`
+// (rdi), from its offset on, into `buf` (rsi), advances the offset past them,
+// and returns their number (`0` at or past the end of the file). Holes read as
+// zeros. Fails with `kSyscallErrorInvalid` unless
+// `0 <= size <= kSyscallFsMaxIoSize`, with `kSyscallErrorBadFd` if `fd` was
+// opened write-only, and with `kSyscallErrorIsDir` if `fd` is a directory.
+constexpr int64_t kSyscallFileRead = 27;
+// FileWrite(fd, buf, size): writes the `size` (rdx) bytes at `buf` (rsi) to
+// regular file `fd` (rdi) at its offset (at the end of the file if `fd` was
+// opened with `kFsOpenAppend`), advances the offset past them, and returns the
+// number of bytes written: fewer than `size` if the server runs out of space
+// or the file reaches `kFsMaxFileSize` bytes. Writing past the end of the file
+// extends it with a hole. Fails with `kSyscallErrorInvalid` unless
+// `0 <= size <= kSyscallFsMaxIoSize`, with `kSyscallErrorBadFd` if `fd` was
+// opened read-only, with `kSyscallErrorIsDir` if `fd` is a directory, with
+// `kSyscallErrorFileTooBig` if `size > 0` and the offset is at or past
+// `kFsMaxFileSize`, and with `kSyscallErrorNoSpace` if the server has no space
+// for any of the bytes.
+constexpr int64_t kSyscallFileWrite = 28;
+// Seek(fd, offset, whence): sets the offset of regular file `fd` (rdi) to
+// `offset` (rsi) bytes past its start (`whence` (rdx) is `kFsSeekSet`), its
+// current offset (`kFsSeekCur`) or its end (`kFsSeekEnd`), and returns the new
+// offset. For a directory, only `Seek(fd, 0, kFsSeekSet)`, which rewinds
+// ReadDir(), and `Seek(fd, 0, kFsSeekCur)`, which returns an opaque position,
+// work. Fails with `kSyscallErrorInvalid` if `whence` is invalid or the new
+// offset would be negative or past `kFsMaxFileSize`.
+constexpr int64_t kSyscallSeek = 29;
+// Stat(path, path_len, out_stat): writes the `FsStat` of the file or directory
+// at the path of `path_len` (rsi) bytes at `path` (rdi) to `out_stat` (rdx),
+// and returns 0. Checks `out_stat` (`kSyscallErrorFault`) before the path.
+constexpr int64_t kSyscallStat = 30;
+// ReadDir(fd, out_entries, max_entries): reads up to `max_entries` (rdx)
+// entries of directory `fd` (rdi) into `out_entries` (rsi), continuing where
+// the previous ReadDir() of `fd` stopped, and returns their number (`0` at the
+// end of the directory). There are no `.` and `..` entries. Each entry that
+// exists throughout the reads appears exactly once; one added or removed
+// meanwhile may or may not appear. Fails with `kSyscallErrorInvalid` unless
+// `0 <= max_entries <= kSyscallFsMaxDirEntries`, and with
+// `kSyscallErrorNotDir` if `fd` is a regular file.
+constexpr int64_t kSyscallReadDir = 31;
+// MkDir(path, path_len): creates an empty directory at the path of `path_len`
+// (rsi) bytes at `path` (rdi) and returns 0. Fails with `kSyscallErrorExists`
+// if the path exists, and with `kSyscallErrorNoSpace` if the server has no
+// room for a new directory.
+constexpr int64_t kSyscallMkDir = 32;
+// Unlink(path, path_len): removes the regular file or empty directory at the
+// path of `path_len` (rsi) bytes at `path` (rdi) and returns 0. A removed file
+// stays readable and writable through the descriptors that have it open until
+// they are closed. Fails with `kSyscallErrorBusy` for the root `/`, with
+// `kSyscallErrorInvalid` if the last component is `.` or `..`, with
+// `kSyscallErrorNotEmpty` for a directory that has entries, and with
+// `kSyscallErrorNotDir` for a regular file whose path ends with '/'.
+constexpr int64_t kSyscallUnlink = 33;
+// Rename(old_path, old_len, new_path, new_len): moves the file or directory at
+// the path of `old_len` (rsi) bytes at `old_path` (rdi) to the path of
+// `new_len` (r10) bytes at `new_path` (rdx), replacing a regular file or empty
+// directory there, and returns 0 (also if both paths name the same entry).
+// Fails with `kSyscallErrorBusy` if either path is the root `/`; with
+// `kSyscallErrorInvalid` if either last component is `.` or `..`, or if a
+// directory would move into itself or one of its subdirectories; with
+// `kSyscallErrorIsDir` if a regular file would replace a directory; with
+// `kSyscallErrorNotDir` if a directory would replace a regular file, or a
+// regular file's path ends with '/'; and with `kSyscallErrorNotEmpty` if the
+// directory to replace has entries.
+constexpr int64_t kSyscallRename = 34;
+
+// Total number of defined system calls (`0 .. kSyscallCount - 1`).
+constexpr int64_t kSyscallCount = 35;
 
 // The most bytes that one Write() writes.
 constexpr int64_t kSyscallWriteMaxSize = 4096;
@@ -299,24 +573,95 @@ constexpr int kIsaDeviceCount = 1;
 constexpr int64_t kSyscallPortIoRead8 = 0;
 constexpr int64_t kSyscallPortIoWrite8 = 1;
 
+// IPC ports and limits (`IpcListen()`, `IpcRecv()`, `IpcReply()`,
+// `IpcCall()`). Port `kIpcPortFs` belongs to the filesystem server: only
+// `kUserCapDriver` processes may claim it, and only the kernel's filesystem
+// system calls call it. Any process may claim and call the other ports.
+constexpr int kIpcPortFs = 0;
+constexpr int kIpcFirstUserPort = 1;
+constexpr int kIpcPortCount = 16;
+// The longest request or reply: room for the longest filesystem request, an
+// `FsWriteRequest` followed by `kSyscallFsMaxIoSize` data bytes
+// (fs_protocol.h), and some to spare.
+constexpr int64_t kIpcMaxMessageSize = 4352;
+constexpr int64_t kSyscallIpcTimeoutMaxTicks = 1000000;
+
+// Anonymous user memory mapping limits (`MemMap`).
+constexpr int64_t kSyscallMemMapMaxSize = 1LL << 20;
+constexpr int64_t kSyscallMemMapMaxTotalSize = 64LL << 20;
+
+// Filesystem limits, `Open()` flags, and `Seek()` modes.
+constexpr int kMaxOpenFiles = 32;
+constexpr int64_t kSyscallFsMaxIoSize = 4096;
+constexpr int64_t kSyscallFsMaxDirEntries = 32;
+constexpr int64_t kFsMaxFileSize = 32LL << 20;
+
+constexpr uint64_t kFsOpenAccessMask = 0x3ULL;
+constexpr uint64_t kFsOpenRead = 0x0ULL;          // O_RDONLY: read-only
+constexpr uint64_t kFsOpenWrite = 0x1ULL;         // O_WRONLY: write-only
+constexpr uint64_t kFsOpenReadWrite = 0x2ULL;     // O_RDWR: read and write
+constexpr uint64_t kFsOpenCreate = 1ULL << 2;     // O_CREAT: create if missing
+constexpr uint64_t kFsOpenTruncate = 1ULL << 3;   // O_TRUNC: truncate to 0
+constexpr uint64_t kFsOpenAppend = 1ULL << 4;     // O_APPEND: append writes
+constexpr uint64_t kFsOpenExclusive = 1ULL << 5;  // O_EXCL: fail if exists
+constexpr uint64_t kFsOpenDirectory = 1ULL << 6;  // O_DIRECTORY: require dir
+constexpr uint64_t kFsOpenFlagsMask = kFsOpenAccessMask | kFsOpenCreate |
+                                      kFsOpenTruncate | kFsOpenAppend |
+                                      kFsOpenExclusive | kFsOpenDirectory;
+
+// True if `flags` is a valid `Open()` flag combination: only `kFsOpen*` bits,
+// one of the three access modes, `kFsOpenExclusive` only with
+// `kFsOpenCreate`, and `kFsOpenTruncate` only with write access.
+constexpr bool FsOpenFlagsValid(const uint64_t flags) {
+  const uint64_t access = flags & kFsOpenAccessMask;
+  return (flags & ~kFsOpenFlagsMask) == 0 &&
+         (access == kFsOpenRead || access == kFsOpenWrite ||
+          access == kFsOpenReadWrite) &&
+         ((flags & kFsOpenExclusive) == 0 || (flags & kFsOpenCreate) != 0) &&
+         ((flags & kFsOpenTruncate) == 0 || access != kFsOpenRead);
+}
+
+constexpr int64_t kFsSeekSet = 0;  // SEEK_SET: offset from start of file
+constexpr int64_t kFsSeekCur = 1;  // SEEK_CUR: offset from current position
+constexpr int64_t kFsSeekEnd = 2;  // SEEK_END: offset from end of file
+
 // Errors, with the numbers of the corresponding Linux errno values.
-constexpr int64_t kSyscallErrorPermission = -1;  // EPERM: operation not allowed
-constexpr int64_t kSyscallErrorNoMemory = -12;   // ENOMEM: out of memory
-constexpr int64_t kSyscallErrorAccess = -13;     // EACCES: permission denied
-constexpr int64_t kSyscallErrorFault = -14;      // EFAULT: bad address
-constexpr int64_t kSyscallErrorBusy = -16;       // EBUSY: resource busy
-constexpr int64_t kSyscallErrorNoDevice = -19;   // ENODEV: no such device
-constexpr int64_t kSyscallErrorInvalid = -22;    // EINVAL: invalid argument
-constexpr int64_t kSyscallErrorNoSys = -38;      // ENOSYS: unknown system call
+constexpr int64_t kSyscallErrorPermission = -1;      // EPERM: not allowed
+constexpr int64_t kSyscallErrorNoEntry = -2;         // ENOENT: no such entry
+constexpr int64_t kSyscallErrorIo = -5;              // EIO: I/O or RPC error
+constexpr int64_t kSyscallErrorBadFd = -9;           // EBADF: bad descriptor
+constexpr int64_t kSyscallErrorNoMemory = -12;       // ENOMEM: out of memory
+constexpr int64_t kSyscallErrorAccess = -13;         // EACCES: access denied
+constexpr int64_t kSyscallErrorFault = -14;          // EFAULT: bad address
+constexpr int64_t kSyscallErrorBusy = -16;           // EBUSY: resource busy
+constexpr int64_t kSyscallErrorExists = -17;         // EEXIST: file exists
+constexpr int64_t kSyscallErrorNoDevice = -19;       // ENODEV: no such device
+constexpr int64_t kSyscallErrorNotDir = -20;         // ENOTDIR: not a directory
+constexpr int64_t kSyscallErrorIsDir = -21;          // EISDIR: is a directory
+constexpr int64_t kSyscallErrorInvalid = -22;        // EINVAL: invalid argument
+constexpr int64_t kSyscallErrorFileTableFull = -23;  // ENFILE: file table full
+constexpr int64_t kSyscallErrorTooManyFiles = -24;   // EMFILE: too many files
+constexpr int64_t kSyscallErrorFileTooBig = -27;     // EFBIG: file too large
+constexpr int64_t kSyscallErrorNoSpace = -28;        // ENOSPC: no space left
+constexpr int64_t kSyscallErrorDeadlock = -35;       // EDEADLK: self-IPC call
+constexpr int64_t kSyscallErrorNameTooLong = -36;    // ENAMETOOLONG: long name
+constexpr int64_t kSyscallErrorNoSys = -38;          // ENOSYS: unknown syscall
+constexpr int64_t kSyscallErrorNotEmpty = -39;       // ENOTEMPTY: dir not empty
+constexpr int64_t kSyscallErrorStale = -116;         // ESTALE: stale descriptor
 
 // Process capability bits (user_mode.h).
 constexpr uint64_t kUserCapNone = 0;
 constexpr uint64_t kUserCapDriver = 1ULL << 0;
 constexpr uint64_t kUserCapSpawnDrivers = 1ULL << 1;
 
-// Bit flag in `init`'s `arg` (`rdi` at entry) instructing `init` to spawn
-// user-space hardware drivers via `SpawnDriver` before starting the shell.
+// Bit flags in `init`'s `arg` (`rdi` at entry):
+// - `kInitArgStartDrivers`: spawn user-space hardware drivers (`usbkbd`,
+//   `ps2kbd`) AND the user-space filesystem server (`ramfs`) via `SpawnDriver`
+//   before starting the shell.
+// - `kInitArgStartFs`: spawn `ramfs` via `SpawnDriver` before starting the
+//   shell even when hardware drivers are omitted (for isolated tests).
 constexpr uint64_t kInitArgStartDrivers = 1ULL << 0;
+constexpr uint64_t kInitArgStartFs = 1ULL << 1;
 
 // Standard argument modes for driver processes (`Main(uint64_t arg)`).
 // - `kDriverArgNormal` (0): normal interrupt-driven daemon loop (exits with 0

@@ -13,10 +13,12 @@
 #include "driver.h"
 #include "format.h"
 #include "fpu.h"
+#include "fs_protocol.h"
 #include "gdt.h"
 #include "heap.h"
 #include "idt.h"
 #include "ioapic.h"
+#include "ipc.h"
 #include "kill_delay_injection.h"
 #include "multiboot.h"
 #include "paging.h"
@@ -3465,12 +3467,40 @@ static bool TestTaskStackGuardPages() {
 // Contents of the user pages in the address space tests.
 constexpr uint64_t kAddressSpaceTestPattern = 0x05E5A11ED0000000ULL;
 
+// Drains all free PMM frames into an intrusive chain stored in the frames'
+// first two words (next run, frame count) and returns its head.
+static uintptr_t DrainAllPmmFrames() {
+  uintptr_t chain = 0;
+  for (int64_t run_frames = 4096; run_frames >= 1; run_frames /= 8) {
+    for (uintptr_t run = PmmAllocFrames(run_frames); run != 0;
+         run = PmmAllocFrames(run_frames)) {
+      volatile uintptr_t* const header =
+          reinterpret_cast<volatile uintptr_t*>(run);
+      header[0] = chain;
+      header[1] = static_cast<uintptr_t>(run_frames);
+      chain = run;
+    }
+  }
+  return chain;
+}
+
+static void FreeDrainedPmmFrames(uintptr_t chain) {
+  while (chain != 0) {
+    const volatile uintptr_t* const header =
+        reinterpret_cast<const volatile uintptr_t*>(chain);
+    const uintptr_t next = header[0];
+    PmmFreeFrames(chain, static_cast<int64_t>(header[1]));
+    chain = next;
+  }
+}
+
 // Checks AddressSpace on the calling CPU: it maps new zeroed pages at
 // page-aligned user addresses only, in page tables of its own, which map the
 // kernel like the kernel's page tables do. While the calling task runs in it,
 // its pages appear at their user addresses and kernel memory stays reachable.
 // The kernel's page tables never map a user page, and destroying the address
-// space returns every frame.
+// space returns every frame. Also checks ReserveRange() across a 2 MiB
+// page-table boundary and under physical-memory exhaustion.
 static bool TestAddressSpaces() {
   TaskScheduler* const scheduler = GetTaskScheduler();
   SELFTEST_EXPECT(scheduler != nullptr);
@@ -3554,6 +3584,79 @@ static bool TestAddressSpaces() {
     SELFTEST_EXPECT(heap_block != nullptr);
     SELFTEST_EXPECT(PagingActiveRoot() == PagingKernelRoot());
     SELFTEST_EXPECT(PagingUserSpaceIsEmpty());
+  }
+  SELFTEST_EXPECT(PmmFreeFrameCount() == pmm_free_before);
+
+  // ReserveRange(): invalid arguments allocate nothing; a valid reservation
+  // across a 2 MiB boundary leaves leaf pages unmapped and lets MapOwnedFrame()
+  // succeed with 0 free PMM frames; a partial OOM failure returns false and
+  // frees any tables allocated so far when the AddressSpace is destroyed.
+  constexpr uintptr_t kCrossPtBase = kUserSpaceBase + kHugePageSize - kPageSize;
+  {
+    const std::unique_ptr<AddressSpace> reserve_space = AddressSpace::Create();
+    SELFTEST_EXPECT(reserve_space != nullptr);
+    const int64_t free_after_create = PmmFreeFrameCount();
+    SELFTEST_EXPECT(!reserve_space->ReserveRange(0, kPageSize));
+    SELFTEST_EXPECT(
+        !reserve_space->ReserveRange(kUserSpaceBase + 8, kPageSize));
+    SELFTEST_EXPECT(!reserve_space->ReserveRange(kUserSpaceBase, 0));
+    SELFTEST_EXPECT(!reserve_space->ReserveRange(kUserSpaceBase, 100));
+    SELFTEST_EXPECT(
+        !reserve_space->ReserveRange(kUserSpaceEnd - kPageSize, 2 * kPageSize));
+    SELFTEST_EXPECT(
+        !reserve_space->ReserveRange(kKernelVirtualBase, kPageSize));
+    SELFTEST_EXPECT(PmmFreeFrameCount() == free_after_create);
+
+    const uintptr_t frame0 = PmmAllocFrame();
+    const uintptr_t frame1 = PmmAllocFrame();
+    SELFTEST_EXPECT(frame0 != 0 && frame1 != 0);
+    SELFTEST_EXPECT(reserve_space->ReserveRange(kCrossPtBase, 2 * kPageSize));
+    SELFTEST_EXPECT(reserve_space->PageFrame(kCrossPtBase) == 0);
+    SELFTEST_EXPECT(reserve_space->PageFrame(kCrossPtBase + kPageSize) == 0);
+
+    const uintptr_t chain = DrainAllPmmFrames();
+    const int64_t free_while_drained = PmmFreeFrameCount();
+    const bool mapped0 =
+        reserve_space->MapOwnedFrame(kCrossPtBase,  //
+                                     frame0,        //
+                                     UserPageAccess::kReadWrite);
+    const bool mapped1 =
+        reserve_space->MapOwnedFrame(kCrossPtBase + kPageSize,  //
+                                     frame1,                    //
+                                     UserPageAccess::kReadWrite);
+    FreeDrainedPmmFrames(chain);
+    if (!mapped0) {
+      PmmFreeFrame(frame0);
+    }
+    if (!mapped1) {
+      PmmFreeFrame(frame1);
+    }
+    SELFTEST_EXPECT(free_while_drained == 0);
+    SELFTEST_EXPECT(mapped0 && mapped1);
+    SELFTEST_EXPECT(reserve_space->PageFrame(kCrossPtBase) == frame0);
+    SELFTEST_EXPECT(reserve_space->PageFrame(kCrossPtBase + kPageSize) ==
+                    frame1);
+  }
+  SELFTEST_EXPECT(PmmFreeFrameCount() == pmm_free_before);
+
+  {
+    const std::unique_ptr<AddressSpace> oom_space = AddressSpace::Create();
+    SELFTEST_EXPECT(oom_space != nullptr);
+    const uintptr_t spare0 = PmmAllocFrame();
+    const uintptr_t spare1 = PmmAllocFrame();
+    SELFTEST_EXPECT(spare0 != 0 && spare1 != 0);
+    // Crossing `kHugePageSize` on an empty PML4 needs 4 page-table frames
+    // (PDPT, PD, and two PTs); leave only 2 frames free so ReserveRange() fails
+    // mid-way after allocating the PDPT and PD.
+    const uintptr_t chain = DrainAllPmmFrames();
+    PmmFreeFrame(spare0);
+    PmmFreeFrame(spare1);
+    const bool reserved_under_oom =
+        oom_space->ReserveRange(kCrossPtBase, 2 * kPageSize);
+    FreeDrainedPmmFrames(chain);
+    SELFTEST_EXPECT(!reserved_under_oom);
+    SELFTEST_EXPECT(oom_space->PageFrame(kCrossPtBase) == 0);
+    SELFTEST_EXPECT(oom_space->PageFrame(kCrossPtBase + kPageSize) == 0);
   }
   SELFTEST_EXPECT(PmmFreeFrameCount() == pmm_free_before);
   return true;
@@ -4817,7 +4920,9 @@ static bool TestUserModeInteractiveShell() {
   SELFTEST_EXPECT(ContainsSubstring(captured, "\b \b"));
   SELFTEST_EXPECT(ContainsSubstring(captured, "edited_line_ok\n"));
   SELFTEST_EXPECT(ContainsSubstring(
-      captured, "built-in commands: help echo cpu programs run exit\n"));
+      captured,
+      "built-in commands: help echo cpu ls cat mkdir rm touch programs run "
+      "exit\n"));
   SELFTEST_EXPECT(ContainsSubstring(captured, "cpu: "));
   SELFTEST_EXPECT(ContainsSubstring(captured, "programs: init sh usertest\n"));
   SELFTEST_EXPECT(
@@ -7747,13 +7852,14 @@ static bool PrepareDeviceForDriverTests(const char* const test_name,
 
 // Verifies capability separation and EPERM gating:
 // - An unprivileged process (`kUserCapNone`) receives `kSyscallErrorPermission`
-//   on every privileged syscall (`7..15` and `17..19`), succeeds on
-//   `kSyscallGetTicks` (`16`), and receives `kSyscallErrorNoSys` on `20`/`-1`.
+//   on every privileged syscall (`7..15` and `17..19`) and on
+//   `IpcListen(kIpcPortFs)`, succeeds on `kSyscallGetTicks` (`16`), and
+//   receives `kSyscallErrorNoSys` on `kSyscallCount`/`-1`.
 // - A `kUserCapSpawnDrivers` process receives `kSyscallErrorPermission` on
-//   driver syscalls `8..15` and `17..19`, succeeds on `kSyscallSpawnDriver`,
-//   and its spawned driver child runs with `kUserCapDriver` (succeeds on
-//   `pci_info` and `get_ticks`, and gets `kSyscallErrorPermission` on
-//   `spawn_driver`).
+//   driver syscalls `8..15` and `17..19` and on `IpcListen(kIpcPortFs)`,
+//   succeeds on `kSyscallSpawnDriver`, and its spawned driver child runs with
+//   `kUserCapDriver` (succeeds on `pci_info` and `get_ticks`, and gets
+//   `kSyscallErrorPermission` on `spawn_driver`).
 // - A child spawned via `kSyscallSpawn` from either a `kUserCapSpawnDrivers`
 //   or a `kUserCapDriver` process receives `kUserCapNone`.
 // - A `kUserCapDriver` process validates `kSyscallConsolePush` error cases and
@@ -9137,6 +9243,650 @@ static bool TestPs2KbdDriverLifecycle() {
   return true;
 }
 
+static bool IsBlockedInIpcRecv(const UserProcessStats& stats) {
+  return stats.blocked_in_ipc_recv;
+}
+
+static bool IsBlockedInIpcCall(const UserProcessStats& stats) {
+  return stats.blocked_in_ipc_call;
+}
+
+// Waits until `parked(stats)` holds for the `stats()` of `process`, a state
+// that the process keeps until the test's next step. Fails if the process
+// ends instead (a server that failed a check before it parked, for example),
+// with its result in the log, so that the failure shows how it ended rather
+// than a timed-out wait.
+template <typename Parked>
+static bool WaitUntilParked(const std::unique_ptr<UserProcess>& process,
+                            const Parked parked) {
+  SELFTEST_EXPECT(WaitForProcesses(
+      &process,  //
+      1,         //
+      [&parked](const UserProcessStats& stats) {
+        return parked(stats) || HasEnded(stats);
+      },
+      WaitMode::kYield));
+  if (HasEnded(process->stats())) {
+    LogUnexpectedResult(process->Wait());
+    return false;
+  }
+  return true;
+}
+
+// Kills `process`, which waits in a system call, and checks that it ends as
+// killed on its way back from that call within 5 * kKillDeadlineTicks (a
+// process that waits takes longer to notice than one that runs).
+static bool KillWaitingProcess(const std::unique_ptr<UserProcess>& process) {
+  process->Kill();
+  UserProcessStats stats{};
+  SELFTEST_EXPECT(EndedKilled(process, &stats));
+  SELFTEST_EXPECT(stats.kill_in_syscall);
+  SELFTEST_EXPECT(stats.end_vector == kVectorSyscall);
+  SELFTEST_EXPECT(KillTicks(stats) <= 5 * kKillDeadlineTicks);
+  return true;
+}
+
+// Checks that no process owns an IPC port, that the kernel's page tables are
+// active and map no user page, and that `expected_pmm` frames and
+// `expected_heap` heap bytes are free, as before the test started its
+// processes.
+static bool VerifyIpcReleased(const int64_t expected_pmm,
+                              const int64_t expected_heap) {
+  SELFTEST_EXPECT(IpcPortOwner(kIpcPortFs) == kIpcNoOwner);
+  SELFTEST_EXPECT(IpcClaimedPortCount() == 0);
+  SELFTEST_EXPECT(PagingActiveRoot() == PagingKernelRoot());
+  SELFTEST_EXPECT(PagingUserSpaceIsEmpty());
+  SELFTEST_EXPECT(PmmFreeFrameCount() == expected_pmm);
+  SELFTEST_EXPECT(HeapTotalFreeBytes() == expected_heap);
+  return true;
+}
+
+// The IPC port of TestIpcSubsystem()'s servers (`kServerHoldCall` also
+// claims the next one).
+constexpr int kIpcTestPort = kIpcFirstUserPort;
+
+// Starts usertest in IPC submode `submode` on kIpcTestPort.
+static std::unique_ptr<UserProcess> StartIpcTest(
+    const usertest::IpcTestSubmode submode) {
+  return UserProcess::Start(UserTestProgram(),
+                            usertest::IpcChecksArg(submode, kIpcTestPort));
+}
+
+// Checks synchronous IPC on user ports (`IpcListen()`, `IpcRecv()`,
+// `IpcReply()` and `IpcCall()`) and `MemMap()` with usertest's `kIpcChecks`
+// submodes: calls with their replies, errors and reply limits, and the
+// notification that a client disconnected; the guard page after a mapping;
+// `Kill()` of a server that waits in IpcRecv(), of a client whose call is
+// queued (the server never sees it), and of a client whose call is in service
+// (the server gets the client's disconnect notification, and its late reply
+// returns 0); and a server that faults, or is killed with one call in
+// service and one queued, which fail with `kSyscallErrorNoDevice`. After
+// each step, no port is claimed and every frame and heap byte is back.
+static bool TestIpcSubsystem() {
+  using usertest::IpcTestSubmode;
+  const ScopedQuietConsole quiet_console;
+  SELFTEST_EXPECT(GetTaskScheduler() != nullptr);
+  SELFTEST_EXPECT(IpcClaimedPortCount() == 0);
+
+  // The heap takes frames from the PMM when it grows and never returns them,
+  // so it must have grown for the IPC buffers, if it needs to, before the
+  // exact frame and heap baseline: run the end-to-end check once first.
+  const int64_t pmm_free_at_start = PmmFreeFrameCount();
+  const int64_t heap_free_at_start = HeapTotalFreeBytes();
+  const uint64_t end_to_end_arg =
+      usertest::IpcChecksArg(IpcTestSubmode::kEndToEnd, kIpcTestPort);
+  UserProgramResult result{};
+  SELFTEST_EXPECT(RunUserTestWithCaps(end_to_end_arg, kUserCapNone, &result));
+  SELFTEST_EXPECT(ExitedWith(result, 0));
+  const int64_t pmm_free_before = PmmFreeFrameCount();
+  const int64_t heap_free_before = HeapTotalFreeBytes();
+  const bool heap_grew = pmm_free_before < pmm_free_at_start &&
+                         heap_free_before > heap_free_at_start;
+  if (!heap_grew) {
+    SELFTEST_EXPECT(pmm_free_before == pmm_free_at_start);
+    SELFTEST_EXPECT(heap_free_before == heap_free_at_start);
+  }
+
+  // 1. Calls between a parent and its child (kEndToEnd and kClient): their
+  //    replies, errors and reply limits, and the disconnect notification
+  //    after the child ended; and MemMap().
+  SELFTEST_EXPECT(RunUserTestWithCaps(end_to_end_arg, kUserCapNone, &result));
+  SELFTEST_EXPECT(ExitedWith(result, 0));
+  SELFTEST_EXPECT(VerifyIpcReleased(pmm_free_before, heap_free_before));
+
+  // 2. A write to the unmapped guard page after a mapping of MemMap() faults.
+  SELFTEST_EXPECT(RunUserTestWithCaps(
+      usertest::IpcChecksArg(IpcTestSubmode::kMemMapGuardFault, kIpcTestPort),
+      kUserCapNone,  //
+      &result));
+  SELFTEST_EXPECT(FaultedWith(result,                //
+                              kVectorPageFault,      //
+                              kPageFaultAccessBits,  //
+                              kPageFaultWrite | kPageFaultUser));
+  SELFTEST_EXPECT(result.fault_address % kPageSize == 0);
+  SELFTEST_EXPECT(result.fault_address > kUserAnonWindowBase &&
+                  result.fault_address <
+                      kUserAnonWindowBase + kUserAnonWindowSize);
+  SELFTEST_EXPECT(VerifyIpcReleased(pmm_free_before, heap_free_before));
+
+  // 3. Kill() of a server that waits in IpcRecv() (kServerPark).
+  {
+    const std::unique_ptr<UserProcess> server =
+        StartIpcTest(IpcTestSubmode::kServerPark);
+    SELFTEST_EXPECT(server != nullptr);
+    SELFTEST_EXPECT(WaitUntilParked(server, IsBlockedInIpcRecv));
+    SELFTEST_EXPECT(IpcPortOwner(kIpcTestPort) == server->IpcOwnerToken());
+    SELFTEST_EXPECT(KillWaitingProcess(server));
+  }
+  SELFTEST_EXPECT(VerifyIpcReleased(pmm_free_before, heap_free_before));
+
+  // 4. A server that faults (#UD) right after it received a call
+  //    (kServerFaultMidRpc): the call fails with kSyscallErrorNoDevice, which
+  //    the client (kClientCallOnce) exits with, negated.
+  {
+    const std::unique_ptr<UserProcess> server =
+        StartIpcTest(IpcTestSubmode::kServerFaultMidRpc);
+    SELFTEST_EXPECT(server != nullptr);
+    SELFTEST_EXPECT(WaitUntilParked(server, IsBlockedInIpcRecv));
+    const std::unique_ptr<UserProcess> client =
+        StartIpcTest(IpcTestSubmode::kClientCallOnce);
+    SELFTEST_EXPECT(client != nullptr);
+    SELFTEST_EXPECT(WaitForProcesses(&server, 1, HasEnded, WaitMode::kYield));
+    SELFTEST_EXPECT(FaultedWith(server->Wait(), kVectorInvalidOpcode, 0, 0));
+    SELFTEST_EXPECT(WaitForProcesses(&client, 1, HasEnded, WaitMode::kYield));
+    SELFTEST_EXPECT(ExitedWith(client->Wait(), -kSyscallErrorNoDevice));
+  }
+  SELFTEST_EXPECT(VerifyIpcReleased(pmm_free_before, heap_free_before));
+
+  // 5. Clients that wait in IpcCall() while the server (kServerHoldCall)
+  //    keeps one call in service and waits on the next port: Kill() of a
+  //    client whose call is queued, which the server never sees; then Kill()
+  //    of the server, which fails the call in service and a queued one with
+  //    kSyscallErrorNoDevice.
+  {
+    const std::unique_ptr<UserProcess> server =
+        StartIpcTest(IpcTestSubmode::kServerHoldCall);
+    SELFTEST_EXPECT(server != nullptr);
+    SELFTEST_EXPECT(WaitUntilParked(server, IsBlockedInIpcRecv));
+    const std::unique_ptr<UserProcess> in_service =
+        StartIpcTest(IpcTestSubmode::kClientCallOnce);
+    SELFTEST_EXPECT(in_service != nullptr);
+    SELFTEST_EXPECT(WaitUntilParked(server, [](const UserProcessStats& stats) {
+      return stats.syscalls >= usertest::kServerHoldCallParkedSyscall &&
+             stats.blocked_in_ipc_recv;
+    }));
+    SELFTEST_EXPECT(WaitUntilParked(in_service, IsBlockedInIpcCall));
+    {
+      const std::unique_ptr<UserProcess> queued =
+          StartIpcTest(IpcTestSubmode::kClientCallOnce);
+      SELFTEST_EXPECT(queued != nullptr);
+      SELFTEST_EXPECT(WaitUntilParked(queued, IsBlockedInIpcCall));
+      SELFTEST_EXPECT(KillWaitingProcess(queued));
+    }
+    const UserProcessStats server_stats = server->stats();
+    SELFTEST_EXPECT(server_stats.syscalls ==
+                    usertest::kServerHoldCallParkedSyscall);
+    SELFTEST_EXPECT(server_stats.blocked_in_ipc_recv);
+    const std::unique_ptr<UserProcess> queued =
+        StartIpcTest(IpcTestSubmode::kClientCallOnce);
+    SELFTEST_EXPECT(queued != nullptr);
+    SELFTEST_EXPECT(WaitUntilParked(queued, IsBlockedInIpcCall));
+    SELFTEST_EXPECT(KillWaitingProcess(server));
+    SELFTEST_EXPECT(
+        WaitForProcesses(&in_service, 1, HasEnded, WaitMode::kYield));
+    SELFTEST_EXPECT(ExitedWith(in_service->Wait(), -kSyscallErrorNoDevice));
+    SELFTEST_EXPECT(WaitForProcesses(&queued, 1, HasEnded, WaitMode::kYield));
+    SELFTEST_EXPECT(ExitedWith(queued->Wait(), -kSyscallErrorNoDevice));
+  }
+  SELFTEST_EXPECT(VerifyIpcReleased(pmm_free_before, heap_free_before));
+
+  // 6. Kill() of a client whose call is in service: the server
+  //    (kServerLateReply) gets the client's disconnect notification, and its
+  //    reply to the call afterwards returns 0.
+  {
+    const std::unique_ptr<UserProcess> server =
+        StartIpcTest(IpcTestSubmode::kServerLateReply);
+    SELFTEST_EXPECT(server != nullptr);
+    SELFTEST_EXPECT(WaitUntilParked(server, IsBlockedInIpcRecv));
+    const std::unique_ptr<UserProcess> client =
+        StartIpcTest(IpcTestSubmode::kClientCallOnce);
+    SELFTEST_EXPECT(client != nullptr);
+    SELFTEST_EXPECT(WaitUntilParked(server, [](const UserProcessStats& stats) {
+      return stats.syscalls >= usertest::kServerLateReplyWaitSyscall &&
+             stats.blocked_in_ipc_recv;
+    }));
+    SELFTEST_EXPECT(WaitUntilParked(client, IsBlockedInIpcCall));
+    SELFTEST_EXPECT(KillWaitingProcess(client));
+    SELFTEST_EXPECT(WaitForProcesses(&server, 1, HasEnded, WaitMode::kYield));
+    SELFTEST_EXPECT(ExitedWith(server->Wait(), 0));
+  }
+  SELFTEST_EXPECT(VerifyIpcReleased(pmm_free_before, heap_free_before));
+  return true;
+}
+
+// Starts ramfs as a driver in `mode` (`kDriverArg*`).
+static std::unique_ptr<UserProcess> StartRamfs(const uint64_t mode) {
+  return UserProcess::Start(RamfsProgram(), mode, kUserCapDriver);
+}
+
+// Checks the ramfs filesystem server (user/ramfs/ramfs.cpp):
+// 0. Started without kUserCapDriver, it exits with kDriverExitNotDriver.
+// (a) With kDriverArgExitAfterReady, it claims kIpcPortFs, maps a block with
+//     MemMap() and exits with 0.
+// (b) With kDriverArgFaultAfterReady, it does the same but faults (#UD).
+// (c) With kDriverArgNormal, it owns kIpcPortFs, which no other process may
+//     claim, waits in IpcRecv() without a system call and with at most 2% of
+//     a CPU while idle, and Kill() ends it.
+// (d) Then another ramfs claims kIpcPortFs.
+// After each step, every frame and heap byte is back.
+static bool TestRamfsDriverLifecycle() {
+  const ScopedQuietConsole quiet_console;
+  TaskScheduler* const scheduler = GetTaskScheduler();
+  SELFTEST_EXPECT(scheduler != nullptr);
+  SELFTEST_EXPECT(IpcClaimedPortCount() == 0);
+
+  const int64_t pmm_free_before = PmmFreeFrameCount();
+  const int64_t heap_free_before = HeapTotalFreeBytes();
+
+  // 0. Unprivileged spawn fails with `kDriverExitNotDriver`.
+  {
+    const std::unique_ptr<UserProcess> proc =
+        UserProcess::Start(RamfsProgram(), kDriverArgNormal, kUserCapNone);
+    SELFTEST_EXPECT(proc != nullptr);
+    SELFTEST_EXPECT(WaitForProcesses(&proc, 1, HasEnded, WaitMode::kYield));
+    SELFTEST_EXPECT(ExitedWith(proc->Wait(), kDriverExitNotDriver));
+  }
+  SELFTEST_EXPECT(VerifyIpcReleased(pmm_free_before, heap_free_before));
+
+  // (a) Clean exit(0) after claiming `kIpcPortFs` and mapping a block slab.
+  {
+    const std::unique_ptr<UserProcess> proc =
+        StartRamfs(kDriverArgExitAfterReady);
+    SELFTEST_EXPECT(proc != nullptr);
+    SELFTEST_EXPECT(WaitForProcesses(&proc, 1, HasEnded, WaitMode::kYield));
+    SELFTEST_EXPECT(ExitedWith(proc->Wait(), 0));
+  }
+  SELFTEST_EXPECT(VerifyIpcReleased(pmm_free_before, heap_free_before));
+
+  // (b) Ring-3 fault (#UD) after claiming `kIpcPortFs` and mapping a slab.
+  {
+    const std::unique_ptr<UserProcess> proc =
+        StartRamfs(kDriverArgFaultAfterReady);
+    SELFTEST_EXPECT(proc != nullptr);
+    SELFTEST_EXPECT(WaitForProcesses(&proc, 1, HasEnded, WaitMode::kYield));
+    SELFTEST_EXPECT(FaultedWith(proc->Wait(), kVectorInvalidOpcode, 0, 0));
+  }
+  SELFTEST_EXPECT(VerifyIpcReleased(pmm_free_before, heap_free_before));
+
+  // (c) Normal daemon mode: exclusive ownership of kIpcPortFs; parked in
+  //     IpcRecv() for the whole idle window, without a system call and with
+  //     `<= 2%` of the CPU ticks; and `Kill()` teardown.
+  constexpr int64_t kRamfsIdleWindowTicks = 100;
+  int64_t measured_driver_ticks = 0;
+  int64_t measured_total_ticks = 0;
+  {
+    const std::unique_ptr<UserProcess> proc = StartRamfs(kDriverArgNormal);
+    SELFTEST_EXPECT(proc != nullptr);
+    SELFTEST_EXPECT(WaitUntilParked(proc, IsBlockedInIpcRecv));
+    SELFTEST_EXPECT(IpcPortOwner(kIpcPortFs) == proc->IpcOwnerToken());
+    SELFTEST_EXPECT(IpcClaimedPortCount() == 1);
+    {
+      IpcContext probe;
+      SELFTEST_EXPECT(probe.Listen(kIpcPortFs, kUserCapDriver) ==
+                      kSyscallErrorBusy);
+      SELFTEST_EXPECT(probe.Listen(kIpcPortFs, kUserCapNone) ==
+                      kSyscallErrorPermission);
+    }
+    SELFTEST_EXPECT(IpcPortOwner(kIpcPortFs) == proc->IpcOwnerToken());
+
+    const TickDeadline idle_deadline(2 * kRamfsIdleWindowTicks);
+    const int64_t syscalls_before = proc->syscall_count();
+    const int64_t driver_ticks_before = proc->stats().task_timer_ticks;
+    const int64_t total_ticks_before = Cpu0TimerTicks();
+    bool checked_mid_window = false;
+    for (;;) {
+      const int64_t elapsed = Cpu0TimerTicks() - total_ticks_before;
+      if (elapsed >= kRamfsIdleWindowTicks) {
+        break;
+      }
+      if (!checked_mid_window && elapsed >= kRamfsIdleWindowTicks / 2) {
+        SELFTEST_EXPECT(proc->stats().blocked_in_ipc_recv);
+        checked_mid_window = true;
+      }
+      SELFTEST_EXPECT(!idle_deadline.Expired());
+      scheduler->Yield();
+    }
+
+    const UserProcessStats end_stats = proc->stats();
+    const int64_t total_ticks_after = Cpu0TimerTicks();
+    measured_driver_ticks = end_stats.task_timer_ticks - driver_ticks_before;
+    measured_total_ticks = total_ticks_after - total_ticks_before;
+
+    SELFTEST_EXPECT(end_stats.blocked_in_ipc_recv);
+    SELFTEST_EXPECT(end_stats.syscalls == syscalls_before);
+    SELFTEST_EXPECT(measured_driver_ticks * 100 <= measured_total_ticks * 2);
+    SELFTEST_EXPECT(KillWaitingProcess(proc));
+  }
+  SELFTEST_EXPECT(VerifyIpcReleased(pmm_free_before, heap_free_before));
+
+  // (d) Re-claim after Kill().
+  {
+    const std::unique_ptr<UserProcess> proc =
+        StartRamfs(kDriverArgExitAfterReady);
+    SELFTEST_EXPECT(proc != nullptr);
+    SELFTEST_EXPECT(WaitForProcesses(&proc, 1, HasEnded, WaitMode::kYield));
+    SELFTEST_EXPECT(ExitedWith(proc->Wait(), 0));
+  }
+  SELFTEST_EXPECT(VerifyIpcReleased(pmm_free_before, heap_free_before));
+
+  LineBuffer summary;
+  summary.Append("[TEST] ramfs_driver_lifecycle: driver_ticks=")
+      .AppendDec(static_cast<uint64_t>(measured_driver_ticks))
+      .Append(" total_ticks=")
+      .AppendDec(static_cast<uint64_t>(measured_total_ticks))
+      .Append("\n");
+  UartWrite(summary.c_str());
+  return true;
+}
+
+// The shell session of TestFilesystemEndToEnd(): it seeds `/docs` with
+// usertest's kSeedDocs, then lists, reads, creates and removes files and
+// directories.
+constexpr char kFsShellScript[] =
+    "run usertest 544\n"
+    "ls\n"
+    "ls /docs\n"
+    "cat /docs/readme.txt\n"
+    "mkdir /work\n"
+    "touch /work/note.txt\n"
+    "ls /work\n"
+    "rm /work/note.txt /work\n"
+    "ls /work\n"
+    "cat /missing\n"
+    "exit 0\n";
+static_assert(usertest::FsChecksArg(usertest::FsTestSubmode::kSeedDocs) == 544);
+constexpr int64_t kFsShellScriptSize =
+    static_cast<int64_t>(sizeof(kFsShellScript)) - 1;
+// Everything that the session prints: init's and ramfs's greetings, then each
+// command line, which the shell echoes after its prompt, with the command's
+// output (none for mkdir, touch and rm when they succeed).
+constexpr char kFsShellTranscript[] =
+    "[INIT] hello from ring 3\n"
+    "[RAMFS] ready\n"
+    "sh> run usertest 544\n"
+    "sh: usertest exited with status 0\n"
+    "sh> ls\n"
+    "docs/\n"
+    "sh> ls /docs\n"
+    "readme.txt\n"
+    "sh> cat /docs/readme.txt\n"
+    "hello from ramfs\n"
+    "sh> mkdir /work\n"
+    "sh> touch /work/note.txt\n"
+    "sh> ls /work\n"
+    "note.txt\n"
+    "sh> rm /work/note.txt /work\n"
+    "sh> ls /work\n"
+    "sh: ls: /work: no such file or directory\n"
+    "sh> cat /missing\n"
+    "sh: cat: /missing: no such file or directory\n"
+    "sh> exit 0\n";
+constexpr int64_t kFsShellTranscriptSize =
+    static_cast<int64_t>(sizeof(kFsShellTranscript)) - 1;
+
+static FsDirEntry MakeTestDirEntry(const uint64_t ino,       //
+                                   const FsNodeType type,    //
+                                   const int32_t name_len,   //
+                                   const char* const bytes,  //
+                                   const int32_t copy_len) {
+  FsDirEntry entry{};
+  entry.ino = ino;
+  entry.type = type;
+  entry.name_len = name_len;
+  for (int32_t i = 0; i < copy_len; ++i) {
+    entry.name[i] = bytes[i];
+  }
+  return entry;
+}
+
+static bool ReceiveMockFsCall(IpcContext& server,                        //
+                              const std::unique_ptr<UserProcess>& proc,  //
+                              void* const buf,                           //
+                              const int64_t buf_cap,                     //
+                              IpcReceivedMessage* const out_msg) {
+  TaskScheduler* const scheduler = GetTaskScheduler();
+  const TscDeadline deadline(kSelfTestWaitTimeoutTscCycles);
+  for (;;) {
+    const int64_t rc =
+        server.Recv(kIpcPortFs, buf, buf_cap, out_msg, 0, nullptr, nullptr);
+    if (rc == 1) {
+      return out_msg->kind == IpcMessageKind::kCall;
+    }
+    SELFTEST_EXPECT(rc == 0);
+    if (HasEnded(proc->stats())) {
+      LogUnexpectedResult(proc->Wait());
+      return false;
+    }
+    if (!SELFTEST_OK(!deadline.Expired())) {
+      WriteFailureReport("[TEST] mock fs server wait timed out: FAIL\n");
+      return false;
+    }
+    scheduler->Yield();
+  }
+}
+
+// Exercises kernel validation of malformed `FsOpenReply`, `FsStat` and
+// `FsDirEntry` server replies (`kSyscallErrorIo`), verifies that a failed
+// `Open()` (`kSyscallErrorNoEntry`) does not queue a spurious
+// `kClientDisconnect`, and verifies that a replacement server on `kIpcPortFs`
+// does not receive stale `kClientDisconnect` notifications for files opened on
+// its predecessor.
+static bool TestFsMalformedRepliesAndDisconnectScoping() {
+  using usertest::FsTestSubmode;
+  static uint8_t req_buf[kIpcMaxMessageSize];
+  IpcReceivedMessage msg{};
+
+  IpcContext mock_fs;
+  SELFTEST_EXPECT(mock_fs.Listen(kIpcPortFs, kUserCapDriver) == 0);
+
+  // A client whose only Open() fails with ENOENT sends no disconnect on exit.
+  {
+    const std::unique_ptr<UserProcess> failed_open = UserProcess::Start(
+        UserTestProgram(),
+        usertest::FsChecksArg(FsTestSubmode::kFailedOpenOnly));
+    SELFTEST_EXPECT(failed_open != nullptr);
+    SELFTEST_EXPECT(ReceiveMockFsCall(mock_fs,          //
+                                      failed_open,      //
+                                      req_buf,          //
+                                      sizeof(req_buf),  //
+                                      &msg));
+    SELFTEST_EXPECT(mock_fs.Reply(kIpcPortFs,  //
+                                  msg.token,   //
+                                  nullptr,     //
+                                  0,           //
+                                  kSyscallErrorNoEntry) == 0);
+    SELFTEST_EXPECT(
+        WaitForProcesses(&failed_open, 1, HasEnded, WaitMode::kYield));
+    SELFTEST_EXPECT(ExitedWith(failed_open->Wait(), 0));
+    SELFTEST_EXPECT(mock_fs.Recv(kIpcPortFs,       //
+                                 req_buf,          //
+                                 sizeof(req_buf),  //
+                                 &msg,             //
+                                 0,                //
+                                 nullptr,          //
+                                 nullptr) == 0);
+  }
+
+  // Malformed server replies fail with kSyscallErrorIo, and replacing the
+  // server while the client holds an open descriptor does not notify the
+  // replacement server when the client exits.
+  const std::unique_ptr<UserProcess> client = UserProcess::Start(
+      UserTestProgram(),
+      usertest::FsChecksArg(FsTestSubmode::kMalformedServer));
+  SELFTEST_EXPECT(client != nullptr);
+
+  const FsOpenReply bad_open_replies[] = {
+      FsOpenReply{.handle = 1, .type = FsNodeType::kNone},
+      FsOpenReply{.handle = 0, .type = FsNodeType::kRegular},
+  };
+  for (const FsOpenReply& reply : bad_open_replies) {
+    SELFTEST_EXPECT(
+        ReceiveMockFsCall(mock_fs, client, req_buf, sizeof(req_buf), &msg));
+    SELFTEST_EXPECT(
+        mock_fs.Reply(kIpcPortFs, msg.token, &reply, sizeof(reply), 0) == 0);
+  }
+
+  const FsStat bad_stats[] = {
+      FsStat{.type = FsNodeType::kNone, .ino = 1, .size = 0, .nlink = 1},
+      FsStat{.type = FsNodeType::kRegular, .ino = 0, .size = 0, .nlink = 1},
+      FsStat{.type = FsNodeType::kRegular, .ino = 1, .size = -1, .nlink = 1},
+      FsStat{.type = FsNodeType::kRegular, .ino = 1, .size = 0, .nlink = 0},
+  };
+  for (const FsStat& st : bad_stats) {
+    SELFTEST_EXPECT(
+        ReceiveMockFsCall(mock_fs, client, req_buf, sizeof(req_buf), &msg));
+    SELFTEST_EXPECT(mock_fs.Reply(kIpcPortFs, msg.token, &st, sizeof(st), 0) ==
+                    0);
+  }
+
+  const FsOpenReply dir_reply{.handle = 7, .type = FsNodeType::kDirectory};
+  SELFTEST_EXPECT(
+      ReceiveMockFsCall(mock_fs, client, req_buf, sizeof(req_buf), &msg));
+  SELFTEST_EXPECT(mock_fs.Reply(kIpcPortFs,         //
+                                msg.token,          //
+                                &dir_reply,         //
+                                sizeof(dir_reply),  //
+                                0) == 0);
+
+  const FsDirEntry bad_entries[] = {
+      MakeTestDirEntry(0, FsNodeType::kRegular, 1, "a", 1),
+      MakeTestDirEntry(2, FsNodeType::kNone, 1, "a", 1),
+      MakeTestDirEntry(2, FsNodeType::kRegular, 1, ".", 1),
+      MakeTestDirEntry(2, FsNodeType::kRegular, 2, "..", 2),
+      MakeTestDirEntry(2, FsNodeType::kRegular, 3, "a/b", 3),
+      MakeTestDirEntry(2, FsNodeType::kRegular, 3, "a\0b", 3),
+  };
+  for (const FsDirEntry& entry : bad_entries) {
+    SELFTEST_EXPECT(
+        ReceiveMockFsCall(mock_fs, client, req_buf, sizeof(req_buf), &msg));
+    SELFTEST_EXPECT(
+        mock_fs.Reply(kIpcPortFs, msg.token, &entry, sizeof(entry), 1) == 0);
+  }
+
+  SELFTEST_EXPECT(WaitUntilParked(client, [](const UserProcessStats& stats) {
+    return stats.syscalls >= usertest::kMalformedServerReadSyscall &&
+           stats.in_syscall;
+  }));
+  SELFTEST_EXPECT(mock_fs.Release() == 1);
+
+  IpcContext replacement_fs;
+  SELFTEST_EXPECT(replacement_fs.Listen(kIpcPortFs, kUserCapDriver) == 0);
+  ConsolePushInput("x", 1);
+  SELFTEST_EXPECT(WaitForProcesses(&client, 1, HasEnded, WaitMode::kYield));
+  SELFTEST_EXPECT(ExitedWith(client->Wait(), 0));
+  SELFTEST_EXPECT(replacement_fs.Recv(kIpcPortFs,       //
+                                      req_buf,          //
+                                      sizeof(req_buf),  //
+                                      &msg,             //
+                                      0,                //
+                                      nullptr,          //
+                                      nullptr) == 0);
+  SELFTEST_EXPECT(replacement_fs.Release() == 1);
+  return true;
+}
+
+// Checks the filesystem system calls against a mock server and ramfs end to
+// end:
+// 0. Malformed server replies (`kSyscallErrorIo`), no spurious disconnect on a
+//    failed Open(), and no stale disconnect to a replacement server.
+// 1. usertest's kFullSuite (argument checks, file data, directories, unlink
+//    while open, and the files of processes that end with files open).
+// 2. ramfs replaced while a process has a file open (kStaleFd): the old
+//    descriptor fails with kSyscallErrorStale, Close() frees it, and the new
+//    ramfs serves new descriptors.
+// 3. A shell session: init (kInitArgStartFs) starts ramfs and the shell,
+//    whose `ls`, `cat`, `mkdir`, `touch` and `rm` print exactly what they
+//    should.
+// Afterwards no port is claimed and every frame and heap byte is back.
+static bool TestFilesystemEndToEnd() {
+  using usertest::FsTestSubmode;
+  const ScopedQuietConsole quiet_console;
+  SELFTEST_EXPECT(GetTaskScheduler() != nullptr);
+  SELFTEST_EXPECT(IpcClaimedPortCount() == 0);
+
+  const int64_t pmm_free_before = PmmFreeFrameCount();
+  const int64_t heap_free_before = HeapTotalFreeBytes();
+
+  SELFTEST_EXPECT(TestFsMalformedRepliesAndDisconnectScoping());
+  SELFTEST_EXPECT(VerifyIpcReleased(pmm_free_before, heap_free_before));
+
+  {
+    const std::unique_ptr<UserProcess> ramfs = StartRamfs(kDriverArgNormal);
+    SELFTEST_EXPECT(ramfs != nullptr);
+    SELFTEST_EXPECT(WaitUntilParked(ramfs, IsBlockedInIpcRecv));
+
+    // 1. The filesystem system calls.
+    UserProgramResult result{};
+    SELFTEST_EXPECT(RunUserTestWithCaps(
+        usertest::FsChecksArg(FsTestSubmode::kFullSuite),  //
+        kUserCapNone,                                      //
+        &result));
+    SELFTEST_EXPECT(ExitedWith(result, 0));
+
+    // 2. A stale descriptor: the client opens a file and waits for console
+    //    input, while ramfs is killed and a new one starts.
+    const std::unique_ptr<UserProcess> client = UserProcess::Start(
+        UserTestProgram(), usertest::FsChecksArg(FsTestSubmode::kStaleFd));
+    SELFTEST_EXPECT(client != nullptr);
+    SELFTEST_EXPECT(WaitUntilParked(client, [](const UserProcessStats& stats) {
+      return stats.syscalls >= usertest::kStaleFdReadSyscall &&
+             stats.in_syscall;
+    }));
+    // ramfs, which answered the client, waits for the next request again.
+    SELFTEST_EXPECT(WaitUntilParked(ramfs, IsBlockedInIpcRecv));
+    SELFTEST_EXPECT(KillWaitingProcess(ramfs));
+    const std::unique_ptr<UserProcess> new_ramfs = StartRamfs(kDriverArgNormal);
+    SELFTEST_EXPECT(new_ramfs != nullptr);
+    SELFTEST_EXPECT(WaitUntilParked(new_ramfs, IsBlockedInIpcRecv));
+    ConsolePushInput("x", 1);
+    SELFTEST_EXPECT(WaitForProcesses(&client, 1, HasEnded, WaitMode::kYield));
+    SELFTEST_EXPECT(ExitedWith(client->Wait(), 0));
+    SELFTEST_EXPECT(WaitUntilParked(new_ramfs, IsBlockedInIpcRecv));
+    SELFTEST_EXPECT(KillWaitingProcess(new_ramfs));
+  }
+  SELFTEST_EXPECT(VerifyIpcReleased(pmm_free_before, heap_free_before));
+
+  // 3. The shell session, whose whole output the console captures.
+  ConsoleResetOutputCapture();
+  ConsolePushInput(kFsShellScript, kFsShellScriptSize);
+  bool init_ended = false;
+  UserProgramResult init_result{};
+  {
+    const std::unique_ptr<UserProcess> init = UserProcess::Start(
+        InitProgram(), kInitArgStartFs, kUserCapSpawnDrivers);
+    SELFTEST_EXPECT(init != nullptr);
+    init_ended = WaitForProcesses(&init, 1, HasEnded, WaitMode::kYield);
+    if (init_ended) {
+      init_result = init->Wait();
+    }
+  }
+  static char captured[4096];
+  const int64_t captured_len =
+      ConsoleCopyOutputCapture(captured, sizeof(captured));
+  const bool transcript_ok = captured_len == kFsShellTranscriptSize &&
+                             ContainsSubstring(captured, kFsShellTranscript);
+  if (!transcript_ok) {
+    UartWrite("[TEST] filesystem_end_to_end: the shell session printed:\n");
+    UartWrite(captured);
+    UartWrite("\n");
+  }
+  SELFTEST_EXPECT(init_ended);
+  SELFTEST_EXPECT(ExitedWith(init_result, 0));
+  SELFTEST_EXPECT(transcript_ok);
+  SELFTEST_EXPECT(VerifyIpcReleased(pmm_free_before, heap_free_before));
+  return true;
+}
+
 struct BootTest {
   const char* name;
   bool (*run)();
@@ -9182,6 +9932,9 @@ constexpr BootTest kBootTests[] = {
     {"driver_teardown", TestDriverTeardown},
     {"usbkbd_driver_lifecycle", TestUsbKbdDriverLifecycle},
     {"ps2kbd_driver_lifecycle", TestPs2KbdDriverLifecycle},
+    {"ipc_subsystem", TestIpcSubsystem},
+    {"ramfs_driver_lifecycle", TestRamfsDriverLifecycle},
+    {"filesystem_end_to_end", TestFilesystemEndToEnd},
     // End-to-end tests.
     {"user_mode_kill_edge_cases", TestUserModeKillEdgeCases},
     {"user_mode_syscall_buffer_checks", TestUserModeSyscallBufferChecks},

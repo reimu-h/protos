@@ -5,9 +5,11 @@ protos is a small x86-64 SMP kernel in freestanding C++20. It has:
 - GRUB boot (Multiboot 1 and 2) on BIOS and UEFI machines;
 - multiprocessor support (xAPIC, x2APIC, and I/O APIC) with a preemptive,
   work-stealing scheduler;
-- user-mode ELF programs with system calls, PCI MSI/MSI-X and legacy ISA
-  device/IRQ ownership, a shell, a USB keyboard driver (`usbkbd`: xHCI, with
-  hubs), and an `i8042` PS/2 keyboard driver (`ps2kbd`).
+- user-mode ELF programs with system calls, synchronous IPC, PCI MSI/MSI-X and
+  legacy ISA device/IRQ ownership, an in-memory filesystem server (`ramfs`) with
+  POSIX-like file and directory operations, a shell (`sh`), a USB keyboard
+  driver (`usbkbd`: xHCI, with hubs), and an `i8042` PS/2 keyboard driver
+  (`ps2kbd`).
 
 ## Build and run
 
@@ -35,7 +37,9 @@ exceptions: there is no KPTI or other mitigation for speculative-execution
 attacks such as Meltdown, and user-space drivers (`kUserCapDriver`) program DMA
 without an IOMMU, control PCI Bus Master and configuration space, and issue
 kernel-proxied ISA port `0x60`/`0x64` I/O, so a driver process is effectively as
-privileged as the kernel.
+privileged as the kernel. That includes the filesystem server `ramfs`, which
+needs `kUserCapDriver` to claim the filesystem's IPC port and parses the
+requests that the kernel forwards from every process.
 
 ## License
 
