@@ -373,31 +373,41 @@ TEST_F(IpcTest, CallWithInvalidArgumentsFailsWithoutBeingSent) {
       {"reply_cap too large", kPort, req, 1, reply, kTooLarge},
       {"null reply_buf", kPort, req, 1, nullptr, 1},
   };
+  TaskThreads threads(*env_, [&] { server.Release(); });
   for (const InvalidCall& call : invalid_calls) {
     SCOPED_TRACE(call.what);
     int64_t reply_size = -1;
     bool was_popped = true;
     uintptr_t owner = kUnwrittenOwner;
-    EXPECT_EQ(IpcCall(call.port,        //
-                      /*client_id=*/1,  //
-                      kIpcNoOwner,      //
-                      kIpcNoOwner,      //
-                      call.req_buf,     //
-                      call.req_size,    //
-                      call.reply_buf,   //
-                      call.reply_cap,   //
-                      &reply_size,      //
-                      &was_popped,      //
-                      &owner,           //
-                      nullptr,          //
-                      nullptr),
-              kSyscallErrorInvalid);
+    int64_t rc = 0;
+    // If an invalid call were queued, it would block waiting for a reply.
+    Task* const client = threads.Start([&] {
+      rc = IpcCall(call.port,        //
+                   /*client_id=*/1,  //
+                   kIpcNoOwner,      //
+                   kIpcNoOwner,      //
+                   call.req_buf,     //
+                   call.req_size,    //
+                   call.reply_buf,   //
+                   call.reply_cap,   //
+                   &reply_size,      //
+                   &was_popped,      //
+                   &owner,           //
+                   nullptr,          //
+                   nullptr);
+    });
+    ASSERT_TRUE(ReturnsWithoutBlocking(client));
+    ASSERT_TRUE(threads.Join(client));
+    EXPECT_EQ(rc, kSyscallErrorInvalid);
     EXPECT_EQ(reply_size, 0);
     EXPECT_FALSE(was_popped);
     EXPECT_EQ(owner, kIpcNoOwner);
   }
+  uint8_t srv_buf[1] = {};
   IpcReceivedMessage msg{};
-  EXPECT_EQ(server.Recv(kPort, nullptr, 0, &msg, 0, nullptr, nullptr), 0);
+  EXPECT_EQ(
+      server.Recv(kPort, srv_buf, sizeof(srv_buf), &msg, 0, nullptr, nullptr),
+      0);
 }
 
 TEST_F(IpcTest, CallUnclaimedAndSelfCallDeadlock) {
@@ -455,9 +465,16 @@ TEST_F(IpcTest, CallUnclaimedAndSelfCallDeadlock) {
   EXPECT_FALSE(was_popped);
   EXPECT_EQ(owner, kIpcNoOwner);
 
+  uint8_t srv_buf[1] = {};
   IpcReceivedMessage msg{};
-  EXPECT_EQ(
-      server.Recv(kIpcFirstUserPort, nullptr, 0, &msg, 0, nullptr, nullptr), 0);
+  EXPECT_EQ(server.Recv(kIpcFirstUserPort,  //
+                        srv_buf,            //
+                        sizeof(srv_buf),    //
+                        &msg,               //
+                        0,                  //
+                        nullptr,            //
+                        nullptr),
+            0);
 }
 
 TEST_F(IpcTest, CallExpectingAnotherOwnerFailsStaleWithoutBeingSent) {
@@ -616,13 +633,53 @@ TEST_F(IpcTest, RecvAndReplyValidateArgumentsAndOwnership) {
   EXPECT_EQ(server.Recv(1, buf, sizeof(buf), &msg, 5, nullptr, nullptr), 0);
   env_->on_block_until_ = nullptr;
 
-  // Reply validation.
+  // Reply validation with no call in service.
   EXPECT_EQ(other.Reply(1, 1, nullptr, 0, 0), kSyscallErrorAccess);
+  EXPECT_EQ(server.Reply(-1, 1, nullptr, 0, 0), kSyscallErrorInvalid);
+  EXPECT_EQ(server.Reply(kIpcPortCount, 1, nullptr, 0, 0),
+            kSyscallErrorInvalid);
   EXPECT_EQ(server.Reply(1, 0, nullptr, 0, 0), kSyscallErrorInvalid);
   EXPECT_EQ(server.Reply(1, 999, nullptr, 0, 0), kSyscallErrorInvalid);
-  EXPECT_EQ(server.Reply(1, 1, buf, 4, kSyscallErrorNoEntry),
+
+  // Reply validation against a live in-service token: invalid sizes, payloads,
+  // statuses, and non-owner callers fail without consuming the call.
+  int64_t client_rc = 0;
+  int64_t client_reply_size = -1;
+  uint8_t client_reply[16] = {};
+  TaskThreads threads(*env_, [&] { server.Release(); });
+  Task* const client = threads.Start([&] {
+    const uint8_t req = 0x5A;
+    client_rc = IpcCall(1,                     //
+                        /*client_id=*/77,      //
+                        kIpcNoOwner,           //
+                        kIpcNoOwner,           //
+                        &req,                  //
+                        1,                     //
+                        client_reply,          //
+                        sizeof(client_reply),  //
+                        &client_reply_size,    //
+                        nullptr,               //
+                        nullptr,               //
+                        nullptr,               //
+                        nullptr);
+  });
+  ASSERT_TRUE(WaitUntilBlocked(client));
+  ASSERT_EQ(server.Recv(1, buf, sizeof(buf), &msg, 0, nullptr, nullptr), 1);
+  EXPECT_EQ(other.Reply(1, msg.token, nullptr, 0, 0), kSyscallErrorAccess);
+  EXPECT_EQ(server.Reply(1, msg.token, buf, -1, 0), kSyscallErrorInvalid);
+  EXPECT_EQ(server.Reply(1, msg.token, buf, kIpcMaxMessageSize + 1, 0),
             kSyscallErrorInvalid);
-  EXPECT_EQ(server.Reply(1, 1, nullptr, 0, -5000), kSyscallErrorInvalid);
+  EXPECT_EQ(server.Reply(1, msg.token, nullptr, 4, 0), kSyscallErrorInvalid);
+  EXPECT_EQ(server.Reply(1, msg.token, buf, 4, kSyscallErrorNoEntry),
+            kSyscallErrorInvalid);
+  EXPECT_EQ(server.Reply(1, msg.token, nullptr, 0, -4096),
+            kSyscallErrorInvalid);
+  EXPECT_EQ(server.Reply(1, msg.token, nullptr, 0, -5000),
+            kSyscallErrorInvalid);
+  EXPECT_EQ(server.Reply(1, msg.token, nullptr, 0, kSyscallErrorNoEntry), 0);
+  ASSERT_TRUE(threads.Join(client));
+  EXPECT_EQ(client_rc, kSyscallErrorNoEntry);
+  EXPECT_EQ(client_reply_size, 0);
 }
 
 TEST_F(IpcTest, SynchronousRendezvousMaxPayloadAndOutOfOrderReply) {
@@ -1169,6 +1226,78 @@ TEST_F(IpcTest, TimedRecvReturnsEarlyOnceShouldStopHolds) {
   EXPECT_EQ(rc, 0);
 }
 
+TEST_F(IpcTest, NonBlockingRecvReturnsEarlyOnceShouldStopHolds) {
+  constexpr int kPort = 11;
+  IpcContext server;
+  ASSERT_EQ(server.Listen(kPort, kUserCapNone), 0);
+  const uintptr_t server_owner = server.OwnerToken();
+
+  int64_t client_rc = -1;
+  bool client_was_popped = false;
+  TaskThreads threads(*env_, [&] { server.Release(); });
+  Task* const client = threads.Start([&] {
+    const uint8_t req = 0x2A;
+    client_rc = IpcCall(kPort,               //
+                        /*client_id=*/42,    //
+                        kIpcNoOwner,         //
+                        kIpcNoOwner,         //
+                        &req,                //
+                        1,                   //
+                        nullptr,             //
+                        0,                   //
+                        nullptr,             //
+                        &client_was_popped,  //
+                        nullptr,             //
+                        nullptr,             //
+                        nullptr);
+  });
+  ASSERT_TRUE(WaitUntilBlocked(client));
+  IpcNotifyClientDisconnect(kPort, 99, server_owner);
+
+  // With `should_stop` already true, even a non-blocking poll (`timeout_ticks
+  // == 0`) returns 0 without popping either the disconnect or the queued call.
+  std::atomic<bool> stop{true};
+  uint8_t buf[8] = {};
+  IpcReceivedMessage msg{};
+  EXPECT_EQ(server.Recv(kPort,                //
+                        buf,                  //
+                        sizeof(buf),          //
+                        &msg,                 //
+                        /*timeout_ticks=*/0,  //
+                        &StopWhenFlagSet,     //
+                        &stop),
+            0);
+
+  // Clearing `stop` lets subsequent non-blocking polls receive both intact.
+  stop.store(false, std::memory_order_release);
+  ASSERT_EQ(server.Recv(kPort,                //
+                        buf,                  //
+                        sizeof(buf),          //
+                        &msg,                 //
+                        /*timeout_ticks=*/0,  //
+                        &StopWhenFlagSet,     //
+                        &stop),
+            1);
+  EXPECT_EQ(msg.kind, IpcMessageKind::kClientDisconnect);
+  EXPECT_EQ(msg.client_id, 99u);
+
+  ASSERT_EQ(server.Recv(kPort,                //
+                        buf,                  //
+                        sizeof(buf),          //
+                        &msg,                 //
+                        /*timeout_ticks=*/0,  //
+                        &StopWhenFlagSet,     //
+                        &stop),
+            1);
+  EXPECT_EQ(msg.kind, IpcMessageKind::kCall);
+  EXPECT_EQ(msg.client_id, 42u);
+  EXPECT_EQ(buf[0], 0x2A);
+  EXPECT_EQ(server.Reply(kPort, msg.token, nullptr, 0, 7), 0);
+  ASSERT_TRUE(threads.Join(client));
+  EXPECT_EQ(client_rc, 7);
+  EXPECT_TRUE(client_was_popped);
+}
+
 TEST_F(IpcTest, ConcurrentReceiversWakeIndependentlyAndPassBaton) {
   constexpr int kPort = 13;
   IpcContext server;
@@ -1402,9 +1531,16 @@ TEST_F(IpcTest, NotifyClientDisconnectWithoutMatchingOwnerReturnsAtOnce) {
   IpcNotifyClientDisconnect(kIpcFirstUserPort, 5, kIpcNoOwner);
   IpcNotifyClientDisconnect(kIpcFirstUserPort, 5, other.OwnerToken());
   EXPECT_EQ(BlockCount(main_task_), 0);
+  uint8_t srv_buf[1] = {};
   IpcReceivedMessage msg{};
-  EXPECT_EQ(
-      server.Recv(kIpcFirstUserPort, nullptr, 0, &msg, 0, nullptr, nullptr), 0);
+  EXPECT_EQ(server.Recv(kIpcFirstUserPort,  //
+                        srv_buf,            //
+                        sizeof(srv_buf),    //
+                        &msg,               //
+                        0,                  //
+                        nullptr,            //
+                        nullptr),
+            0);
 }
 
 TEST_F(IpcTest, NotifyClientDisconnectWaitsForRoomWhileRingIsFull) {

@@ -358,8 +358,9 @@ def shell():
             if words[:1] == ["echo"]:
                 log(" ".join(words[1:16]) + "\n")
             elif words == ["help"]:
-                log("built-in commands: help echo cpu ls cat mkdir rm touch "
-                    "programs run exit\n"
+                log("built-in commands: help echo cpu programs run exit\n"
+                    "built-in file commands: ls cat stat mkdir rm touch "
+                    "write append cp mv\n"
                     "user programs: init sh usertest\n")
             elif words == ["usertest", "0"]:
                 log("sh: usertest exited with status -1250999896491\n")

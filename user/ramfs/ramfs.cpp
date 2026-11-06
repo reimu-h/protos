@@ -18,62 +18,11 @@
 namespace protos::user {
 namespace {
 
-class Ring3BlockAllocator final : public ramfs::BlockAllocator {
- public:
-  constexpr Ring3BlockAllocator() = default;
+StatusOr<uintptr_t> MapAnonymousPages(const int64_t size, void* const /*ctx*/) {
+  return MemMap(size);
+}
 
-  uint8_t* AllocBlock() override {
-    if (free_head_ != nullptr) {
-      FreeNode* const node = free_head_;
-      free_head_ = node->next;
-      uint8_t* const blk = reinterpret_cast<uint8_t*>(node);
-      __builtin_memset(blk, 0, static_cast<size_t>(ramfs::kBlockSize));
-      return blk;
-    }
-
-    // Map `kSlabBlocks` blocks at a time, and single blocks once that fails:
-    // near the mapping limit or with little physical memory left, one block
-    // may still fit.
-    int slab_blocks = single_block_maps_ ? 1 : kSlabBlocks;
-    StatusOr<uintptr_t> mapped = MemMap(slab_blocks * ramfs::kBlockSize);
-    if (!mapped.ok() && slab_blocks > 1) {
-      single_block_maps_ = true;
-      slab_blocks = 1;
-      mapped = MemMap(ramfs::kBlockSize);
-    }
-    if (!mapped.ok()) {
-      return nullptr;
-    }
-
-    uint8_t* const base = reinterpret_cast<uint8_t*>(*mapped);
-    for (int i = slab_blocks - 1; i >= 1; --i) {
-      FreeBlock(base + static_cast<int64_t>(i) * ramfs::kBlockSize);
-    }
-    return base;
-  }
-
-  void FreeBlock(uint8_t* const block) override {
-    if (block == nullptr) {
-      return;
-    }
-    FreeNode* const node = reinterpret_cast<FreeNode*>(block);
-    node->next = free_head_;
-    free_head_ = node;
-  }
-
- private:
-  static constexpr int kSlabBlocks = 16;
-
-  struct FreeNode {
-    FreeNode* next = nullptr;
-  };
-
-  FreeNode* free_head_ = nullptr;
-  // Set once mapping a slab failed.
-  bool single_block_maps_ = false;
-};
-
-constinit Ring3BlockAllocator g_alloc{};
+constinit ramfs::SlabBlockAllocator g_alloc{&MapAnonymousPages};
 constinit ramfs::FileSystem g_fs{};
 alignas(8) constinit uint8_t g_req_buf[kIpcMaxMessageSize]{};
 alignas(8) constinit uint8_t g_reply_buf[kIpcMaxMessageSize]{};

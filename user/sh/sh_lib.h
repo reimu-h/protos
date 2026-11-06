@@ -15,16 +15,22 @@ namespace protos::sh {
 
 constexpr int kShellMaxLineLength = 128;
 constexpr int kShellMaxTokens = 16;
-constexpr int kShellOutputBufferSize = 192;
+// Room for the longest line that the shell writes: an error message about a
+// path of `kFsMaxPathLength` bytes that the shell built (`cp` and `mv` into a
+// directory).
+constexpr int kShellOutputBufferSize = 320;
 constexpr const char* kShellPrompt = "sh> ";
+// The words of any line that the shell reads, with a newline, fit in a
+// `ShellOutBuffer` (echo, write and append).
+static_assert(kShellMaxLineLength + 1 < kShellOutputBufferSize);
 // The most directory entries that `ls` reads with one ReadDir() call and the
-// most bytes that `cat` reads with one FileRead() call. Their buffers are on
-// the stack, which has 16 KiB in a user program (`kUserStackPages` in
+// most bytes that `cat` and `cp` read with one FileRead() call. Their buffers
+// are on the stack, which has 16 KiB in a user program (`kUserStackPages` in
 // user_mode.h), so they are smaller than the system calls allow.
 constexpr int kShellReadDirBatch = 8;
-constexpr int kShellCatChunkSize = 2048;
+constexpr int kShellFileChunkSize = 2048;
 static_assert(kShellReadDirBatch <= kSyscallFsMaxDirEntries);
-static_assert(kShellCatChunkSize <= kSyscallFsMaxIoSize);
+static_assert(kShellFileChunkSize <= kSyscallFsMaxIoSize);
 
 // Action taken by `ShellLineEditor::FeedChar()` for one input byte.
 enum class ShellCharAction : uint8_t {
@@ -302,8 +308,9 @@ struct ShellOutBuffer {
 };
 
 // System call callbacks used by the shell. A filesystem built-in that lacks a
-// callback that it needs (`open` through `unlink` may be null) reports the
-// filesystem unavailable instead of calling the others.
+// callback that it needs (the filesystem callbacks, `open` through `rename`,
+// may be null) reports the filesystem unavailable instead of calling the
+// others.
 struct ShellEnv {
   // MkDir() or Unlink() of the path of `path_len` bytes at `path`.
   using PathOp = int64_t (*)(void* ctx, const char* path, int64_t path_len);
@@ -320,12 +327,16 @@ struct ShellEnv {
   int64_t (*close)(void* ctx, int64_t fd) = nullptr;
   int64_t (*file_read)(void* ctx, int64_t fd, void* buffer,
                        int64_t size) = nullptr;
+  int64_t (*file_write)(void* ctx, int64_t fd, const void* buffer,
+                        int64_t size) = nullptr;
   int64_t (*stat)(void* ctx, const char* path, int64_t path_len,
                   FsStat* out_stat) = nullptr;
   int64_t (*read_dir)(void* ctx, int64_t fd, FsDirEntry* entries,
                       int64_t max_entries) = nullptr;
   PathOp mkdir = nullptr;
   PathOp unlink = nullptr;
+  int64_t (*rename)(void* ctx, const char* old_path, int64_t old_len,
+                    const char* new_path, int64_t new_len) = nullptr;
 };
 
 inline void WriteStr(const ShellEnv& env, const char* const text) {
@@ -518,8 +529,8 @@ inline void RunCatOne(const ShellEnv& env, const ShellToken& path) {
     return;
   }
   for (;;) {
-    char chunk[kShellCatChunkSize];
-    const int64_t rc = env.file_read(env.ctx, fd, chunk, kShellCatChunkSize);
+    char chunk[kShellFileChunkSize];
+    const int64_t rc = env.file_read(env.ctx, fd, chunk, kShellFileChunkSize);
     if (rc < 0) {
       WriteFsError(env, "cat", path, rc);
       break;
@@ -528,7 +539,7 @@ inline void RunCatOne(const ShellEnv& env, const ShellToken& path) {
       break;
     }
     if (env.write != nullptr) {
-      (void)env.write(env.ctx, chunk, ClampCount(rc, kShellCatChunkSize));
+      (void)env.write(env.ctx, chunk, ClampCount(rc, kShellFileChunkSize));
     }
   }
   (void)env.close(env.ctx, fd);
@@ -574,18 +585,307 @@ inline void RunPathOp(const ShellEnv& env,         //
   }
 }
 
+// Writes the `size` bytes at `data` to file `fd` with as many FileWrite()
+// calls as it takes, and returns 0, or the error of the call that failed. A
+// call that writes nothing fails with `kSyscallErrorIo` rather than loop.
+inline int64_t WriteAll(const ShellEnv& env,     //
+                        const int64_t fd,        //
+                        const char* const data,  //
+                        const int64_t size) {
+  int64_t done = 0;
+  while (done < size) {
+    const int64_t rc = env.file_write(env.ctx, fd, data + done, size - done);
+    if (rc < 0) {
+      return rc;
+    }
+    if (rc == 0) {
+      return kSyscallErrorIo;
+    }
+    done += ClampCount(rc, size - done);
+  }
+  return 0;
+}
+
+// `write` and `append`: writes the operands of `cmd` after the first one, the
+// path, separated by spaces and followed by a newline as echo writes them, to
+// the file at the path, which `flags` opens: in place of its contents
+// (`write`) or after them (`append`). Creates the file if it doesn't exist.
+inline void RunWriteText(const ShellEnv& env,         //
+                         const ShellCommand& cmd,     //
+                         const char* const cmd_name,  //
+                         const uint64_t flags) {
+  const ShellToken& path = cmd.tokens[1];
+  if (env.open == nullptr || env.file_write == nullptr ||
+      env.close == nullptr) {
+    WriteFsError(env, cmd_name, path, kSyscallErrorNoDevice);
+    return;
+  }
+  ShellOutBuffer text;
+  for (int i = 2; i < cmd.token_count; ++i) {
+    if (i > 2) {
+      text.AppendChar(' ');
+    }
+    text.AppendBytes(cmd.tokens[i].ptr, cmd.tokens[i].length);
+  }
+  text.AppendChar('\n');
+  const int64_t fd = env.open(env.ctx, path.ptr, path.length, flags);
+  if (fd < 0) {
+    WriteFsError(env, cmd_name, path, fd);
+    return;
+  }
+  const int64_t rc = WriteAll(env, fd, text.data, text.length);
+  if (rc < 0) {
+    WriteFsError(env, cmd_name, path, rc);
+  }
+  (void)env.close(env.ctx, fd);
+}
+
+// A path that the shell builds.
+struct ShellPathBuffer {
+  char data[kFsMaxPathLength] = {};
+  int length = 0;
+
+  ShellToken token() const { return ShellToken{data, length}; }
+};
+
+// Returns the last component of `path`, without the '/' characters after it:
+// empty if `path` has no other characters.
+inline ShellToken LastComponent(const ShellToken& path) {
+  int end = path.length;
+  while (end > 0 && path.ptr[end - 1] == '/') {
+    --end;
+  }
+  int start = end;
+  while (start > 0 && path.ptr[start - 1] != '/') {
+    --start;
+  }
+  return ShellToken{path.ptr + start, end - start};
+}
+
+// Writes the path of `name` in directory `dir` to `*out`: `dir`, a '/' unless
+// `dir` ends with one, and `name`. Returns false if it would be longer than
+// `kFsMaxPathLength` bytes, the most that a filesystem call accepts.
+inline bool JoinPath(const ShellToken& dir,   //
+                     const ShellToken& name,  //
+                     ShellPathBuffer* const out) {
+  const bool dir_ends_with_slash =
+      dir.length > 0 && dir.ptr[dir.length - 1] == '/';
+  const int64_t length =
+      int64_t{dir.length} + (dir_ends_with_slash ? 0 : 1) + name.length;
+  if (length > kFsMaxPathLength) {
+    return false;
+  }
+  int pos = 0;
+  for (int i = 0; i < dir.length; ++i) {
+    out->data[pos++] = dir.ptr[i];
+  }
+  if (!dir_ends_with_slash) {
+    out->data[pos++] = '/';
+  }
+  for (int i = 0; i < name.length; ++i) {
+    out->data[pos++] = name.ptr[i];
+  }
+  out->length = pos;
+  return true;
+}
+
+// `cp` of one file: copies the contents of regular file `src` to `dst`,
+// creating `dst` or replacing its contents.
+inline void CopyFile(const ShellEnv& env,    //
+                     const ShellToken& src,  //
+                     const ShellToken& dst) {
+  FsStat src_stat{};
+  const int64_t src_rc = env.stat(env.ctx, src.ptr, src.length, &src_stat);
+  if (src_rc < 0 || src_stat.type == FsNodeType::kDirectory) {
+    // Like POSIX cp without -R, cp copies no directories.
+    WriteFsError(env, "cp", src, src_rc < 0 ? src_rc : kSyscallErrorIsDir);
+    return;
+  }
+  FsStat dst_stat{};
+  if (env.stat(env.ctx, dst.ptr, dst.length, &dst_stat) == 0 &&
+      dst_stat.fnode_id == src_stat.fnode_id) {
+    // Opening `dst` would empty `src`.
+    ShellOutBuffer err;
+    err.AppendStr("sh: cp: ");
+    err.AppendBytes(src.ptr, src.length);
+    err.AppendStr(" and ");
+    WriteBuf(env, err);
+    ShellOutBuffer rest;
+    rest.AppendBytes(dst.ptr, dst.length);
+    rest.AppendStr(" are the same file\n");
+    WriteBuf(env, rest);
+    return;
+  }
+  const int64_t in = env.open(env.ctx, src.ptr, src.length, kFsOpenRead);
+  if (in < 0) {
+    WriteFsError(env, "cp", src, in);
+    return;
+  }
+  const int64_t out = env.open(env.ctx,     //
+                               dst.ptr,     //
+                               dst.length,  //
+                               kFsOpenWrite | kFsOpenCreate | kFsOpenTruncate);
+  if (out < 0) {
+    WriteFsError(env, "cp", dst, out);
+  } else {
+    for (;;) {
+      char chunk[kShellFileChunkSize];
+      const int64_t n = env.file_read(env.ctx, in, chunk, kShellFileChunkSize);
+      if (n < 0) {
+        WriteFsError(env, "cp", src, n);
+        break;
+      }
+      if (n == 0) {
+        break;
+      }
+      const int64_t rc =
+          WriteAll(env, out, chunk, ClampCount(n, kShellFileChunkSize));
+      if (rc < 0) {
+        WriteFsError(env, "cp", dst, rc);
+        break;
+      }
+    }
+    (void)env.close(env.ctx, out);
+  }
+  (void)env.close(env.ctx, in);
+}
+
+// `mv` of one file or directory: renames `src` to `dst` (Rename()), replacing
+// a file or empty directory there.
+inline void MoveFile(const ShellEnv& env,    //
+                     const ShellToken& src,  //
+                     const ShellToken& dst) {
+  FsStat st{};
+  const int64_t src_rc = env.stat(env.ctx, src.ptr, src.length, &st);
+  if (src_rc < 0) {
+    WriteFsError(env, "mv", src, src_rc);
+    return;
+  }
+  // `src` exists, so an error is about `dst` but for rare cases (`src` is the
+  // root, or a directory that would move into itself).
+  const int64_t rc =
+      env.rename(env.ctx, src.ptr, src.length, dst.ptr, dst.length);
+  if (rc < 0) {
+    WriteFsError(env, "mv", dst, rc);
+  }
+}
+
+// `CopyFile()` or `MoveFile()`.
+using ShellTransfer = void (*)(const ShellEnv& env,    //
+                               const ShellToken& src,  //
+                               const ShellToken& dst);
+
+// `cp` and `mv`: like POSIX cp and mv, copies or moves (`transfer`) each
+// operand of `cmd` but the last, a source, to the last operand, `target`: into
+// `target` if it is a directory, as `<target>/<last component of the
+// source>`, else to `target` itself, which a single source then replaces.
+// Reports the filesystem unavailable for each source unless `fs_available`.
+inline void RunTransfer(const ShellEnv& env,         //
+                        const ShellCommand& cmd,     //
+                        const char* const cmd_name,  //
+                        const bool fs_available,     //
+                        const ShellTransfer transfer) {
+  const int source_count = cmd.token_count - 2;
+  const ShellToken& target = cmd.tokens[cmd.token_count - 1];
+  if (!fs_available) {
+    for (int i = 1; i <= source_count; ++i) {
+      WriteFsError(env, cmd_name, cmd.tokens[i], kSyscallErrorNoDevice);
+    }
+    return;
+  }
+  FsStat target_stat{};
+  const int64_t target_rc =
+      env.stat(env.ctx, target.ptr, target.length, &target_stat);
+  const bool into_dir =
+      target_rc == 0 && target_stat.type == FsNodeType::kDirectory;
+  if (source_count > 1 && !into_dir) {
+    // Several sources need a directory to go to.
+    WriteFsError(env,       //
+                 cmd_name,  //
+                 target,    //
+                 target_rc < 0 ? target_rc : kSyscallErrorNotDir);
+    return;
+  }
+  for (int i = 1; i <= source_count; ++i) {
+    const ShellToken& src = cmd.tokens[i];
+    ShellPathBuffer joined;
+    if (into_dir && !JoinPath(target, LastComponent(src), &joined)) {
+      // No filesystem call would take the destination's path.
+      WriteFsError(env, cmd_name, src, kSyscallErrorNameTooLong);
+      continue;
+    }
+    transfer(env, src, into_dir ? joined.token() : target);
+  }
+}
+
+inline void RunCp(const ShellEnv& env, const ShellCommand& cmd) {
+  const bool fs_available = env.stat != nullptr && env.open != nullptr &&
+                            env.file_read != nullptr &&
+                            env.file_write != nullptr && env.close != nullptr;
+  RunTransfer(env, cmd, "cp", fs_available, CopyFile);
+}
+
+inline void RunMv(const ShellEnv& env, const ShellCommand& cmd) {
+  const bool fs_available = env.stat != nullptr && env.rename != nullptr;
+  RunTransfer(env, cmd, "mv", fs_available, MoveFile);
+}
+
+// Returns the name of node type `type` for `stat`.
+inline const char* FsNodeTypeName(const FsNodeType type) {
+  switch (type) {
+    case FsNodeType::kRegular:
+      return "regular file";
+    case FsNodeType::kDirectory:
+      return "directory";
+    case FsNodeType::kNone:
+      break;
+  }
+  return "unknown";
+}
+
+// `stat`: writes the type, size, fnode ID and number of links of the file or
+// directory at `path`, one per line with the labels of GNU stat (`Fnode` in
+// place of `Inode`).
+inline void RunStatOne(const ShellEnv& env, const ShellToken& path) {
+  FsStat st{};
+  const int64_t rc = (env.stat != nullptr)
+                         ? env.stat(env.ctx, path.ptr, path.length, &st)
+                         : kSyscallErrorNoDevice;
+  if (rc < 0) {
+    WriteFsError(env, "stat", path, rc);
+    return;
+  }
+  ShellOutBuffer file_line;
+  file_line.AppendStr("  File: ");
+  file_line.AppendBytes(path.ptr, path.length);
+  file_line.AppendChar('\n');
+  WriteBuf(env, file_line);
+  ShellOutBuffer out;
+  out.AppendStr("  Type: ");
+  out.AppendStr(FsNodeTypeName(st.type));
+  out.AppendStr("\n  Size: ");
+  out.AppendInt64Dec(st.size);
+  out.AppendStr("\n Fnode: ");
+  out.AppendUint64Dec(st.fnode_id);
+  out.AppendStr("\n Links: ");
+  out.AppendInt64Dec(st.nlink);
+  out.AppendChar('\n');
+  WriteBuf(env, out);
+}
+
 // Returns true if filesystem built-in `cmd` may run. Otherwise writes why not
 // and returns false: the line had more than `kShellMaxTokens` tokens, so the
-// built-in would skip operands, or `cmd` has no operands and `usage`, the
-// usage message of a built-in that needs some, isn't null.
+// built-in would skip operands, or `cmd` has fewer than `min_operands`
+// operands, for which it writes `usage`.
 inline bool CheckFsOperands(const ShellEnv& env,      //
                             const ShellCommand& cmd,  //
+                            const int min_operands,   //
                             const char* const usage) {
   if (cmd.truncated) {
     WriteStr(env, "sh: too many arguments\n");
     return false;
   }
-  if (cmd.token_count < 2 && usage != nullptr) {
+  if (cmd.token_count - 1 < min_operands) {
     WriteStr(env, usage);
     return false;
   }
@@ -604,9 +904,11 @@ inline StatusOr<int64_t> ExecuteLine(const ShellEnv& env,     //
   const ShellToken& first = cmd.tokens[0];
 
   if (TokenEquals(first, "help")) {
+    // Each line fits the 80 columns of the VGA text console.
     WriteStr(env,
-             "built-in commands: help echo cpu ls cat mkdir rm touch programs "
-             "run exit\n"
+             "built-in commands: help echo cpu programs run exit\n"
+             "built-in file commands: ls cat stat mkdir rm touch write append "
+             "cp mv\n"
              "user programs: init sh usertest\n");
     return kStatusError;
   }
@@ -639,14 +941,14 @@ inline StatusOr<int64_t> ExecuteLine(const ShellEnv& env,     //
   }
 
   if (TokenEquals(first, "ls")) {
-    if (CheckFsOperands(env, cmd, nullptr)) {
+    if (CheckFsOperands(env, cmd, 0, nullptr)) {
       RunLs(env, cmd);
     }
     return kStatusError;
   }
 
   if (TokenEquals(first, "cat")) {
-    if (CheckFsOperands(env, cmd, "sh: usage: cat <path> ...\n")) {
+    if (CheckFsOperands(env, cmd, 1, "sh: usage: cat <path> ...\n")) {
       for (int i = 1; i < cmd.token_count; ++i) {
         RunCatOne(env, cmd.tokens[i]);
       }
@@ -654,8 +956,17 @@ inline StatusOr<int64_t> ExecuteLine(const ShellEnv& env,     //
     return kStatusError;
   }
 
+  if (TokenEquals(first, "stat")) {
+    if (CheckFsOperands(env, cmd, 1, "sh: usage: stat <path> ...\n")) {
+      for (int i = 1; i < cmd.token_count; ++i) {
+        RunStatOne(env, cmd.tokens[i]);
+      }
+    }
+    return kStatusError;
+  }
+
   if (TokenEquals(first, "mkdir")) {
-    if (CheckFsOperands(env, cmd, "sh: usage: mkdir <path> ...\n")) {
+    if (CheckFsOperands(env, cmd, 1, "sh: usage: mkdir <path> ...\n")) {
       RunPathOp(env, cmd, "mkdir", env.mkdir);
     }
     return kStatusError;
@@ -664,17 +975,53 @@ inline StatusOr<int64_t> ExecuteLine(const ShellEnv& env,     //
   // Unlike POSIX rm, which needs -d or -r for a directory, rm also removes
   // empty directories: Unlink() removes both files and empty directories.
   if (TokenEquals(first, "rm")) {
-    if (CheckFsOperands(env, cmd, "sh: usage: rm <path> ...\n")) {
+    if (CheckFsOperands(env, cmd, 1, "sh: usage: rm <path> ...\n")) {
       RunPathOp(env, cmd, "rm", env.unlink);
     }
     return kStatusError;
   }
 
   if (TokenEquals(first, "touch")) {
-    if (CheckFsOperands(env, cmd, "sh: usage: touch <path> ...\n")) {
+    if (CheckFsOperands(env, cmd, 1, "sh: usage: touch <path> ...\n")) {
       for (int i = 1; i < cmd.token_count; ++i) {
         RunTouchOne(env, cmd.tokens[i]);
       }
+    }
+    return kStatusError;
+  }
+
+  // write and append take the place of echo's `>` and `>>`, which the shell
+  // doesn't have.
+  if (TokenEquals(first, "write")) {
+    if (CheckFsOperands(env, cmd, 1, "sh: usage: write <path> [word ...]\n")) {
+      RunWriteText(env,      //
+                   cmd,      //
+                   "write",  //
+                   kFsOpenWrite | kFsOpenCreate | kFsOpenTruncate);
+    }
+    return kStatusError;
+  }
+
+  if (TokenEquals(first, "append")) {
+    if (CheckFsOperands(env, cmd, 1, "sh: usage: append <path> [word ...]\n")) {
+      RunWriteText(env,       //
+                   cmd,       //
+                   "append",  //
+                   kFsOpenWrite | kFsOpenCreate | kFsOpenAppend);
+    }
+    return kStatusError;
+  }
+
+  if (TokenEquals(first, "cp")) {
+    if (CheckFsOperands(env, cmd, 2, "sh: usage: cp <source> ... <target>\n")) {
+      RunCp(env, cmd);
+    }
+    return kStatusError;
+  }
+
+  if (TokenEquals(first, "mv")) {
+    if (CheckFsOperands(env, cmd, 2, "sh: usage: mv <source> ... <target>\n")) {
+      RunMv(env, cmd);
     }
     return kStatusError;
   }

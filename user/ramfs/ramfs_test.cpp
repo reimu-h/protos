@@ -1,5 +1,6 @@
 #include "user/ramfs/ramfs.h"
 
+#include <gmock/gmock.h>
 #include <gtest/gtest.h>
 
 #include <cstddef>
@@ -131,19 +132,19 @@ TEST_F(RamfsTest, RootStatAndPathResolution) {
   FsStat st{};
   ASSERT_EQ(StatStr("/", &st), 0);
   EXPECT_EQ(st.type, FsNodeType::kDirectory);
-  EXPECT_EQ(st.ino, 1u);
+  EXPECT_EQ(st.fnode_id, 1u);
   EXPECT_EQ(st.nlink, 2);
   EXPECT_EQ(st.size, 0);
 
   FsStat st2{};
   ASSERT_EQ(StatStr("///", &st2), 0);
-  EXPECT_EQ(st2.ino, 1u);
+  EXPECT_EQ(st2.fnode_id, 1u);
   ASSERT_EQ(StatStr("/.", &st2), 0);
-  EXPECT_EQ(st2.ino, 1u);
+  EXPECT_EQ(st2.fnode_id, 1u);
   ASSERT_EQ(StatStr("/..", &st2), 0);
-  EXPECT_EQ(st2.ino, 1u);
+  EXPECT_EQ(st2.fnode_id, 1u);
   ASSERT_EQ(StatStr(".", &st2), 0);
-  EXPECT_EQ(st2.ino, 1u);
+  EXPECT_EQ(st2.fnode_id, 1u);
 
   EXPECT_EQ(StatStr("", &st2), kSyscallErrorNoEntry);
   const char with_nul[] = {'/', 'a', '\0', 'b'};
@@ -164,7 +165,7 @@ TEST_F(RamfsTest, RootStatAndPathResolution) {
   ASSERT_EQ(StatStr("/dir/sub/..", &st2), 0);
   FsStat dir_st{};
   ASSERT_EQ(StatStr("/dir", &dir_st), 0);
-  EXPECT_EQ(st2.ino, dir_st.ino);
+  EXPECT_EQ(st2.fnode_id, dir_st.fnode_id);
   EXPECT_EQ(dir_st.nlink, 3);
 
   uint64_t h = 0;
@@ -232,7 +233,7 @@ TEST_F(RamfsTest, MkDirAndUnlinkDirectoryReclaimAllBlocks) {
   ASSERT_EQ(StatStr("/", &root_st), 0);
   EXPECT_EQ(root_st.nlink, 2);
   EXPECT_EQ(alloc_.live_blocks(), 0);
-  EXPECT_EQ(fs_->ActiveInodeCount(), 1);
+  EXPECT_EQ(fs_->ActiveFnodeCount(), 1);
 }
 
 TEST_F(RamfsTest, OpenFlagsAndAccessModes) {
@@ -252,7 +253,7 @@ TEST_F(RamfsTest, OpenFlagsAndAccessModes) {
             kSyscallErrorInvalid);
   EXPECT_EQ(OpenStr(1, "/f", kFsOpenCreate | kFsOpenDirectory, &h),
             kSyscallErrorIsDir);
-  EXPECT_EQ(fs_->ActiveInodeCount(), 1);
+  EXPECT_EQ(fs_->ActiveFnodeCount(), 1);
 
   ASSERT_EQ(OpenStr(1,                                                    //
                     "/f",                                                 //
@@ -394,7 +395,7 @@ TEST_F(RamfsTest, FullHandleTableFailsWithFileTableFullAndChangesNothing) {
   EXPECT_EQ(StatStr("/g", &st), kSyscallErrorNoEntry);
   ASSERT_EQ(StatStr("/f", &st), 0);
   EXPECT_EQ(st.size, 4);
-  EXPECT_EQ(fs_->ActiveInodeCount(), 2);
+  EXPECT_EQ(fs_->ActiveFnodeCount(), 2);
 
   // Closing a handle makes room for one more.
   ASSERT_EQ(fs_->Close(1, last), 0);
@@ -405,12 +406,12 @@ TEST_F(RamfsTest, FullHandleTableFailsWithFileTableFullAndChangesNothing) {
   EXPECT_EQ(fs_->ActiveHandleCount(), 0);
 }
 
-TEST_F(RamfsTest, FullInodeTableFailsWithNoSpace) {
-  // The root takes one of the `kMaxInodes` inodes.
-  for (int i = 1; i < kMaxInodes; ++i) {
+TEST_F(RamfsTest, FullFnodeTableFailsWithNoSpace) {
+  // The root takes one of the `kMaxFnodes` fnodes.
+  for (int i = 1; i < kMaxFnodes; ++i) {
     ASSERT_EQ(CreateFile("/f" + std::to_string(i)), 0);
   }
-  ASSERT_EQ(fs_->ActiveInodeCount(), kMaxInodes);
+  ASSERT_EQ(fs_->ActiveFnodeCount(), kMaxFnodes);
   const int blocks = alloc_.live_blocks();
 
   uint64_t h = 0;
@@ -422,15 +423,15 @@ TEST_F(RamfsTest, FullInodeTableFailsWithNoSpace) {
   FsStat st{};
   EXPECT_EQ(StatStr("/extra", &st), kSyscallErrorNoEntry);
 
-  // Existing files still open, and unlinking one frees its inode.
+  // Existing files still open, and unlinking one frees its fnode.
   ASSERT_EQ(OpenStr(1, "/f1", kFsOpenRead, &h), 0);
   ASSERT_EQ(fs_->Close(1, h), 0);
   ASSERT_EQ(UnlinkStr("/f1"), 0);
   ASSERT_EQ(MkDirStr("/extra"), 0);
-  EXPECT_EQ(fs_->ActiveInodeCount(), kMaxInodes);
+  EXPECT_EQ(fs_->ActiveFnodeCount(), kMaxFnodes);
 }
 
-TEST_F(RamfsTest, FailedDirectoryInsertRollsBackTheNewInode) {
+TEST_F(RamfsTest, FailedDirectoryInsertRollsBackTheNewFnode) {
   ASSERT_EQ(MkDirStr("/d"), 0);
   // Only the root has a `DirBlock` (the empty `/d` has none), and no more
   // blocks fit.
@@ -441,7 +442,7 @@ TEST_F(RamfsTest, FailedDirectoryInsertRollsBackTheNewInode) {
   EXPECT_EQ(OpenStr(1, "/d/f", kFsOpenWrite | kFsOpenCreate, &h),
             kSyscallErrorNoSpace);
   EXPECT_EQ(MkDirStr("/d/sub"), kSyscallErrorNoSpace);
-  EXPECT_EQ(fs_->ActiveInodeCount(), 2);
+  EXPECT_EQ(fs_->ActiveFnodeCount(), 2);
   EXPECT_EQ(fs_->ActiveHandleCount(), 0);
   EXPECT_EQ(alloc_.live_blocks(), 1);
   FsStat st{};
@@ -455,7 +456,7 @@ TEST_F(RamfsTest, FailedDirectoryInsertRollsBackTheNewInode) {
   alloc_.set_max_blocks(-1);
   ASSERT_EQ(CreateFile("/d/f"), 0);
   ASSERT_EQ(MkDirStr("/d/sub"), 0);
-  EXPECT_EQ(fs_->ActiveInodeCount(), 4);
+  EXPECT_EQ(fs_->ActiveFnodeCount(), 4);
   ASSERT_EQ(StatStr("/d", &st), 0);
   EXPECT_EQ(st.nlink, 3);
 }
@@ -656,7 +657,7 @@ TEST_F(RamfsTest, ReadDirPaginationRewindAndDirBlockReclamation) {
       }
       for (int64_t i = 0; i < n; ++i) {
         EXPECT_EQ(page[i].type, FsNodeType::kRegular);
-        EXPECT_GT(page[i].ino, 1u);
+        EXPECT_GT(page[i].fnode_id, 1u);
         for (int64_t p = page[i].name_len; p <= kFsMaxNameLength; ++p) {
           EXPECT_EQ(page[i].name[p], '\0');
         }
@@ -698,7 +699,7 @@ TEST_F(RamfsTest, ReadDirPaginationRewindAndDirBlockReclamation) {
 TEST_F(RamfsTest, ReadDirAcrossChangesBetweenPages) {
   ASSERT_EQ(MkDirStr("/d"), 0);
   ASSERT_EQ(MkDirStr("/other"), 0);
-  for (int i = 0; i < 8; ++i) {
+  for (int i = 0; i < 10; ++i) {
     ASSERT_EQ(CreateFile("/d/e" + std::to_string(i)), 0);
   }
   uint64_t dir_h = 0;
@@ -708,25 +709,29 @@ TEST_F(RamfsTest, ReadDirAcrossChangesBetweenPages) {
 
   // Between pages: unlink a returned (e1) and a pending (e4) entry, create an
   // entry (in e1's slot), rename a returned (e0) and a pending (e5) entry
-  // within the directory (into e4's and e0's slots), and move a pending entry
-  // (e6) out of it.
+  // within the directory (into e4's and e0's slots), move a pending entry (e6)
+  // out of it, and replace both a returned (e2 <- e8) and a pending (e7 <- e9)
+  // entry with Rename().
   ASSERT_EQ(UnlinkStr("/d/e1"), 0);
   ASSERT_EQ(UnlinkStr("/d/e4"), 0);
   ASSERT_EQ(CreateFile("/d/new"), 0);
   ASSERT_EQ(RenameStr("/d/e0", "/d/r0"), 0);
   ASSERT_EQ(RenameStr("/d/e5", "/d/r5"), 0);
   ASSERT_EQ(RenameStr("/d/e6", "/other/e6"), 0);
+  ASSERT_EQ(RenameStr("/d/e8", "/d/e2"), 0);
+  ASSERT_EQ(RenameStr("/d/e9", "/d/e7"), 0);
 
-  // The pending entries that stayed (e3, e7) appear once, removed ones don't,
-  // and added ones follow in the order they were added, whatever their slots.
+  // The pending entry that stayed unchanged (e3) appears once, removed ones
+  // don't, and created or renamed entries (including Rename() replacements)
+  // follow in the order they were added, whatever their slots.
   EXPECT_EQ(ReadDirNames(dir_h, kSyscallFsMaxDirEntries),
-            (std::vector<std::string>{"e3", "e7", "new", "r0", "r5"}));
+            (std::vector<std::string>{"e3", "new", "r0", "r5", "e2", "e7"}));
   EXPECT_EQ(ReadDirNames(dir_h, kSyscallFsMaxDirEntries),
             std::vector<std::string>{});
 
   ASSERT_EQ(fs_->Seek(1, dir_h, 0, kFsSeekSet), 0);
   EXPECT_EQ(ReadDirNames(dir_h, kSyscallFsMaxDirEntries),
-            (std::vector<std::string>{"e2", "e3", "e7", "new", "r0", "r5"}));
+            (std::vector<std::string>{"e3", "new", "r0", "r5", "e2", "e7"}));
   FsStat st{};
   ASSERT_EQ(StatStr("/d", &st), 0);
   EXPECT_EQ(st.size, 6 * static_cast<int64_t>(sizeof(FsDirEntry)));
@@ -738,7 +743,7 @@ TEST_F(RamfsTest, UnlinkedOrReplacedOpenDirectoryReadsAsEmpty) {
   uint64_t gone_h = 0;
   ASSERT_EQ(OpenStr(1, "/gone", kFsOpenRead | kFsOpenDirectory, &gone_h), 0);
   ASSERT_EQ(UnlinkStr("/gone"), 0);
-  EXPECT_EQ(fs_->ActiveInodeCount(), 2);
+  EXPECT_EQ(fs_->ActiveFnodeCount(), 2);
 
   // A new directory at the same path is another one.
   ASSERT_EQ(MkDirStr("/gone"), 0);
@@ -747,7 +752,7 @@ TEST_F(RamfsTest, UnlinkedOrReplacedOpenDirectoryReadsAsEmpty) {
   ASSERT_EQ(fs_->Seek(1, gone_h, 0, kFsSeekSet), 0);
   EXPECT_EQ(ReadDirNames(gone_h, 1), std::vector<std::string>{});
   ASSERT_EQ(fs_->Close(1, gone_h), 0);
-  EXPECT_EQ(fs_->ActiveInodeCount(), 3);
+  EXPECT_EQ(fs_->ActiveFnodeCount(), 3);
 
   // So is a directory that a rename replaced.
   ASSERT_EQ(MkDirStr("/replaced"), 0);
@@ -758,9 +763,9 @@ TEST_F(RamfsTest, UnlinkedOrReplacedOpenDirectoryReadsAsEmpty) {
   ASSERT_EQ(RenameStr("/gone", "/replaced"), 0);
   ASSERT_EQ(CreateFile("/replaced/child"), 0);
   EXPECT_EQ(ReadDirNames(replaced_h, 1), std::vector<std::string>{});
-  EXPECT_EQ(fs_->ActiveInodeCount(), 4);
+  EXPECT_EQ(fs_->ActiveFnodeCount(), 4);
   ASSERT_EQ(fs_->Close(1, replaced_h), 0);
-  EXPECT_EQ(fs_->ActiveInodeCount(), 3);
+  EXPECT_EQ(fs_->ActiveFnodeCount(), 3);
 }
 
 TEST_F(RamfsTest, UnlinkWhileOpenAndClientDisconnectReclamation) {
@@ -802,7 +807,7 @@ TEST_F(RamfsTest, UnlinkWhileOpenAndClientDisconnectReclamation) {
   ASSERT_EQ(fs_->Close(10, h1), 0);
   EXPECT_EQ(alloc_.live_blocks(), 1);
   EXPECT_EQ(fs_->ActiveHandleCount(), 0);
-  EXPECT_EQ(fs_->ActiveInodeCount(), 2);
+  EXPECT_EQ(fs_->ActiveFnodeCount(), 2);
 }
 
 TEST_F(RamfsTest, RenameCrossDirOverwriteAndCycleDetection) {
@@ -830,7 +835,7 @@ TEST_F(RamfsTest, RenameCrossDirOverwriteAndCycleDetection) {
   ASSERT_EQ(StatStr("/dst/sub/..", &via_dotdot), 0);
   EXPECT_EQ(src_st.nlink, 2);
   EXPECT_EQ(dst_st.nlink, 3);
-  EXPECT_EQ(via_dotdot.ino, dst_st.ino);
+  EXPECT_EQ(via_dotdot.fnode_id, dst_st.fnode_id);
 
   // Atomic file overwrite while old target is held open by a reader.
   uint64_t old_reader = 0;
@@ -839,7 +844,7 @@ TEST_F(RamfsTest, RenameCrossDirOverwriteAndCycleDetection) {
   ASSERT_EQ(fs_->Write(1, old_reader, "old-value", 9), 9);
   ASSERT_EQ(fs_->Seek(1, old_reader, 0, kFsSeekSet), 0);
 
-  // Same-inode rename is a no-op.
+  // Same-fnode rename is a no-op.
   ASSERT_EQ(RenameStr("/target", "/./target"), 0);
 
   // Type mismatch rejections.
@@ -872,12 +877,12 @@ TEST_F(RamfsTest, RenameCrossDirOverwriteAndCycleDetection) {
   FsStat root_st{};
   ASSERT_EQ(StatStr("/", &root_st), 0);
   const int64_t root_nlink = root_st.nlink;
-  const int inodes = fs_->ActiveInodeCount();
+  const int fnodes = fs_->ActiveFnodeCount();
   ASSERT_EQ(RenameStr("/other_dir", "/empty_dir"), 0);
   // The replaced directory is gone: the root has one subdirectory less.
   ASSERT_EQ(StatStr("/", &root_st), 0);
   EXPECT_EQ(root_st.nlink, root_nlink - 1);
-  EXPECT_EQ(fs_->ActiveInodeCount(), inodes - 1);
+  EXPECT_EQ(fs_->ActiveFnodeCount(), fnodes - 1);
   FsStat st{};
   EXPECT_EQ(StatStr("/other_dir", &st), kSyscallErrorNoEntry);
 
@@ -890,8 +895,8 @@ TEST_F(RamfsTest, RenameCrossDirOverwriteAndCycleDetection) {
   ASSERT_EQ(StatStr("/src/victim/..", &via_dotdot), 0);
   EXPECT_EQ(src_st.nlink, 3);
   EXPECT_EQ(dst_st.nlink, 2);
-  EXPECT_EQ(via_dotdot.ino, src_st.ino);
-  EXPECT_EQ(fs_->ActiveInodeCount(), inodes - 1);
+  EXPECT_EQ(via_dotdot.fnode_id, src_st.fnode_id);
+  EXPECT_EQ(fs_->ActiveFnodeCount(), fnodes - 1);
 
   // Clean up everything and confirm zero leaked blocks.
   ASSERT_EQ(UnlinkStr("/target"), 0);
@@ -902,7 +907,7 @@ TEST_F(RamfsTest, RenameCrossDirOverwriteAndCycleDetection) {
   ASSERT_EQ(UnlinkStr("/nonempty_dir/child"), 0);
   ASSERT_EQ(UnlinkStr("/nonempty_dir"), 0);
   EXPECT_EQ(alloc_.live_blocks(), 0);
-  EXPECT_EQ(fs_->ActiveInodeCount(), 1);
+  EXPECT_EQ(fs_->ActiveFnodeCount(), 1);
 }
 
 TEST_F(RamfsTest, OutOfSpaceRollbackLeavesZeroLeakedBlocks) {
@@ -1292,7 +1297,7 @@ TEST_F(RamfsRpcTest, RejectsMalformedRequestsWithoutSideEffects) {
   EXPECT_EQ(StatStr("/g", &st), kSyscallErrorNoEntry);
   ASSERT_EQ(StatStr("/f", &st), 0);
   EXPECT_EQ(st.size, 4);
-  EXPECT_EQ(fs_->ActiveInodeCount(), 2);
+  EXPECT_EQ(fs_->ActiveFnodeCount(), 2);
   EXPECT_EQ(fs_->ActiveHandleCount(), 2);
   char buf[8]{};
   ASSERT_EQ(fs_->Read(kClient, h, buf, sizeof(buf)), 4);
@@ -1398,6 +1403,86 @@ TEST_F(RamfsRpcTest, RejectsRequestsWhoseReplyMayExceedReplyCap) {
             kSyscallErrorInvalid);
   EXPECT_EQ(fs_->ActiveHandleCount(), 1);
   EXPECT_EQ(Dispatch(CloseReq(dir_h), 0), 0);
+}
+
+TEST(SlabBlockAllocatorTest, BatchesSlabsFallsBackToSingleBlocksAndRezeroes) {
+  static_assert(std::is_trivially_destructible_v<SlabBlockAllocator>);
+
+  SlabBlockAllocator null_alloc{nullptr};
+  EXPECT_EQ(null_alloc.AllocBlock(), nullptr);
+  null_alloc.FreeBlock(nullptr);
+
+  struct FakeMapper {
+    int64_t remaining_blocks = SlabBlockAllocator::kSlabBlocks + 2;
+    std::vector<int64_t> requested_sizes;
+    std::vector<std::unique_ptr<uint8_t[]>> regions;
+
+    static StatusOr<uintptr_t> Map(const int64_t size, void* const ctx) {
+      auto* const self = static_cast<FakeMapper*>(ctx);
+      self->requested_sizes.push_back(size);
+      const int64_t blocks = size / kBlockSize;
+      if (size <= 0 || (size % kBlockSize) != 0 ||
+          blocks > self->remaining_blocks) {
+        return Error(kSyscallErrorNoMemory);
+      }
+      self->remaining_blocks -= blocks;
+      auto mem = std::make_unique<uint8_t[]>(static_cast<size_t>(size));
+      __builtin_memset(mem.get(), 0, static_cast<size_t>(size));
+      const uintptr_t addr = reinterpret_cast<uintptr_t>(mem.get());
+      self->regions.push_back(std::move(mem));
+      return addr;
+    }
+  } mapper;
+
+  SlabBlockAllocator alloc{&FakeMapper::Map, &mapper};
+
+  // First allocation maps one 16-block slab; the next 15 come from its free
+  // list without invoking `Map`.
+  std::vector<uint8_t*> first_slab;
+  for (int i = 0; i < SlabBlockAllocator::kSlabBlocks; ++i) {
+    uint8_t* const blk = alloc.AllocBlock();
+    ASSERT_NE(blk, nullptr);
+    for (int64_t b = 0; b < kBlockSize; ++b) {
+      ASSERT_EQ(blk[b], 0u);
+    }
+    first_slab.push_back(blk);
+  }
+  EXPECT_THAT(mapper.requested_sizes,
+              t::ElementsAre(SlabBlockAllocator::kSlabBlocks * kBlockSize));
+  for (int i = 1; i < SlabBlockAllocator::kSlabBlocks; ++i) {
+    EXPECT_EQ(first_slab[i], first_slab[0] + i * kBlockSize);
+  }
+
+  // With only 2 blocks left, a 16-block map fails, falls back to 1 block, and
+  // stays in single-block mode for the next block until space runs out.
+  uint8_t* const single1 = alloc.AllocBlock();
+  ASSERT_NE(single1, nullptr);
+  uint8_t* const single2 = alloc.AllocBlock();
+  ASSERT_NE(single2, nullptr);
+  EXPECT_EQ(alloc.AllocBlock(), nullptr);
+  EXPECT_THAT(mapper.requested_sizes,
+              t::ElementsAre(SlabBlockAllocator::kSlabBlocks * kBlockSize,
+                             SlabBlockAllocator::kSlabBlocks * kBlockSize,
+                             kBlockSize, kBlockSize, kBlockSize));
+
+  // Dirtying and freeing blocks recycles them in LIFO order and zeroes every
+  // byte (including the intrusive `FreeNode::next` pointer at offset 0).
+  alloc.FreeBlock(nullptr);
+  __builtin_memset(single1, 0xA5, static_cast<size_t>(kBlockSize));
+  __builtin_memset(single2, 0x5A, static_cast<size_t>(kBlockSize));
+  alloc.FreeBlock(single1);
+  alloc.FreeBlock(single2);
+  const int maps_before_reuse = static_cast<int>(mapper.requested_sizes.size());
+
+  uint8_t* const reused2 = alloc.AllocBlock();
+  uint8_t* const reused1 = alloc.AllocBlock();
+  EXPECT_EQ(reused2, single2);
+  EXPECT_EQ(reused1, single1);
+  EXPECT_EQ(static_cast<int>(mapper.requested_sizes.size()), maps_before_reuse);
+  for (int64_t b = 0; b < kBlockSize; ++b) {
+    ASSERT_EQ(reused2[b], 0u);
+    ASSERT_EQ(reused1[b], 0u);
+  }
 }
 
 }  // namespace

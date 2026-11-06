@@ -32,14 +32,21 @@ since other versions format some code differently; to format with it, run
 
 ## Security
 
-User programs are isolated from each other and from the kernel, with two known
-exceptions: there is no KPTI or other mitigation for speculative-execution
-attacks such as Meltdown, and user-space drivers (`kUserCapDriver`) program DMA
-without an IOMMU, control PCI Bus Master and configuration space, and issue
-kernel-proxied ISA port `0x60`/`0x64` I/O, so a driver process is effectively as
-privileged as the kernel. That includes the filesystem server `ramfs`, which
-needs `kUserCapDriver` to claim the filesystem's IPC port and parses the
-requests that the kernel forwards from every process.
+Each user program runs in its own virtual address space with isolated CPU and
+FPU register state, and CPU exceptions in user mode terminate only the faulting
+process. There are no user accounts, file permissions, or per-process resource
+quotas: user processes share the `ramfs` namespace, the unprivileged IPC ports,
+and finite system-wide pools of physical memory, kernel tasks, and `ramfs` open
+handles, fnodes (file nodes), and blocks.
+
+Two hardware/privilege boundaries are also not isolated: there is no KPTI or
+other mitigation for speculative-execution attacks such as Meltdown, and
+user-space drivers (`kUserCapDriver`) program DMA without an IOMMU, control PCI
+Bus Master and configuration space, and issue kernel-proxied ISA port
+`0x60`/`0x64` I/O, so a driver process is effectively as privileged as the
+kernel. That includes the filesystem server `ramfs`, which needs
+`kUserCapDriver` to claim the filesystem's IPC port and parses the requests
+that the kernel forwards from every process.
 
 ## License
 

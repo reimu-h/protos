@@ -684,8 +684,9 @@ TEST(ShellLibTest, RunShellExecutesBuiltinsSpawnsProgramsAndExitsCleanly) {
                     "sh> ecxx\b \b\b \bho hello shell\n"
                     "hello shell\n"
                     "sh> help\n"
-                    "built-in commands: help echo cpu ls cat mkdir rm touch "
-                    "programs run exit\n"
+                    "built-in commands: help echo cpu programs run exit\n"
+                    "built-in file commands: ls cat stat mkdir rm touch write "
+                    "append cp mv\n"
                     "user programs: init sh usertest\n"
                     "sh> cpu\n"
                     "cpu: 3\n"
@@ -708,9 +709,11 @@ TEST(ShellLibTest, RunShellExecutesBuiltinsSpawnsProgramsAndExitsCleanly) {
 
 // FakeShellState whose filesystem callbacks serve `fs` the way the kernel does,
 // for client `kClient`: `fds` maps each file descriptor to the server's handle,
-// or to 0 if the descriptor isn't open. FileRead() and ReadDir() fail with
-// `file_read_error` and `read_dir_error` instead if those aren't 0, and
-// `bad_fd_calls` counts the calls with a descriptor that isn't open.
+// or to 0 if the descriptor isn't open. FileRead(), FileWrite() and ReadDir()
+// fail with `file_read_error`, `file_write_error` and `read_dir_error` instead
+// if those aren't 0, FileWrite() writes at most `write_limit` bytes per call if
+// it isn't 0 (a short write), and `bad_fd_calls` counts the calls with a
+// descriptor that isn't open.
 struct RamfsShellHarness : FakeShellState {
   class SimpleBlockAlloc final : public ramfs::BlockAllocator {
    public:
@@ -731,7 +734,9 @@ struct RamfsShellHarness : FakeShellState {
   std::unique_ptr<ramfs::FileSystem> fs = std::make_unique<ramfs::FileSystem>();
   uint64_t fds[kMaxOpenFiles] = {};
   int64_t file_read_error = 0;
+  int64_t file_write_error = 0;
   int64_t read_dir_error = 0;
+  int64_t write_limit = 0;
   int bad_fd_calls = 0;
 
   RamfsShellHarness() {
@@ -739,10 +744,12 @@ struct RamfsShellHarness : FakeShellState {
     env.open = Open;
     env.close = Close;
     env.file_read = FileRead;
+    env.file_write = FileWrite;
     env.stat = Stat;
     env.read_dir = ReadDir;
     env.mkdir = MkDir;
     env.unlink = Unlink;
+    env.rename = Rename;
   }
 
   // Creates directory `path`.
@@ -782,6 +789,42 @@ struct RamfsShellHarness : FakeShellState {
     const int64_t rc =
         fs->Stat(path.data(), static_cast<int64_t>(path.size()), &st);
     return (rc == 0) ? st.type : FsNodeType::kNone;
+  }
+
+  // Returns the contents of regular file `path`, or "<error N>" if it can't be
+  // read.
+  std::string Contents(const std::string& path) {
+    FsOpenReply rep{};
+    const int64_t open_rc = fs->Open(kClient,                            //
+                                     path.data(),                        //
+                                     static_cast<int64_t>(path.size()),  //
+                                     kFsOpenRead,                        //
+                                     &rep);
+    if (open_rc < 0) {
+      return "<error " + std::to_string(open_rc) + ">";
+    }
+    std::string contents;
+    for (;;) {
+      char buf[kSyscallFsMaxIoSize];
+      const int64_t n = fs->Read(kClient, rep.handle, buf, sizeof(buf));
+      if (n <= 0) {
+        if (n < 0) {
+          contents = "<error " + std::to_string(n) + ">";
+        }
+        break;
+      }
+      contents.append(buf, static_cast<size_t>(n));
+    }
+    EXPECT_THAT(fs->Close(kClient, rep.handle), t::Eq(0)) << path;
+    return contents;
+  }
+
+  // Expects that the shell closed every file that it opened, also after
+  // errors.
+  void ExpectNoOpenFiles() const {
+    EXPECT_THAT(fs->ActiveHandleCount(), t::Eq(0));
+    EXPECT_THAT(fds, t::Each(t::Eq(0U)));
+    EXPECT_THAT(bad_fd_calls, t::Eq(0));
   }
 
   static RamfsShellHarness* Self(void* const ctx) {
@@ -844,6 +887,23 @@ struct RamfsShellHarness : FakeShellState {
     return h->fs->Read(kClient, handle, buf, size);
   }
 
+  static int64_t FileWrite(void* const ctx,        //
+                           const int64_t fd,       //
+                           const void* const buf,  //
+                           const int64_t size) {
+    RamfsShellHarness* const h = Self(ctx);
+    const uint64_t handle = h->Handle(fd);
+    if (handle == 0) {
+      return kSyscallErrorBadFd;
+    }
+    if (h->file_write_error != 0) {
+      return h->file_write_error;
+    }
+    const int64_t limited =
+        (h->write_limit > 0 && size > h->write_limit) ? h->write_limit : size;
+    return h->fs->Write(kClient, handle, buf, limited);
+  }
+
   static int64_t Stat(void* const ctx,         //
                       const char* const path,  //
                       const int64_t path_len,  //
@@ -876,6 +936,14 @@ struct RamfsShellHarness : FakeShellState {
                         const char* const path,  //
                         const int64_t path_len) {
     return Self(ctx)->fs->Unlink(path, path_len);
+  }
+
+  static int64_t Rename(void* const ctx,             //
+                        const char* const old_path,  //
+                        const int64_t old_len,       //
+                        const char* const new_path,  //
+                        const int64_t new_len) {
+    return Self(ctx)->fs->Rename(old_path, old_len, new_path, new_len);
   }
 };
 
@@ -919,47 +987,86 @@ TEST(ShellLibTest, FilesystemBuiltinsWithoutAFilesystemReportItUnavailable) {
                     "sh: ls: /b: filesystem unavailable\n"));
   EXPECT_THAT(no_fs.Run("cat /a"),
               t::Eq("sh: cat: /a: filesystem unavailable\n"));
+  EXPECT_THAT(no_fs.Run("stat /a"),
+              t::Eq("sh: stat: /a: filesystem unavailable\n"));
   EXPECT_THAT(no_fs.Run("mkdir /a"),
               t::Eq("sh: mkdir: /a: filesystem unavailable\n"));
   EXPECT_THAT(no_fs.Run("rm /a"),
               t::Eq("sh: rm: /a: filesystem unavailable\n"));
   EXPECT_THAT(no_fs.Run("touch /a"),
               t::Eq("sh: touch: /a: filesystem unavailable\n"));
+  EXPECT_THAT(no_fs.Run("write /a text"),
+              t::Eq("sh: write: /a: filesystem unavailable\n"));
+  EXPECT_THAT(no_fs.Run("append /a text"),
+              t::Eq("sh: append: /a: filesystem unavailable\n"));
+  // cp and mv report each source.
+  EXPECT_THAT(no_fs.Run("cp /a /b /c"),
+              t::Eq("sh: cp: /a: filesystem unavailable\n"
+                    "sh: cp: /b: filesystem unavailable\n"));
+  EXPECT_THAT(no_fs.Run("mv /a /b"),
+              t::Eq("sh: mv: /a: filesystem unavailable\n"));
 }
 
 // A built-in that lacks one of the callbacks that it needs calls none of the
 // others: it changes nothing and opens no file that it then couldn't read,
-// list or close.
+// write, list or close.
 TEST(ShellLibTest, FilesystemBuiltinsNeedEachOfTheirCallbacks) {
+  using Remove = void (*)(sh::ShellEnv& env);
+  const Remove no_open = [](sh::ShellEnv& env) { env.open = nullptr; };
+  const Remove no_close = [](sh::ShellEnv& env) { env.close = nullptr; };
+  const Remove no_read = [](sh::ShellEnv& env) { env.file_read = nullptr; };
+  const Remove no_write = [](sh::ShellEnv& env) { env.file_write = nullptr; };
+  const Remove no_stat = [](sh::ShellEnv& env) { env.stat = nullptr; };
+  const Remove no_read_dir = [](sh::ShellEnv& env) { env.read_dir = nullptr; };
+  const Remove no_mkdir = [](sh::ShellEnv& env) { env.mkdir = nullptr; };
+  const Remove no_unlink = [](sh::ShellEnv& env) { env.unlink = nullptr; };
+  const Remove no_rename = [](sh::ShellEnv& env) { env.rename = nullptr; };
   const struct {
-    const char* cmd;
+    const char* line;
+    // The operand that the error names.
     const char* path;
-    void (*remove)(sh::ShellEnv& env);
+    Remove remove;
   } kCases[] = {
-      {"ls", "/d", [](sh::ShellEnv& env) { env.stat = nullptr; }},
-      {"ls", "/d", [](sh::ShellEnv& env) { env.open = nullptr; }},
-      {"ls", "/d", [](sh::ShellEnv& env) { env.read_dir = nullptr; }},
-      {"ls", "/d", [](sh::ShellEnv& env) { env.close = nullptr; }},
-      {"cat", "/d/f", [](sh::ShellEnv& env) { env.open = nullptr; }},
-      {"cat", "/d/f", [](sh::ShellEnv& env) { env.file_read = nullptr; }},
-      {"cat", "/d/f", [](sh::ShellEnv& env) { env.close = nullptr; }},
-      {"touch", "/d/new", [](sh::ShellEnv& env) { env.open = nullptr; }},
-      {"touch", "/d/new", [](sh::ShellEnv& env) { env.close = nullptr; }},
-      {"mkdir", "/d/new", [](sh::ShellEnv& env) { env.mkdir = nullptr; }},
-      {"rm", "/d/f", [](sh::ShellEnv& env) { env.unlink = nullptr; }},
+      {"ls /d", "/d", no_stat},
+      {"ls /d", "/d", no_open},
+      {"ls /d", "/d", no_read_dir},
+      {"ls /d", "/d", no_close},
+      {"cat /d/f", "/d/f", no_open},
+      {"cat /d/f", "/d/f", no_read},
+      {"cat /d/f", "/d/f", no_close},
+      {"stat /d/f", "/d/f", no_stat},
+      {"touch /d/new", "/d/new", no_open},
+      {"touch /d/new", "/d/new", no_close},
+      {"mkdir /d/new", "/d/new", no_mkdir},
+      {"rm /d/f", "/d/f", no_unlink},
+      {"write /d/f text", "/d/f", no_open},
+      {"write /d/f text", "/d/f", no_write},
+      {"write /d/f text", "/d/f", no_close},
+      {"append /d/new text", "/d/new", no_open},
+      {"append /d/new text", "/d/new", no_write},
+      {"append /d/new text", "/d/new", no_close},
+      {"cp /d/f /d/new", "/d/f", no_stat},
+      {"cp /d/f /d/new", "/d/f", no_open},
+      {"cp /d/f /d/new", "/d/f", no_read},
+      {"cp /d/f /d/new", "/d/f", no_write},
+      {"cp /d/f /d/new", "/d/f", no_close},
+      {"mv /d/f /d/new", "/d/f", no_stat},
+      {"mv /d/f /d/new", "/d/f", no_rename},
   };
   for (const auto& c : kCases) {
     RamfsShellHarness h;
     h.MakeDir("/d");
     h.WriteFile("/d/f", "data");
-    const int inodes = h.fs->ActiveInodeCount();
+    const int fnodes = h.fs->ActiveFnodeCount();
     c.remove(h.env);
-    const std::string line = std::string(c.cmd) + " " + c.path;
-    const std::string error = "sh: " + std::string(c.cmd) + ": " + c.path +
-                              ": filesystem unavailable\n";
+    const std::string line = c.line;
+    const std::string cmd = line.substr(0, line.find(' '));
+    const std::string error =
+        "sh: " + cmd + ": " + c.path + ": filesystem unavailable\n";
     EXPECT_THAT(h.Run(line), t::Eq(error)) << line;
     EXPECT_THAT(h.fs->ActiveHandleCount(), t::Eq(0)) << line;
-    EXPECT_THAT(h.fs->ActiveInodeCount(), t::Eq(inodes)) << line;
+    EXPECT_THAT(h.fs->ActiveFnodeCount(), t::Eq(fnodes)) << line;
+    EXPECT_THAT(h.Contents("/d/f"), t::Eq("data")) << line;
   }
 }
 
@@ -967,10 +1074,10 @@ TEST(ShellLibTest, FilesystemBuiltinsOperateOnRamfsAndReportErrors) {
   RamfsShellHarness h;
   // Longer than two of cat's reads.
   const std::string readme =
-      std::string(2 * sh::kShellCatChunkSize + 100, 'A') + "END_OF_README\n";
+      std::string(2 * sh::kShellFileChunkSize + 100, 'A') + "END_OF_README\n";
   h.MakeDir("/docs");
   h.WriteFile("/docs/readme.txt", readme);
-  const int inodes = h.fs->ActiveInodeCount();
+  const int fnodes = h.fs->ActiveFnodeCount();
 
   EXPECT_THAT(h.Run("mkdir"), t::Eq("sh: usage: mkdir <path> ...\n"));
   EXPECT_THAT(h.Run("touch"), t::Eq("sh: usage: touch <path> ...\n"));
@@ -1021,13 +1128,10 @@ TEST(ShellLibTest, FilesystemBuiltinsOperateOnRamfsAndReportErrors) {
   EXPECT_THAT(h.Run("rm /work/empty /work/sub /work /missing"),
               t::Eq("sh: rm: /missing: no such file or directory\n"));
   EXPECT_THAT(h.TypeOf("/work"), t::Eq(FsNodeType::kNone));
-  EXPECT_THAT(h.fs->ActiveInodeCount(), t::Eq(inodes));
+  EXPECT_THAT(h.fs->ActiveFnodeCount(), t::Eq(fnodes));
   EXPECT_THAT(h.Run("ls"), t::Eq("docs/\n"));
 
-  // The shell closed every file that it opened, also after errors.
-  EXPECT_THAT(h.fs->ActiveHandleCount(), t::Eq(0));
-  EXPECT_THAT(h.fds, t::Each(t::Eq(0U)));
-  EXPECT_THAT(h.bad_fd_calls, t::Eq(0));
+  h.ExpectNoOpenFiles();
 }
 
 TEST(ShellLibTest, LsListsDirectoriesOfMoreEntriesThanOneReadDirBatch) {
@@ -1093,7 +1197,7 @@ TEST(ShellLibTest, LsWithSeveralOperandsGroupsThemLikePosixLs) {
 TEST(ShellLibTest, FilesystemBuiltinsRefuseLinesWithTooManyTokens) {
   RamfsShellHarness h;
   h.MakeDir("/t");
-  const int inodes = h.fs->ActiveInodeCount();
+  const int fnodes = h.fs->ActiveFnodeCount();
   // " /t/0 /t/1 ...": as many operands as a command holds, and one more.
   std::string most;
   for (int i = 0; i < sh::kShellMaxTokens - 1; ++i) {
@@ -1101,18 +1205,19 @@ TEST(ShellLibTest, FilesystemBuiltinsRefuseLinesWithTooManyTokens) {
   }
   const std::string too_many = most + " /t/extra";
 
-  for (const char* const cmd : {"ls", "cat", "mkdir", "rm", "touch"}) {
+  for (const char* const cmd : {"ls", "cat", "stat", "mkdir", "rm", "touch",
+                                "write", "append", "cp", "mv"}) {
     EXPECT_THAT(h.Run(cmd + too_many), t::Eq("sh: too many arguments\n"))
         << cmd;
   }
-  EXPECT_THAT(h.fs->ActiveInodeCount(), t::Eq(inodes));
+  EXPECT_THAT(h.fs->ActiveFnodeCount(), t::Eq(fnodes));
 
   EXPECT_THAT(h.Run("touch" + most), t::Eq(""));
-  EXPECT_THAT(h.fs->ActiveInodeCount(),
-              t::Eq(inodes + sh::kShellMaxTokens - 1));
+  EXPECT_THAT(h.fs->ActiveFnodeCount(),
+              t::Eq(fnodes + sh::kShellMaxTokens - 1));
   EXPECT_THAT(h.Run("touch /t/extra"), t::Eq(""));
   EXPECT_THAT(h.Run("rm" + too_many), t::Eq("sh: too many arguments\n"));
-  EXPECT_THAT(h.fs->ActiveInodeCount(), t::Eq(inodes + sh::kShellMaxTokens));
+  EXPECT_THAT(h.fs->ActiveFnodeCount(), t::Eq(fnodes + sh::kShellMaxTokens));
   EXPECT_THAT(h.Run("rm" + most), t::Eq(""));
   EXPECT_THAT(h.Run("ls /t"), t::Eq("extra\n"));
 
@@ -1122,11 +1227,15 @@ TEST(ShellLibTest, FilesystemBuiltinsRefuseLinesWithTooManyTokens) {
 
 // FakeShellState whose filesystem callbacks claim more than they may: the
 // first ReadDir() claims more entries than asked for, with names longer than
-// `kFsMaxNameLength` or of negative length, and the first FileRead() claims
-// more bytes than asked for. `/` is a directory and every other path a file.
+// `kFsMaxNameLength` or of negative length, the first FileRead() claims more
+// bytes than asked for, and FileWrite(), which appends to `written`, claims
+// more bytes than it got (or none if `zero_writes`). `/` is a directory and
+// every other path a file, whose fnode ID is its last character.
 struct OverclaimingFs : FakeShellState {
   int read_dir_calls = 0;
   int file_read_calls = 0;
+  bool zero_writes = false;
+  std::string written;
 
   OverclaimingFs() {
     env.open = Open;
@@ -1134,6 +1243,7 @@ struct OverclaimingFs : FakeShellState {
     env.stat = Stat;
     env.read_dir = ReadDir;
     env.file_read = FileRead;
+    env.file_write = FileWrite;
   }
 
   static OverclaimingFs* Self(void* const ctx) {
@@ -1156,6 +1266,7 @@ struct OverclaimingFs : FakeShellState {
     *out_stat = FsStat{};
     out_stat->type = (path_len == 1 && path[0] == '/') ? FsNodeType::kDirectory
                                                        : FsNodeType::kRegular;
+    out_stat->fnode_id = static_cast<uint8_t>(path[path_len - 1]);
     return 0;
   }
 
@@ -1184,9 +1295,22 @@ struct OverclaimingFs : FakeShellState {
     __builtin_memset(buf, 'x', static_cast<size_t>(size));
     return size + 100;
   }
+
+  static int64_t FileWrite(void* const ctx,        //
+                           const int64_t /*fd*/,   //
+                           const void* const buf,  //
+                           const int64_t size) {
+    OverclaimingFs* const fs = Self(ctx);
+    if (fs->zero_writes) {
+      return 0;
+    }
+    fs->written.append(static_cast<const char*>(buf),
+                       static_cast<size_t>(size));
+    return size + 100;
+  }
 };
 
-TEST(ShellLibTest, LsAndCatClampWhatCallbacksClaimToTheirBuffers) {
+TEST(ShellLibTest, LsCatAndCpClampWhatCallbacksClaimToTheirBuffers) {
   OverclaimingFs fs;
   std::string listing;
   for (int i = 0; i < sh::kShellReadDirBatch; ++i) {
@@ -1196,7 +1320,301 @@ TEST(ShellLibTest, LsAndCatClampWhatCallbacksClaimToTheirBuffers) {
   }
   EXPECT_THAT(fs.Run("ls"), t::Eq(listing));
   EXPECT_THAT(fs.Run("cat /f"),
-              t::Eq(std::string(sh::kShellCatChunkSize, 'x')));
+              t::Eq(std::string(sh::kShellFileChunkSize, 'x')));
+
+  OverclaimingFs cp_fs;
+  EXPECT_THAT(cp_fs.Run("cp /f /g"), t::Eq(""));
+  EXPECT_THAT(cp_fs.written, t::Eq(std::string(sh::kShellFileChunkSize, 'x')));
+}
+
+// A FileWrite() that writes nothing fails the command instead of being
+// retried forever.
+TEST(ShellLibTest, WritesThatWriteNothingFailWithAnIoError) {
+  OverclaimingFs fs;
+  fs.zero_writes = true;
+  EXPECT_THAT(fs.Run("write /f text"), t::Eq("sh: write: /f: io error\n"));
+  EXPECT_THAT(fs.Run("append /f text"), t::Eq("sh: append: /f: io error\n"));
+  EXPECT_THAT(fs.Run("cp /f /g"), t::Eq("sh: cp: /g: io error\n"));
+}
+
+TEST(ShellLibTest, WriteAndAppendReplaceOrExtendAFile) {
+  RamfsShellHarness h;
+  h.MakeDir("/d");
+
+  EXPECT_THAT(h.Run("write"), t::Eq("sh: usage: write <path> [word ...]\n"));
+  EXPECT_THAT(h.Run("append"), t::Eq("sh: usage: append <path> [word ...]\n"));
+
+  // write creates a missing file and writes the words as echo writes them.
+  EXPECT_THAT(h.Run("write /d/f  hello   world "), t::Eq(""));
+  EXPECT_THAT(h.Contents("/d/f"), t::Eq("hello world\n"));
+  EXPECT_THAT(h.Run("append /d/f second line"), t::Eq(""));
+  EXPECT_THAT(h.Contents("/d/f"), t::Eq("hello world\nsecond line\n"));
+  // write replaces the contents, also with shorter ones.
+  EXPECT_THAT(h.Run("write /d/f new"), t::Eq(""));
+  EXPECT_THAT(h.Contents("/d/f"), t::Eq("new\n"));
+  // Without words, the newline that echo writes.
+  EXPECT_THAT(h.Run("write /d/f"), t::Eq(""));
+  EXPECT_THAT(h.Contents("/d/f"), t::Eq("\n"));
+  // append creates a missing file. '<', '>' and '&' are only characters.
+  EXPECT_THAT(h.Run("append /d/new <a> & b>c"), t::Eq(""));
+  EXPECT_THAT(h.Contents("/d/new"), t::Eq("<a> & b>c\n"));
+
+  // After a short write, the shell writes the rest.
+  h.write_limit = 3;
+  EXPECT_THAT(h.Run("write /d/f one two three"), t::Eq(""));
+  EXPECT_THAT(h.Contents("/d/f"), t::Eq("one two three\n"));
+  h.write_limit = 0;
+
+  // Errors of Open() and FileWrite().
+  EXPECT_THAT(h.Run("write /d text"), t::Eq("sh: write: /d: is a directory\n"));
+  EXPECT_THAT(h.Run("append /nodir/f text"),
+              t::Eq("sh: append: /nodir/f: no such file or directory\n"));
+  h.file_write_error = kSyscallErrorNoSpace;
+  EXPECT_THAT(h.Run("append /d/f more"),
+              t::Eq("sh: append: /d/f: no space left\n"));
+  h.file_write_error = 0;
+  EXPECT_THAT(h.Contents("/d/f"), t::Eq("one two three\n"));
+  EXPECT_THAT(h.TypeOf("/d"), t::Eq(FsNodeType::kDirectory));
+  EXPECT_THAT(h.TypeOf("/nodir"), t::Eq(FsNodeType::kNone));
+  h.ExpectNoOpenFiles();
+}
+
+TEST(ShellLibTest, CpCopiesFilesToPathsOrIntoDirectories) {
+  RamfsShellHarness h;
+  // Longer than two of cp's reads.
+  const std::string big =
+      std::string(2 * sh::kShellFileChunkSize + 100, 'B') + "END\n";
+  h.MakeDir("/d");
+  h.MakeDir("/e");
+  h.WriteFile("/f", big);
+  h.WriteFile("/g", "gee\n");
+
+  EXPECT_THAT(h.Run("cp"), t::Eq("sh: usage: cp <source> ... <target>\n"));
+  EXPECT_THAT(h.Run("cp /f"), t::Eq("sh: usage: cp <source> ... <target>\n"));
+
+  // To a new path, and over a file, whose contents the copy replaces.
+  EXPECT_THAT(h.Run("cp /f /copy"), t::Eq(""));
+  EXPECT_THAT(h.Contents("/copy"), t::Eq(big));
+  EXPECT_THAT(h.Run("cp /g /copy"), t::Eq(""));
+  EXPECT_THAT(h.Contents("/copy"), t::Eq("gee\n"));
+  // Into a directory, under the source's name. Several sources need one.
+  EXPECT_THAT(h.Run("cp /f /d"), t::Eq(""));
+  EXPECT_THAT(h.Contents("/d/f"), t::Eq(big));
+  EXPECT_THAT(h.Run("cp /f /g /e/"), t::Eq(""));
+  EXPECT_THAT(h.Run("ls /e"), t::Eq("f\ng\n"));
+  EXPECT_THAT(h.Contents("/e/g"), t::Eq("gee\n"));
+  EXPECT_THAT(h.Run("cp /f /g /copy"),
+              t::Eq("sh: cp: /copy: not a directory\n"));
+  EXPECT_THAT(h.Run("cp /f /g /missing"),
+              t::Eq("sh: cp: /missing: no such file or directory\n"));
+  EXPECT_THAT(h.TypeOf("/missing"), t::Eq(FsNodeType::kNone));
+  EXPECT_THAT(h.Contents("/f"), t::Eq(big));
+
+  // After a short write, the shell writes the rest.
+  h.write_limit = 1000;
+  EXPECT_THAT(h.Run("cp /f /short"), t::Eq(""));
+  EXPECT_THAT(h.Contents("/short"), t::Eq(big));
+  h.write_limit = 0;
+
+  // Sources that cp doesn't copy: missing ones, directories, and a file that
+  // is the destination too (opening the destination would empty it).
+  EXPECT_THAT(h.Run("cp /missing /x /d"),
+              t::Eq("sh: cp: /missing: no such file or directory\n"
+                    "sh: cp: /x: no such file or directory\n"));
+  EXPECT_THAT(h.Run("cp /d /x"), t::Eq("sh: cp: /d: is a directory\n"));
+  EXPECT_THAT(h.Run("cp /g /g"),
+              t::Eq("sh: cp: /g and /g are the same file\n"));
+  EXPECT_THAT(h.Run("cp /g /./g"),
+              t::Eq("sh: cp: /g and /./g are the same file\n"));
+  EXPECT_THAT(h.Run("cp /g /"), t::Eq("sh: cp: /g and /g are the same file\n"));
+  EXPECT_THAT(h.Contents("/g"), t::Eq("gee\n"));
+  // Destinations that cp can't write: a directory, a missing directory.
+  h.WriteFile("/x", "ex\n");
+  h.MakeDir("/e/x");
+  EXPECT_THAT(h.Run("cp /x /e"), t::Eq("sh: cp: /e/x: is a directory\n"));
+  EXPECT_THAT(h.Run("cp /x /nodir/x"),
+              t::Eq("sh: cp: /nodir/x: no such file or directory\n"));
+  // Errors of FileRead() and FileWrite().
+  h.file_read_error = kSyscallErrorAccess;
+  EXPECT_THAT(h.Run("cp /x /y"), t::Eq("sh: cp: /x: error -13\n"));
+  h.file_read_error = 0;
+  h.file_write_error = kSyscallErrorNoSpace;
+  EXPECT_THAT(h.Run("cp /x /z"), t::Eq("sh: cp: /z: no space left\n"));
+  h.file_write_error = 0;
+
+  // A destination in a directory whose path is too long for it: 252 bytes
+  // and a '/' leave room for names of up to 2 bytes.
+  const std::string dir = "/" + std::string(kFsMaxNameLength, 'a') + "/" +
+                          std::string(kFsMaxNameLength, 'b') + "/" +
+                          std::string(kFsMaxNameLength, 'c') + "/" +
+                          std::string(59, 'd');
+  ASSERT_THAT(dir.size(), t::Eq(252U));
+  h.MakeDir(dir.substr(0, 64));
+  h.MakeDir(dir.substr(0, 128));
+  h.MakeDir(dir.substr(0, 192));
+  h.MakeDir(dir);
+  EXPECT_THAT(h.Run("cp /x " + dir), t::Eq(""));
+  EXPECT_THAT(h.Contents(dir + "/x"), t::Eq("ex\n"));
+  EXPECT_THAT(h.Run("cp /copy " + dir),
+              t::Eq("sh: cp: /copy: name too long\n"));
+  h.ExpectNoOpenFiles();
+}
+
+TEST(ShellLibTest, MvRenamesAndMovesFilesAndDirectories) {
+  RamfsShellHarness h;
+  h.MakeDir("/d");
+  h.MakeDir("/e");
+  h.WriteFile("/f", "eff\n");
+  h.WriteFile("/g", "gee\n");
+  h.WriteFile("/h", "aitch\n");
+  const int fnodes = h.fs->ActiveFnodeCount();
+
+  EXPECT_THAT(h.Run("mv"), t::Eq("sh: usage: mv <source> ... <target>\n"));
+  EXPECT_THAT(h.Run("mv /f"), t::Eq("sh: usage: mv <source> ... <target>\n"));
+
+  // Renames a file, and replaces a file.
+  EXPECT_THAT(h.Run("mv /f /f2"), t::Eq(""));
+  EXPECT_THAT(h.TypeOf("/f"), t::Eq(FsNodeType::kNone));
+  EXPECT_THAT(h.Contents("/f2"), t::Eq("eff\n"));
+  EXPECT_THAT(h.Run("mv /f2 /g"), t::Eq(""));
+  EXPECT_THAT(h.Contents("/g"), t::Eq("eff\n"));
+  EXPECT_THAT(h.fs->ActiveFnodeCount(), t::Eq(fnodes - 1));
+  // Moves files and directories into a directory, under their names.
+  EXPECT_THAT(h.Run("mv /g /d"), t::Eq(""));
+  EXPECT_THAT(h.Run("mv /d/g /h /e"), t::Eq(""));
+  EXPECT_THAT(h.Run("ls /d /e"), t::Eq("/d:\n\n/e:\ng\nh\n"));
+  EXPECT_THAT(h.Run("mv /e /d/"), t::Eq(""));
+  EXPECT_THAT(h.Run("ls /d/e"), t::Eq("g\nh\n"));
+  // Renames a directory. A source that is its own destination stays.
+  EXPECT_THAT(h.Run("mv /d/e /moved"), t::Eq(""));
+  EXPECT_THAT(h.Contents("/moved/h"), t::Eq("aitch\n"));
+  EXPECT_THAT(h.Run("mv /moved/h /moved/h"), t::Eq(""));
+  EXPECT_THAT(h.Contents("/moved/h"), t::Eq("aitch\n"));
+  EXPECT_THAT(h.fs->ActiveFnodeCount(), t::Eq(fnodes - 1));
+
+  // Errors name the source if it doesn't exist, else the destination.
+  EXPECT_THAT(h.Run("mv /missing /x"),
+              t::Eq("sh: mv: /missing: no such file or directory\n"));
+  EXPECT_THAT(h.Run("mv /moved/h /nodir/h"),
+              t::Eq("sh: mv: /nodir/h: no such file or directory\n"));
+  EXPECT_THAT(h.Run("mv /moved /moved"),
+              t::Eq("sh: mv: /moved/moved: invalid argument\n"));
+  EXPECT_THAT(h.Run("mv /moved/g /moved/h /moved/g"),
+              t::Eq("sh: mv: /moved/g: not a directory\n"));
+  h.MakeDir("/y");
+  h.MakeDir("/y/sub");
+  h.WriteFile("/y/sub/file", "");
+  h.MakeDir("/sub");
+  EXPECT_THAT(h.Run("mv /sub /y"),
+              t::Eq("sh: mv: /y/sub: directory not empty\n"));
+  h.MakeDir("/y/g");
+  EXPECT_THAT(h.Run("mv /moved/g /y"), t::Eq("sh: mv: /y/g: is a directory\n"));
+  EXPECT_THAT(h.Contents("/moved/g"), t::Eq("eff\n"));
+  EXPECT_THAT(h.TypeOf("/sub"), t::Eq(FsNodeType::kDirectory));
+  h.ExpectNoOpenFiles();
+}
+
+TEST(ShellLibTest, StatDescribesFilesAndDirectories) {
+  RamfsShellHarness h;
+  // The root has fnode ID 1, and the others follow in creation order.
+  h.MakeDir("/d");
+  h.WriteFile("/d/f", "hello\n");
+
+  EXPECT_THAT(h.Run("stat"), t::Eq("sh: usage: stat <path> ...\n"));
+  // A directory's size is that of its entries (`sizeof(FsDirEntry)` each).
+  EXPECT_THAT(h.Run("stat /d/f /d / /missing"),
+              t::Eq("  File: /d/f\n"
+                    "  Type: regular file\n"
+                    "  Size: 6\n"
+                    " Fnode: 3\n"
+                    " Links: 1\n"
+                    "  File: /d\n"
+                    "  Type: directory\n"
+                    "  Size: 80\n"
+                    " Fnode: 2\n"
+                    " Links: 2\n"
+                    "  File: /\n"
+                    "  Type: directory\n"
+                    "  Size: 80\n"
+                    " Fnode: 1\n"
+                    " Links: 3\n"
+                    "sh: stat: /missing: no such file or directory\n"));
+
+  // A `kFsMaxPathLength` (255-byte) path does not truncate the trailing fields.
+  const std::string deep_dir = "/" + std::string(kFsMaxNameLength, 'a') + "/" +
+                               std::string(kFsMaxNameLength, 'b') + "/" +
+                               std::string(kFsMaxNameLength, 'c');
+  const std::string max_path = deep_dir + "/" + std::string(62, 'd');
+  ASSERT_THAT(static_cast<int64_t>(max_path.size()), t::Eq(kFsMaxPathLength));
+  h.MakeDir(deep_dir.substr(0, 64));
+  h.MakeDir(deep_dir.substr(0, 128));
+  h.MakeDir(deep_dir);
+  h.WriteFile(max_path, "0123456789");
+  EXPECT_THAT(h.Run("stat " + max_path), t::Eq("  File: " + max_path +
+                                               "\n"
+                                               "  Type: regular file\n"
+                                               "  Size: 10\n"
+                                               " Fnode: 7\n"
+                                               " Links: 1\n"));
+
+  // A type that the shell doesn't know.
+  FakeShellState odd;
+  odd.env.stat = [](void* const /*ctx*/,         //
+                    const char* const /*path*/,  //
+                    const int64_t /*path_len*/,  //
+                    FsStat* const out_stat) -> int64_t {
+    *out_stat = FsStat{};
+    out_stat->type = static_cast<FsNodeType>(7);
+    return 0;
+  };
+  EXPECT_THAT(odd.Run("stat /x"), t::Eq("  File: /x\n"
+                                        "  Type: unknown\n"
+                                        "  Size: 0\n"
+                                        " Fnode: 0\n"
+                                        " Links: 0\n"));
+}
+
+TEST(SyscallAbiTest, UserSegmentRangeAllowedRejectsReservedWindows) {
+  // Valid placements: bottom of user space, right below each reserved window,
+  // right above each reserved window, and the linked top-2-GiB ELF region.
+  EXPECT_TRUE(UserSegmentRangeAllowed(kUserSpaceBase, 1));
+  EXPECT_TRUE(UserSegmentRangeAllowed(kDriverMmioWindowBase - kPageSize, 1));
+  EXPECT_TRUE(UserSegmentRangeAllowed(
+      kDriverMmioWindowBase + kDriverMmioWindowSize, kPageSize));
+  EXPECT_TRUE(UserSegmentRangeAllowed(kDriverDmaWindowBase - kPageSize, 1));
+  EXPECT_TRUE(UserSegmentRangeAllowed(
+      kDriverDmaWindowBase + kDriverDmaWindowSize, kPageSize));
+  EXPECT_TRUE(UserSegmentRangeAllowed(kUserAnonWindowBase - kPageSize, 1));
+  EXPECT_TRUE(
+      UserSegmentRangeAllowed(kUserAnonWindowBase + kUserAnonWindowSize, 1));
+  EXPECT_TRUE(
+      UserSegmentRangeAllowed(kUserStackRegionBase - kPageSize, kPageSize));
+  EXPECT_TRUE(UserSegmentRangeAllowed(0xFFFFFFFF80000000ULL, kPageSize));
+  EXPECT_TRUE(UserSegmentRangeAllowed(kUserSpaceEnd - kPageSize, 1));
+
+  // Unaligned, empty, negative, or out-of-user-space segments.
+  EXPECT_FALSE(UserSegmentRangeAllowed(0xFFFFFFFF80000001ULL, kPageSize));
+  EXPECT_FALSE(UserSegmentRangeAllowed(0xFFFFFFFF80000000ULL, 0));
+  EXPECT_FALSE(UserSegmentRangeAllowed(0xFFFFFFFF80000000ULL, -kPageSize));
+  EXPECT_FALSE(UserSegmentRangeAllowed(kUserSpaceEnd, kPageSize));
+  EXPECT_FALSE(
+      UserSegmentRangeAllowed(kUserSpaceEnd - kPageSize, kPageSize + 1));
+
+  // Overlapping MMIO, DMA, anonymous `MemMap()`, or stack + guard pages.
+  EXPECT_FALSE(UserSegmentRangeAllowed(kDriverMmioWindowBase - kPageSize,
+                                       kPageSize + 1));
+  EXPECT_FALSE(UserSegmentRangeAllowed(kDriverMmioWindowBase, 1));
+  EXPECT_FALSE(UserSegmentRangeAllowed(
+      kDriverMmioWindowBase + kDriverMmioWindowSize - kPageSize, 1));
+  EXPECT_FALSE(UserSegmentRangeAllowed(kDriverDmaWindowBase, 1));
+  EXPECT_FALSE(UserSegmentRangeAllowed(kUserAnonWindowBase, 1));
+  EXPECT_FALSE(UserSegmentRangeAllowed(
+      kUserAnonWindowBase + kUserAnonWindowSize - kPageSize, 1));
+  EXPECT_FALSE(
+      UserSegmentRangeAllowed(kUserStackRegionBase - kPageSize, kPageSize + 1));
+  EXPECT_FALSE(UserSegmentRangeAllowed(kUserStackRegionBase, 1));
+  EXPECT_FALSE(UserSegmentRangeAllowed(kUserStackTop - kPageSize, 1));
+  EXPECT_FALSE(UserSegmentRangeAllowed(kUserStackTop, 1));
 }
 
 }  // namespace

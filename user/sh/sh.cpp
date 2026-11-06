@@ -58,6 +58,13 @@ static int64_t ShellSysFileRead(void* const /*ctx*/,  //
   return FileRead(fd, buffer, size);
 }
 
+static int64_t ShellSysFileWrite(void* const /*ctx*/,       //
+                                 const int64_t fd,          //
+                                 const void* const buffer,  //
+                                 const int64_t size) {
+  return FileWrite(fd, buffer, size);
+}
+
 static int64_t ShellSysStat(void* const /*ctx*/,     //
                             const char* const path,  //
                             const int64_t path_len,  //
@@ -84,6 +91,14 @@ static int64_t ShellSysUnlink(void* const /*ctx*/,     //
   return Unlink(path, path_len);
 }
 
+static int64_t ShellSysRename(void* const /*ctx*/,         //
+                              const char* const old_path,  //
+                              const int64_t old_len,       //
+                              const char* const new_path,  //
+                              const int64_t new_len) {
+  return Rename(old_path, old_len, new_path, new_len);
+}
+
 int64_t Main(const uint64_t /*arg*/) {
   if (CurrentPrivilegeLevel() != 3) {
     return 1;
@@ -98,10 +113,12 @@ int64_t Main(const uint64_t /*arg*/) {
       .open = ShellSysOpen,
       .close = ShellSysClose,
       .file_read = ShellSysFileRead,
+      .file_write = ShellSysFileWrite,
       .stat = ShellSysStat,
       .read_dir = ShellSysReadDir,
       .mkdir = ShellSysMkDir,
       .unlink = ShellSysUnlink,
+      .rename = ShellSysRename,
   };
   return sh::RunShell(env);
 }

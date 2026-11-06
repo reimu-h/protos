@@ -1293,7 +1293,8 @@ RAMFS_NOT_READY = "[INIT] ramfs not ready"
 STRESS = "[STRESS]"
 PROMPT = "sh> "
 HELP_LINES = (
-    "built-in commands: help echo cpu ls cat mkdir rm touch programs run exit",
+    "built-in commands: help echo cpu programs run exit",
+    "built-in file commands: ls cat stat mkdir rm touch write append cp mv",
     "user programs: init sh usertest",
 )
 SCRIPTED_ECHO = "boot_sh_ok"

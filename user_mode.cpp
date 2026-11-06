@@ -488,6 +488,9 @@ bool UserProcess::Load(const ElfExecutable& executable,
   int64_t pages = 0;
   for (int i = 0; i < executable.segment_count; ++i) {
     const ElfSegment& segment = executable.segments[i];
+    if (!UserSegmentRangeAllowed(segment.vaddr, segment.mem_size)) {
+      return false;
+    }
     pages += (segment.mem_size + kPageSize - 1) / kPageSize;
   }
   if (pages > kUserProgramMaxPages) {
@@ -1517,7 +1520,6 @@ int64_t UserProcess::FsOpen(const uintptr_t path_ptr,  //
   // Also if the program was killed meanwhile: it ends on its way back to user
   // mode, and `Run()` then has the server close the file.
   fds_[fd] = FsFdSlot{.open = true, .handle = reply.handle, .server = server};
-  ++open_fd_count_;
   return fd;
 }
 
@@ -1528,7 +1530,6 @@ int64_t UserProcess::FsClose(const int64_t fd) {
   }
   const FsFdSlot closed = *slot;
   *slot = FsFdSlot{};
-  --open_fd_count_;
 
   FsCloseRequest req{};
   req.op = FsRpcOp::kClose;
@@ -1684,7 +1685,7 @@ int64_t UserProcess::FsStatPath(const uintptr_t path_ptr,  //
     return rc;
   }
   if (rc != 0 || reply_size != static_cast<int64_t>(sizeof(FsStat)) ||
-      !IsValidFsNodeType(server_stat.type) || server_stat.ino == 0 ||
+      !IsValidFsNodeType(server_stat.type) || server_stat.fnode_id == 0 ||
       server_stat.size < 0 || server_stat.nlink <= 0) {
     return kSyscallErrorIo;
   }
@@ -1693,7 +1694,7 @@ int64_t UserProcess::FsStatPath(const uintptr_t path_ptr,  //
     FsStat user_stat;
     __builtin_memset(static_cast<void*>(&user_stat), 0, sizeof(user_stat));
     user_stat.type = server_stat.type;
-    user_stat.ino = server_stat.ino;
+    user_stat.fnode_id = server_stat.fnode_id;
     user_stat.size = server_stat.size;
     user_stat.nlink = server_stat.nlink;
     WriteUserMemory(stat_ptr, &user_stat, sizeof(user_stat));
@@ -1749,13 +1750,13 @@ int64_t UserProcess::FsReadDir(const int64_t fd,             //
     // Only the fields and the name's `name_len` bytes reach the program;
     // the rest is zero.
     FsDirEntry& entry = entries[static_cast<size_t>(i)];
-    if (entry.ino == 0 || !IsValidFsNodeType(entry.type) ||
+    if (entry.fnode_id == 0 || !IsValidFsNodeType(entry.type) ||
         !IsValidFsEntryName(entry.name, entry.name_len)) {
       return kSyscallErrorIo;
     }
     FsDirEntry clean;
     __builtin_memset(static_cast<void*>(&clean), 0, sizeof(clean));
-    clean.ino = entry.ino;
+    clean.fnode_id = entry.fnode_id;
     clean.type = entry.type;
     clean.name_len = entry.name_len;
     __builtin_memcpy(clean.name, entry.name,

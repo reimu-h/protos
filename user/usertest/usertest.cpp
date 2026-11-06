@@ -3196,8 +3196,8 @@ constexpr int64_t kFsStraddleSize = 200;
 constexpr uint64_t kFsCreateNewFlags =
     kFsOpenReadWrite | kFsOpenCreate | kFsOpenExclusive;
 // The `kLeakAndFault` children of `kFullSuite`, which open 512 files in all
-// (`kMaxOpenFiles` each): twice as many as ramfs has handles and inodes for
-// (ramfs::kMaxOpenHandles and ramfs::kMaxInodes), so that ramfs runs out of
+// (`kMaxOpenFiles` each): twice as many as ramfs has handles and fnodes for
+// (ramfs::kMaxOpenHandles and ramfs::kMaxFnodes), so that ramfs runs out of
 // them unless it frees the files of each child when the child ends.
 constexpr int kFsLeakRounds = 16;
 static_assert(kMaxOpenFiles < 100, "kLeakAndFault names files with 2 digits");
@@ -3209,13 +3209,13 @@ static uint8_t FsPatternByte(const int64_t offset) {
 }
 
 // Returns true if `entry`, which ReadDir() wrote, describes the regular file
-// `name` (null-terminated) with inode number `ino`, with zeros after the name
+// `name` (null-terminated) with fnode ID `fnode_id`, with zeros after the name
 // and in the reserved bytes.
 static bool IsFileEntry(const FsDirEntry& entry,  //
                         const char* const name,   //
-                        const uint64_t ino) {
+                        const uint64_t fnode_id) {
   const int64_t name_len = StringLength(name);
-  if (entry.ino != ino || entry.type != FsNodeType::kRegular ||
+  if (entry.fnode_id != fnode_id || entry.type != FsNodeType::kRegular ||
       entry.name_len != name_len) {
     return false;
   }
@@ -3478,7 +3478,7 @@ static int64_t CheckFsRenameAndUnlink() {
     FsDirEntry entry;
     __builtin_memset(static_cast<void*>(&entry), 0xA5, sizeof(entry));
     if (ReadDir(dir_fd, &entry, 1) != 1 ||
-        !IsFileEntry(entry, "moved.bin", st.ino) ||
+        !IsFileEntry(entry, "moved.bin", st.fnode_id) ||
         ReadDir(dir_fd, &entry, 1) != 0 || Seek(dir_fd, 0, kFsSeekSet) != 0) {
       return 28;
     }
@@ -3660,7 +3660,8 @@ static int64_t RunFsMalformedServer() {
   if (Open("/zero_handle", kFsOpenRead) != kSyscallErrorIo) {
     return 2;
   }
-  // System calls 3..6: malformed FsStat (type kNone, ino 0, size -1, nlink 0).
+  // System calls 3..6: malformed FsStat (type kNone, fnode_id 0, size -1,
+  // nlink 0).
   FsStat st{};
   for (int i = 0; i < 4; ++i) {
     if (Stat("/s", &st) != kSyscallErrorIo) {
@@ -3672,8 +3673,8 @@ static int64_t RunFsMalformedServer() {
   if (dir_fd != 0) {
     return 4;
   }
-  // System calls 8..13: malformed FsDirEntry (ino 0, type kNone, ".", "..",
-  // '/' in name, and NUL in name).
+  // System calls 8..13: malformed FsDirEntry (fnode_id 0, type kNone, ".",
+  // "..", '/' in name, and NUL in name).
   FsDirEntry entry{};
   for (int i = 0; i < 6; ++i) {
     if (ReadDir(dir_fd, &entry, 1) != kSyscallErrorIo) {

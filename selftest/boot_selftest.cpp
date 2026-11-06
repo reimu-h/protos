@@ -11,6 +11,7 @@
 #include "cpu.h"
 #include "device_irq.h"
 #include "driver.h"
+#include "elf.h"
 #include "format.h"
 #include "fpu.h"
 #include "fs_protocol.h"
@@ -4008,6 +4009,102 @@ static bool TestUserModePrograms() {
     SELFTEST_EXPECT(process->syscall_count() == 0);
   }
 
+  // Valid user-space ELF64 executables whose segment overlaps a reserved
+  // per-process window (MMIO, DMA, anonymous `MemMap()`, or the stack and its
+  // two guard pages) parse cleanly in `ElfParseExecutable()` but fail in
+  // `UserProcess::Load()` with `kLoadFailed`.
+  static_assert(UserSegmentRangeAllowed(0xFFFFFFFF80000000ULL, kPageSize));
+  static_assert(
+      UserSegmentRangeAllowed(kUserStackRegionBase - kPageSize, kPageSize));
+  static_assert(!UserSegmentRangeAllowed(kUserStackRegionBase - kPageSize,
+                                         kPageSize + 1));
+  static_assert(!UserSegmentRangeAllowed(kUserStackRegionBase, kPageSize));
+  static_assert(!UserSegmentRangeAllowed(kUserStackTop, kPageSize));
+  static_assert(!UserSegmentRangeAllowed(kDriverMmioWindowBase, kPageSize));
+  static_assert(!UserSegmentRangeAllowed(kDriverDmaWindowBase, kPageSize));
+  static_assert(!UserSegmentRangeAllowed(kUserAnonWindowBase, kPageSize));
+  {
+    struct MinimalElf {
+      uint8_t bytes[128] = {};
+    };
+    auto build_one_page_elf = [](const uintptr_t vaddr) -> MinimalElf {
+      struct Header {
+        uint8_t ident[16];
+        uint16_t type;
+        uint16_t machine;
+        uint32_t version;
+        uint64_t entry;
+        uint64_t phoff;
+        uint64_t shoff;
+        uint32_t flags;
+        uint16_t ehsize;
+        uint16_t phentsize;
+        uint16_t phnum;
+        uint16_t shentsize;
+        uint16_t shnum;
+        uint16_t shstrndx;
+      };
+      struct Phdr {
+        uint32_t type;
+        uint32_t flags;
+        uint64_t offset;
+        uint64_t vaddr;
+        uint64_t paddr;
+        uint64_t filesz;
+        uint64_t memsz;
+        uint64_t align;
+      };
+      static_assert(sizeof(Header) == 64);
+      static_assert(sizeof(Phdr) == 56);
+      MinimalElf out{};
+      Header hdr{};
+      hdr.ident[0] = 0x7F;
+      hdr.ident[1] = 'E';
+      hdr.ident[2] = 'L';
+      hdr.ident[3] = 'F';
+      hdr.ident[4] = 2;  // ELFCLASS64
+      hdr.ident[5] = 1;  // ELFDATA2LSB
+      hdr.ident[6] = 1;  // EV_CURRENT
+      hdr.type = 2;      // ET_EXEC
+      hdr.machine = 62;  // EM_X86_64
+      hdr.version = 1;
+      hdr.entry = vaddr;
+      hdr.phoff = sizeof(Header);
+      hdr.ehsize = sizeof(Header);
+      hdr.phentsize = sizeof(Phdr);
+      hdr.phnum = 1;
+      Phdr phdr{};
+      phdr.type = 1;   // PT_LOAD
+      phdr.flags = 5;  // PF_R | PF_X
+      phdr.offset = sizeof(Header) + sizeof(Phdr);
+      phdr.vaddr = vaddr;
+      phdr.paddr = vaddr;
+      phdr.filesz = 1;
+      phdr.memsz = kPageSize;
+      phdr.align = kPageSize;
+      __builtin_memcpy(out.bytes, &hdr, sizeof(hdr));
+      __builtin_memcpy(out.bytes + sizeof(hdr), &phdr, sizeof(phdr));
+      out.bytes[sizeof(hdr) + sizeof(phdr)] = 0xC3;  // ret
+      return out;
+    };
+    const uintptr_t forbidden_addrs[] = {
+        kDriverMmioWindowBase, kDriverDmaWindowBase, kUserAnonWindowBase,
+        kUserStackRegionBase,  kUserStackTop,
+    };
+    for (const uintptr_t vaddr : forbidden_addrs) {
+      const MinimalElf elf = build_one_page_elf(vaddr);
+      SELFTEST_EXPECT(ElfParseExecutable(elf.bytes, sizeof(elf.bytes)).ok());
+      const std::unique_ptr<UserProcess> process =
+          UserProcess::Start(UserProgram{elf.bytes, sizeof(elf.bytes)}, 0);
+      SELFTEST_EXPECT(process != nullptr);
+      SELFTEST_EXPECT(
+          WaitForProcesses(&process, 1, HasEnded, WaitMode::kYield));
+      result = process->Wait();
+      SELFTEST_EXPECT(result.outcome == UserProgramOutcome::kLoadFailed);
+      SELFTEST_EXPECT(process->syscall_count() == 0);
+    }
+  }
+
   SELFTEST_EXPECT(TestUserModeConsoleRead());
   SELFTEST_EXPECT(TestUserModeSpawnAndWait());
   SELFTEST_EXPECT(TestUserModeInteractiveShell());
@@ -4921,8 +5018,9 @@ static bool TestUserModeInteractiveShell() {
   SELFTEST_EXPECT(ContainsSubstring(captured, "edited_line_ok\n"));
   SELFTEST_EXPECT(ContainsSubstring(
       captured,
-      "built-in commands: help echo cpu ls cat mkdir rm touch programs run "
-      "exit\n"));
+      "built-in commands: help echo cpu programs run exit\n"
+      "built-in file commands: ls cat stat mkdir rm touch write append cp "
+      "mv\n"));
   SELFTEST_EXPECT(ContainsSubstring(captured, "cpu: "));
   SELFTEST_EXPECT(ContainsSubstring(captured, "programs: init sh usertest\n"));
   SELFTEST_EXPECT(
@@ -9590,8 +9688,8 @@ static bool TestRamfsDriverLifecycle() {
 }
 
 // The shell session of TestFilesystemEndToEnd(): it seeds `/docs` with
-// usertest's kSeedDocs, then lists, reads, creates and removes files and
-// directories.
+// usertest's kSeedDocs, then lists, reads, creates, writes, copies, moves,
+// describes and removes files and directories.
 constexpr char kFsShellScript[] =
     "run usertest 544\n"
     "ls\n"
@@ -9600,7 +9698,15 @@ constexpr char kFsShellScript[] =
     "mkdir /work\n"
     "touch /work/note.txt\n"
     "ls /work\n"
-    "rm /work/note.txt /work\n"
+    "write /work/note.txt first line\n"
+    "append /work/note.txt second line\n"
+    "cat /work/note.txt\n"
+    "stat /work/note.txt\n"
+    "cp /work/note.txt /docs/copy.txt\n"
+    "mv /docs/copy.txt /work\n"
+    "ls /docs /work\n"
+    "cat /work/copy.txt\n"
+    "rm /work/note.txt /work/copy.txt /work\n"
     "ls /work\n"
     "cat /missing\n"
     "exit 0\n";
@@ -9609,7 +9715,9 @@ constexpr int64_t kFsShellScriptSize =
     static_cast<int64_t>(sizeof(kFsShellScript)) - 1;
 // Everything that the session prints: init's and ramfs's greetings, then each
 // command line, which the shell echoes after its prompt, with the command's
-// output (none for mkdir, touch and rm when they succeed).
+// output (none for mkdir, touch, write, append, cp, mv and rm when they
+// succeed). The new ramfs numbers fnodes from 1, the root's: kSeedDocs creates
+// 2 and 3, so `/work/note.txt` is 5.
 constexpr char kFsShellTranscript[] =
     "[INIT] hello from ring 3\n"
     "[RAMFS] ready\n"
@@ -9625,7 +9733,30 @@ constexpr char kFsShellTranscript[] =
     "sh> touch /work/note.txt\n"
     "sh> ls /work\n"
     "note.txt\n"
-    "sh> rm /work/note.txt /work\n"
+    "sh> write /work/note.txt first line\n"
+    "sh> append /work/note.txt second line\n"
+    "sh> cat /work/note.txt\n"
+    "first line\n"
+    "second line\n"
+    "sh> stat /work/note.txt\n"
+    "  File: /work/note.txt\n"
+    "  Type: regular file\n"
+    "  Size: 23\n"
+    " Fnode: 5\n"
+    " Links: 1\n"
+    "sh> cp /work/note.txt /docs/copy.txt\n"
+    "sh> mv /docs/copy.txt /work\n"
+    "sh> ls /docs /work\n"
+    "/docs:\n"
+    "readme.txt\n"
+    "\n"
+    "/work:\n"
+    "note.txt\n"
+    "copy.txt\n"
+    "sh> cat /work/copy.txt\n"
+    "first line\n"
+    "second line\n"
+    "sh> rm /work/note.txt /work/copy.txt /work\n"
     "sh> ls /work\n"
     "sh: ls: /work: no such file or directory\n"
     "sh> cat /missing\n"
@@ -9634,13 +9765,13 @@ constexpr char kFsShellTranscript[] =
 constexpr int64_t kFsShellTranscriptSize =
     static_cast<int64_t>(sizeof(kFsShellTranscript)) - 1;
 
-static FsDirEntry MakeTestDirEntry(const uint64_t ino,       //
+static FsDirEntry MakeTestDirEntry(const uint64_t fnode_id,  //
                                    const FsNodeType type,    //
                                    const int32_t name_len,   //
                                    const char* const bytes,  //
                                    const int32_t copy_len) {
   FsDirEntry entry{};
-  entry.ino = ino;
+  entry.fnode_id = fnode_id;
   entry.type = type;
   entry.name_len = name_len;
   for (int32_t i = 0; i < copy_len; ++i) {
@@ -9737,10 +9868,10 @@ static bool TestFsMalformedRepliesAndDisconnectScoping() {
   }
 
   const FsStat bad_stats[] = {
-      FsStat{.type = FsNodeType::kNone, .ino = 1, .size = 0, .nlink = 1},
-      FsStat{.type = FsNodeType::kRegular, .ino = 0, .size = 0, .nlink = 1},
-      FsStat{.type = FsNodeType::kRegular, .ino = 1, .size = -1, .nlink = 1},
-      FsStat{.type = FsNodeType::kRegular, .ino = 1, .size = 0, .nlink = 0},
+      {.type = FsNodeType::kNone, .fnode_id = 1, .size = 0, .nlink = 1},
+      {.type = FsNodeType::kRegular, .fnode_id = 0, .size = 0, .nlink = 1},
+      {.type = FsNodeType::kRegular, .fnode_id = 1, .size = -1, .nlink = 1},
+      {.type = FsNodeType::kRegular, .fnode_id = 1, .size = 0, .nlink = 0},
   };
   for (const FsStat& st : bad_stats) {
     SELFTEST_EXPECT(
@@ -9805,8 +9936,8 @@ static bool TestFsMalformedRepliesAndDisconnectScoping() {
 //    descriptor fails with kSyscallErrorStale, Close() frees it, and the new
 //    ramfs serves new descriptors.
 // 3. A shell session: init (kInitArgStartFs) starts ramfs and the shell,
-//    whose `ls`, `cat`, `mkdir`, `touch` and `rm` print exactly what they
-//    should.
+//    whose `ls`, `cat`, `stat`, `mkdir`, `rm`, `touch`, `write`, `append`,
+//    `cp` and `mv` print and update files as expected.
 // Afterwards no port is claimed and every frame and heap byte is back.
 static bool TestFilesystemEndToEnd() {
   using usertest::FsTestSubmode;

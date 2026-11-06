@@ -72,10 +72,38 @@ static_assert(kDriverMmioWindowBase + kDriverMmioWindowSize <=
               kDriverDmaWindowBase);
 static_assert(kDriverDmaWindowBase + kDriverDmaWindowSize <=
               kUserAnonWindowBase);
-// Below the stack's guard page.
+// The user stack and its unmapped bottom and top guard pages.
+constexpr uintptr_t kUserStackRegionBase =
+    kUserStackTop - static_cast<uintptr_t>((kUserStackPages + 1) * kPageSize);
+constexpr uintptr_t kUserStackRegionEnd =
+    kUserStackTop + static_cast<uintptr_t>(kPageSize);
 static_assert(kUserAnonWindowBase + kUserAnonWindowSize <=
-              kUserStackTop -
-                  static_cast<uintptr_t>((kUserStackPages + 1) * kPageSize));
+              kUserStackRegionBase);
+
+// Returns true if a loadable ELF segment of `mem_size` bytes at page-aligned
+// `vaddr` lies in user space without overlapping the per-process MMIO, DMA,
+// anonymous `MemMap()`, or stack/guard-page regions.
+constexpr bool UserSegmentRangeAllowed(const uintptr_t vaddr,
+                                       const int64_t mem_size) {
+  constexpr uintptr_t page_mask = static_cast<uintptr_t>(kPageSize) - 1;
+  if ((vaddr & page_mask) != 0 || mem_size <= 0 ||
+      !IsUserRange(vaddr, mem_size)) {
+    return false;
+  }
+  const uintptr_t end =
+      vaddr + ((static_cast<uintptr_t>(mem_size) + page_mask) & ~page_mask);
+  auto overlaps = [vaddr, end](const uintptr_t win_base,
+                               const uintptr_t win_end) {
+    return vaddr < win_end && end > win_base;
+  };
+  return !overlaps(kDriverMmioWindowBase,
+                   kDriverMmioWindowBase + kDriverMmioWindowSize) &&
+         !overlaps(kDriverDmaWindowBase,
+                   kDriverDmaWindowBase + kDriverDmaWindowSize) &&
+         !overlaps(kUserAnonWindowBase,
+                   kUserAnonWindowBase + kUserAnonWindowSize) &&
+         !overlaps(kUserStackRegionBase, kUserStackRegionEnd);
+}
 
 // The most pages that a program's segments may take.
 constexpr int64_t kUserProgramMaxPages = 4096;
@@ -329,10 +357,11 @@ class UserProcess {
                                 char* out_path) const;
   // Sends the `req_size`-byte request at `req_buf` to the filesystem server,
   // with room for `reply_cap` reply bytes at `reply_buf`, and returns the
-  // server's status. Fails with `kSyscallErrorStale` unless `server` is
-  // `kIpcNoOwner` or still owns `kIpcPortFs`. Writes the reply's size, whether
-  // the server received the request, and the owner token of the server that
-  // got it to the `out_*` pointers that aren't null.
+  // server's status. Fails with `kSyscallErrorNoDevice` if no process owns
+  // `kIpcPortFs`, or with `kSyscallErrorStale` if another server than `server`
+  // (`!= kIpcNoOwner`) owns it. Writes the reply's size, whether the server
+  // received the request, and the owner token of the server that got it to the
+  // `out_*` pointers that aren't null.
   int64_t CallFsServer(uintptr_t server,         //
                        const void* req_buf,      //
                        int64_t req_size,         //
@@ -417,7 +446,6 @@ class UserProcess {
     uintptr_t server = kIpcNoOwner;
   };
   FsFdSlot fds_[kMaxOpenFiles] = {};
-  int open_fd_count_ = 0;
   // Owner token of a filesystem server that may hold an open file of this
   // process that no descriptor names (an open or close was interrupted or
   // failed after or before reaching the server), so that if that server still

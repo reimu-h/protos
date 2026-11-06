@@ -30,7 +30,8 @@ enum class UserProgramOutcome : uint8_t {
   kFaulted = 1,
   // `UserProcess::Kill()` killed it.
   kKilled = 2,
-  // It never ran: its executable is invalid (elf.h) or memory ran out.
+  // It never ran: its executable is invalid (elf.h, user_mode.h) or memory ran
+  // out.
   kLoadFailed = 3,
 };
 
@@ -177,7 +178,11 @@ static_assert(offsetof(IpcReceivedMessage, kind) == 24);
 static_assert(offsetof(IpcReceivedMessage, reply_cap) == 28);
 static_assert(std::has_unique_object_representations_v<IpcReceivedMessage>);
 
-// Type of a filesystem inode (`FsStat::type`, `FsDirEntry::type`).
+// Each file and directory of a filesystem has an fnode ("file node", the
+// counterpart of a Unix inode), which holds everything about it but its name:
+// directory entries map names to fnodes.
+//
+// Type of an fnode (`FsStat::type`, `FsDirEntry::type`).
 enum class FsNodeType : uint8_t {
   kNone = 0,
   kRegular = 1,
@@ -189,9 +194,9 @@ enum class FsNodeType : uint8_t {
 struct FsStat {
   FsNodeType type = FsNodeType::kNone;
   uint8_t reserved[7] = {};
-  // Inode number, which no other file or directory of the same filesystem
+  // The fnode's ID, which no other file or directory of the same filesystem
   // server has had (the root's is 1).
-  uint64_t ino = 0;
+  uint64_t fnode_id = 0;
   // Size in bytes; for a directory, `sizeof(FsDirEntry)` per entry.
   int64_t size = 0;
   // Number of links: 1 for a regular file, and 2 plus the number of
@@ -202,7 +207,7 @@ static_assert(sizeof(FsStat) == 32);
 static_assert(alignof(FsStat) == 8);
 static_assert(offsetof(FsStat, type) == 0);
 static_assert(offsetof(FsStat, reserved) == 1);
-static_assert(offsetof(FsStat, ino) == 8);
+static_assert(offsetof(FsStat, fnode_id) == 8);
 static_assert(offsetof(FsStat, size) == 16);
 static_assert(offsetof(FsStat, nlink) == 24);
 static_assert(std::has_unique_object_representations_v<FsStat>);
@@ -216,7 +221,8 @@ constexpr int64_t kFsMaxPathLength = 255;
 // implicit padding. `name` holds `name_len` (`1 <= name_len <=
 // kFsMaxNameLength`) bytes followed by NUL bytes through the end of the array.
 struct FsDirEntry {
-  uint64_t ino = 0;
+  // The entry's fnode (`FsStat::fnode_id`).
+  uint64_t fnode_id = 0;
   FsNodeType type = FsNodeType::kNone;
   uint8_t reserved[3] = {};
   int32_t name_len = 0;
@@ -224,7 +230,7 @@ struct FsDirEntry {
 };
 static_assert(sizeof(FsDirEntry) == 80);
 static_assert(alignof(FsDirEntry) == 8);
-static_assert(offsetof(FsDirEntry, ino) == 0);
+static_assert(offsetof(FsDirEntry, fnode_id) == 0);
 static_assert(offsetof(FsDirEntry, type) == 8);
 static_assert(offsetof(FsDirEntry, reserved) == 9);
 static_assert(offsetof(FsDirEntry, name_len) == 12);
@@ -501,10 +507,11 @@ constexpr int64_t kSyscallStat = 30;
 // entries of directory `fd` (rdi) into `out_entries` (rsi), continuing where
 // the previous ReadDir() of `fd` stopped, and returns their number (`0` at the
 // end of the directory). There are no `.` and `..` entries. Each entry that
-// exists throughout the reads appears exactly once; one added or removed
-// meanwhile may or may not appear. Fails with `kSyscallErrorInvalid` unless
-// `0 <= max_entries <= kSyscallFsMaxDirEntries`, and with
-// `kSyscallErrorNotDir` if `fd` is a regular file.
+// stays unchanged throughout the reads appears once; an entry added, removed or
+// renamed meanwhile (Rename() removes the old entry and adds a new one, also
+// when replacing an existing target) may appear zero or more times. Fails with
+// `kSyscallErrorInvalid` unless `0 <= max_entries <= kSyscallFsMaxDirEntries`,
+// and with `kSyscallErrorNotDir` if `fd` is a regular file.
 constexpr int64_t kSyscallReadDir = 31;
 // MkDir(path, path_len): creates an empty directory at the path of `path_len`
 // (rsi) bytes at `path` (rdi) and returns 0. Fails with `kSyscallErrorExists`

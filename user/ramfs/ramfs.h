@@ -6,6 +6,7 @@
 #include <new>
 
 #include "fs_protocol.h"
+#include "status_or.h"
 #include "syscall_abi.h"
 
 // Freestanding, header-only in-memory filesystem core (`ramfs::FileSystem`) and
@@ -18,7 +19,7 @@
 namespace protos::ramfs {
 
 constexpr int64_t kBlockSize = 4096;
-constexpr int kMaxInodes = 256;
+constexpr int kMaxFnodes = 256;
 constexpr int kMaxOpenHandles = 256;
 constexpr int kDirectBlocks = 12;
 constexpr int kPtrsPerIndirectBlock =
@@ -45,13 +46,82 @@ class BlockAllocator {
   ~BlockAllocator() = default;
 };
 
+// Block allocator backed by a page-mapping callback (`MapPagesFn`), such as
+// `user::MemMap` in ring 3. Maps `kSlabBlocks` 4 KiB blocks at a time, falls
+// back permanently to single-block mappings once a slab map fails, and recycles
+// freed blocks on an intrusive free list (zeroing them on reuse). Trivially
+// destructible and `constexpr`-constructible for `constinit` globals in
+// freestanding ring-3 binaries.
+class SlabBlockAllocator final : public BlockAllocator {
+ public:
+  static constexpr int kSlabBlocks = 16;
+  using MapPagesFn = StatusOr<uintptr_t> (*)(int64_t size, void* ctx);
+
+  constexpr explicit SlabBlockAllocator(const MapPagesFn map_pages,
+                                        void* const ctx = nullptr)
+      : map_pages_(map_pages), ctx_(ctx) {}
+
+  uint8_t* AllocBlock() override {
+    if (free_head_ != nullptr) {
+      FreeNode* const node = free_head_;
+      free_head_ = node->next;
+      uint8_t* const blk = reinterpret_cast<uint8_t*>(node);
+      __builtin_memset(blk, 0, static_cast<size_t>(kBlockSize));
+      return blk;
+    }
+    if (map_pages_ == nullptr) {
+      return nullptr;
+    }
+
+    // Map `kSlabBlocks` blocks at a time, and single blocks once that fails:
+    // near the mapping limit or with little physical memory left, one block
+    // may still fit.
+    int slab_blocks = single_block_maps_ ? 1 : kSlabBlocks;
+    StatusOr<uintptr_t> mapped = map_pages_(slab_blocks * kBlockSize, ctx_);
+    if (!mapped.ok() && slab_blocks > 1) {
+      single_block_maps_ = true;
+      slab_blocks = 1;
+      mapped = map_pages_(kBlockSize, ctx_);
+    }
+    if (!mapped.ok()) {
+      return nullptr;
+    }
+
+    uint8_t* const base = reinterpret_cast<uint8_t*>(*mapped);
+    for (int i = slab_blocks - 1; i >= 1; --i) {
+      FreeBlock(base + static_cast<int64_t>(i) * kBlockSize);
+    }
+    return base;
+  }
+
+  void FreeBlock(uint8_t* const block) override {
+    if (block == nullptr) {
+      return;
+    }
+    FreeNode* const node = reinterpret_cast<FreeNode*>(block);
+    node->next = free_head_;
+    free_head_ = node;
+  }
+
+ private:
+  struct FreeNode {
+    FreeNode* next = nullptr;
+  };
+
+  MapPagesFn map_pages_ = nullptr;
+  void* ctx_ = nullptr;
+  FreeNode* free_head_ = nullptr;
+  // Set once mapping a slab failed.
+  bool single_block_maps_ = false;
+};
+
 // One block of a directory's entries. A directory keeps a list of them and
 // frees each one that becomes empty.
 struct DirBlock {
   struct Slot {
     // 0 = free; > 0 = monotonically increasing directory entry cookie.
     uint64_t seq = 0;
-    int32_t inode_idx = -1;
+    int32_t fnode_idx = -1;
     int32_t name_len = 0;
     char name[kFsMaxNameLength + 1] = {};
   };
@@ -72,7 +142,7 @@ static_assert(static_cast<int64_t>(offsetof(DirBlock, slots)) ==
 static_assert(sizeof(DirBlock) <= static_cast<size_t>(kBlockSize));
 static_assert(alignof(DirBlock) <= 8);
 
-// The filesystem: up to `kMaxInodes` files and directories, the root `/`
+// The filesystem: up to `kMaxFnodes` files and directories, the root `/`
 // included, and one table of up to `kMaxOpenHandles` open files and
 // directories for all clients. The methods from Open() to Rename() implement
 // the filesystem system calls (syscall_abi.h), with server handles in place of
@@ -102,21 +172,21 @@ class FileSystem {
 
   void Initialize(BlockAllocator* const alloc) {
     alloc_ = alloc;
-    for (int i = 0; i < kMaxInodes; ++i) {
-      inodes_[i] = Inode{};
+    for (int i = 0; i < kMaxFnodes; ++i) {
+      fnodes_[i] = Fnode{};
     }
     for (int i = 0; i < kMaxOpenHandles; ++i) {
       handles_[i] = OpenHandle{};
     }
-    next_ino_ = 1;
+    next_fnode_id_ = 1;
     next_handle_gen_ = 1;
-    // Allocate root directory `/` at inode slot 0 (`ino == 1`).
-    Inode& root = inodes_[kRootInodeIdx];
+    // Allocate root directory `/` at fnode slot 0 (`fnode_id == 1`).
+    Fnode& root = fnodes_[kRootFnodeIdx];
     root.in_use = true;
     root.type = FsNodeType::kDirectory;
-    root.ino = next_ino_++;
+    root.fnode_id = next_fnode_id_++;
     root.nlink = 2;
-    root.parent_idx = kRootInodeIdx;
+    root.parent_idx = kRootFnodeIdx;
     root.next_dir_seq = 1;
   }
 
@@ -168,7 +238,7 @@ class FileSystem {
       if (want_create && want_excl) {
         return kSyscallErrorExists;
       }
-      Inode& node = inodes_[target_idx];
+      Fnode& node = fnodes_[target_idx];
       if (node.type == FsNodeType::kDirectory) {
         if (want_write || want_create || want_trunc || want_append) {
           return kSyscallErrorIsDir;
@@ -189,21 +259,21 @@ class FileSystem {
       if (want_dir || parsed.trailing_slash) {
         return kSyscallErrorIsDir;
       }
-      const int new_idx = AllocInode(FsNodeType::kRegular, parsed.parent_idx);
+      const int new_idx = AllocFnode(FsNodeType::kRegular, parsed.parent_idx);
       if (new_idx < 0) {
         return kSyscallErrorNoSpace;
       }
       const int64_t link_rc =
           InsertInDir(parsed.parent_idx, parsed.name, parsed.name_len, new_idx);
       if (link_rc < 0) {
-        inodes_[new_idx] = Inode{};
+        fnodes_[new_idx] = Fnode{};
         return link_rc;
       }
-      inodes_[new_idx].nlink = 1;
+      fnodes_[new_idx].nlink = 1;
       target_idx = new_idx;
     }
 
-    Inode& node = inodes_[target_idx];
+    Fnode& node = fnodes_[target_idx];
     ++node.open_refs;
     const uint64_t gen = AllocateHandleGen();
     const uint64_t handle =
@@ -212,7 +282,7 @@ class FileSystem {
         .in_use = true,
         .client_id = client_id,
         .handle = handle,
-        .inode_idx = target_idx,
+        .fnode_idx = target_idx,
         .flags = flags,
         .offset = 0,
     };
@@ -256,7 +326,7 @@ class FileSystem {
     if (h == nullptr) {
       return kSyscallErrorBadFd;
     }
-    const Inode& node = inodes_[h->inode_idx];
+    const Fnode& node = fnodes_[h->fnode_idx];
     if (node.type == FsNodeType::kDirectory) {
       return kSyscallErrorIsDir;
     }
@@ -303,7 +373,7 @@ class FileSystem {
     if (h == nullptr) {
       return kSyscallErrorBadFd;
     }
-    Inode& node = inodes_[h->inode_idx];
+    Fnode& node = fnodes_[h->fnode_idx];
     if (node.type == FsNodeType::kDirectory) {
       return kSyscallErrorIsDir;
     }
@@ -358,7 +428,7 @@ class FileSystem {
     if (h == nullptr) {
       return kSyscallErrorBadFd;
     }
-    const Inode& node = inodes_[h->inode_idx];
+    const Fnode& node = fnodes_[h->fnode_idx];
     if (node.type == FsNodeType::kDirectory) {
       if (whence == kFsSeekSet && offset == 0) {
         h->offset = 0;
@@ -401,10 +471,10 @@ class FileSystem {
     if (rc < 0) {
       return rc;
     }
-    const Inode& node = inodes_[idx];
+    const Fnode& node = fnodes_[idx];
     __builtin_memset(static_cast<void*>(out_stat), 0, sizeof(*out_stat));
     out_stat->type = node.type;
-    out_stat->ino = node.ino;
+    out_stat->fnode_id = node.fnode_id;
     out_stat->size = (node.type == FsNodeType::kDirectory)
                          ? static_cast<int64_t>(node.entry_count) *
                                static_cast<int64_t>(sizeof(FsDirEntry))
@@ -425,7 +495,7 @@ class FileSystem {
     if (h == nullptr) {
       return kSyscallErrorBadFd;
     }
-    const Inode& dir = inodes_[h->inode_idx];
+    const Fnode& dir = fnodes_[h->fnode_idx];
     if (dir.type != FsNodeType::kDirectory) {
       return kSyscallErrorNotDir;
     }
@@ -449,10 +519,10 @@ class FileSystem {
       if (best == nullptr) {
         break;
       }
-      const Inode& child = inodes_[best->inode_idx];
+      const Fnode& child = fnodes_[best->fnode_idx];
       FsDirEntry entry;
       __builtin_memset(static_cast<void*>(&entry), 0, sizeof(entry));
-      entry.ino = child.ino;
+      entry.fnode_id = child.fnode_id;
       entry.type = child.type;
       entry.name_len = best->name_len;
       __builtin_memcpy(entry.name,  //
@@ -483,18 +553,18 @@ class FileSystem {
       return kSyscallErrorExists;
     }
 
-    const int new_idx = AllocInode(FsNodeType::kDirectory, parsed.parent_idx);
+    const int new_idx = AllocFnode(FsNodeType::kDirectory, parsed.parent_idx);
     if (new_idx < 0) {
       return kSyscallErrorNoSpace;
     }
     const int64_t link_rc =
         InsertInDir(parsed.parent_idx, parsed.name, parsed.name_len, new_idx);
     if (link_rc < 0) {
-      inodes_[new_idx] = Inode{};
+      fnodes_[new_idx] = Fnode{};
       return link_rc;
     }
-    inodes_[new_idx].nlink = 2;
-    ++inodes_[parsed.parent_idx].nlink;
+    fnodes_[new_idx].nlink = 2;
+    ++fnodes_[parsed.parent_idx].nlink;
     return 0;
   }
 
@@ -520,15 +590,15 @@ class FileSystem {
       return kSyscallErrorNoEntry;
     }
 
-    Inode& target = inodes_[target_idx];
+    Fnode& target = fnodes_[target_idx];
     if (target.type == FsNodeType::kDirectory) {
       if (target.entry_count > 0) {
         return kSyscallErrorNotEmpty;
       }
       RemoveDirSlot(parsed.parent_idx, blk, slot_in_blk);
-      --inodes_[parsed.parent_idx].nlink;
+      --fnodes_[parsed.parent_idx].nlink;
       target.nlink = 0;
-      MaybeReclaimInode(target_idx);
+      MaybeReclaimFnode(target_idx);
       return 0;
     }
 
@@ -537,7 +607,7 @@ class FileSystem {
     }
     RemoveDirSlot(parsed.parent_idx, blk, slot_in_blk);
     --target.nlink;
-    MaybeReclaimInode(target_idx);
+    MaybeReclaimFnode(target_idx);
     return 0;
   }
 
@@ -575,7 +645,7 @@ class FileSystem {
     if (src_idx < 0) {
       return kSyscallErrorNoEntry;
     }
-    Inode& src = inodes_[src_idx];
+    Fnode& src = fnodes_[src_idx];
     if (src.type != FsNodeType::kDirectory &&
         (old_p.trailing_slash || new_p.trailing_slash)) {
       return kSyscallErrorNotDir;
@@ -598,7 +668,7 @@ class FileSystem {
     }
 
     if (dst_idx >= 0) {
-      Inode& dst = inodes_[dst_idx];
+      Fnode& dst = fnodes_[dst_idx];
       if (src.type == FsNodeType::kDirectory &&
           dst.type != FsNodeType::kDirectory) {
         return kSyscallErrorNotDir;
@@ -614,17 +684,17 @@ class FileSystem {
       // Point the destination's slot at the source in place: this allocates
       // nothing, so it can't fail halfway. The new cookie makes it a new entry
       // for ReadDir().
-      new_blk->slots[new_slot].inode_idx = src_idx;
-      new_blk->slots[new_slot].seq = inodes_[new_p.parent_idx].next_dir_seq++;
+      new_blk->slots[new_slot].fnode_idx = src_idx;
+      new_blk->slots[new_slot].seq = fnodes_[new_p.parent_idx].next_dir_seq++;
       RemoveDirSlot(old_p.parent_idx, old_blk, old_slot);
       if (src.type == FsNodeType::kDirectory) {
-        --inodes_[old_p.parent_idx].nlink;
+        --fnodes_[old_p.parent_idx].nlink;
         src.parent_idx = new_p.parent_idx;
         dst.nlink = 0;
       } else {
         --dst.nlink;
       }
-      MaybeReclaimInode(dst_idx);
+      MaybeReclaimFnode(dst_idx);
       return 0;
     }
 
@@ -639,8 +709,8 @@ class FileSystem {
     }
     RemoveDirSlot(old_p.parent_idx, old_blk, old_slot);
     if (src.type == FsNodeType::kDirectory) {
-      --inodes_[old_p.parent_idx].nlink;
-      ++inodes_[new_p.parent_idx].nlink;
+      --fnodes_[old_p.parent_idx].nlink;
+      ++fnodes_[new_p.parent_idx].nlink;
       src.parent_idx = new_p.parent_idx;
     }
     return 0;
@@ -657,10 +727,10 @@ class FileSystem {
     return count;
   }
 
-  int ActiveInodeCount() const {
+  int ActiveFnodeCount() const {
     int count = 0;
-    for (int i = 0; i < kMaxInodes; ++i) {
-      if (inodes_[i].in_use) {
+    for (int i = 0; i < kMaxFnodes; ++i) {
+      if (fnodes_[i].in_use) {
         ++count;
       }
     }
@@ -668,16 +738,19 @@ class FileSystem {
   }
 
  private:
-  static constexpr int kRootInodeIdx = 0;
+  static constexpr int kRootFnodeIdx = 0;
   // A handle's low `kHandleSlotBits` bits hold its slot plus 1, and the bits
   // above them its generation.
   static constexpr int kHandleSlotBits = 16;
   static_assert(kMaxOpenHandles < (1 << kHandleSlotBits));
 
-  struct Inode {
+  // The fnode (syscall_abi.h) of a file or directory, in slot `fnode_idx` of
+  // `fnodes_`, which directory entries point to. Unlike the slot, `fnode_id` is
+  // never reused.
+  struct Fnode {
     bool in_use = false;
     FsNodeType type = FsNodeType::kNone;
-    uint64_t ino = 0;
+    uint64_t fnode_id = 0;
     int64_t size = 0;
     int64_t nlink = 0;
     int open_refs = 0;
@@ -700,14 +773,14 @@ class FileSystem {
     bool in_use = false;
     uint64_t client_id = 0;
     uint64_t handle = 0;
-    int inode_idx = 0;
+    int fnode_idx = 0;
     uint64_t flags = 0;
     int64_t offset = 0;
   };
 
   struct ParsedParent {
-    int parent_idx = kRootInodeIdx;
-    int resolved_dir_idx = kRootInodeIdx;
+    int parent_idx = kRootFnodeIdx;
+    int resolved_dir_idx = kRootFnodeIdx;
     bool is_self_or_dotdot = false;
     bool is_root_slash_only = false;
     bool trailing_slash = false;
@@ -775,35 +848,35 @@ class FileSystem {
     if (!h.in_use) {
       return;
     }
-    const int idx = h.inode_idx;
+    const int idx = h.fnode_idx;
     h = OpenHandle{};
-    if (idx >= 0 && idx < kMaxInodes && inodes_[idx].in_use) {
-      --inodes_[idx].open_refs;
-      MaybeReclaimInode(idx);
+    if (idx >= 0 && idx < kMaxFnodes && fnodes_[idx].in_use) {
+      --fnodes_[idx].open_refs;
+      MaybeReclaimFnode(idx);
     }
   }
 
-  int AllocInode(const FsNodeType type, const int parent_idx) {
-    for (int i = 1; i < kMaxInodes; ++i) {
-      if (!inodes_[i].in_use) {
-        inodes_[i] = Inode{};
-        inodes_[i].in_use = true;
-        inodes_[i].type = type;
-        inodes_[i].ino = next_ino_++;
-        inodes_[i].parent_idx = parent_idx;
+  int AllocFnode(const FsNodeType type, const int parent_idx) {
+    for (int i = 1; i < kMaxFnodes; ++i) {
+      if (!fnodes_[i].in_use) {
+        fnodes_[i] = Fnode{};
+        fnodes_[i].in_use = true;
+        fnodes_[i].type = type;
+        fnodes_[i].fnode_id = next_fnode_id_++;
+        fnodes_[i].parent_idx = parent_idx;
         // Cookies start at 1: `seq == 0` marks a free slot.
-        inodes_[i].next_dir_seq = 1;
+        fnodes_[i].next_dir_seq = 1;
         return i;
       }
     }
     return -1;
   }
 
-  void MaybeReclaimInode(const int idx) {
-    if (idx <= kRootInodeIdx || idx >= kMaxInodes) {
+  void MaybeReclaimFnode(const int idx) {
+    if (idx <= kRootFnodeIdx || idx >= kMaxFnodes) {
       return;
     }
-    Inode& node = inodes_[idx];
+    Fnode& node = fnodes_[idx];
     if (!node.in_use || node.nlink > 0 || node.open_refs > 0) {
       return;
     }
@@ -812,10 +885,10 @@ class FileSystem {
     } else if (node.type == FsNodeType::kDirectory) {
       FreeAllDirBlocks(node);
     }
-    node = Inode{};
+    node = Fnode{};
   }
 
-  const uint8_t* LookupFileBlock(const Inode& node,
+  const uint8_t* LookupFileBlock(const Fnode& node,
                                  const int64_t blk_idx) const {
     if (blk_idx < 0) {
       return nullptr;
@@ -847,7 +920,7 @@ class FileSystem {
     return l2_ptrs[l2];
   }
 
-  uint8_t* EnsureFileBlock(Inode& node, const int64_t blk_idx) {
+  uint8_t* EnsureFileBlock(Fnode& node, const int64_t blk_idx) {
     if (blk_idx < 0 || alloc_ == nullptr) {
       return nullptr;
     }
@@ -925,7 +998,7 @@ class FileSystem {
     return l2_ptrs[l2];
   }
 
-  void FreeAllFileBlocks(Inode& node) {
+  void FreeAllFileBlocks(Fnode& node) {
     if (alloc_ == nullptr) {
       return;
     }
@@ -963,7 +1036,7 @@ class FileSystem {
     }
   }
 
-  void FreeAllDirBlocks(Inode& dir) {
+  void FreeAllDirBlocks(Fnode& dir) {
     if (alloc_ == nullptr) {
       return;
     }
@@ -982,7 +1055,7 @@ class FileSystem {
                   const int32_t name_len,    //
                   DirBlock** const out_blk,  //
                   int* const out_slot) const {
-    const Inode& dir = inodes_[dir_idx];
+    const Fnode& dir = fnodes_[dir_idx];
     for (DirBlock* blk = dir.dir_head; blk != nullptr; blk = blk->next) {
       for (int i = 0; i < DirBlock::kSlotsPerBlock; ++i) {
         const DirBlock::Slot& s = blk->slots[i];
@@ -993,7 +1066,7 @@ class FileSystem {
           if (out_slot != nullptr) {
             *out_slot = i;
           }
-          return s.inode_idx;
+          return s.fnode_idx;
         }
       }
     }
@@ -1007,7 +1080,7 @@ class FileSystem {
     if (alloc_ == nullptr) {
       return kSyscallErrorNoSpace;
     }
-    Inode& dir = inodes_[dir_idx];
+    Fnode& dir = fnodes_[dir_idx];
     DirBlock* target_blk = nullptr;
     int target_slot = -1;
     DirBlock* tail = nullptr;
@@ -1040,7 +1113,7 @@ class FileSystem {
     DirBlock::Slot& s = target_blk->slots[target_slot];
     __builtin_memset(static_cast<void*>(&s), 0, sizeof(s));
     s.seq = dir.next_dir_seq++;
-    s.inode_idx = child_idx;
+    s.fnode_idx = child_idx;
     s.name_len = name_len;
     __builtin_memcpy(s.name, name, static_cast<size_t>(name_len));
     ++target_blk->used_count;
@@ -1049,7 +1122,7 @@ class FileSystem {
   }
 
   void RemoveDirSlot(const int dir_idx, DirBlock* const blk, const int slot) {
-    Inode& dir = inodes_[dir_idx];
+    Fnode& dir = fnodes_[dir_idx];
     blk->slots[slot] = DirBlock::Slot{};
     --blk->used_count;
     --dir.entry_count;
@@ -1067,14 +1140,14 @@ class FileSystem {
   }
 
   bool IsAncestorOrSelf(const int ancestor_idx, int cur_idx) const {
-    for (int depth = 0; depth <= kMaxInodes; ++depth) {
+    for (int depth = 0; depth <= kMaxFnodes; ++depth) {
       if (cur_idx == ancestor_idx) {
         return true;
       }
-      if (cur_idx == kRootInodeIdx) {
+      if (cur_idx == kRootFnodeIdx) {
         return false;
       }
-      cur_idx = inodes_[cur_idx].parent_idx;
+      cur_idx = fnodes_[cur_idx].parent_idx;
     }
     return true;
   }
@@ -1108,11 +1181,11 @@ class FileSystem {
       // Path consisted solely of one or more `/` characters.
       out->is_self_or_dotdot = true;
       out->is_root_slash_only = true;
-      out->resolved_dir_idx = kRootInodeIdx;
+      out->resolved_dir_idx = kRootFnodeIdx;
       return 0;
     }
 
-    int cur_dir = kRootInodeIdx;
+    int cur_dir = kRootFnodeIdx;
     int64_t pos = 0;
     while (pos < end) {
       while (pos < end && path[pos] == '/') {
@@ -1135,7 +1208,7 @@ class FileSystem {
       }
       const bool is_last = (next_pos == end);
 
-      if (inodes_[cur_dir].type != FsNodeType::kDirectory) {
+      if (fnodes_[cur_dir].type != FsNodeType::kDirectory) {
         return kSyscallErrorNotDir;
       }
 
@@ -1147,7 +1220,7 @@ class FileSystem {
         }
         if (IsDotDot(comp, clen)) {
           out->is_self_or_dotdot = true;
-          out->resolved_dir_idx = inodes_[cur_dir].parent_idx;
+          out->resolved_dir_idx = fnodes_[cur_dir].parent_idx;
           return 0;
         }
         out->parent_idx = cur_dir;
@@ -1161,13 +1234,13 @@ class FileSystem {
       if (IsDot(comp, clen)) {
         // Stay in `cur_dir`.
       } else if (IsDotDot(comp, clen)) {
-        cur_dir = inodes_[cur_dir].parent_idx;
+        cur_dir = fnodes_[cur_dir].parent_idx;
       } else {
         const int next_idx = LookupInDir(cur_dir, comp, clen, nullptr, nullptr);
         if (next_idx < 0) {
           return kSyscallErrorNoEntry;
         }
-        if (inodes_[next_idx].type != FsNodeType::kDirectory) {
+        if (fnodes_[next_idx].type != FsNodeType::kDirectory) {
           return kSyscallErrorNotDir;
         }
         cur_dir = next_idx;
@@ -1197,7 +1270,7 @@ class FileSystem {
     if (idx < 0) {
       return kSyscallErrorNoEntry;
     }
-    if (parsed.trailing_slash && inodes_[idx].type != FsNodeType::kDirectory) {
+    if (parsed.trailing_slash && fnodes_[idx].type != FsNodeType::kDirectory) {
       return kSyscallErrorNotDir;
     }
     *out_idx = idx;
@@ -1205,9 +1278,9 @@ class FileSystem {
   }
 
   BlockAllocator* alloc_ = nullptr;
-  Inode inodes_[kMaxInodes] = {};
+  Fnode fnodes_[kMaxFnodes] = {};
   OpenHandle handles_[kMaxOpenHandles] = {};
-  uint64_t next_ino_ = 0;
+  uint64_t next_fnode_id_ = 0;
   uint64_t next_handle_gen_ = 0;
 };
 

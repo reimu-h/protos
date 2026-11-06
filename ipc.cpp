@@ -545,7 +545,7 @@ int64_t IpcContext::Recv(const int64_t port,                         //
     if (p.owner != self_owner) {
       return kSyscallErrorAccess;
     }
-    if (*out_stop && timeout_ticks != 0) {
+    if (*out_stop) {
       if (p.disconnect_count > 0 || p.queued_list.head != nullptr) {
         p.WakeOneServerLocked();
       }
