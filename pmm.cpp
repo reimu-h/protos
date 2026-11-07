@@ -499,9 +499,10 @@ static void FlushCurrentRun(PmmFrameList* const list) {
 
 // Fills `g_usable_intervals` with the available regions of `memory_map` minus
 // its non-available regions, lower memory, the kernel image, the Multiboot
-// information structures, and the framebuffer. Multiboot modules and the
-// Multiboot1 command line and boot loader name strings are not carved out,
-// because `MultibootMemoryMap` does not record them (no modules are loaded).
+// information structures, the framebuffer, and the boot modules. The Multiboot1
+// command line and boot loader name strings and module list are not carved
+// out, because `MultibootMemoryMap` does not record them (nothing reads them
+// after the parser).
 static void CollectUsableRegions(const MultibootMemoryMap& memory_map) {
   for (int i = 0; i < memory_map.region_count; ++i) {
     if (memory_map.regions[i].type == kMemoryTypeAvailable) {
@@ -543,6 +544,24 @@ static void CollectUsableRegions(const MultibootMemoryMap& memory_map) {
         static_cast<int64_t>(memory_map.fb_pitch) * memory_map.fb_height;
     CarveExcludedRange(memory_map.fb_addr, fb_bytes);
   }
+  for (int i = 0; i < memory_map.module_count; ++i) {
+    const BootModule& module = memory_map.modules[i];
+    if (module.end > module.start) {
+      CarveExcludedRange(module.start, module.end - module.start);
+    }
+  }
+}
+
+// Returns the highest end address of the boot modules in `memory_map`, or 0
+// if there are none.
+static uintptr_t BootModulesEnd(const MultibootMemoryMap& memory_map) {
+  uintptr_t end = 0;
+  for (int i = 0; i < memory_map.module_count; ++i) {
+    if (memory_map.modules[i].end > end) {
+      end = memory_map.modules[i].end;
+    }
+  }
+  return end;
 }
 
 }  // namespace
@@ -616,7 +635,13 @@ void PmmInit(const uint32_t multiboot_magic,
     }
   }
 
-  CHECK(PagingExtendIdentityMap(g_max_managed_phys_addr));
+  // The identity map also covers the boot modules, whose memory may lie above
+  // the highest usable frame (when they occupy the top of RAM).
+  const uintptr_t modules_end = BootModulesEnd(g_memory_map);
+  const uintptr_t identity_map_end = (modules_end > g_max_managed_phys_addr)
+                                         ? modules_end
+                                         : g_max_managed_phys_addr;
+  CHECK(PagingExtendIdentityMap(identity_map_end));
 
   // Now that the identity mapping covers all usable physical RAM up to
   // `g_max_managed_phys_addr`, insert intervals at or above 64 MiB and
@@ -672,6 +697,15 @@ uintptr_t PmmAllocFrame() {
 bool PmmRangeIsValidUsableRam(const uintptr_t addr, const int64_t size) {
   const PmmLockGuard lock_guard;
   return PmmRangeIsValidUsableRamLocked(addr, size);
+}
+
+// `PmmInit` fixes the boot modules before other CPUs start, so they are read
+// without locking, like the other values that it fixes.
+int PmmBootModuleCount() { return g_memory_map.module_count; }
+
+const BootModule& PmmBootModule(const int index) {
+  DCHECK(index >= 0 && index < g_memory_map.module_count);
+  return g_memory_map.modules[index];
 }
 
 void PmmFreeFrames(const uintptr_t base_addr, const int64_t count) {

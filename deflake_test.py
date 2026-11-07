@@ -198,14 +198,23 @@ def make_serial_log(
 # turns the key events of each USB keyboard into boot-protocol reports (like
 # QEMU's usb-kbd) and those into US-layout characters, and the shell's line
 # editor; the serial console socket drops unread input when the client hangs
-# up (like QEMU). FAKE_BOOT_LINES names a file of lines to print before the
-# self-tests end; FAKE_BUG injects one bug: "noninteractive" (the kernel
-# ignores the fw_cfg opt-in), "symbols_unshifted" (Shift does not change
-# digits and symbols), "late_failure" (the stress test fails while the
-# harness dumps the VGA text buffer or framebuffer, after its last serial log
-# check before that dump), "no_ramfs" (init's ramfs never reports
-# '[RAMFS] ready'), or "ramfs_not_ready" (init reports that ramfs did not get
-# ready, as it does when ramfs doesn't start in time).
+# up (like QEMU). Like the kernel, it also prints what the boot self-tests
+# print besides their results: ramfs loading the boot filesystem, and init
+# reporting that ramfs did not get ready (filesystem_end_to_end), which
+# test_boot.sh must not take for init's session. FAKE_BOOT_LINES names a file
+# of lines to print before the self-tests end; FAKE_BUG injects one bug:
+# "noninteractive" (the kernel ignores the fw_cfg opt-in), "symbols_unshifted"
+# (Shift does not change digits and symbols), "overflow_runs" (the shell runs
+# what fits of a line that is too long instead of refusing it),
+# "late_failure" (the stress test fails while the harness dumps the VGA text
+# buffer or framebuffer, after its last serial log check before that dump),
+# "ps2_prefixed" (a prompt comes before ps2kbd's marker on its line),
+# "no_ramfs" (init's ramfs never reports '[RAMFS] ready'), "ramfs_not_ready"
+# (init reports that ramfs did not get ready, as it does when ramfs doesn't
+# start in time), "no_rootfs" (init's ramfs reports ready without loading the
+# boot filesystem), or "rootfs_skipped", "rootfs_errors" or "rootfs_damaged"
+# (init's ramfs skipped a member of the boot filesystem, failed to create one,
+# or found the archive damaged).
 FAKE_GUEST_QEMU = r'''#!/usr/bin/env python3
 import json, os, queue, select, socket, sys, threading, time
 
@@ -343,6 +352,7 @@ def detach(kb):
 
 def shell():
     line = []
+    overflowed = False  # a character didn't fit (the line is refused)
     last_cr = False
     log("sh> ")
     while True:
@@ -354,28 +364,34 @@ def shell():
         if ch in "\r\n":
             log("\n")
             words = "".join(line).split()
-            line = []
-            if words[:1] == ["echo"]:
+            if overflowed and BUG != "overflow_runs":
+                log("sh: line too long\n")
+            elif words[:1] == ["echo"]:
                 log(" ".join(words[1:16]) + "\n")
             elif words == ["help"]:
                 log("built-in commands: help echo cpu programs run exit\n"
                     "built-in file commands: ls cat stat mkdir rm touch "
                     "write append cp mv\n"
-                    "user programs: init sh usertest\n")
+                    "user programs: init sh usertest, or files in /bin or by "
+                    "path\n")
             elif words == ["usertest", "0"]:
                 log("sh: usertest exited with status -1250999896491\n")
             elif words[:1] == ["exit"]:
                 return
             elif words:
                 log("sh: unknown command: %s\n" % words[0])
+            line, overflowed = [], False
             log("sh> ")
         elif ch == "\b":
             if line:
                 line.pop()
                 log("\b \b")
-        elif " " <= ch.replace("\t", " ") <= "~" and len(line) < 128:
-            line.append(ch.replace("\t", " "))
-            log(line[-1])
+        elif " " <= ch.replace("\t", " ") <= "~":
+            if len(line) < 1024:
+                line.append(ch.replace("\t", " "))
+                log(line[-1])
+            else:
+                overflowed = True
 
 
 def serial_server():
@@ -410,19 +426,38 @@ def boot():
     script = "help\necho boot_sh_ok\nusertest 0\n"
     stress = "[STRESS] random_multicpu_stress: PASS\n" * 3
     # Like the real init, which starts the shell only once ramfs is ready (or
-    # it gave up on it).
-    ramfs = {"no_ramfs": "",
-             "ramfs_not_ready": "[INIT] ramfs not ready; continuing without a "
-                                "filesystem\n"}.get(BUG, "[RAMFS] ready\n")
+    # it gave up on it), and ramfs, which loads the boot filesystem first.
+    rootfs = {
+        "no_rootfs": "",
+        "rootfs_skipped": "[RAMFS] rootfs: files=2 dirs=1 skipped=1 errors=0\n",
+        "rootfs_errors": "[RAMFS] rootfs: files=1 dirs=1 skipped=0 errors=1\n",
+        "rootfs_damaged": "[RAMFS] rootfs: files=1 dirs=1 skipped=0 errors=0 "
+                          "damaged at byte 1536\n",
+    }.get(BUG, "[RAMFS] rootfs: files=2 dirs=1 skipped=0 errors=0\n")
+    not_ready = ("[INIT] ramfs not ready (timed out); continuing without a "
+                 "filesystem\n")
+    ramfs = {"no_ramfs": "", "ramfs_not_ready": not_ready}.get(
+        BUG, rootfs + "[RAMFS] ready\n")
+    # The output of ramfs and init in the boot self-tests: ramfs loading the
+    # boot filesystem (rootfs_boot_module), and init, which may not spawn
+    # drivers, without ramfs (filesystem_end_to_end).
+    selftests = ("[RAMFS] rootfs: files=2 dirs=1 skipped=0 errors=0\n"
+                 "[RAMFS] ready\n"
+                 "[INIT] hello from ring 3\n"
+                 "[INIT] ramfs not ready (spawn error -1); continuing without a "
+                 "filesystem\n"
+                 "sh> ls\nsh: ls: /: filesystem unavailable\nsh> exit 0\n")
     if not interactive:
         log("[INIT] hello from ring 3\n" + ramfs)
         for ch in script + "exit 0\n":
             shell_input.put(ch)
         shell()
-        log("[INIT] exited with status 0\n[TEST] ALL BOOT SELF-TESTS PASSED\n")
+        log("[INIT] exited with status 0\n" + selftests +
+            "[TEST] ALL BOOT SELF-TESTS PASSED\n")
         log(stress)
         return
-    log("[TEST] ALL BOOT SELF-TESTS PASSED\n[INIT] hello from ring 3\n")
+    log(selftests + "[TEST] ALL BOOT SELF-TESTS PASSED\n"
+        "[INIT] hello from ring 3\n")
     for ch in script:
         shell_input.put(ch)
     for bdf, mode in controllers.values():
@@ -2557,7 +2592,10 @@ class UsbHarnessTest(unittest.TestCase):
       self.setup_fake_guest(tmp_path)
 
       # 1. With an ideal driver every scenario of both passes passes, and so
-      # do the usual checks after the session.
+      # do the usual checks after the session. The boot self-tests, which run
+      # before the init session, report that ramfs did not get ready (for
+      # their init that may not spawn drivers), which only counts in the init
+      # session.
       proc, art_dir, _ = self.run_test_boot(tmp_path, "bios,uefi")
       out = proc.stdout + proc.stderr
       self.assertEqual(proc.returncode, 0, out[-3000:])
@@ -2566,15 +2604,15 @@ class UsbHarnessTest(unittest.TestCase):
           "bios": ("usb_serial_sync", "usb_token", "usb_shift_backspace",
                    "usb_editing_edges", "usb_serial_mixed", "usb_unplug",
                    "ps2_typing", "ps2_caps", "usb_hotplug_add", "usb_replug",
-                   "usb_second_keyboard", "usb_long_line", "usb_hub_single",
-                   "usb_hub_chained", "usb_hub_hotplug", "usb_hub_replug",
-                   "usb_commands"),
+                   "usb_second_keyboard", "usb_long_line",
+                   "usb_serial_too_long", "usb_hub_single", "usb_hub_chained",
+                   "usb_hub_hotplug", "usb_hub_replug", "usb_commands"),
           "uefi": ("usb_serial_sync", "usb_token", "usb_shift_backspace",
                    "usb_unplug", "usb_hub_single", "usb_root_controller",
                    "usb_editing_edges", "usb_serial_after_usb", "usb_replug",
-                   "usb_bridged_controller", "usb_hotplug_add",
-                   "usb_hub_chained", "usb_hub_hotplug", "usb_hub_replug",
-                   "usb_commands", "ps2_typing"),
+                   "usb_bridged_controller", "usb_serial_too_long",
+                   "usb_hotplug_add", "usb_hub_chained", "usb_hub_hotplug",
+                   "usb_hub_replug", "usb_commands", "ps2_typing"),
       }
       for p, names in scenarios.items():
         output = (art_dir / p / "output.log").read_text(encoding="utf-8")
@@ -2583,6 +2621,11 @@ class UsbHarnessTest(unittest.TestCase):
         self.assertIn("USB session: all scenarios passed", output)
         serial = (art_dir / p / "serial.log").read_text(encoding="latin-1")
         self.assertIn("[TEST] driver_session_cleanup: PASS", serial)
+        self.assertIn("\nsh: line too long\nsh> ", serial)
+        self.assertLess(
+            serial.index("[INIT] ramfs not ready (spawn error -1)"),
+            serial.index("[TEST] ALL BOOT SELF-TESTS PASSED"),
+        )
       self.assertEqual(sorted(os.listdir(tmp_path / "build")), [])
 
       # 2. A driver that ignores Shift on digits and symbols fails the
@@ -2616,6 +2659,17 @@ class UsbHarnessTest(unittest.TestCase):
       self.assertEqual(
           proc.returncode, 0, (proc.stdout + proc.stderr)[-3000:]
       )
+      # 5. A shell that runs what fits of a line that is too long, instead of
+      # refusing it, fails the scenario of that line.
+      proc, art_dir, _ = self.run_test_boot(tmp_path, "bios", "overflow_runs")
+      self.assertEqual(proc.returncode, 1)
+      output = (art_dir / "bios" / "output.log").read_text(encoding="utf-8")
+      self.assertTrue(
+          (deflake.first_harness_failure(output) or "").startswith(
+              "FAIL: usb_serial_too_long: unexpected serial output instead of "
+              "the shell's report that the line is too long"),
+          output[-3000:],
+      )
 
   def test_test_boot_sh_requires_init_ramfs(self) -> None:
     with tempfile.TemporaryDirectory() as tmp:
@@ -2626,6 +2680,17 @@ class UsbHarnessTest(unittest.TestCase):
         output = (art_dir / "bios" / "output.log").read_text(encoding="utf-8")
         return deflake.first_harness_failure(output) or output[-2000:]
 
+      # 0. Only init's session counts: without the interactive session the
+      # boot self-tests run after it and report that ramfs did not get ready
+      # (for their init that may not spawn drivers), and the boot passes.
+      proc, art_dir, _ = self.run_test_boot(
+          tmp_path, "bios", extra_env={"BOOT_TEST_USB": "0"})
+      self.assertEqual(proc.returncode, 0, (proc.stdout + proc.stderr)[-3000:])
+      serial = (art_dir / "bios" / "serial.log").read_text(encoding="latin-1")
+      self.assertGreater(
+          serial.index("[INIT] ramfs not ready (spawn error -1)"),
+          serial.index("[INIT] exited with status 0"),
+      )
       # 1. Without the interactive session, init's ramfs must report ready
       # between init's greeting and its end.
       proc, art_dir, _ = self.run_test_boot(
@@ -2668,6 +2733,43 @@ class UsbHarnessTest(unittest.TestCase):
               "FAIL: init reported that ramfs did not get ready"),
           first_failure(art_dir),
       )
+
+  def test_test_boot_sh_requires_init_rootfs(self) -> None:
+    with tempfile.TemporaryDirectory() as tmp:
+      tmp_path = Path(tmp)
+      self.setup_fake_guest(tmp_path)
+
+      def first_failure(art_dir: Path) -> str:
+        output = (art_dir / "bios" / "output.log").read_text(encoding="utf-8")
+        return deflake.first_harness_failure(output) or output[-2000:]
+
+      # Before it reports ready, init's ramfs must report once that it loaded
+      # the boot filesystem, with no member skipped, no error and no damage,
+      # without the interactive session and in it. The reports of the boot
+      # self-tests' ramfs, outside the init session, don't count.
+      bad_rootfs = ("FAIL: init's ramfs did not load the boot filesystem "
+                    "cleanly",
+                    "FAIL: usb_ready: init's ramfs did not load the boot "
+                    "filesystem cleanly")
+      cases = {
+          "no_rootfs": (
+              "FAIL: Missing '[RAMFS] rootfs: files=' of init's ramfs between "
+              "'[INIT] hello from ring 3' and '[RAMFS] ready'",
+              "FAIL: usb_ready: init's ramfs reported ready without "
+              "'[RAMFS] rootfs: files='"),
+          "rootfs_skipped": bad_rootfs,
+          "rootfs_errors": bad_rootfs,
+          "rootfs_damaged": bad_rootfs,
+      }
+      for bug, failures in cases.items():
+        for extra_env, failure in zip(({"BOOT_TEST_USB": "0"}, {}), failures):
+          proc, art_dir, elapsed = self.run_test_boot(
+              tmp_path, "bios", bug, extra_env=extra_env)
+          self.assertEqual(proc.returncode, 1, (
+              bug, extra_env, (proc.stdout + proc.stderr)[-3000:]))
+          self.assertTrue(first_failure(art_dir).startswith(failure),
+                          (bug, extra_env, first_failure(art_dir)))
+          self.assertLess(elapsed, 30)
 
 
 if __name__ == "__main__":

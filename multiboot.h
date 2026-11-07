@@ -12,16 +12,20 @@ constexpr uint32_t kMultiboot1Magic = 0x2BADB002;
 constexpr uint32_t kMultiboot2Magic = 0x36D76289;
 // Multiboot1 info `flags` bit 0: `mem_lower` and `mem_upper` fields are valid.
 constexpr uint32_t kMultiboot1FlagMemBasic = 1u << 0;
+// Multiboot1 info `flags` bit 3: `mods_count` and `mods_addr` fields are
+// valid.
+constexpr uint32_t kMultiboot1FlagMods = 1u << 3;
 // Multiboot1 info `flags` bit 6: `mmap_length` and `mmap_addr` fields are
 // valid.
 constexpr uint32_t kMultiboot1FlagMmap = 1u << 6;
 // Multiboot1 info `flags` bit 12: the framebuffer fields
 // (`Multiboot1FramebufferInfo`) are valid.
 constexpr uint32_t kMultiboot1FlagFramebuffer = 1u << 12;
-// Multiboot2 tag types: the end tag that terminates the tag list, the memory
-// map, the framebuffer, and copies of the ACPI 1.0 RSDP (old) and the ACPI 2.0+
-// RSDP (new).
+// Multiboot2 tag types: the end tag that terminates the tag list, a boot
+// module, the memory map, the framebuffer, and copies of the ACPI 1.0 RSDP
+// (old) and the ACPI 2.0+ RSDP (new).
 constexpr uint32_t kMultiboot2TagEnd = 0;
+constexpr uint32_t kMultiboot2TagModule = 3;
 constexpr uint32_t kMultiboot2TagMmap = 6;
 constexpr uint32_t kMultiboot2TagFramebuffer = 8;
 constexpr uint32_t kMultiboot2TagAcpiOld = 14;
@@ -49,6 +53,11 @@ constexpr int64_t kMaxMultibootStructureBytes = 4 * 1024 * 1024;
 // Maximum number of memory map regions stored in `MultibootMemoryMap`
 // (sized for large UEFI memory maps which often exceed 100+ descriptors).
 constexpr int kMaxMemoryRegions = 512;
+// Maximum number of boot modules stored in `MultibootMemoryMap`, and the size
+// of the buffer for a module's name (`BootModule::name`), NUL terminator
+// included.
+constexpr int kMaxBootModules = 8;
+constexpr int kBootModuleNameSize = 64;
 
 // Color information of a direct-color (RGB) framebuffer, which follows the
 // fixed framebuffer fields of either Multiboot version: for each color channel,
@@ -110,6 +119,17 @@ struct [[gnu::packed]] Multiboot1MmapEntry {
 };
 static_assert(sizeof(Multiboot1MmapEntry) == 24);
 
+// Multiboot1 boot module: `mods_addr` points at `mods_count` of them. The
+// module occupies `[mod_start, mod_end)`, and `string` is the physical address
+// of its NUL-terminated command line (or 0).
+struct [[gnu::packed]] Multiboot1Module {
+  uint32_t mod_start;
+  uint32_t mod_end;
+  uint32_t string;
+  uint32_t reserved;
+};
+static_assert(sizeof(Multiboot1Module) == 16);
+
 // Fixed header of the Multiboot2 boot information structure. The tags follow
 // it, each starting at an 8-byte aligned offset.
 struct [[gnu::packed]] Multiboot2InfoHeader {
@@ -144,6 +164,17 @@ struct [[gnu::packed]] Multiboot2MmapEntry {
   uint32_t reserved;
 };
 static_assert(sizeof(Multiboot2MmapEntry) == 24);
+
+// Multiboot2 boot module tag (`kMultiboot2TagModule`): the module occupies
+// `[mod_start, mod_end)`, and its NUL-terminated command line follows inside
+// the tag.
+struct [[gnu::packed]] Multiboot2TagModule {
+  uint32_t type;
+  uint32_t size;
+  uint32_t mod_start;
+  uint32_t mod_end;
+};
+static_assert(sizeof(Multiboot2TagModule) == 16);
 
 // Multiboot2 framebuffer tag (`kMultiboot2TagFramebuffer`), up to the color
 // information that follows.
@@ -233,8 +264,19 @@ struct MemoryRegion {
   uint32_t type;
 };
 
-// Parsed summary of the bootloader memory map, optional linear framebuffer, and
-// the physical address ranges occupied by the Multiboot info structures.
+// A boot module: a file that the boot loader loaded at physical addresses
+// `[start, end)`, named by the last word (words are separated by spaces and
+// tabs) of its command line, cut to `kBootModuleNameSize - 1` bytes and
+// NUL-padded (empty if the command line has no word).
+struct BootModule {
+  uintptr_t start;
+  uintptr_t end;
+  char name[kBootModuleNameSize];
+};
+
+// Parsed summary of the bootloader memory map, optional linear framebuffer,
+// boot modules, and the physical address ranges occupied by the Multiboot info
+// structures.
 struct MultibootMemoryMap {
   MemoryRegion regions[kMaxMemoryRegions];
   int region_count;
@@ -245,6 +287,11 @@ struct MultibootMemoryMap {
   uintptr_t mb_reserved_end;
   uintptr_t mb1_mmap_reserved_start;
   uintptr_t mb1_mmap_reserved_end;
+  // The boot modules in the order of the boot information: the first
+  // `kMaxBootModules` that start above address 0, don't end before they start
+  // and end at or below the parser's `max_physical_addr`.
+  BootModule modules[kMaxBootModules];
+  int module_count;
   // The linear framebuffer, if the boot information describes a direct-color
   // (RGB) one with 24 or 32 bits per pixel and consistent dimensions (`fb_addr`
   // is 0 otherwise), and the bit position and width of each of its color
@@ -275,13 +322,15 @@ bool MultibootRecordMmapEntry(MultibootMemoryMap* out_map,  //
 // Parses the Multiboot1 (`0x2BADB002`) or Multiboot2 (`0x36D76289`) boot
 // information at physical address `multiboot_info_addr` (which must lie below
 // `max_physical_addr`) into `*out_map`: the memory map, the framebuffer (the
-// Multiboot2 framebuffer tag or the Multiboot1 framebuffer fields), and the
+// Multiboot2 framebuffer tag or the Multiboot1 framebuffer fields), the boot
+// modules (Multiboot2 module tags or the Multiboot1 module list), and the
 // physical ranges occupied by the Multiboot structures. Structures above the
 // 64 MiB bootstrap identity map are mapped on demand with
 // `PagingMapBootstrapRange`. Also logs the magic number and every memory map
-// entry to the console ("[PMM] mmap entry: ..."); `PmmInit` calls this at boot.
-// Returns true if a valid memory map with usable RAM was found without
-// overflowing the region table.
+// entry and boot module to the console ("[PMM] mmap entry: ...", "[PMM] boot
+// module: ..."); `PmmInit` calls this at boot. Returns true if a valid memory
+// map with usable RAM was found without overflowing the region table; boot
+// modules that can't be read are left out.
 bool MultibootParseMemoryMap(uint32_t multiboot_magic,
                              uint64_t multiboot_info_addr,
                              uintptr_t max_physical_addr,

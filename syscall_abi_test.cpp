@@ -134,7 +134,10 @@ TEST(SyscallAbiTest, NumbersAndLimitsStayTheSame) {
   EXPECT_THAT(kSyscallMkDir, t::Eq(32));
   EXPECT_THAT(kSyscallUnlink, t::Eq(33));
   EXPECT_THAT(kSyscallRename, t::Eq(34));
-  EXPECT_THAT(kSyscallCount, t::Eq(35));
+  EXPECT_THAT(kSyscallBootModuleInfo, t::Eq(35));
+  EXPECT_THAT(kSyscallBootModuleRead, t::Eq(36));
+  EXPECT_THAT(kSyscallSpawnFile, t::Eq(37));
+  EXPECT_THAT(kSyscallCount, t::Eq(38));
   EXPECT_THAT(kIsaDeviceI8042, t::Eq(0));
   EXPECT_THAT(kIsaDeviceCount, t::Eq(1));
   EXPECT_THAT(kSyscallPortIoRead8, t::Eq(0));
@@ -144,6 +147,8 @@ TEST(SyscallAbiTest, NumbersAndLimitsStayTheSame) {
   EXPECT_THAT(kSyscallSpinMaxTicks, t::Eq(1000000));
   EXPECT_THAT(kSyscallReadMaxSize, t::Eq(4096));
   EXPECT_THAT(kSyscallSpawnMaxNameLength, t::Eq(64));
+  EXPECT_THAT(kSyscallSpawnMaxArgs, t::Eq(16));
+  EXPECT_THAT(kSyscallSpawnMaxArgBytes, t::Eq(1024));
   EXPECT_THAT(kMaxUserChildProcesses, t::Eq(8));
   EXPECT_THAT(kSyscallConsolePushMaxSize, t::Eq(256));
   EXPECT_THAT(kSyscallMmioMaxSize, t::Eq(16LL << 20));
@@ -168,6 +173,7 @@ TEST(SyscallAbiTest, NumbersAndLimitsStayTheSame) {
   EXPECT_THAT(kSyscallErrorNoSys, t::Eq(-38));
   EXPECT_THAT(kSyscallErrorNoEntry, t::Eq(-2));
   EXPECT_THAT(kSyscallErrorIo, t::Eq(-5));
+  EXPECT_THAT(kSyscallErrorExecFormat, t::Eq(-8));
   EXPECT_THAT(kSyscallErrorBadFd, t::Eq(-9));
   EXPECT_THAT(kSyscallErrorExists, t::Eq(-17));
   EXPECT_THAT(kSyscallErrorNotDir, t::Eq(-20));
@@ -187,6 +193,9 @@ TEST(SyscallAbiTest, NumbersAndLimitsStayTheSame) {
   EXPECT_THAT(kSyscallIpcTimeoutMaxTicks, t::Eq(1000000));
   EXPECT_THAT(kSyscallMemMapMaxSize, t::Eq(1LL << 20));
   EXPECT_THAT(kSyscallMemMapMaxTotalSize, t::Eq(64LL << 20));
+  EXPECT_THAT(kSyscallBootModuleReadMaxSize, t::Eq(4096));
+  EXPECT_THAT(kBootModuleMaxNameLength, t::Eq(63));
+  EXPECT_THAT(std::string(kRootfsBootModuleName), t::Eq("rootfs"));
   EXPECT_THAT(kMaxOpenFiles, t::Eq(32));
   EXPECT_THAT(kSyscallFsMaxIoSize, t::Eq(4096));
   EXPECT_THAT(kSyscallFsMaxDirEntries, t::Eq(32));
@@ -211,9 +220,12 @@ TEST(SyscallAbiTest, NumbersAndLimitsStayTheSame) {
   EXPECT_THAT(kUserCapSpawnDrivers, t::Eq(1ULL << 1));
   EXPECT_THAT(kInitArgStartDrivers, t::Eq(1ULL << 0));
   EXPECT_THAT(kInitArgStartFs, t::Eq(1ULL << 1));
+  EXPECT_THAT(kInitArgEmptyFs, t::Eq(1ULL << 2));
   EXPECT_THAT(kDriverArgNormal, t::Eq(0ULL));
   EXPECT_THAT(kDriverArgExitAfterReady, t::Eq(1ULL));
   EXPECT_THAT(kDriverArgFaultAfterReady, t::Eq(2ULL));
+  EXPECT_THAT(kDriverArgHandoffOnly, t::Eq(3ULL));
+  EXPECT_THAT(kRamfsArgEmpty, t::Eq(4ULL));
 }
 
 TEST(SyscallAbiTest, DriverAbiLayoutsAndHelpers) {
@@ -231,7 +243,8 @@ TEST(SyscallAbiTest, DriverAbiLayoutsAndHelpers) {
   EXPECT_FALSE(SyscallIsError(static_cast<int64_t>(0xFFFFB00000000000ULL)));
 
   for (int64_t num = -1; num <= kSyscallCount + 2; ++num) {
-    const bool expected = (num >= 8 && num <= 15) || (num >= 17 && num <= 19);
+    const bool expected = (num >= 8 && num <= 15) || (num >= 17 && num <= 19) ||
+                          (num >= 35 && num <= 36);
     EXPECT_THAT(SyscallIsDriverOnly(num), t::Eq(expected)) << "syscall " << num;
   }
 
@@ -239,7 +252,8 @@ TEST(SyscallAbiTest, DriverAbiLayoutsAndHelpers) {
     const bool is_spawn_drv = (num == kSyscallSpawnDriver);
     const bool is_drv_only =
         (num >= kSyscallPciInfo && num <= kSyscallConsolePush) ||
-        (num >= kSyscallIsaClaim && num <= kSyscallIsaIrqAlloc);
+        (num >= kSyscallIsaClaim && num <= kSyscallIsaIrqAlloc) ||
+        num == kSyscallBootModuleInfo || num == kSyscallBootModuleRead;
     EXPECT_THAT(MayMakeSyscall(kUserCapNone, num),
                 t::Eq(!is_spawn_drv && !is_drv_only))
         << "syscall " << num;
@@ -294,6 +308,32 @@ TEST(SyscallAbiTest, IpcReceivedMessageLayoutStaysTheSame) {
   EXPECT_THAT(offsetof(IpcReceivedMessage, reply_cap), t::Eq(28U));
   EXPECT_TRUE(
       (std::is_same_v<decltype(IpcReceivedMessage::reply_cap), int32_t>));
+}
+
+TEST(SyscallAbiTest, BootModuleInfoLayoutStaysTheSame) {
+  EXPECT_THAT(sizeof(BootModuleInfo), t::Eq(72U));
+  EXPECT_THAT(alignof(BootModuleInfo), t::Eq(8U));
+  EXPECT_THAT(offsetof(BootModuleInfo, size), t::Eq(0U));
+  EXPECT_THAT(offsetof(BootModuleInfo, name), t::Eq(8U));
+  EXPECT_THAT(sizeof(BootModuleInfo::name),
+              t::Eq(static_cast<size_t>(kBootModuleMaxNameLength + 1)));
+  EXPECT_TRUE((std::is_same_v<decltype(BootModuleInfo::size), int64_t>));
+  // The defaults are zeros, which the kernel doesn't rely on: it builds the
+  // struct that it writes in zeroed memory and copies at most
+  // `kBootModuleMaxNameLength` bytes of the name into it
+  // (`UserProcess::GetBootModuleInfo()`, user_mode.cpp), so a name always ends
+  // with NUL bytes.
+  const BootModuleInfo info{};
+  EXPECT_THAT(info.size, t::Eq(0));
+  EXPECT_THAT(info.name, t::Each(t::Eq('\0')));
+  // The boot filesystem's name fits.
+  EXPECT_THAT(sizeof(kRootfsBootModuleName),
+              t::Le(static_cast<size_t>(kBootModuleMaxNameLength + 1)));
+
+  EXPECT_THAT(sizeof(SyscallArgSlice), t::Eq(16U));
+  EXPECT_THAT(alignof(SyscallArgSlice), t::Eq(8U));
+  EXPECT_THAT(offsetof(SyscallArgSlice, ptr), t::Eq(0U));
+  EXPECT_THAT(offsetof(SyscallArgSlice, len), t::Eq(8U));
 }
 
 // Returns the bytes of a value-initialized `T` (`T{}`) constructed in memory
@@ -488,6 +528,7 @@ struct FakeShellState {
   struct SpawnCall {
     std::string name;
     uint64_t arg = 0;
+    std::vector<std::string> argv;
   };
   std::vector<SpawnCall> spawns;
   sh::ShellEnv env{
@@ -542,7 +583,7 @@ struct FakeShellState {
     if (prog != "init" && prog != "sh" && prog != "usertest") {
       return kSyscallErrorInvalid;
     }
-    s->spawns.push_back(SpawnCall{prog, arg});
+    s->spawns.push_back(SpawnCall{prog, arg, {}});
     return static_cast<int64_t>(s->spawns.size());
   }
 
@@ -599,18 +640,42 @@ TEST(ShellLibTest, LineEditorHandlesBackspaceCrLfAndClamping) {
   // A subsequent '\n' submits an empty line.
   EXPECT_THAT(editor.FeedChar(&ch), t::Eq(sh::ShellCharAction::kSubmitLine));
 
-  // Clamping at kShellMaxLineLength.
+  // Clamping at kShellMaxLineLength (1024, as rootfs/doc/shell.txt says).
+  EXPECT_THAT(sh::kShellMaxLineLength, t::Eq(1024));
   editor.ResetLine();
-  for (int i = 0; i < sh::kShellMaxLineLength + 10; ++i) {
-    char c = 'x';
-    const sh::ShellCharAction action = editor.FeedChar(&c);
-    if (i < sh::kShellMaxLineLength) {
-      EXPECT_THAT(action, t::Eq(sh::ShellCharAction::kEchoChar));
-    } else {
-      EXPECT_THAT(action, t::Eq(sh::ShellCharAction::kNone));
-    }
+  for (int i = 0; i < sh::kShellMaxLineLength; ++i) {
+    ch = 'x';
+    EXPECT_THAT(editor.FeedChar(&ch), t::Eq(sh::ShellCharAction::kEchoChar));
   }
   EXPECT_THAT(editor.length, t::Eq(sh::kShellMaxLineLength));
+  EXPECT_FALSE(editor.overflowed);
+  // A control character, which the editor ignores anyway, loses nothing.
+  ch = '\x1b';
+  EXPECT_THAT(editor.FeedChar(&ch), t::Eq(sh::ShellCharAction::kNone));
+  EXPECT_FALSE(editor.overflowed);
+  // A printable character that doesn't fit, also a tab, is dropped without an
+  // echo and marks the line overflowed.
+  ch = 'y';
+  EXPECT_THAT(editor.FeedChar(&ch), t::Eq(sh::ShellCharAction::kNone));
+  EXPECT_TRUE(editor.overflowed);
+  ch = '\t';
+  EXPECT_THAT(editor.FeedChar(&ch), t::Eq(sh::ShellCharAction::kNone));
+  EXPECT_THAT(editor.length, t::Eq(sh::kShellMaxLineLength));
+  EXPECT_THAT(std::string(editor.buffer),
+              t::Eq(std::string(sh::kShellMaxLineLength, 'x')));
+  // Backspace makes room but doesn't bring back what was dropped: the line
+  // stays overflowed until ResetLine().
+  ch = '\b';
+  EXPECT_THAT(editor.FeedChar(&ch),
+              t::Eq(sh::ShellCharAction::kBackspaceErase));
+  ch = 'z';
+  EXPECT_THAT(editor.FeedChar(&ch), t::Eq(sh::ShellCharAction::kEchoChar));
+  ch = '\n';
+  EXPECT_THAT(editor.FeedChar(&ch), t::Eq(sh::ShellCharAction::kSubmitLine));
+  EXPECT_TRUE(editor.overflowed);
+  editor.ResetLine();
+  EXPECT_FALSE(editor.overflowed);
+  EXPECT_THAT(editor.length, t::Eq(0));
 }
 
 TEST(ShellLibTest, TokenizeAndParseInt64HandleEdgeCases) {
@@ -687,7 +752,8 @@ TEST(ShellLibTest, RunShellExecutesBuiltinsSpawnsProgramsAndExitsCleanly) {
                     "built-in commands: help echo cpu programs run exit\n"
                     "built-in file commands: ls cat stat mkdir rm touch write "
                     "append cp mv\n"
-                    "user programs: init sh usertest\n"
+                    "user programs: init sh usertest, or files in /bin or by "
+                    "path\n"
                     "sh> cpu\n"
                     "cpu: 3\n"
                     "sh> programs\n"
@@ -699,12 +765,81 @@ TEST(ShellLibTest, RunShellExecutesBuiltinsSpawnsProgramsAndExitsCleanly) {
                     "sh> run usertest 99\n"
                     "sh: usertest killed\n"
                     "sh> run\n"
-                    "sh: usage: run <program> [arg]\n"
+                    "sh: usage: run <program> [arg ...]\n"
                     "sh> usertest badarg\n"
                     "sh: invalid argument: badarg\n"
                     "sh> unknown_cmd\n"
                     "sh: unknown command: unknown_cmd\n"
                     "sh> exit 7\n"));
+}
+
+// FakeShellState whose Unlink() records its path in `unlinked` and succeeds.
+struct UnlinkRecordingShellState : FakeShellState {
+  std::vector<std::string> unlinked;
+
+  UnlinkRecordingShellState() { env.unlink = Unlink; }
+
+  static int64_t Unlink(void* const ctx,         //
+                        const char* const path,  //
+                        const int64_t path_len) {
+    static_cast<UnlinkRecordingShellState*>(static_cast<FakeShellState*>(ctx))
+        ->unlinked.emplace_back(path, static_cast<size_t>(path_len));
+    return 0;
+  }
+};
+
+// A line holds at most `kShellMaxLineLength` characters. The shell drops the
+// characters that don't fit and refuses the line rather than run what it
+// kept, then reads the next line as usual.
+TEST(ShellLibTest, RunShellRefusesLinesLongerThanItsLimit) {
+  UnlinkRecordingShellState state;
+  // `rm /f` padded with spaces to the limit: with more characters, it names
+  // another path, such as /fx.
+  const std::string rm_f =
+      "rm" + std::string(sh::kShellMaxLineLength - 5, ' ') + " /f";
+  ASSERT_THAT(rm_f.size(), t::Eq(static_cast<size_t>(sh::kShellMaxLineLength)));
+  state.input = rm_f + "x\n" + rm_f + "xy\n" + "echo next\n" + rm_f + "\n";
+  EXPECT_THAT(sh::RunShell(state.env), t::Eq(0));
+  EXPECT_THAT(state.unlinked, t::ElementsAre("/f"));
+  // The shell echoes the characters that it keeps, and no others.
+  const std::string refused = "sh> " + rm_f + "\nsh: line too long\n";
+  EXPECT_THAT(state.output, t::Eq(refused + refused +
+                                  "sh> echo next\n"
+                                  "next\n"
+                                  "sh> " +
+                                  rm_f + "\nsh> "));
+}
+
+// Backspace makes room on an overflowed line but doesn't bring back what was
+// dropped, so the shell still refuses the line, also at the end of the input.
+TEST(ShellLibTest, RunShellRefusesOverflowedLinesAfterBackspaceAndAtEof) {
+  // `exit 7` padded with spaces to the limit.
+  const std::string exit_7 =
+      "exit 7" + std::string(sh::kShellMaxLineLength - 6, ' ');
+  ASSERT_THAT(exit_7.size(),
+              t::Eq(static_cast<size_t>(sh::kShellMaxLineLength)));
+  FakeShellState state;
+  state.input = exit_7 + "x\b\n" + "echo next\n" + exit_7 + "x";
+  EXPECT_THAT(sh::RunShell(state.env), t::Eq(0));
+  // Backspace erases the last character that the shell kept.
+  EXPECT_THAT(state.output, t::Eq("sh> " + exit_7 +
+                                  "\b \b\n"
+                                  "sh: line too long\n"
+                                  "sh> echo next\n"
+                                  "next\n"
+                                  "sh> " +
+                                  exit_7 + "\nsh: line too long\n"));
+  // Also when Backspace erased all of the line before the input ended.
+  FakeShellState erased;
+  erased.input = exit_7 + "x" + std::string(sh::kShellMaxLineLength, '\b');
+  EXPECT_THAT(sh::RunShell(erased.env), t::Eq(0));
+  EXPECT_THAT(erased.output, t::EndsWith("\b \b\nsh: line too long\n"));
+
+  // A line of exactly the limit runs, also at the end of the input.
+  FakeShellState at_limit;
+  at_limit.input = exit_7;
+  EXPECT_THAT(sh::RunShell(at_limit.env), t::Eq(7));
+  EXPECT_THAT(at_limit.output, t::Eq("sh> " + exit_7 + "\n"));
 }
 
 // FakeShellState whose filesystem callbacks serve `fs` the way the kernel does,
@@ -741,6 +876,7 @@ struct RamfsShellHarness : FakeShellState {
 
   RamfsShellHarness() {
     fs->Initialize(&alloc);
+    env.spawn_file = SpawnFile;
     env.open = Open;
     env.close = Close;
     env.file_read = FileRead;
@@ -945,6 +1081,48 @@ struct RamfsShellHarness : FakeShellState {
                         const int64_t new_len) {
     return Self(ctx)->fs->Rename(old_path, old_len, new_path, new_len);
   }
+
+  static int64_t SpawnFile(void* const ctx,                    //
+                           const char* const path,             //
+                           const int64_t path_len,             //
+                           const SyscallArgSlice* const args,  //
+                           const int64_t argc) {
+    RamfsShellHarness* const h = Self(ctx);
+    FsOpenReply rep{};
+    const int64_t open_rc =
+        h->fs->Open(kClient, path, path_len, kFsOpenRead, &rep);
+    if (open_rc < 0) {
+      return open_rc;
+    }
+    if (rep.type == FsNodeType::kDirectory) {
+      (void)h->fs->Close(kClient, rep.handle);
+      return kSyscallErrorIsDir;
+    }
+    char magic[4] = {};
+    const int64_t n = h->fs->Read(kClient, rep.handle, magic, sizeof(magic));
+    (void)h->fs->Close(kClient, rep.handle);
+    if (n < 0) {
+      return n;
+    }
+    if (n != 4 || magic[0] != '\x7F' || magic[1] != 'E' || magic[2] != 'L' ||
+        magic[3] != 'F') {
+      return kSyscallErrorExecFormat;
+    }
+    std::vector<std::string> argv;
+    for (int64_t i = 0; i < argc; ++i) {
+      argv.emplace_back(reinterpret_cast<const char*>(args[i].ptr),
+                        args[i].len);
+    }
+    uint64_t sim_arg = static_cast<uint64_t>(argc - 1);
+    if (argc >= 2 && argv[1] == "fault") {
+      sim_arg = 6;
+    } else if (argc >= 2 && argv[1] == "kill") {
+      sim_arg = 99;
+    }
+    h->spawns.push_back(
+        SpawnCall{std::string(path, path_len), sim_arg, std::move(argv)});
+    return static_cast<int64_t>(h->spawns.size());
+  }
 };
 
 TEST(ShellLibTest, FsErrorMessagesDescribeTheErrorOrGiveItsNumber) {
@@ -956,6 +1134,8 @@ TEST(ShellLibTest, FsErrorMessagesDescribeTheErrorOrGiveItsNumber) {
   EXPECT_THAT(message(kSyscallErrorNoEntry),
               t::Eq("no such file or directory"));
   EXPECT_THAT(message(kSyscallErrorIo), t::Eq("io error"));
+  EXPECT_THAT(message(kSyscallErrorExecFormat),
+              t::Eq("executable format error"));
   EXPECT_THAT(message(kSyscallErrorBadFd), t::Eq("bad file descriptor"));
   EXPECT_THAT(message(kSyscallErrorNoMemory), t::Eq("out of memory"));
   EXPECT_THAT(message(kSyscallErrorFault), t::Eq("bad address"));
@@ -1005,6 +1185,10 @@ TEST(ShellLibTest, FilesystemBuiltinsWithoutAFilesystemReportItUnavailable) {
                     "sh: cp: /b: filesystem unavailable\n"));
   EXPECT_THAT(no_fs.Run("mv /a /b"),
               t::Eq("sh: mv: /a: filesystem unavailable\n"));
+  EXPECT_THAT(no_fs.Run("/bin/hello"),
+              t::Eq("sh: /bin/hello: filesystem unavailable\n"));
+  EXPECT_THAT(no_fs.Run("run /bin/hello"),
+              t::Eq("sh: run: /bin/hello: filesystem unavailable\n"));
 }
 
 // A built-in that lacks one of the callbacks that it needs calls none of the
@@ -1188,6 +1372,14 @@ TEST(ShellLibTest, LsWithSeveralOperandsGroupsThemLikePosixLs) {
               t::Eq("sh: ls: /missing: no such file or directory\n"
                     "/docs:\n"
                     "readme.txt\n"));
+  // An error in listing a directory goes in its group.
+  h.read_dir_error = kSyscallErrorNoMemory;
+  EXPECT_THAT(h.Run("ls /docs/readme.txt /void"),
+              t::Eq("/docs/readme.txt\n"
+                    "\n"
+                    "/void:\n"
+                    "sh: ls: /void: out of memory\n"));
+  h.read_dir_error = 0;
   EXPECT_THAT(h.fs->ActiveHandleCount(), t::Eq(0));
   EXPECT_THAT(h.bad_fd_calls, t::Eq(0));
 }
@@ -1223,6 +1415,32 @@ TEST(ShellLibTest, FilesystemBuiltinsRefuseLinesWithTooManyTokens) {
 
   // echo writes the arguments that the command holds instead.
   EXPECT_THAT(h.Run("echo" + too_many), t::Eq(most.substr(1) + "\n"));
+}
+
+// A line has room for paths of `kFsMaxPathLength` bytes, two of them for `cp`,
+// and the shell passes them whole to the filesystem.
+TEST(ShellLibTest, RunShellTakesLinesWithTheLongestPaths) {
+  RamfsShellHarness h;
+  const std::string dir = "/" + std::string(kFsMaxNameLength, 'a') + "/" +
+                          std::string(kFsMaxNameLength, 'b') + "/" +
+                          std::string(kFsMaxNameLength, 'c');
+  const std::string src = dir + "/" + std::string(62, 'd');
+  const std::string dst = dir + "/" + std::string(62, 'e');
+  ASSERT_THAT(static_cast<int64_t>(src.size()), t::Eq(kFsMaxPathLength));
+  ASSERT_THAT(static_cast<int64_t>(dst.size()), t::Eq(kFsMaxPathLength));
+  h.MakeDir(dir.substr(0, 64));
+  h.MakeDir(dir.substr(0, 128));
+  h.MakeDir(dir);
+  h.WriteFile(src, "long\n");
+  h.input = "cat " + src + "\n" + "cp " + src + " " + dst + "\n";
+  EXPECT_THAT(sh::RunShell(h.env), t::Eq(0));
+  EXPECT_THAT(h.output, t::Eq("sh> cat " + src +
+                              "\n"
+                              "long\n"
+                              "sh> cp " +
+                              src + " " + dst + "\nsh> "));
+  EXPECT_THAT(h.Contents(dst), t::Eq("long\n"));
+  h.ExpectNoOpenFiles();
 }
 
 // FakeShellState whose filesystem callbacks claim more than they may: the
@@ -1492,17 +1710,27 @@ TEST(ShellLibTest, MvRenamesAndMovesFilesAndDirectories) {
   EXPECT_THAT(h.Contents("/moved/h"), t::Eq("aitch\n"));
   EXPECT_THAT(h.fs->ActiveFnodeCount(), t::Eq(fnodes - 1));
 
-  // Errors name the source if it doesn't exist, else the destination.
+  // Errors name the destination, except those about the source: it doesn't
+  // exist, it is the root, its last component is `.` or `..` (as is then that
+  // of its destination in a directory), or it is a directory that would move
+  // into itself or a subdirectory.
   EXPECT_THAT(h.Run("mv /missing /x"),
               t::Eq("sh: mv: /missing: no such file or directory\n"));
+  EXPECT_THAT(h.Run("mv / /d"), t::Eq("sh: mv: /: device or resource busy\n"));
+  EXPECT_THAT(h.Run("mv /. /moved/.. /d"),
+              t::Eq("sh: mv: /.: invalid argument\n"
+                    "sh: mv: /moved/..: invalid argument\n"));
+  EXPECT_THAT(h.Run("mv /moved /moved"),
+              t::Eq("sh: mv: /moved: invalid argument\n"));
   EXPECT_THAT(h.Run("mv /moved/h /nodir/h"),
               t::Eq("sh: mv: /nodir/h: no such file or directory\n"));
-  EXPECT_THAT(h.Run("mv /moved /moved"),
-              t::Eq("sh: mv: /moved/moved: invalid argument\n"));
+  EXPECT_THAT(h.Run("mv /moved/h /h/"),
+              t::Eq("sh: mv: /h/: not a directory\n"));
   EXPECT_THAT(h.Run("mv /moved/g /moved/h /moved/g"),
               t::Eq("sh: mv: /moved/g: not a directory\n"));
   h.MakeDir("/y");
   h.MakeDir("/y/sub");
+  EXPECT_THAT(h.Run("mv /y /y/sub"), t::Eq("sh: mv: /y: invalid argument\n"));
   h.WriteFile("/y/sub/file", "");
   h.MakeDir("/sub");
   EXPECT_THAT(h.Run("mv /sub /y"),
@@ -1511,7 +1739,32 @@ TEST(ShellLibTest, MvRenamesAndMovesFilesAndDirectories) {
   EXPECT_THAT(h.Run("mv /moved/g /y"), t::Eq("sh: mv: /y/g: is a directory\n"));
   EXPECT_THAT(h.Contents("/moved/g"), t::Eq("eff\n"));
   EXPECT_THAT(h.TypeOf("/sub"), t::Eq(FsNodeType::kDirectory));
+  EXPECT_THAT(h.TypeOf("/y"), t::Eq(FsNodeType::kDirectory));
   h.ExpectNoOpenFiles();
+
+  // A filesystem that checks the last components of both paths before it
+  // looks them up fails because of a destination whose last component is `.`
+  // or `..`.
+  FakeShellState dots_first;
+  dots_first.env.stat = [](void* const /*ctx*/,     //
+                           const char* const path,  //
+                           const int64_t path_len,  //
+                           FsStat* const out_stat) -> int64_t {
+    *out_stat = FsStat{};
+    out_stat->type = FsNodeType::kRegular;
+    return (std::string(path, static_cast<size_t>(path_len)) == "/f")
+               ? 0
+               : kSyscallErrorNoEntry;
+  };
+  dots_first.env.rename = [](void* const /*ctx*/,             //
+                             const char* const /*old_path*/,  //
+                             const int64_t /*old_len*/,       //
+                             const char* const /*new_path*/,  //
+                             const int64_t /*new_len*/) -> int64_t {
+    return kSyscallErrorInvalid;
+  };
+  EXPECT_THAT(dots_first.Run("mv /f /nodir/.."),
+              t::Eq("sh: mv: /nodir/..: invalid argument\n"));
 }
 
 TEST(ShellLibTest, StatDescribesFilesAndDirectories) {
@@ -1574,13 +1827,128 @@ TEST(ShellLibTest, StatDescribesFilesAndDirectories) {
                                         " Links: 0\n"));
 }
 
+TEST(ShellLibTest, RunsProgramsFromPathsAndBinAndReportsErrors) {
+  RamfsShellHarness h;
+  h.MakeDir("/bin");
+  h.MakeDir("/bin/subdir");
+  h.WriteFile("/bin/hello", std::string("\x7F"
+                                        "ELFbinary",
+                                        10));
+  h.WriteFile("/bin/not_elf", "plain text\n");
+  h.WriteFile("/README.txt", "readme\n");
+
+  // `programs` lists embedded programs and regular files in /bin (ignoring
+  // subdirectories).
+  EXPECT_THAT(h.Run("programs"), t::Eq("programs: init sh usertest\n"
+                                       "/bin: hello not_elf\n"));
+
+  // `programs` flushes `/bin:` in pieces so arbitrarily many long names across
+  // multiple ReadDir() batches all appear with a closing newline.
+  {
+    RamfsShellHarness many;
+    many.MakeDir("/bin");
+    std::string expected = "programs: init sh usertest\n/bin:";
+    // 25 names of 50 bytes each = 1275 bytes in `/bin:`, exceeding both
+    // `kShellReadDirBatch` (8) and `kShellOutputBufferSize` (1088).
+    for (int i = 0; i < 25; ++i) {
+      char buf[64];
+      std::snprintf(buf, sizeof(buf), "prog_%02d_", i);
+      std::string name(buf);
+      name.append(50 - name.size(), 'a');
+      many.WriteFile("/bin/" + name,
+                     "\x7F"
+                     "ELF");
+      expected += " ";
+      expected += name;
+    }
+    expected += "\n";
+    EXPECT_THAT(many.Run("programs"), t::Eq(expected));
+    many.ExpectNoOpenFiles();
+  }
+
+  // Bare name from /bin, direct path, relative path, and `run` (both bare and
+  // path), forwarding arbitrary `argv` words, faults and kills.
+  EXPECT_THAT(h.Run("hello"), t::Eq("sh: hello exited with status 0\n"));
+  EXPECT_THAT(h.spawns.back().argv, t::ElementsAre("hello"));
+
+  EXPECT_THAT(h.Run("hello world from protos"),
+              t::Eq("sh: hello exited with status 3\n"));
+  EXPECT_THAT(h.spawns.back().argv,
+              t::ElementsAre("hello", "world", "from", "protos"));
+
+  EXPECT_THAT(h.Run("/bin/hello alpha beta"),
+              t::Eq("sh: /bin/hello exited with status 2\n"));
+  EXPECT_THAT(h.spawns.back().argv,
+              t::ElementsAre("/bin/hello", "alpha", "beta"));
+
+  EXPECT_THAT(h.Run("bin/hello fault"),
+              t::Eq("sh: bin/hello faulted vector=6 error=0x0\n"));
+  EXPECT_THAT(h.Run("run hello kill"), t::Eq("sh: hello killed\n"));
+  EXPECT_THAT(h.Run("run /bin/hello one two"),
+              t::Eq("sh: /bin/hello exited with status 2\n"));
+  EXPECT_THAT(h.spawns.back().argv, t::ElementsAre("/bin/hello", "one", "two"));
+
+  // Copying a binary to another path and running the copy with string words.
+  EXPECT_THAT(h.Run("cp /bin/hello /copy"), t::Eq(""));
+  EXPECT_THAT(h.Run("/copy arg1"), t::Eq("sh: /copy exited with status 1\n"));
+  EXPECT_THAT(h.spawns.back().argv, t::ElementsAre("/copy", "arg1"));
+
+  // Embedded program validation vs truncated lines (> 16 tokens) vs unknown
+  // commands.
+  EXPECT_THAT(h.Run("run usertest bad"), t::Eq("sh: invalid argument: bad\n"));
+  std::string sixteen_args;
+  for (int i = 0; i < sh::kShellMaxTokens; ++i) {
+    sixteen_args += " a";
+  }
+  EXPECT_THAT(h.Run("hello" + sixteen_args), t::Eq("sh: too many arguments\n"));
+  EXPECT_THAT(h.Run("/bin/hello" + sixteen_args),
+              t::Eq("sh: too many arguments\n"));
+  EXPECT_THAT(h.Run("run hello" + sixteen_args),
+              t::Eq("sh: too many arguments\n"));
+  EXPECT_THAT(h.Run("run /bin/hello" + sixteen_args),
+              t::Eq("sh: too many arguments\n"));
+  EXPECT_THAT(h.Run("unknown_cmd"),
+              t::Eq("sh: unknown command: unknown_cmd\n"));
+  EXPECT_THAT(h.Run("unknown_cmd a b c"),
+              t::Eq("sh: unknown command: unknown_cmd\n"));
+  EXPECT_THAT(h.Run("unknown_cmd" + sixteen_args),
+              t::Eq("sh: unknown command: unknown_cmd\n"));
+  EXPECT_THAT(h.Run("run nope"), t::Eq("sh: unknown program: nope\n"));
+
+  // Non-ELF files, directories, and missing paths.
+  EXPECT_THAT(h.Run("/README.txt"),
+              t::Eq("sh: /README.txt: executable format error\n"));
+  EXPECT_THAT(h.Run("run /README.txt"),
+              t::Eq("sh: run: /README.txt: executable format error\n"));
+  EXPECT_THAT(h.Run("not_elf"),
+              t::Eq("sh: /bin/not_elf: executable format error\n"));
+  EXPECT_THAT(h.Run("run not_elf"),
+              t::Eq("sh: run: /bin/not_elf: executable format error\n"));
+  EXPECT_THAT(h.Run("/bin"), t::Eq("sh: /bin: is a directory\n"));
+  EXPECT_THAT(h.Run("subdir"), t::Eq("sh: /bin/subdir: is a directory\n"));
+  EXPECT_THAT(h.Run("run subdir"),
+              t::Eq("sh: run: /bin/subdir: is a directory\n"));
+  EXPECT_THAT(h.Run("/missing"),
+              t::Eq("sh: /missing: no such file or directory\n"));
+  EXPECT_THAT(h.Run("run /missing"),
+              t::Eq("sh: run: /missing: no such file or directory\n"));
+
+  h.ExpectNoOpenFiles();
+}
+
 TEST(SyscallAbiTest, UserSegmentRangeAllowedRejectsReservedWindows) {
   // Valid placements: bottom of user space, right below each reserved window,
-  // right above each reserved window, and the linked top-2-GiB ELF region.
+  // right above each reserved window, and the linked top-2-GiB ELF region
+  // (including unaligned segment virtual addresses whose pages stay outside
+  // reserved windows).
   EXPECT_TRUE(UserSegmentRangeAllowed(kUserSpaceBase, 1));
+  EXPECT_TRUE(UserSegmentRangeAllowed(kUserSpaceBase + 0x1A0, 0x200));
   EXPECT_TRUE(UserSegmentRangeAllowed(kDriverMmioWindowBase - kPageSize, 1));
+  EXPECT_TRUE(UserSegmentRangeAllowed(kDriverMmioWindowBase - 1, 1));
   EXPECT_TRUE(UserSegmentRangeAllowed(
       kDriverMmioWindowBase + kDriverMmioWindowSize, kPageSize));
+  EXPECT_TRUE(UserSegmentRangeAllowed(
+      kDriverMmioWindowBase + kDriverMmioWindowSize + 0x100, 0x200));
   EXPECT_TRUE(UserSegmentRangeAllowed(kDriverDmaWindowBase - kPageSize, 1));
   EXPECT_TRUE(UserSegmentRangeAllowed(
       kDriverDmaWindowBase + kDriverDmaWindowSize, kPageSize));
@@ -1590,20 +1958,24 @@ TEST(SyscallAbiTest, UserSegmentRangeAllowedRejectsReservedWindows) {
   EXPECT_TRUE(
       UserSegmentRangeAllowed(kUserStackRegionBase - kPageSize, kPageSize));
   EXPECT_TRUE(UserSegmentRangeAllowed(0xFFFFFFFF80000000ULL, kPageSize));
+  EXPECT_TRUE(UserSegmentRangeAllowed(0xFFFFFFFF80000001ULL, kPageSize));
   EXPECT_TRUE(UserSegmentRangeAllowed(kUserSpaceEnd - kPageSize, 1));
 
-  // Unaligned, empty, negative, or out-of-user-space segments.
-  EXPECT_FALSE(UserSegmentRangeAllowed(0xFFFFFFFF80000001ULL, kPageSize));
+  // Empty, negative, or out-of-user-space segments.
   EXPECT_FALSE(UserSegmentRangeAllowed(0xFFFFFFFF80000000ULL, 0));
   EXPECT_FALSE(UserSegmentRangeAllowed(0xFFFFFFFF80000000ULL, -kPageSize));
   EXPECT_FALSE(UserSegmentRangeAllowed(kUserSpaceEnd, kPageSize));
   EXPECT_FALSE(
       UserSegmentRangeAllowed(kUserSpaceEnd - kPageSize, kPageSize + 1));
 
-  // Overlapping MMIO, DMA, anonymous `MemMap()`, or stack + guard pages.
+  // Overlapping MMIO, DMA, anonymous `MemMap()`, or stack + guard pages
+  // (including unaligned segments whose rounded pages touch a reserved window).
   EXPECT_FALSE(UserSegmentRangeAllowed(kDriverMmioWindowBase - kPageSize,
                                        kPageSize + 1));
+  EXPECT_FALSE(UserSegmentRangeAllowed(kDriverMmioWindowBase - 1, 2));
   EXPECT_FALSE(UserSegmentRangeAllowed(kDriverMmioWindowBase, 1));
+  EXPECT_FALSE(UserSegmentRangeAllowed(
+      kDriverMmioWindowBase + kDriverMmioWindowSize - 1, 0x200));
   EXPECT_FALSE(UserSegmentRangeAllowed(
       kDriverMmioWindowBase + kDriverMmioWindowSize - kPageSize, 1));
   EXPECT_FALSE(UserSegmentRangeAllowed(kDriverDmaWindowBase, 1));

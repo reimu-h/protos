@@ -30,19 +30,26 @@ struct Task;
 // - Each port's state is guarded by its own `IrqSpinLock`, which may be held
 //   while waking a task (lock order: port lock, then the scheduler's locks).
 // - The client owns its transaction (heap memory freed when `IpcCall()`
-//   returns); the server side touches it only under the port lock while it is
-//   linked into one of the port's lists, and the client unlinks it under the
-//   lock before freeing it.
+//   returns). The server side touches it only under the port lock: while it
+//   is linked into one of the port's lists, and after unlinking it until it
+//   drops the lock (to complete a call, it unlinks the transaction, then
+//   stores `kDone`, reads `client_task` and calls `Wake()`). So the client
+//   always takes the port lock again before freeing it, even after it has seen
+//   `kDone`, and unlinks it then if it is still linked.
 // - `should_stop(stop_ctx)` callbacks may run with a port lock held, so they
 //   must not block or take a port lock.
 
 constexpr uintptr_t kIpcNoOwner = 0;
 
 // The most client-disconnect notifications pending on one port. At least
-// `kTaskStackSlotCount` (task_stack.h), so in the kernel it always has room:
-// `IpcContext::Recv()` drains every pending notification before popping any
-// new call, and at most `kTaskStackSlotCount - 1` live client tasks can hold a
-// popped call from the current owner at once.
+// `kTaskStackSlotCount` (task_stack.h), the most tasks that can have a stack
+// at a time, so in the kernel it always has room: the ring is empty whenever
+// `IpcContext::Recv()` pops a call (notifications come first), a client id has
+// at most one pending notification, and the kernel notifies an owner only
+// about processes that it has received a call from (`UserProcess::Run()`). So
+// the pending notifications are at most the processes that were alive at the
+// owner's latest pop and had a call popped by it, which are at most the tasks,
+// since each process has a single task.
 constexpr int kIpcDisconnectRingCapacity = 4096;
 
 // The most canceled in-service calls whose tokens one port remembers, so that
@@ -83,12 +90,16 @@ uintptr_t IpcPortOwner(int64_t port);
 
 // Posts an `IpcMessageKind::kClientDisconnect` notification for `client_id`
 // (`!= 0`) to `port` if `expected_owner` (`!= kIpcNoOwner`) still owns `port`,
-// waking a server task if one is blocked in `IpcContext::Recv()`. A
-// notification for `client_id` that is still pending on `port` is not
-// repeated. While `kIpcDisconnectRingCapacity` notifications are pending (in
-// host tests that invent more client IDs than `kTaskStackSlotCount`), waits a
-// timer tick at a time until the server receives one, `expected_owner` no
-// longer owns `port`, or `should_stop(stop_ctx)` returns true.
+// waking a server task if one is blocked in `IpcContext::Recv()`. Callers post
+// it only after the last `IpcCall()` of `client_id` has returned
+// (`UserProcess::Run()`, once the process has ended), so that every call of
+// `client_id` that the server has received and not answered by then was
+// canceled, as syscall_abi.h promises. A notification for `client_id` that is
+// still pending on `port` is not repeated. While `kIpcDisconnectRingCapacity`
+// notifications are pending (in host tests that invent more client IDs than
+// `kTaskStackSlotCount`), waits a timer tick at a time until the server
+// receives one, `expected_owner` no longer owns `port`, or
+// `should_stop(stop_ctx)` returns true.
 void IpcNotifyClientDisconnect(int64_t port,                              //
                                uint64_t client_id,                        //
                                uintptr_t expected_owner,                  //
@@ -97,13 +108,18 @@ void IpcNotifyClientDisconnect(int64_t port,                              //
 
 // Sends the request `[req_buf, req_buf + req_size)` on `port` on behalf of
 // client `client_id`, and blocks until the port's owner replies, the owner
-// releases the port (`kSyscallErrorNoDevice`), or `should_stop(stop_ctx)`
-// returns true (the call is canceled; returns `kSyscallErrorInvalid`). Fails at
-// once, without sending anything, with `kSyscallErrorNoDevice` if no process
-// owns `port`, with `kSyscallErrorDeadlock` if the caller owns it
-// (`caller_owner_token` is the caller's `IpcContext::OwnerToken()`), and with
-// `kSyscallErrorStale` if `expected_owner` isn't `kIpcNoOwner` and another
-// context owns it.
+// releases the port (`kSyscallErrorNoDevice`), the owner's `Recv()` turns the
+// call down because the request is longer than its receive buffer
+// (`kSyscallErrorInvalid`, with `*out_was_popped` false), or
+// `should_stop(stop_ctx)` returns true (the call is canceled; returns
+// `kSyscallErrorInvalid`). Fails at once, without sending anything, with
+// `kSyscallErrorNoDevice` if no process owns `port`, with `kSyscallErrorStale`
+// if `expected_owner` isn't `kIpcNoOwner` and another context owns it (also if
+// that context is the caller's), and otherwise with `kSyscallErrorDeadlock` if
+// the caller owns it (`caller_owner_token` is the caller's
+// `IpcContext::OwnerToken()`). These checks come after the allocation of the
+// call, which fails with `kSyscallErrorNoMemory` if the kernel runs out of
+// memory.
 //
 // Returns the reply's status. On a non-negative status, copies the reply
 // (`0 <= reply_size <= reply_cap` bytes) to `reply_buf` and writes its size to

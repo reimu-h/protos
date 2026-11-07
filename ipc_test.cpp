@@ -17,6 +17,7 @@
 #include <utility>
 #include <vector>
 
+#include "spinlock.h"
 #include "syscall_abi.h"
 
 namespace protos {
@@ -34,6 +35,9 @@ struct Task {
   // How many times the task has started to block in `Block()` or
   // `BlockUntil()`.
   int block_count = 0;
+  // How many of the task's next blocks in `Block()` end at once, without a
+  // wake (`FakeIpcEnvironment::ReturnSpuriouslyFromNextBlocks()`).
+  int spurious_block_returns = 0;
   // Whether the task's `TaskThreads` thread has returned from its function.
   bool finished = false;
 };
@@ -126,10 +130,22 @@ class FakeIpcEnvironment final : public IpcEnvironment {
     return current_task_;
   }
 
+  // Makes the calling task's next `count` blocks in `Block()` end at once,
+  // without a wake, as `IpcEnvironment::Block()` may.
+  void ReturnSpuriouslyFromNextBlocks(const int count) {
+    Task* const self = CurrentTask();
+    const std::lock_guard<std::mutex> lock(self->mu);
+    self->spurious_block_returns = count;
+  }
+
   void Block() override {
     Task* const self = CurrentTask();
     std::unique_lock<std::mutex> lock(self->mu);
     StartBlockLocked(*self);
+    if (self->spurious_block_returns > 0) {
+      --self->spurious_block_returns;
+      return;
+    }
     self->wake_cv.wait(lock, [self] { return self->wake_pending; });
     self->wake_pending = false;
   }
@@ -279,6 +295,31 @@ class TaskThreads {
 
 static bool StopWhenFlagSet(void* const ctx) {
   return static_cast<std::atomic<bool>*>(ctx)->load(std::memory_order_acquire);
+}
+
+// A stop request that an action precedes (`RunActionThenStop()`).
+struct StopWithAction {
+  std::atomic<bool> armed{false};
+  // May take a port lock.
+  std::function<void()> action;
+};
+
+// The `should_stop` of a client with the `StopWithAction` at `ctx`. Returns
+// false until it is armed, and when asked with a port lock held; otherwise runs
+// its action the first time and returns true. `IpcCall()` asks without a port
+// lock in its wait loop, after it has found its call unfinished and before it
+// takes the port lock to end it, so arming it while the client waits makes the
+// action happen in between.
+static bool RunActionThenStop(void* const ctx) {
+  StopWithAction* const stop = static_cast<StopWithAction*>(ctx);
+  if (!stop->armed.load(std::memory_order_acquire) || HoldsAnyIrqSpinLock()) {
+    return false;
+  }
+  if (stop->action != nullptr) {
+    const std::function<void()> action = std::exchange(stop->action, nullptr);
+    action();
+  }
+  return true;
 }
 
 class IpcTest : public t::Test {
@@ -538,6 +579,112 @@ TEST_F(IpcTest, CallExpectingAnotherOwnerFailsStaleWithoutBeingSent) {
                     nullptr),
             kSyscallErrorNoDevice);
   EXPECT_EQ(owner, kIpcNoOwner);
+}
+
+TEST_F(IpcTest, CallExpectingAnEndedOwnerIsStaleAlsoWhenTheCallerOwnsThePort) {
+  constexpr int kPort = 8;
+  // The owner that the call expects ends, and then the caller itself claims
+  // the port.
+  IpcContext first_server;
+  ASSERT_EQ(first_server.Listen(kPort, kUserCapNone), 0);
+  const uintptr_t first_owner = first_server.OwnerToken();
+  ASSERT_EQ(first_server.Release(), 1);
+  IpcContext caller;
+  ASSERT_EQ(caller.Listen(kPort, kUserCapNone), 0);
+
+  struct Case {
+    const char* what;
+    uintptr_t expected_owner;
+    int64_t want;
+  };
+  const Case cases[] = {
+      {"expects the owner that ended", first_owner, kSyscallErrorStale},
+      {"expects itself", caller.OwnerToken(), kSyscallErrorDeadlock},
+      {"expects any owner", kIpcNoOwner, kSyscallErrorDeadlock},
+  };
+  TaskThreads threads(*env_, [&] { caller.Release(); });
+  for (const Case& c : cases) {
+    SCOPED_TRACE(c.what);
+    const uint8_t req = 1;
+    int64_t reply_size = -1;
+    bool was_popped = true;
+    uintptr_t owner = kUnwrittenOwner;
+    int64_t rc = 0;
+    // If the call were sent, it would wait for a reply.
+    Task* const client = threads.Start([&] {
+      rc = IpcCall(kPort,                //
+                   /*client_id=*/1,      //
+                   caller.OwnerToken(),  //
+                   c.expected_owner,     //
+                   &req,                 //
+                   1,                    //
+                   nullptr,              //
+                   0,                    //
+                   &reply_size,          //
+                   &was_popped,          //
+                   &owner,               //
+                   nullptr,              //
+                   nullptr);
+    });
+    ASSERT_TRUE(ReturnsWithoutBlocking(client));
+    ASSERT_TRUE(threads.Join(client));
+    EXPECT_EQ(rc, c.want);
+    EXPECT_EQ(reply_size, 0);
+    EXPECT_FALSE(was_popped);
+    EXPECT_EQ(owner, kIpcNoOwner);
+  }
+  uint8_t buf[1] = {};
+  IpcReceivedMessage msg{};
+  EXPECT_EQ(caller.Recv(kPort, buf, sizeof(buf), &msg, 0, nullptr, nullptr), 0);
+}
+
+TEST_F(IpcTest, CallWithStopAlreadyRequestedIsNotSent) {
+  constexpr int kPort = 14;
+  IpcContext server;
+  ASSERT_EQ(server.Listen(kPort, kUserCapNone), 0);
+
+  int64_t recv_rc = 0;
+  std::atomic<bool> stop{true};
+  int64_t reply_size = -1;
+  bool was_popped = true;
+  uintptr_t owner = kUnwrittenOwner;
+  int64_t rc = 0;
+  TaskThreads threads(*env_, [&] { server.Release(); });
+  // A call would wake the waiting server.
+  Task* const receiver = threads.Start([&] {
+    IpcReceivedMessage msg{};
+    recv_rc = server.Recv(kPort, nullptr, 0, &msg, -1, nullptr, nullptr);
+  });
+  ASSERT_TRUE(WaitUntilBlocked(receiver));
+  Task* const client = threads.Start([&] {
+    const uint8_t req = 0x71;
+    rc = IpcCall(kPort,             //
+                 /*client_id=*/71,  //
+                 kIpcNoOwner,       //
+                 kIpcNoOwner,       //
+                 &req,              //
+                 1,                 //
+                 nullptr,           //
+                 0,                 //
+                 &reply_size,       //
+                 &was_popped,       //
+                 &owner,            //
+                 &StopWhenFlagSet,  //
+                 &stop);
+  });
+  ASSERT_TRUE(ReturnsWithoutBlocking(client));
+  ASSERT_TRUE(threads.Join(client));
+  EXPECT_EQ(rc, kSyscallErrorInvalid);
+  EXPECT_EQ(reply_size, 0);
+  EXPECT_FALSE(was_popped);
+  // Only a call that was sent reports the owner that it was sent to.
+  EXPECT_EQ(owner, kIpcNoOwner);
+
+  // Nothing woke the server: only the release ends its wait.
+  EXPECT_EQ(server.Release(), 1);
+  ASSERT_TRUE(threads.Join(receiver));
+  EXPECT_EQ(recv_rc, kSyscallErrorAccess);
+  EXPECT_EQ(BlockCount(receiver), 1);
 }
 
 TEST_F(IpcTest, CallReportsTheOwnerThatReceivedIt) {
@@ -879,6 +1026,55 @@ TEST_F(IpcTest, OversizedRequestFailsItsCallAndOversizedReplyIsRejected) {
   EXPECT_THAT(small_reply, t::ElementsAre(6, 5));
 }
 
+TEST_F(IpcTest, CallBlocksAgainAfterSpuriousWakeupsUntilItIsAnswered) {
+  constexpr int kPort = 14;
+  IpcContext server;
+  ASSERT_EQ(server.Listen(kPort, kUserCapNone), 0);
+
+  int64_t rc = -1;
+  uint8_t reply[2] = {};
+  int64_t reply_size = -1;
+  bool was_popped = false;
+  TaskThreads threads(*env_, [&] { server.Release(); });
+  Task* const client = threads.Start([&] {
+    env_->ReturnSpuriouslyFromNextBlocks(2);
+    const uint8_t req = 0x31;
+    rc = IpcCall(kPort,             //
+                 /*client_id=*/31,  //
+                 kIpcNoOwner,       //
+                 kIpcNoOwner,       //
+                 &req,              //
+                 1,                 //
+                 reply,             //
+                 sizeof(reply),     //
+                 &reply_size,       //
+                 &was_popped,       //
+                 nullptr,           //
+                 nullptr,           //
+                 nullptr);
+  });
+  // The client's first two blocks end at once, and it blocks again after each.
+  ASSERT_TRUE(WaitUntilBlocked(client, 3));
+  uint8_t srv_buf[1] = {};
+  IpcReceivedMessage msg{};
+  ASSERT_EQ(
+      server.Recv(kPort, srv_buf, sizeof(srv_buf), &msg, 0, nullptr, nullptr),
+      1);
+  EXPECT_EQ(srv_buf[0], 0x31);
+  // A wake with neither a reply nor a stop request only makes it block again.
+  env_->Wake(client);
+  ASSERT_TRUE(WaitUntilBlocked(client, 4));
+
+  const uint8_t kReply[2] = {0xAB, 0xCD};
+  ASSERT_EQ(server.Reply(kPort, msg.token, kReply, sizeof(kReply), 5), 0);
+  ASSERT_TRUE(threads.Join(client));
+  EXPECT_EQ(rc, 5);
+  EXPECT_EQ(reply_size, 2);
+  EXPECT_THAT(reply, t::ElementsAre(0xAB, 0xCD));
+  EXPECT_TRUE(was_popped);
+  EXPECT_EQ(BlockCount(client), 4);
+}
+
 TEST_F(IpcTest, ClientKilledWhileQueuedAndWhileInService) {
   constexpr int kPort = 4;
   IpcContext server;
@@ -959,6 +1155,56 @@ TEST_F(IpcTest, ClientKilledWhileQueuedAndWhileInService) {
   // Server replies late to the canceled token: first Reply succeeds with 0,
   // second duplicate Reply fails with `kSyscallErrorInvalid`.
   EXPECT_EQ(server.Reply(kPort, msg.token, nullptr, 0, 0), 0);
+  EXPECT_EQ(server.Reply(kPort, msg.token, nullptr, 0, 0),
+            kSyscallErrorInvalid);
+}
+
+TEST_F(IpcTest, StopRequestedAfterTheReplyIsStoredReturnsTheReply) {
+  constexpr int kPort = 14;
+  IpcContext server;
+  ASSERT_EQ(server.Listen(kPort, kUserCapNone), 0);
+
+  IpcReceivedMessage msg{};
+  const uint8_t kReply[2] = {0x12, 0x34};
+  int64_t reply_rc = -1;
+  // The server answers the call when the client checks for a stop, after it
+  // has found the call unanswered, and then the stop is requested.
+  StopWithAction stop;
+  stop.action = [&] {
+    reply_rc = server.Reply(kPort, msg.token, kReply, sizeof(kReply), 9);
+  };
+  int64_t rc = -1;
+  uint8_t reply[2] = {};
+  int64_t reply_size = -1;
+  bool was_popped = false;
+  TaskThreads threads(*env_, [&] { server.Release(); });
+  Task* const client = threads.Start([&] {
+    rc = IpcCall(kPort,               //
+                 /*client_id=*/41,    //
+                 kIpcNoOwner,         //
+                 kIpcNoOwner,         //
+                 nullptr,             //
+                 0,                   //
+                 reply,               //
+                 sizeof(reply),       //
+                 &reply_size,         //
+                 &was_popped,         //
+                 nullptr,             //
+                 &RunActionThenStop,  //
+                 &stop);
+  });
+  ASSERT_TRUE(WaitUntilBlocked(client));
+  ASSERT_EQ(server.Recv(kPort, nullptr, 0, &msg, 0, nullptr, nullptr), 1);
+  stop.armed.store(true, std::memory_order_release);
+  env_->Wake(client);
+  ASSERT_TRUE(threads.Join(client));
+  EXPECT_EQ(reply_rc, 0);
+  EXPECT_EQ(rc, 9);
+  EXPECT_EQ(reply_size, 2);
+  EXPECT_THAT(reply, t::ElementsAre(0x12, 0x34));
+  EXPECT_TRUE(was_popped);
+  // The call ended with its reply, not canceled, so the port doesn't remember
+  // its token as canceled: another reply fails instead of being dropped.
   EXPECT_EQ(server.Reply(kPort, msg.token, nullptr, 0, 0),
             kSyscallErrorInvalid);
 }
@@ -1131,6 +1377,151 @@ TEST_F(IpcTest, ServerReleaseWakesQueuedAndInServiceClients) {
   EXPECT_EQ(replacement.Listen(5, kUserCapNone), 0);
 }
 
+TEST_F(IpcTest, ReleaseRacingAClientThatCancelsEndsTheCallOnce) {
+  constexpr int kPort = 15;
+  // 1. The server releases the port when the client checks for a stop, after
+  // it has found its call unfinished and before it takes the port lock to
+  // cancel the call: the release ends the call, queued or in service.
+  for (const bool received : {false, true}) {
+    SCOPED_TRACE(received ? "in service" : "queued");
+    IpcContext server;
+    ASSERT_EQ(server.Listen(kPort, kUserCapNone), 0);
+    int released = -1;
+    StopWithAction stop;
+    stop.action = [&] { released = server.Release(); };
+    int64_t rc = 0;
+    bool was_popped = !received;
+    uintptr_t owner = kUnwrittenOwner;
+    TaskThreads threads(*env_, [&] { server.Release(); });
+    Task* const client = threads.Start([&] {
+      rc = IpcCall(kPort,               //
+                   /*client_id=*/51,    //
+                   kIpcNoOwner,         //
+                   kIpcNoOwner,         //
+                   nullptr,             //
+                   0,                   //
+                   nullptr,             //
+                   0,                   //
+                   nullptr,             //
+                   &was_popped,         //
+                   &owner,              //
+                   &RunActionThenStop,  //
+                   &stop);
+    });
+    ASSERT_TRUE(WaitUntilBlocked(client));
+    if (received) {
+      IpcReceivedMessage msg{};
+      ASSERT_EQ(server.Recv(kPort, nullptr, 0, &msg, 0, nullptr, nullptr), 1);
+    }
+    stop.armed.store(true, std::memory_order_release);
+    env_->Wake(client);
+    ASSERT_TRUE(threads.Join(client));
+    EXPECT_EQ(released, 1);
+    EXPECT_EQ(rc, kSyscallErrorNoDevice);
+    EXPECT_EQ(was_popped, received);
+    EXPECT_EQ(owner, server.OwnerToken());
+    EXPECT_EQ(IpcPortOwner(kPort), kIpcNoOwner);
+  }
+
+  // 2. The client cancels its call before the server releases the port, which
+  // then has no call to end and forgets the canceled one.
+  IpcContext server;
+  ASSERT_EQ(server.Listen(kPort, kUserCapNone), 0);
+  std::atomic<bool> stop{false};
+  int64_t rc = 0;
+  bool was_popped = false;
+  TaskThreads threads(*env_, [&] { server.Release(); });
+  Task* const client = threads.Start([&] {
+    rc = IpcCall(kPort,             //
+                 /*client_id=*/52,  //
+                 kIpcNoOwner,       //
+                 kIpcNoOwner,       //
+                 nullptr,           //
+                 0,                 //
+                 nullptr,           //
+                 0,                 //
+                 nullptr,           //
+                 &was_popped,       //
+                 nullptr,           //
+                 &StopWhenFlagSet,  //
+                 &stop);
+  });
+  ASSERT_TRUE(WaitUntilBlocked(client));
+  IpcReceivedMessage msg{};
+  ASSERT_EQ(server.Recv(kPort, nullptr, 0, &msg, 0, nullptr, nullptr), 1);
+  stop.store(true, std::memory_order_release);
+  env_->Wake(client);
+  ASSERT_TRUE(threads.Join(client));
+  EXPECT_EQ(rc, kSyscallErrorInvalid);
+  EXPECT_TRUE(was_popped);
+  EXPECT_EQ(server.Release(), 1);
+  // The next owner's tokens start at 1 again, like the canceled call's, but a
+  // reply to that token fails instead of being dropped.
+  IpcContext replacement;
+  ASSERT_EQ(replacement.Listen(kPort, kUserCapNone), 0);
+  EXPECT_EQ(replacement.Reply(kPort, msg.token, nullptr, 0, 0),
+            kSyscallErrorInvalid);
+}
+
+TEST_F(IpcTest, RecvRacingAClientThatCancelsCancelsTheCallInService) {
+  constexpr int kPort = 15;
+  IpcContext server;
+  ASSERT_EQ(server.Listen(kPort, kUserCapNone), 0);
+  // The server receives the call when the client checks for a stop, after it
+  // has found its call unanswered and before it takes the port lock to cancel
+  // the call: the client cancels the call in service, so it reports the call
+  // received (the server may have acted on it), and the port drops one late
+  // reply to it.
+  uint8_t srv_buf[4] = {};
+  IpcReceivedMessage msg{};
+  int64_t recv_rc = -1;
+  StopWithAction stop;
+  stop.action = [&] {
+    recv_rc = server.Recv(kPort,            //
+                          srv_buf,          //
+                          sizeof(srv_buf),  //
+                          &msg,             //
+                          0,                //
+                          nullptr,          //
+                          nullptr);
+  };
+  int64_t rc = 0;
+  bool was_popped = false;
+  uintptr_t owner = kUnwrittenOwner;
+  TaskThreads threads(*env_, [&] { server.Release(); });
+  Task* const client = threads.Start([&] {
+    const uint8_t req = 0x42;
+    rc = IpcCall(kPort,               //
+                 /*client_id=*/61,    //
+                 kIpcNoOwner,         //
+                 kIpcNoOwner,         //
+                 &req,                //
+                 1,                   //
+                 nullptr,             //
+                 0,                   //
+                 nullptr,             //
+                 &was_popped,         //
+                 &owner,              //
+                 &RunActionThenStop,  //
+                 &stop);
+  });
+  ASSERT_TRUE(WaitUntilBlocked(client));
+  stop.armed.store(true, std::memory_order_release);
+  env_->Wake(client);
+  ASSERT_TRUE(threads.Join(client));
+  EXPECT_EQ(recv_rc, 1);
+  EXPECT_EQ(msg.kind, IpcMessageKind::kCall);
+  EXPECT_EQ(msg.client_id, 61u);
+  EXPECT_EQ(msg.size, 1);
+  EXPECT_EQ(srv_buf[0], 0x42);
+  EXPECT_EQ(rc, kSyscallErrorInvalid);
+  EXPECT_TRUE(was_popped);
+  EXPECT_EQ(owner, server.OwnerToken());
+  EXPECT_EQ(server.Reply(kPort, msg.token, nullptr, 0, 0), 0);
+  EXPECT_EQ(server.Reply(kPort, msg.token, nullptr, 0, 0),
+            kSyscallErrorInvalid);
+}
+
 TEST_F(IpcTest, RecvAndReplyAfterReleaseFailWithAccess) {
   constexpr int kPort = 12;
   IpcContext server;
@@ -1194,6 +1585,56 @@ TEST_F(IpcTest, RecvAndReplyAfterReleaseFailWithAccess) {
   EXPECT_EQ(server.Reply(kPort, token, nullptr, 0, 0), kSyscallErrorAccess);
   EXPECT_EQ(replacement.Reply(kPort, token, nullptr, 0, 0),
             kSyscallErrorInvalid);
+}
+
+TEST_F(IpcTest, TimedRecvReturnsACallThatComesBeforeTheDeadline) {
+  constexpr int kPort = 11;
+  IpcContext server;
+  ASSERT_EQ(server.Listen(kPort, kUserCapNone), 0);
+
+  uint8_t srv_buf[2] = {};
+  IpcReceivedMessage msg{};
+  int64_t recv_rc = -1;
+  int64_t call_rc = -1;
+  TaskThreads threads(*env_, [&] { server.Release(); });
+  Task* const receiver = threads.Start([&] {
+    recv_rc = server.Recv(kPort,                   //
+                          srv_buf,                 //
+                          sizeof(srv_buf),         //
+                          &msg,                    //
+                          /*timeout_ticks=*/1000,  //
+                          nullptr,                 //
+                          nullptr);
+  });
+  ASSERT_TRUE(WaitUntilBlocked(receiver));
+  Task* const client = threads.Start([&] {
+    const uint8_t req[2] = {0x61, 0x62};
+    call_rc = IpcCall(kPort,             //
+                      /*client_id=*/61,  //
+                      kIpcNoOwner,       //
+                      kIpcNoOwner,       //
+                      req,               //
+                      sizeof(req),       //
+                      nullptr,           //
+                      0,                 //
+                      nullptr,           //
+                      nullptr,           //
+                      nullptr,           //
+                      nullptr,           //
+                      nullptr);
+  });
+
+  // No tick passes, so only the call ends the wait, which it ends at once.
+  ASSERT_TRUE(threads.Join(receiver));
+  ASSERT_EQ(recv_rc, 1);
+  EXPECT_EQ(BlockCount(receiver), 1);
+  EXPECT_EQ(msg.kind, IpcMessageKind::kCall);
+  EXPECT_EQ(msg.client_id, 61u);
+  EXPECT_EQ(msg.size, 2);
+  EXPECT_THAT(srv_buf, t::ElementsAre(0x61, 0x62));
+  ASSERT_EQ(server.Reply(kPort, msg.token, nullptr, 0, 3), 0);
+  ASSERT_TRUE(threads.Join(client));
+  EXPECT_EQ(call_rc, 3);
 }
 
 TEST_F(IpcTest, TimedRecvReturnsEarlyOnceShouldStopHolds) {

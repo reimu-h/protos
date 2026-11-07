@@ -14,24 +14,44 @@ extern "C" {
 alignas(64) uint8_t g_initial_fpu_state[protos::user::kInitialFpuStateSize];
 }
 
-// Calls the program's main function with `arg` and exits with its result.
-extern "C" [[noreturn]] void StartProgram(const uint64_t arg) {
-  protos::user::Exit(protos::user::Main(arg));
+namespace protos::user {
+namespace {
+uint64_t g_entry_arg = 0;
+}  // namespace
+
+[[gnu::weak]] int64_t Main(const uint64_t /*arg*/) { return 0; }
+
+[[gnu::weak]] int64_t Main(const int /*argc*/, char** const /*argv*/) {
+  return Main(g_entry_arg);
 }
 
-// The kernel enters a program here, with the program's argument in rdi and a
-// stack pointer that is 8 bytes below a 16-byte boundary, as if a call had
-// pushed a return address (user_mode.h). Before any compiled code can change
-// the x87/SSE/AVX registers, this saves them into `g_initial_fpu_state`: with
-// XSAVE (the x87, SSE and AVX components that XCR0 enables) if the kernel
-// enabled it (CPUID.1:ECX.OSXSAVE), else with FXSAVE. Then it jumps to
-// `StartProgram()`, which sees the stack as the entry point did.
+}  // namespace protos::user
+
+// Calls the program's main function with `(argc, argv)` (or `arg` if the
+// program defines `Main(uint64_t)`) and exits with its result.
+extern "C" [[noreturn]] void StartProgram(const uint64_t arg,  //
+                                          const int64_t argc,  //
+                                          char** const argv) {
+  protos::user::g_entry_arg = arg;
+  protos::user::Exit(protos::user::Main(static_cast<int>(argc), argv));
+}
+
+// The kernel enters a program here, with `arg` in rdi, `argc` in rsi, `argv`
+// in rdx, and a stack pointer that is 8 bytes below a 16-byte boundary, as if
+// a call had pushed a return address (user_mode.h). Before any compiled code
+// can change the x87/SSE/AVX registers, this saves them into
+// `g_initial_fpu_state`: with XSAVE (the x87, SSE and AVX components that XCR0
+// enables) if the kernel enabled it (CPUID.1:ECX.OSXSAVE), else with FXSAVE.
+// Then it jumps to `StartProgram()`, which sees the stack as the entry point
+// did.
 asm(R"(
     .pushsection .text
     .globl _start
     .type _start, @function
 _start:
     mov r12, rdi
+    mov r13, rsi
+    mov r14, rdx
     mov eax, 1
     cpuid
     lea rdi, [rip + g_initial_fpu_state]
@@ -47,6 +67,8 @@ _start:
     fxsave64 [rdi]
 2:
     mov rdi, r12
+    mov rsi, r13
+    mov rdx, r14
     jmp StartProgram
     .size _start, . - _start
     .popsection

@@ -37,6 +37,8 @@ struct MapCall {
 
 struct FakeEnvState {
   bool fail_bootstrap_map = false;
+  // PagingMapBootstrapRange() also fails for ranges that start here, if not 0.
+  uintptr_t fail_bootstrap_map_addr = 0;
   // 0-based index of the RecordingMapper() call that fails, or -1.
   int fail_map_call = -1;
   std::vector<MapCall> map_calls;
@@ -64,7 +66,9 @@ static const void* RecordingMapper(const uintptr_t phys_addr,
 
 bool PagingMapBootstrapRange(const uintptr_t phys_addr, const int64_t size) {
   g_env.map_calls.push_back({phys_addr, size});
-  return !g_env.fail_bootstrap_map;
+  return !g_env.fail_bootstrap_map &&
+         (g_env.fail_bootstrap_map_addr == 0 ||
+          phys_addr != g_env.fail_bootstrap_map_addr);
 }
 
 // console.cpp prints through these.
@@ -885,7 +889,7 @@ class Mb2InfoBuilder {
   }
 
  private:
-  alignas(8) uint8_t bytes_[256] = {};
+  alignas(8) uint8_t bytes_[1024] = {};
   int64_t size_ = sizeof(Multiboot2InfoHeader);
 };
 
@@ -1047,6 +1051,282 @@ TEST(MultibootTest, HasVgaTextModeFollowsTheMultiboot1Framebuffer) {
                                       AddrOf(info),      //
                                       kIdentityMapLimit));
   EXPECT_THAT(g_env.uart_log, t::IsEmpty());
+}
+
+// Appends a memory map tag with one available region to `builder`.
+static void AddAvailableMemoryTag(Mb2InfoBuilder* const builder) {
+  struct [[gnu::packed]] MmapTagWithOneEntry {
+    Multiboot2TagMmap mmap;
+    Multiboot2MmapEntry entry;
+  };
+  MmapTagWithOneEntry tag = {};
+  tag.mmap.type = kMultiboot2TagMmap;
+  tag.mmap.size = sizeof(tag);
+  tag.mmap.entry_size = sizeof(Multiboot2MmapEntry);
+  tag.entry = {0x100000, 0x7F00000, kMemoryTypeAvailable, 0};
+  builder->Add(&tag, sizeof(tag));
+}
+
+// Appends a module tag for `[start, end)` to `builder`, whose command line
+// `cmdline` fills the rest of the tag, followed by a NUL byte if
+// `nul_terminated`.
+static void AddModuleTag(Mb2InfoBuilder* const builder,  //
+                         const uintptr_t start,          //
+                         const uintptr_t end,            //
+                         const std::string& cmdline,     //
+                         const bool nul_terminated = true) {
+  const int64_t size =
+      static_cast<int64_t>(sizeof(Multiboot2TagModule) + cmdline.size()) +
+      (nul_terminated ? 1 : 0);
+  std::vector<uint8_t> tag(size, 0);
+  const Multiboot2TagModule header = {kMultiboot2TagModule,          //
+                                      static_cast<uint32_t>(size),   //
+                                      static_cast<uint32_t>(start),  //
+                                      static_cast<uint32_t>(end)};
+  std::memcpy(tag.data(), &header, sizeof(header));
+  std::memcpy(tag.data() + sizeof(header), cmdline.data(), cmdline.size());
+  builder->Add(tag.data(), size);
+}
+
+// Returns the name of `module` if NUL bytes follow it through the end of
+// `BootModule::name`, else a description of the bad name.
+static std::string NameOf(const BootModule& module) {
+  const int64_t length = static_cast<int64_t>(
+      strnlen(module.name, static_cast<size_t>(kBootModuleNameSize)));
+  if (length == kBootModuleNameSize) {
+    return "<no NUL terminator>";
+  }
+  for (int64_t i = length; i < kBootModuleNameSize; ++i) {
+    if (module.name[i] != '\0') {
+      return "<garbage after the NUL terminator>";
+    }
+  }
+  return std::string(module.name, static_cast<size_t>(length));
+}
+
+TEST(MultibootTest, Multiboot2ModuleTagsAreNamedByTheLastWordOfTheirCmdline) {
+  ResetFakeEnv();
+  const std::string long_word(80, 'x');
+  Mb2InfoBuilder builder;
+  // What GRUB 2 passes for `module2 /boot/rootfs.tar rootfs`: only the
+  // arguments after the file name.
+  AddModuleTag(&builder, 0x200000, 0x202800, "rootfs");
+  // An empty module with an empty command line.
+  AddModuleTag(&builder, 0x300000, 0x300000, "");
+  AddModuleTag(&builder, 0x400000, 0x401000, "  first\tlast \t ");
+  AddModuleTag(&builder, 0x500000, 0x501000, "a " + long_word);
+  AddModuleTag(&builder, 0x600000, 0x601000, "word unterminated",
+               /*nul_terminated=*/false);
+  AddAvailableMemoryTag(&builder);
+  const uintptr_t info_addr = builder.Finish();
+
+  MultibootMemoryMap parsed = {};
+  ASSERT_TRUE(MultibootParseMemoryMap(kMultiboot2Magic,   //
+                                      info_addr,          //
+                                      kIdentityMapLimit,  //
+                                      &parsed));
+  ASSERT_THAT(parsed.module_count, t::Eq(5));
+  EXPECT_THAT(parsed.modules[0].start, t::Eq(0x200000u));
+  EXPECT_THAT(parsed.modules[0].end, t::Eq(0x202800u));
+  EXPECT_THAT(NameOf(parsed.modules[0]), t::Eq("rootfs"));
+  EXPECT_THAT(parsed.modules[1].start, t::Eq(0x300000u));
+  EXPECT_THAT(parsed.modules[1].end, t::Eq(0x300000u));
+  EXPECT_THAT(NameOf(parsed.modules[1]), t::Eq(""));
+  EXPECT_THAT(NameOf(parsed.modules[2]), t::Eq("last"));
+  // A name is cut to `kBootModuleNameSize - 1` bytes.
+  EXPECT_THAT(NameOf(parsed.modules[3]),
+              t::Eq(std::string(kBootModuleNameSize - 1, 'x')));
+  // A command line ends at the end of its tag.
+  EXPECT_THAT(NameOf(parsed.modules[4]), t::Eq("unterminated"));
+  // The memory map still counts.
+  EXPECT_THAT(parsed.region_count, t::Eq(1));
+
+  EXPECT_THAT(g_env.uart_log,
+              t::HasSubstr("[PMM] boot module: base=0x200000 len=0x2800 "
+                           "name=rootfs\n"));
+  EXPECT_THAT(g_env.uart_log,
+              t::HasSubstr("[PMM] boot module: base=0x400000 len=0x1000 "
+                           "name=last\n"));
+  EXPECT_THAT(g_env.vga_log, t::Eq(g_env.uart_log));
+
+  // The quiet parser records the same modules without logging them.
+  ResetFakeEnv();
+  MultibootMemoryMap quiet = {};
+  ASSERT_TRUE(MultibootParseMemoryMapQuiet(kMultiboot2Magic,   //
+                                           info_addr,          //
+                                           kIdentityMapLimit,  //
+                                           &quiet));
+  EXPECT_THAT(quiet.module_count, t::Eq(5));
+  EXPECT_THAT(g_env.uart_log, t::IsEmpty());
+}
+
+TEST(MultibootTest, Multiboot2ParserSkipsInvalidModulesAndKeepsTheFirstEight) {
+  ResetFakeEnv();
+  Mb2InfoBuilder builder;
+  AddModuleTag(&builder, 0, 0x1000, "at_zero");
+  AddModuleTag(&builder, 0x3000, 0x2000, "backwards");
+  // A tag too small for the module fields.
+  const Multiboot2Tag short_tag = {kMultiboot2TagModule, sizeof(Multiboot2Tag)};
+  builder.Add(&short_tag, sizeof(short_tag));
+  for (int i = 0; i <= kMaxBootModules; ++i) {
+    const uintptr_t start = 0x100000 * static_cast<uintptr_t>(i + 1);
+    AddModuleTag(&builder, start, start + 0x1000, "m" + std::to_string(i));
+  }
+  AddAvailableMemoryTag(&builder);
+
+  MultibootMemoryMap parsed = {};
+  ASSERT_TRUE(MultibootParseMemoryMap(kMultiboot2Magic,   //
+                                      builder.Finish(),   //
+                                      kIdentityMapLimit,  //
+                                      &parsed));
+  ASSERT_THAT(parsed.module_count, t::Eq(kMaxBootModules));
+  for (int i = 0; i < kMaxBootModules; ++i) {
+    EXPECT_THAT(NameOf(parsed.modules[i]), t::Eq("m" + std::to_string(i)));
+  }
+  EXPECT_THAT(g_env.uart_log, t::Not(t::HasSubstr("at_zero")));
+  EXPECT_THAT(g_env.uart_log, t::Not(t::HasSubstr("backwards")));
+
+  // A new parse starts without modules.
+  Mb2InfoBuilder no_modules;
+  AddAvailableMemoryTag(&no_modules);
+  ASSERT_TRUE(MultibootParseMemoryMap(kMultiboot2Magic,     //
+                                      no_modules.Finish(),  //
+                                      kIdentityMapLimit,    //
+                                      &parsed));
+  EXPECT_THAT(parsed.module_count, t::Eq(0));
+}
+
+TEST(MultibootTest, MultibootModulesMustEndAtOrBelowTheMaxPhysicalAddress) {
+  ResetFakeEnv();
+  const Low32BitBuffer buffer(1);
+  if (!buffer.ok()) {
+    GTEST_SKIP() << "cannot map host memory below 4 GiB (MAP_32BIT)";
+  }
+  // The boot information ends where the accessible memory ends, which is
+  // also the `max_physical_addr` of the parse.
+  const uintptr_t max_physical_addr = AddrOf(buffer.EndMinus(0));
+  Mb2InfoBuilder builder;
+  AddModuleTag(&builder,                    //
+               max_physical_addr - 0x2000,  //
+               max_physical_addr,           //
+               "at_limit");
+  AddModuleTag(&builder,                    //
+               max_physical_addr - 0x1000,  //
+               max_physical_addr + 1,       //
+               "past_limit");
+  AddAvailableMemoryTag(&builder);
+  const uintptr_t built = builder.Finish();
+  const int64_t total_size =
+      reinterpret_cast<const Multiboot2InfoHeader*>(built)->total_size;
+  uint8_t* const info = buffer.EndMinus(total_size);
+  std::memcpy(info, reinterpret_cast<const void*>(built), total_size);
+
+  MultibootMemoryMap parsed = {};
+  ASSERT_TRUE(MultibootParseMemoryMap(kMultiboot2Magic,   //
+                                      AddrOf(info),       //
+                                      max_physical_addr,  //
+                                      &parsed));
+  ASSERT_THAT(parsed.module_count, t::Eq(1));
+  EXPECT_THAT(NameOf(parsed.modules[0]), t::Eq("at_limit"));
+  EXPECT_THAT(parsed.modules[0].end, t::Eq(max_physical_addr));
+}
+
+TEST(MultibootTest, Multiboot1ModuleListIsNamedByTheLastWordOfEachString) {
+  ResetFakeEnv();
+  const Low32BitBuffer buffer(1);
+  if (!buffer.ok()) {
+    GTEST_SKIP() << "cannot map host memory below 4 GiB (MAP_32BIT)";
+  }
+  // The boot information, the module list and the module strings in low
+  // memory, which their 32-bit addresses can point at, up to the end of the
+  // accessible memory.
+  struct [[gnu::packed]] Mb1WithModules {
+    Multiboot1Info info;
+    Multiboot1Module mods[4];
+    char rootfs_cmdline[32];
+    char initrd_cmdline[32];
+    // At the end, without a NUL terminator.
+    char last_cmdline[7];
+  };
+  Mb1WithModules* const mb1 = reinterpret_cast<Mb1WithModules*>(
+      buffer.EndMinus(sizeof(Mb1WithModules)));
+  std::memset(static_cast<void*>(mb1), 0, sizeof(*mb1));
+  const auto low_addr = [](const void* const ptr) {
+    return static_cast<uint32_t>(AddrOf(ptr));
+  };
+  std::strcpy(mb1->rootfs_cmdline, "/boot/rootfs.tar rootfs");
+  std::strcpy(mb1->initrd_cmdline, "initrd");
+  std::memcpy(mb1->last_cmdline, "abc def", sizeof(mb1->last_cmdline));
+  mb1->info.flags = kMultiboot1FlagMemBasic | kMultiboot1FlagMods;
+  mb1->info.mem_lower = 639;
+  mb1->info.mem_upper = 130048;
+  mb1->info.mods_count = 4;
+  mb1->info.mods_addr = low_addr(mb1->mods);
+  // A command line as QEMU's `-initrd` and GRUB Legacy pass it: the module's
+  // file name, then its arguments (GRUB 2 passes only the arguments).
+  mb1->mods[0] = {0x200000, 0x202800, low_addr(mb1->rootfs_cmdline), 0};
+  // Without a command line.
+  mb1->mods[1] = {0x300000, 0x301000, 0, 0};
+  // Ends before it starts.
+  mb1->mods[2] = {0x400000, 0x3FF000, low_addr(mb1->initrd_cmdline), 0};
+  mb1->mods[3] = {0x500000, 0x501000, low_addr(mb1->initrd_cmdline), 0};
+  const uintptr_t max_physical_addr = AddrOf(buffer.EndMinus(0));
+  MultibootMemoryMap parsed = {};
+  const auto parse = [&]() {
+    return MultibootParseMemoryMap(kMultiboot1Magic,    //
+                                   AddrOf(&mb1->info),  //
+                                   max_physical_addr,   //
+                                   &parsed);
+  };
+
+  ASSERT_TRUE(parse());
+  ASSERT_THAT(parsed.module_count, t::Eq(3));
+  EXPECT_THAT(parsed.modules[0].start, t::Eq(0x200000u));
+  EXPECT_THAT(parsed.modules[0].end, t::Eq(0x202800u));
+  EXPECT_THAT(NameOf(parsed.modules[0]), t::Eq("rootfs"));
+  EXPECT_THAT(NameOf(parsed.modules[1]), t::Eq(""));
+  EXPECT_THAT(parsed.modules[2].start, t::Eq(0x500000u));
+  EXPECT_THAT(NameOf(parsed.modules[2]), t::Eq("initrd"));
+  EXPECT_THAT(g_env.uart_log,
+              t::HasSubstr("[PMM] boot module: base=0x200000 len=0x2800 "
+                           "name=rootfs\n"));
+  // The module list is not reserved: nothing reads it after the parser.
+  EXPECT_THAT(parsed.mb_reserved_end,
+              t::Eq(AddrOf(&mb1->info) + sizeof(Multiboot1Info)));
+
+  // A string is read no further than `max_physical_addr`.
+  mb1->mods[3].string = low_addr(mb1->last_cmdline);
+  ASSERT_TRUE(parse());
+  ASSERT_THAT(parsed.module_count, t::Eq(3));
+  EXPECT_THAT(NameOf(parsed.modules[2]), t::Eq("def"));
+
+  // A string that can't be mapped leaves its module without a name.
+  g_env.fail_bootstrap_map_addr = AddrOf(mb1->rootfs_cmdline);
+  ASSERT_TRUE(parse());
+  ASSERT_THAT(parsed.module_count, t::Eq(3));
+  EXPECT_THAT(NameOf(parsed.modules[0]), t::Eq(""));
+
+  // A module list that can't be mapped, or that is larger than the largest
+  // Multiboot structure, or that reaches past `max_physical_addr`, is left
+  // out, but the rest of the boot information still counts.
+  g_env.fail_bootstrap_map_addr = AddrOf(mb1->mods);
+  ASSERT_TRUE(parse());
+  EXPECT_THAT(parsed.module_count, t::Eq(0));
+  g_env.fail_bootstrap_map_addr = 0;
+  mb1->info.mods_count = 0xFFFFFFFF;
+  ASSERT_TRUE(parse());
+  EXPECT_THAT(parsed.module_count, t::Eq(0));
+  mb1->info.mods_count = 4;
+  mb1->info.mods_addr = low_addr(mb1->last_cmdline);
+  ASSERT_TRUE(parse());
+  EXPECT_THAT(parsed.module_count, t::Eq(0));
+  EXPECT_THAT(parsed.region_count, t::Eq(2));
+
+  // Without the flag, the list is not read.
+  mb1->info.mods_addr = low_addr(mb1->mods);
+  mb1->info.flags = kMultiboot1FlagMemBasic;
+  ASSERT_TRUE(parse());
+  EXPECT_THAT(parsed.module_count, t::Eq(0));
 }
 
 }  // namespace

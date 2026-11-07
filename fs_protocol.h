@@ -89,7 +89,9 @@ static_assert(std::has_unique_object_representations_v<FsReadRequest>);
 static_assert(kSyscallFsMaxIoSize <= kIpcMaxMessageSize);
 
 // `kWrite`: followed immediately by `size` (`0 <= size <= kSyscallFsMaxIoSize`)
-// raw data bytes. Replies with 0 bytes and status `n` (`0 <= n <= size`).
+// raw data bytes. Replies with 0 bytes and status `n` (`0 <= n <= size`, and
+// `n > 0` if `size > 0`: a server that can write none of the bytes fails with
+// `kSyscallErrorFileTooBig` or `kSyscallErrorNoSpace` instead).
 struct FsWriteRequest {
   FsRpcOp op = FsRpcOp::kWrite;
   uint32_t reserved = 0;
@@ -104,7 +106,10 @@ static_assert(static_cast<int64_t>(sizeof(FsWriteRequest)) +
               kIpcMaxMessageSize);
 
 // `kSeek`: repositions `handle` by `(offset, whence)`. Replies with 0 bytes and
-// status equal to the resulting offset (`>= 0`).
+// status equal to the resulting offset (`>= 0`): `offset` for `kFsSeekSet`,
+// and at most `kFsMaxFileSize` for a regular file. A directory accepts only
+// `(0, kFsSeekSet)`, which returns 0, and `(0, kFsSeekCur)`, which returns an
+// opaque position (Seek() in syscall_abi.h).
 struct FsSeekRequest {
   FsRpcOp op = FsRpcOp::kSeek;
   int32_t whence = 0;

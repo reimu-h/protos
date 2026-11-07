@@ -26,9 +26,11 @@ struct Task;
 //
 // A user process runs a user program: an ELF executable (elf.h) in kernel
 // memory, such as the programs in user/ that the kernel image embeds
-// (user_programs.h). Each process is a kernel task that runs the program in
-// an address space of its own (address_space.h): its code and data at the
-// addresses the executable gives, and its stack below `kUserStackTop`.
+// (user_programs.h), or one that `SpawnFile()` reads from the filesystem into
+// the new process's address space before the process starts. Each process is
+// a kernel task that runs the program in an address space of its own
+// (address_space.h): its code and data at the addresses the executable gives,
+// and its stack below `kUserStackTop`.
 //
 // The task enters user mode (CPL 3) at the program's entry point with
 // interrupts enabled. From then on the CPU returns to the kernel on every
@@ -55,17 +57,23 @@ struct Task;
 // another one's values. The state is freed when the program ends, however it
 // ends.
 
-// The top of the user stack: the initial stack pointer of a program is 8 bytes
-// below it, where a call would have pushed a return address. The stack takes
-// `kUserStackPages` pages below it. The page above is unmapped, and so is the
-// page below the stack, which catches stack overflows.
+// The top of the user stack. The initial stack pointer of an embedded program
+// is 8 bytes below it, where a call would have pushed a return address; that
+// of a `SpawnFile()` child is below its argument strings and `argv` array,
+// which the top stack page holds. Either way it is 8 more than a multiple of
+// 16, as right after a call. The stack takes `kUserStackPages` pages below it.
+// The page above is unmapped, and so is the page below the stack, which
+// catches stack overflows.
 constexpr uintptr_t kUserStackTop = 0xFFFFFFFF7FFFF000ULL;
 constexpr int64_t kUserStackPages = 4;
 
 // Per-process user virtual address window for anonymous memory mappings
 // (`MemMap()`, `kSyscallMemMap`), placed above `kDriverMmioWindowBase` and
-// `kDriverDmaWindowBase` (driver.h) and below the ELF image and user stack.
-// Each mapping is followed by one unmapped 4 KiB guard page.
+// `kDriverDmaWindowBase` (driver.h) and below the user stack, and so below the
+// programs that user/user.ld links above the stack. Other executables may put
+// their segments anywhere outside these windows and the stack
+// (`UserSegmentRangeAllowed()`). Each mapping is followed by one unmapped
+// 4 KiB guard page.
 constexpr uintptr_t kUserAnonWindowBase = 0xFFFFB00000000000ULL;
 constexpr uintptr_t kUserAnonWindowSize = 1ULL << 30;  // 1 GiB
 static_assert(kDriverMmioWindowBase + kDriverMmioWindowSize <=
@@ -80,21 +88,21 @@ constexpr uintptr_t kUserStackRegionEnd =
 static_assert(kUserAnonWindowBase + kUserAnonWindowSize <=
               kUserStackRegionBase);
 
-// Returns true if a loadable ELF segment of `mem_size` bytes at page-aligned
-// `vaddr` lies in user space without overlapping the per-process MMIO, DMA,
-// anonymous `MemMap()`, or stack/guard-page regions.
+// Returns true if a loadable ELF segment of `mem_size` bytes at `vaddr` lies in
+// user space without its pages overlapping the per-process MMIO, DMA, anonymous
+// `MemMap()`, or stack/guard-page regions.
 constexpr bool UserSegmentRangeAllowed(const uintptr_t vaddr,
                                        const int64_t mem_size) {
   constexpr uintptr_t page_mask = static_cast<uintptr_t>(kPageSize) - 1;
-  if ((vaddr & page_mask) != 0 || mem_size <= 0 ||
-      !IsUserRange(vaddr, mem_size)) {
+  if (mem_size <= 0 || !IsUserRange(vaddr, mem_size)) {
     return false;
   }
+  const uintptr_t page_base = vaddr & ~page_mask;
   const uintptr_t end =
-      vaddr + ((static_cast<uintptr_t>(mem_size) + page_mask) & ~page_mask);
-  auto overlaps = [vaddr, end](const uintptr_t win_base,
-                               const uintptr_t win_end) {
-    return vaddr < win_end && end > win_base;
+      ((vaddr + static_cast<uintptr_t>(mem_size)) + page_mask) & ~page_mask;
+  auto overlaps = [page_base, end](const uintptr_t win_base,
+                                   const uintptr_t win_end) {
+    return page_base < win_end && end > win_base;
   };
   return !overlaps(kDriverMmioWindowBase,
                    kDriverMmioWindowBase + kDriverMmioWindowSize) &&
@@ -280,6 +288,24 @@ class UserProcess {
   UserProcess(const UserProgram& program,  //
               uint64_t arg,                //
               uint64_t capabilities);
+  UserProcess(std::unique_ptr<AddressSpace> preloaded_space,  //
+              uintptr_t preloaded_entry,                      //
+              uintptr_t initial_rsp,                          //
+              uint64_t arg,                                   //
+              uint64_t initial_rsi,                           //
+              uint64_t initial_rdx,                           //
+              uint64_t capabilities);
+
+  // Starts a process whose segments and stack are already mapped in `space`
+  // with entry point `entry` and initial stack/arguments.
+  static std::unique_ptr<UserProcess> StartPrepared(
+      std::unique_ptr<AddressSpace> space,  //
+      uintptr_t entry,                      //
+      uintptr_t initial_rsp,                //
+      uint64_t arg,                         //
+      uint64_t initial_rsi,                 //
+      uint64_t initial_rdx,                 //
+      uint64_t capabilities);
 
   static void TaskEntry(void* raw_process);
   // Loads the program and runs it until it ends, leaving the result in
@@ -307,8 +333,8 @@ class UserProcess {
   // `buffer`.
   bool MayRead(uintptr_t buffer, int64_t size) const;
   bool MayWrite(uintptr_t buffer, int64_t size) const;
-  // Serve write(), spin(), read(), spawn(), wait(), driver, IPC and filesystem
-  // system calls (syscall_abi.h): return the result for rax.
+  // Serve write(), spin(), read(), spawn(), wait(), driver, IPC, boot module
+  // and filesystem system calls (syscall_abi.h): return the result for rax.
   // `meter` measures the system call from its start; spin() lasts until
   // `meter` has counted `ticks` timer interrupts that interrupted the task,
   // on whichever CPUs: other runnable tasks on its CPU make it last longer in
@@ -323,6 +349,11 @@ class UserProcess {
                 int64_t name_len,    //
                 uint64_t arg,        //
                 uint64_t child_caps);
+  int64_t SpawnFile(uintptr_t path_ptr,  //
+                    int64_t path_len,    //
+                    uintptr_t args_ptr,  //
+                    int64_t argc,        //
+                    uint64_t arg);
   int64_t WaitChild(int64_t pid, uintptr_t result_ptr);
   int64_t PciInfo(int64_t index, uintptr_t info_ptr) const;
   int64_t DmaAlloc(int64_t size, uintptr_t phys_out_ptr, uint64_t flags);
@@ -346,6 +377,12 @@ class UserProcess {
                          int64_t reply_cap,    //
                          uintptr_t reply_size_ptr);
   int64_t MemMap(int64_t size);
+  // The boot module system calls, BootModuleInfo() and BootModuleRead().
+  int64_t GetBootModuleInfo(int64_t index, uintptr_t info_ptr) const;
+  int64_t ReadBootModule(int64_t index,     //
+                         int64_t offset,    //
+                         uintptr_t buffer,  //
+                         int64_t size) const;
   // The filesystem system calls (syscall_abi.h) and their helpers.
   struct FsFdSlot;
   // Returns the slot of open file descriptor `fd`, or nullptr.
@@ -360,8 +397,9 @@ class UserProcess {
   // server's status. Fails with `kSyscallErrorNoDevice` if no process owns
   // `kIpcPortFs`, or with `kSyscallErrorStale` if another server than `server`
   // (`!= kIpcNoOwner`) owns it. Writes the reply's size, whether the server
-  // received the request, and the owner token of the server that got it to the
-  // `out_*` pointers that aren't null.
+  // received the request, and the owner token of the server that the request
+  // was sent to (`kIpcNoOwner` if it wasn't sent) to the `out_*` pointers that
+  // aren't null.
   int64_t CallFsServer(uintptr_t server,         //
                        const void* req_buf,      //
                        int64_t req_size,         //
@@ -378,6 +416,33 @@ class UserProcess {
                                void* reply_buf,     //
                                int64_t reply_cap,   //
                                int64_t* out_reply_size);
+  int64_t CloseFsHandle(uintptr_t server, uint64_t handle);
+  int64_t SeekFsHandle(uintptr_t server,  //
+                       uint64_t handle,   //
+                       int64_t offset,    //
+                       int64_t whence);
+  // Reads `size` (> 0) bytes from open file `handle` on `server` at its
+  // current offset into `dst`, returning 0 on success, 1 if the file ended
+  // early, or a negative `kSyscallError*` value.
+  int64_t ReadExactFsSequential(uintptr_t server,  //
+                                uint64_t handle,   //
+                                void* dst,         //
+                                int64_t size);
+  // Seeks `handle` on `server` to `offset` (`kFsSeekSet`) and reads `size`
+  // (> 0) bytes into `dst`, with the same return values as
+  // `ReadExactFsSequential()`.
+  int64_t ReadExactFsRange(uintptr_t server,  //
+                           uint64_t handle,   //
+                           int64_t offset,    //
+                           void* dst,         //
+                           int64_t size);
+  // Maps and fills the segments of `executable` from `handle` on `server` and
+  // maps the stack in a new address space, storing it in `*out_space`. Returns
+  // 0 on success or a negative `kSyscallError*` value.
+  int64_t LoadFromFs(uintptr_t server,                 //
+                     uint64_t handle,                  //
+                     const ElfExecutable& executable,  //
+                     std::unique_ptr<AddressSpace>* out_space);
   int64_t FsOpen(uintptr_t path_ptr, int64_t path_len, uint64_t flags);
   int64_t FsClose(int64_t fd);
   int64_t FsRead(int64_t fd, uintptr_t buf_ptr, int64_t size);
@@ -406,7 +471,12 @@ class UserProcess {
                         const UserProgramResult& result);
 
   const UserProgram program_;
+  std::unique_ptr<AddressSpace> preloaded_space_;
+  const uintptr_t preloaded_entry_ = 0;
+  const uintptr_t initial_rsp_ = kUserStackTop - 8;
   const uint64_t arg_;
+  const uint64_t initial_rsi_ = 0;
+  const uint64_t initial_rdx_ = 0;
   const uint64_t capabilities_;
   // The process's task. Start() stores it once CreateTask() has returned, but
   // the task may start running, on another CPU, before that: only the creator,
@@ -442,6 +512,9 @@ class UserProcess {
   // token of the server that issued it.
   struct FsFdSlot {
     bool open = false;
+    // Whether the server opened a directory (`FsNodeType::kDirectory`) rather
+    // than a regular file, which decides which Seek() replies are well-formed.
+    bool directory = false;
     uint64_t handle = 0;
     uintptr_t server = kIpcNoOwner;
   };

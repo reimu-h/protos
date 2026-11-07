@@ -7,6 +7,8 @@
 #include <cstdint>
 
 #include "syscall_abi.h"
+#include "user/ramfs/boot_module_source.h"
+#include "user/ramfs/tar.h"
 #include "user/syscall.h"
 #include "user/usbkbd/xhci_platform.h"
 #include "user/usbkbd/xhci_regs.h"
@@ -24,6 +26,8 @@ static_assert(protos::kSyscallSpinMaxTicks <=
 // register but rax and rsp, and returns the bits of these registers that the
 // call changed: 0 if it preserved them all.
 extern "C" uint64_t SyscallChangedRegisterBits();
+extern "C" const uint8_t g_fs_test_prog_start[];
+extern "C" const uint8_t g_fs_test_prog_end[];
 
 // What `FpuHoldRound()` does. The offsets of the fields are part of its code.
 struct FpuHoldParams {
@@ -1907,6 +1911,12 @@ static int64_t RunDriverDenied() {
   if (IpcListen(kIpcPortFs) != kSyscallErrorPermission) {
     return 16;
   }
+  if (GetBootModuleCount() != kSyscallErrorPermission) {
+    return 17;
+  }
+  if (ReadBootModule(0, 0, nullptr, 0) != kSyscallErrorPermission) {
+    return 18;
+  }
   if (Syscall(kSyscallCount, 0, 0, 0) != kSyscallErrorNoSys) {
     return 11;
   }
@@ -1940,6 +1950,10 @@ static int64_t RunDriverCapProbe(const uint64_t arg) {
         Syscall(kSyscallCount, 0, 0, 0) != kSyscallErrorNoSys) {
       return 6;
     }
+    // Allowed for a driver: returns the number of boot modules.
+    if (GetBootModuleCount() < 0) {
+      return 7;
+    }
     const int64_t child_pid =
         Spawn("usertest", usertest::Arg(Mode::kDriverDenied));
     if (child_pid < 1) {
@@ -1966,7 +1980,10 @@ static int64_t RunDriverCapProbe(const uint64_t arg) {
       IsaClaim(kIsaDeviceI8042) != kSyscallErrorPermission ||
       IsaPortIo(kSyscallPortIoRead8, 0x60, 0) != kSyscallErrorPermission ||
       IsaIrqAlloc(kIsaDeviceI8042) != kSyscallErrorPermission ||
-      IpcListen(kIpcPortFs) != kSyscallErrorPermission || GetTicks() < 0) {
+      IpcListen(kIpcPortFs) != kSyscallErrorPermission ||
+      GetBootModuleCount() != kSyscallErrorPermission ||
+      ReadBootModule(0, 0, nullptr, 0) != kSyscallErrorPermission ||
+      GetTicks() < 0) {
     return 10;
   }
   if (SpawnDriver(nullptr, 0, 0) != kSyscallErrorInvalid ||
@@ -3145,13 +3162,68 @@ static int64_t RunIpcServerLateReply(const int port) {
   return 0;
 }
 
+// `IpcTestSubmode::kMemMapLimits`.
+static int64_t RunMemMapLimits() {
+  constexpr int kChunks =
+      static_cast<int>(kSyscallMemMapMaxTotalSize / kSyscallMemMapMaxSize);
+  static_assert(kChunks * kSyscallMemMapMaxSize == kSyscallMemMapMaxTotalSize);
+  for (int i = 0; i < kChunks; ++i) {
+    const StatusOr<uintptr_t> mapped = MemMap(kSyscallMemMapMaxSize);
+    if (!mapped.ok() || (*mapped % kPageSize) != 0) {
+      return 1;
+    }
+    volatile uint8_t* const bytes =
+        reinterpret_cast<volatile uint8_t*>(*mapped);
+    if (bytes[0] != 0 || bytes[kSyscallMemMapMaxSize - 1] != 0) {
+      return 2;
+    }
+    bytes[0] = static_cast<uint8_t>(i + 1);
+    bytes[kSyscallMemMapMaxSize - 1] = static_cast<uint8_t>(0xFF - i);
+    if (bytes[0] != static_cast<uint8_t>(i + 1) ||
+        bytes[kSyscallMemMapMaxSize - 1] != static_cast<uint8_t>(0xFF - i)) {
+      return 3;
+    }
+  }
+  if (MemMap(kPageSize).status() != kSyscallErrorNoMemory) {
+    return 4;
+  }
+  return 0;
+}
+
+// `IpcTestSubmode::kMemMapPmmRollback`.
+static int64_t RunMemMapPmmRollback() {
+  // System call 1: map 1 page so the page table for this 2 MiB window exists.
+  const StatusOr<uintptr_t> first = MemMap(kPageSize);
+  if (!first.ok()) {
+    return 1;
+  }
+  // System call 2: wait until the boot self-test drains PMM to 2 free frames.
+  char byte = 0;
+  if (Read(&byte, 1) != 1) {
+    return 1;
+  }
+  // Needs 4 frames; only 2 are free, so all allocated frames must roll back.
+  if (MemMap(4 * kPageSize).status() != kSyscallErrorNoMemory) {
+    return 2;
+  }
+  // If both frames were freed back to the PMM, mapping 2 pages succeeds.
+  const StatusOr<uintptr_t> recovered = MemMap(2 * kPageSize);
+  if (!recovered.ok()) {
+    return 3;
+  }
+  return 0;
+}
+
 // Runs `Mode::kIpcChecks` as `arg` says.
 static int64_t RunIpcChecks(const uint64_t arg) {
   const IpcTestSubmode submode =
       static_cast<IpcTestSubmode>(usertest::DriverSubmode(arg));
   const int port = usertest::DriverDeviceIndex(arg);
   // The ports that the submode uses: none, `port`, or `port` and `port + 1`.
-  const int ports = (submode == IpcTestSubmode::kMemMapGuardFault) ? 0
+  const bool no_port = (submode == IpcTestSubmode::kMemMapGuardFault ||
+                        submode == IpcTestSubmode::kMemMapLimits ||
+                        submode == IpcTestSubmode::kMemMapPmmRollback);
+  const int ports = no_port                                        ? 0
                     : (submode == IpcTestSubmode::kServerHoldCall) ? 2
                                                                    : 1;
   if (ports > 0 && (port < kIpcFirstUserPort || port + ports > kIpcPortCount)) {
@@ -3174,6 +3246,10 @@ static int64_t RunIpcChecks(const uint64_t arg) {
       return RunIpcServerHoldCall(port);
     case IpcTestSubmode::kServerLateReply:
       return RunIpcServerLateReply(port);
+    case IpcTestSubmode::kMemMapLimits:
+      return RunMemMapLimits();
+    case IpcTestSubmode::kMemMapPmmRollback:
+      return RunMemMapPmmRollback();
   }
   return usertest::kBadSubmodeStatus;
 }
@@ -3681,12 +3757,979 @@ static int64_t RunFsMalformedServer() {
       return 5;
     }
   }
-  // System call 14 (`kMalformedServerReadSyscall`): wait until the boot
+  // System call 14: open a regular file on the initial server.
+  const int64_t file_fd = Open("/file", kFsOpenReadWrite);
+  if (file_fd != 1) {
+    return 6;
+  }
+  // System calls 15..16: malformed FileRead (status > size, reply_size !=
+  // status).
+  if (FileRead(file_fd, g_ipc_buf_a, 4) != kSyscallErrorIo ||
+      FileRead(file_fd, g_ipc_buf_a, 4) != kSyscallErrorIo) {
+    return 7;
+  }
+  // System calls 17..18: malformed FileWrite (status > size, 0 for size > 0).
+  if (FileWrite(file_fd, "abcd", 4) != kSyscallErrorIo ||
+      FileWrite(file_fd, "abcd", 4) != kSyscallErrorIo) {
+    return 8;
+  }
+  // System calls 19..21: malformed Seek (wrong kFsSeekSet offset, past
+  // kFsMaxFileSize, nonzero kFsSeekSet on directory).
+  if (Seek(file_fd, 4, kFsSeekSet) != kSyscallErrorIo) {
+    return 9;
+  }
+  if (Seek(file_fd, 0, kFsSeekEnd) != kSyscallErrorIo) {
+    return 10;
+  }
+  if (Seek(dir_fd, 0, kFsSeekSet) != kSyscallErrorIo) {
+    return 11;
+  }
+  // System calls 22..24: malformed positive status on MkDir, Unlink, Rename.
+  if (MkDir("/d") != kSyscallErrorIo) {
+    return 12;
+  }
+  if (Unlink("/u") != kSyscallErrorIo) {
+    return 13;
+  }
+  if (Rename("/a", "/b") != kSyscallErrorIo) {
+    return 14;
+  }
+  // System call 25 (`kMalformedServerReadSyscall`): wait until the boot
   // self-test replaces the server and types a byte, then exit with `dir_fd`
-  // still open.
+  // and `file_fd` still open.
   char byte = 0;
   if (Read(&byte, 1) != 1) {
+    return 15;
+  }
+  return 0;
+}
+
+// `FsTestSubmode::kInterleavedServers`.
+static int64_t RunFsInterleavedServers() {
+  // System calls 1..3: descriptors 0-2 on the initial server.
+  if (Open("/a", kFsOpenRead) != 0) {
+    return 1;
+  }
+  if (Open("/b", kFsOpenRead) != 1) {
+    return 2;
+  }
+  if (Open("/c", kFsOpenRead) != 2) {
+    return 3;
+  }
+  // System call 4 (`kInterleavedServersReadSyscall`): the boot self-test
+  // replaces the server, then types a byte.
+  char byte = 0;
+  if (Read(&byte, 1) != 1) {
+    return 4;
+  }
+  // Descriptors 0 and 2 belong to the server that is gone: Close() frees them
+  // without a request to the new one.
+  if (Close(0) != 0) {
+    return 5;
+  }
+  if (Close(2) != 0) {
     return 6;
+  }
+  // The new server's files get them back, so that the servers of descriptors
+  // 0-2 alternate: the new one, the one that is gone, the new one.
+  if (Open("/d", kFsOpenRead) != 0) {
+    return 7;
+  }
+  if (Open("/e", kFsOpenRead) != 2) {
+    return 8;
+  }
+  return 0;
+}
+
+// Returns the `SyscallSpinChecksum()` of boot module `index`, read with
+// BootModuleRead() calls of `chunk` bytes into `g_ipc_buf_a`, or -1 if a call
+// fails or returns more than `chunk` bytes, or if the module doesn't hold
+// `size` bytes.
+static int64_t ChecksumBootModule(const int64_t index,  //
+                                  const int64_t size,   //
+                                  const int64_t chunk) {
+  int64_t checksum = kSyscallSpinChecksumInit;
+  int64_t offset = 0;
+  for (;;) {
+    const int64_t got = ReadBootModule(index, offset, g_ipc_buf_a, chunk);
+    if (got < 0 || got > chunk) {
+      return -1;
+    }
+    if (got == 0) {
+      break;
+    }
+    checksum = SyscallSpinChecksum(g_ipc_buf_a, got, checksum);
+    offset += got;
+  }
+  return offset == size ? checksum : -1;
+}
+
+// Compares regular file `fd`, at offset 0, with the data of archive member
+// `entry`, which `reader` read. Returns 0 if they are the same, 12 if a read
+// fails, or 13 if they differ or the file is longer.
+static int64_t CompareFileWithArchive(const int64_t fd,     //
+                                      tar::Reader& reader,  //
+                                      const tar::Entry& entry) {
+  for (int64_t pos = 0; pos < entry.size;) {
+    const int64_t left = entry.size - pos;
+    const int64_t chunk =
+        (left < kSyscallFsMaxIoSize) ? left : kSyscallFsMaxIoSize;
+    if (reader.ReadData(entry, pos, g_ipc_buf_a, chunk) != chunk ||
+        FileRead(fd, g_ipc_buf_b, chunk) != chunk) {
+      return 12;
+    }
+    if (!BytesEqual(g_ipc_buf_a, g_ipc_buf_b, chunk)) {
+      return 13;
+    }
+    pos += chunk;
+  }
+  return FileRead(fd, g_ipc_buf_b, 1) == 0 ? 0 : 13;
+}
+
+// `FsTestSubmode::kVerifyRootfs`.
+static int64_t RunFsVerifyRootfs() {
+  const int64_t index = FindBootModule(kRootfsBootModuleName);
+  if (index < 0) {
+    return 1;
+  }
+  const int64_t count = GetBootModuleCount();
+  const StatusOr<BootModuleInfo> info = GetBootModuleInfo(index);
+  if (count <= index || !info.ok() || info->size <= 0) {
+    return 2;
+  }
+  const int64_t size = info->size;
+
+  // BootModuleInfo() checks the index before the buffer.
+  const auto get_info = [](const int64_t i, const uintptr_t out_info) {
+    return Syscall(kSyscallBootModuleInfo, static_cast<uint64_t>(i), out_info);
+  };
+  BootModuleInfo scratch{};
+  const uintptr_t scratch_addr = reinterpret_cast<uintptr_t>(&scratch);
+  const uintptr_t read_only_addr =
+      reinterpret_cast<uintptr_t>(ReadOnlyAs<BootModuleInfo>());
+  if (get_info(count, scratch_addr) != kSyscallErrorInvalid ||
+      get_info(-1, scratch_addr) != kSyscallErrorInvalid ||
+      get_info(count, 0) != kSyscallErrorInvalid ||
+      get_info(index, usertest::kKernelAddress) != kSyscallErrorFault ||
+      get_info(index, read_only_addr) != kSyscallErrorFault) {
+    return 3;
+  }
+
+  // BootModuleRead() checks its arguments, then the whole buffer (even where
+  // the module has fewer bytes left), and reads nothing at or past the end.
+  void* const buffer = g_ipc_buf_b;
+  void* const kernel_buffer = reinterpret_cast<void*>(usertest::kKernelAddress);
+  void* const past_stack_top =
+      reinterpret_cast<void*>(usertest::kStackTop - 16);
+  if (ReadBootModule(count, 0, buffer, 1) != kSyscallErrorInvalid ||
+      ReadBootModule(-1, 0, buffer, 1) != kSyscallErrorInvalid ||
+      ReadBootModule(index, -1, buffer, 1) != kSyscallErrorInvalid ||
+      ReadBootModule(index, 0, buffer, -1) != kSyscallErrorInvalid ||
+      ReadBootModule(index, 0, buffer, kSyscallBootModuleReadMaxSize + 1) !=
+          kSyscallErrorInvalid ||
+      ReadBootModule(index, 0, nullptr, 1) != kSyscallErrorFault ||
+      ReadBootModule(index, 0, kernel_buffer, 1) != kSyscallErrorFault ||
+      ReadBootModule(index, 0, ReadOnlyAs<void>(), 1) != kSyscallErrorFault ||
+      ReadBootModule(index, size - 1, past_stack_top, 32) !=
+          kSyscallErrorFault ||
+      ReadBootModule(index, 0, nullptr, 0) != 0 ||
+      ReadBootModule(index, size, buffer, 16) != 0 ||
+      ReadBootModule(index, INT64_MAX, buffer, 16) != 0 ||
+      ReadBootModule(index, size - 1, buffer, 16) != 1) {
+    return 4;
+  }
+
+  // Reads of the largest size and of an odd one return the same bytes.
+  constexpr int64_t kOddChunkSize = 1000;
+  const int64_t checksum =
+      ChecksumBootModule(index, size, kSyscallBootModuleReadMaxSize);
+  if (checksum < 0 ||
+      ChecksumBootModule(index, size, kOddChunkSize) != checksum) {
+    return 5;
+  }
+
+  // The filesystem holds every directory and regular file of the archive.
+  BootModuleSource source(index);
+  tar::Reader reader(&source);
+  int64_t files = 0;
+  for (;;) {
+    tar::Entry entry;
+    const int64_t next = reader.Next(&entry);
+    if (next == 0) {
+      break;
+    }
+    if (next < 0) {
+      return 6;
+    }
+    if (entry.type == tar::EntryType::kSkipped) {
+      continue;
+    }
+    FsStat st{};
+    if (Stat(entry.path, entry.path_len, &st) != 0) {
+      return 7;
+    }
+    if (entry.type == tar::EntryType::kDirectory) {
+      if (st.type != FsNodeType::kDirectory) {
+        return 8;
+      }
+      continue;
+    }
+    if (st.type != FsNodeType::kRegular || st.size != entry.size) {
+      return 9;
+    }
+    const int64_t fd = Open(entry.path, entry.path_len, kFsOpenRead);
+    if (fd < 0) {
+      return 10;
+    }
+    const int64_t status = CompareFileWithArchive(fd, reader, entry);
+    if (Close(fd) != 0 && status == 0) {
+      return 11;
+    }
+    if (status != 0) {
+      return status;
+    }
+    ++files;
+  }
+  // The build's boot filesystem has files, including `/bin/hello`, which runs
+  // via `SpawnFile()`.
+  if (files <= 0) {
+    return 14;
+  }
+  {
+    const int64_t pid = SpawnFile("/bin/hello");
+    if (pid < 1) {
+      return 15;
+    }
+    const StatusOr<UserProgramResult> res = Wait(pid);
+    if (!res.ok() || res->outcome != UserProgramOutcome::kExited ||
+        res->exit_status != 0) {
+      return 16;
+    }
+  }
+  {
+    const char* const argv[] = {"hello", "world", "test"};
+    const int64_t pid = SpawnFile("/bin/hello", 3, argv);
+    if (pid < 1) {
+      return 15;
+    }
+    const StatusOr<UserProgramResult> res = Wait(pid);
+    if (!res.ok() || res->outcome != UserProgramOutcome::kExited ||
+        res->exit_status != 0) {
+      return 16;
+    }
+  }
+  return 0;
+}
+
+asm(R"(
+    .pushsection .rodata
+    .globl g_fs_test_prog_start
+    .globl g_fs_test_prog_end
+g_fs_test_prog_start:
+    // rdi holds `arg`, rsi holds `argc`, rdx holds `argv`, and rsp is 8 mod 16
+    // pointing at a zero return address:
+    //   0xDEAD: execute ud2 (#UD)
+    //   0xBEEF: spin in user mode until killed
+    //   otherwise: verify initial stack + `(argc, argv)`, code on page 1,
+    //   unaligned rodata, multi-page unaligned data + zeroed bss, user stack,
+    //   and kUserCapNone, then Exit(arg + 100 + argv_tag).
+    mov r12, rdi
+    mov r13, rsi
+    mov r14, rdx
+    mov r15, rsp
+    cmp r12, 0xDEAD
+    jne 1f
+    ud2
+1:
+    cmp r12, 0xBEEF
+    jne 3f
+2:
+    pause
+    jmp 2b
+3:
+    // Verify initial stack pointer alignment (8 mod 16) and zero return
+    // address, plus `argc >= 0`, `argv != nullptr`, and `argv[argc] == nullptr`.
+    mov rax, r15
+    and eax, 0xF
+    cmp eax, 8
+    jne 9f
+    cmp qword ptr [r15], 0
+    jne 9f
+    test r13, r13
+    js 9f
+    test r14, r14
+    jz 9f
+    cmp qword ptr [r14 + r13 * 8], 0
+    jne 9f
+
+    // Compute `ExpectedArgvTag(argc, argv)` in rbx (0 when `argc == 0`).
+    xor ebx, ebx
+    xor ecx, ecx
+4:
+    cmp rcx, r13
+    jge 6f
+    mov rsi, [r14 + rcx * 8]
+    test rsi, rsi
+    jz 9f
+    imul rbx, rbx, 131
+    lea rbx, [rbx + rcx + 1]
+5:
+    movzx eax, byte ptr [rsi]
+    test eax, eax
+    jz 55f
+    imul rbx, rbx, 31
+    add rbx, rax
+    inc rsi
+    jmp 5b
+55:
+    inc rcx
+    jmp 4b
+6:
+    and ebx, 0xFFFF
+
+    // Call the `ret` instruction placed at the start of `.text` page 1
+    // (0xFFFFFFFF80001000).
+    mov rax, 0xFFFFFFFF80001000
+    call rax
+    cmp eax, 0x5A
+    jne 9f
+
+    // Verify unaligned `.rodata` at 0xFFFFFFFF80002080 and zeroed leading
+    // sub-page bytes at 0xFFFFFFFF80002000.
+    mov rax, 0xFFFFFFFF80002000
+    cmp qword ptr [rax], 0
+    jne 9f
+    mov rcx, [rax + 0x80]
+    mov rdx, 0xCAFEBABE12345678
+    cmp rcx, rdx
+    jne 9f
+
+    // Verify unaligned `.data`+`.bss` starting at 0xFFFFFFFF800031A0:
+    //   - leading sub-page bytes [0x...3000, 0x...31A0) are mapped R+W and 0
+    //   - 42 at 0x...31A0 (page 0) and 0x1122334455667788 at 0x...41A0 (page 1)
+    //   - zeroed `.bss` tail at 0x...41A8 and pure `.bss` page 2 (0x...5000)
+    mov rax, 0xFFFFFFFF80003000
+    cmp qword ptr [rax], 0
+    jne 9f
+    cmp qword ptr [rax + 0x198], 0
+    jne 9f
+    mov qword ptr [rax], 11
+    cmp qword ptr [rax], 11
+    jne 9f
+    cmp qword ptr [rax + 0x1A0], 42
+    jne 9f
+    mov qword ptr [rax + 0x1A0], 99
+    cmp qword ptr [rax + 0x1A0], 99
+    jne 9f
+    mov rcx, [rax + 0x11A0]
+    mov rdx, 0x1122334455667788
+    cmp rcx, rdx
+    jne 9f
+    cmp qword ptr [rax + 0x11A8], 0
+    jne 9f
+    cmp qword ptr [rax + 0x2000], 0
+    jne 9f
+    cmp qword ptr [rax + 0x2FF8], 0
+    jne 9f
+    mov qword ptr [rax + 0x2FF8], 77
+
+    // Verify the user stack is writable.
+    push r12
+    pop rax
+    cmp rax, r12
+    jne 9f
+
+    // Verify `kUserCapNone`: driver-only PciInfo (8) and SpawnDriver (7) fail
+    // with EPERM (-1), even when the parent had driver capabilities.
+    mov eax, 8
+    xor edi, edi
+    xor esi, esi
+    int 0x80
+    cmp rax, -1
+    jne 9f
+    mov eax, 7
+    xor edi, edi
+    xor esi, esi
+    xor edx, edx
+    int 0x80
+    cmp rax, -1
+    jne 9f
+
+    // Exit(arg + 100 + argv_tag).
+    xor eax, eax
+    lea rdi, [r12 + rbx + 100]
+    int 0x80
+9:
+    xor eax, eax
+    mov edi, 999
+    int 0x80
+g_fs_test_prog_end:
+    .popsection
+)");
+
+struct TestElf64Header {
+  uint8_t ident[16] = {0x7F, 'E', 'L', 'F', 2, 1, 1};
+  uint16_t type = 2;      // ET_EXEC
+  uint16_t machine = 62;  // EM_X86_64
+  uint32_t version = 1;
+  uint64_t entry = 0xFFFFFFFF80000000ULL;
+  uint64_t phoff = 64;
+  uint64_t shoff = 0;
+  uint32_t flags = 0;
+  uint16_t ehsize = 64;
+  uint16_t phentsize = 56;
+  uint16_t phnum = 0;
+  uint16_t shentsize = 0;
+  uint16_t shnum = 0;
+  uint16_t shstrndx = 0;
+};
+static_assert(sizeof(TestElf64Header) == 64);
+
+struct TestElf64Phdr {
+  uint32_t type = 1;  // PT_LOAD
+  uint32_t flags = 0;
+  uint64_t offset = 0;
+  uint64_t vaddr = 0;
+  uint64_t paddr = 0;
+  uint64_t filesz = 0;
+  uint64_t memsz = 0;
+  uint64_t align = 0x1000;
+};
+static_assert(sizeof(TestElf64Phdr) == 56);
+
+static bool WriteZerosToFd(const int64_t fd, const int64_t total_bytes) {
+  for (int64_t i = 0; i < kSyscallFsMaxIoSize; ++i) {
+    g_ipc_buf_b[i] = 0;
+  }
+  for (int64_t left = total_bytes; left > 0;) {
+    const int64_t chunk =
+        (left < kSyscallFsMaxIoSize) ? left : kSyscallFsMaxIoSize;
+    if (FileWrite(fd, g_ipc_buf_b, chunk) != chunk) {
+      return false;
+    }
+    left -= chunk;
+  }
+  return true;
+}
+
+static int64_t ExpectedArgvTag(const int argc, const char* const* const argv) {
+  uint64_t acc = 0;
+  for (int i = 0; i < argc; ++i) {
+    acc = acc * 131 + static_cast<uint64_t>(i + 1);
+    for (int64_t j = 0; argv[i][j] != '\0'; ++j) {
+      acc = acc * 31 + static_cast<uint8_t>(argv[i][j]);
+    }
+  }
+  return static_cast<int64_t>(acc & 0xFFFF);
+}
+
+// Writes the multi-page 3-segment test executable to `path`:
+//   - `.text` at 0xFFFFFFFF80000000 (R+X, file offset 0x1000, size 0x1010):
+//     page 0 holds `g_fs_test_prog_start..end`; page 1 (+0x1000) holds
+//     `mov eax, 0x5A; ret`.
+//   - `.rodata` at non-page-aligned 0xFFFFFFFF80002080 (R, file offset 0x2080,
+//     size 8): 0xCAFEBABE12345678.
+//   - `.data`+`.bss` at non-page-aligned 0xFFFFFFFF800031A0 (R+W, file offset
+//     0x21A0, filesz 0x1008, memsz 0x2E60 -> [0x...3000, 0x...6000)): 42 at
+//     +0, 0x1122334455667788 at +0x1000, with non-zero file bytes right before
+//     offset 0x21A0 to verify leading sub-page bytes stay zeroed.
+static bool WriteValidTestElf(const char* const path) {
+  const int64_t fd = Open(path, kFsOpenWrite | kFsOpenCreate | kFsOpenTruncate);
+  if (fd < 0) {
+    return false;
+  }
+  const int64_t code_len = g_fs_test_prog_end - g_fs_test_prog_start;
+  if (code_len <= 0 || code_len > 0x1000) {
+    (void)Close(fd);
+    return false;
+  }
+  if (!WriteZerosToFd(fd, 0x31A8)) {
+    (void)Close(fd);
+    return false;
+  }
+  TestElf64Header ehdr{};
+  ehdr.phnum = 3;
+  const TestElf64Phdr phdrs[3] = {
+      {.type = 1,
+       .flags = 5,
+       .offset = 0x1000,
+       .vaddr = 0xFFFFFFFF80000000ULL,
+       .paddr = 0xFFFFFFFF80000000ULL,
+       .filesz = 0x1010,
+       .memsz = 0x1010},
+      {.type = 1,
+       .flags = 4,
+       .offset = 0x2080,
+       .vaddr = 0xFFFFFFFF80002080ULL,
+       .paddr = 0xFFFFFFFF80002080ULL,
+       .filesz = 8,
+       .memsz = 8},
+      {.type = 1,
+       .flags = 6,
+       .offset = 0x21A0,
+       .vaddr = 0xFFFFFFFF800031A0ULL,
+       .paddr = 0xFFFFFFFF800031A0ULL,
+       .filesz = 0x1008,
+       .memsz = 0x2E60},
+  };
+  // `mov eax, 0x5A; ret` at the start of `.text` page 1.
+  const uint8_t page1_fn[6] = {0xB8, 0x5A, 0x00, 0x00, 0x00, 0xC3};
+  const uint64_t rodata_val = 0xCAFEBABE12345678ULL;
+  const uint64_t guard_noise = 0xAAAAAAAAAAAAAAAAULL;
+  const uint64_t data0_val = 42;
+  const uint64_t data1_val = 0x1122334455667788ULL;
+  const bool ok = Seek(fd, 0, kFsSeekSet) == 0 &&
+                  FileWrite(fd, &ehdr, sizeof(ehdr)) ==
+                      static_cast<int64_t>(sizeof(ehdr)) &&
+                  FileWrite(fd, phdrs, sizeof(phdrs)) ==
+                      static_cast<int64_t>(sizeof(phdrs)) &&
+                  Seek(fd, 0x1000, kFsSeekSet) == 0x1000 &&
+                  FileWrite(fd, g_fs_test_prog_start, code_len) == code_len &&
+                  Seek(fd, 0x2000, kFsSeekSet) == 0x2000 &&
+                  FileWrite(fd, page1_fn, sizeof(page1_fn)) ==
+                      static_cast<int64_t>(sizeof(page1_fn)) &&
+                  Seek(fd, 0x2078, kFsSeekSet) == 0x2078 &&
+                  FileWrite(fd, &guard_noise, sizeof(guard_noise)) ==
+                      static_cast<int64_t>(sizeof(guard_noise)) &&
+                  FileWrite(fd, &rodata_val, sizeof(rodata_val)) ==
+                      static_cast<int64_t>(sizeof(rodata_val)) &&
+                  Seek(fd, 0x2198, kFsSeekSet) == 0x2198 &&
+                  FileWrite(fd, &guard_noise, sizeof(guard_noise)) ==
+                      static_cast<int64_t>(sizeof(guard_noise)) &&
+                  FileWrite(fd, &data0_val, sizeof(data0_val)) ==
+                      static_cast<int64_t>(sizeof(data0_val)) &&
+                  Seek(fd, 0x31A0, kFsSeekSet) == 0x31A0 &&
+                  FileWrite(fd, &data1_val, sizeof(data1_val)) ==
+                      static_cast<int64_t>(sizeof(data1_val));
+  return Close(fd) == 0 && ok;
+}
+
+// Writes a compact single-segment ELF with `ehdr` and `phdrs[0..phnum - 1]` of
+// `file_size` total bytes (`<= kSyscallFsMaxIoSize`) to `/bad_elf`.
+static bool WriteCustomElf(const TestElf64Header& ehdr,       //
+                           const TestElf64Phdr* const phdrs,  //
+                           const int phnum,                   //
+                           const int64_t file_size) {
+  for (int64_t i = 0; i < file_size; ++i) {
+    g_ipc_buf_a[i] = 0xC3;  // `ret`
+  }
+  TestElf64Header h = ehdr;
+  h.phnum = static_cast<uint16_t>(phnum);
+  __builtin_memcpy(g_ipc_buf_a, &h, sizeof(h));
+  __builtin_memcpy(g_ipc_buf_a + sizeof(h), phdrs,
+                   phnum * static_cast<int64_t>(sizeof(TestElf64Phdr)));
+  const int64_t fd =
+      Open("/bad_elf", kFsOpenWrite | kFsOpenCreate | kFsOpenTruncate);
+  if (fd < 0) {
+    return false;
+  }
+  const bool ok = FileWrite(fd, g_ipc_buf_a, file_size) == file_size;
+  return Close(fd) == 0 && ok;
+}
+
+// `FsTestSubmode::kSpawnFileNoServer`.
+static int64_t RunFsSpawnFileNoServer() {
+  if (SpawnFile("/bin/hello", 0) != kSyscallErrorNoDevice) {
+    return 1;
+  }
+  if (IpcListen(kIpcPortFs) != 0) {
+    return 2;
+  }
+  if (SpawnFile("/bin/hello", 0) != kSyscallErrorDeadlock) {
+    return 3;
+  }
+  return 0;
+}
+
+// `FsTestSubmode::kSpawnFileOrphanSpinner`.
+static int64_t RunFsSpawnFileOrphanSpinner() {
+  return SpawnFile("/prog", 0xBEEF) >= 1 ? 0 : 1;
+}
+
+// `FsTestSubmode::kOpenWaitOnly`.
+static int64_t RunFsOpenWaitOnly() {
+  (void)Open("/wait", kFsOpenRead);
+  return 1;
+}
+
+// `FsTestSubmode::kSpawnFileWaitOnly`.
+static int64_t RunFsSpawnFileWaitOnly() {
+  (void)SpawnFile("/prog", 0);
+  return 1;
+}
+
+// `FsTestSubmode::kCloseErrorOnly`.
+static int64_t RunFsCloseErrorOnly() {
+  const int64_t fd = Open("/c", kFsOpenRead);
+  if (fd != 0) {
+    return 1;
+  }
+  if (Close(fd) != kSyscallErrorIo) {
+    return 2;
+  }
+  return 0;
+}
+
+// `FsTestSubmode::kSpawnFileSuite`.
+static int64_t RunFsSpawnFileSuite() {
+  if (!WriteValidTestElf("/prog") || MkDir("/dir") != 0) {
+    return 1;
+  }
+
+  // 1. Path and pointer validation.
+  const char with_nul[3] = {'/', '\0', 'a'};
+  char long_path[kFsMaxPathLength + 2];
+  for (int64_t i = 0; i < kFsMaxPathLength + 1; ++i) {
+    long_path[i] = (i % 32 == 0) ? '/' : 'a';
+  }
+  char long_comp[kFsMaxNameLength + 3];
+  long_comp[0] = '/';
+  for (int64_t i = 1; i <= kFsMaxNameLength + 1; ++i) {
+    long_comp[i] = 'b';
+  }
+  if (SpawnFile(nullptr, 4, 0) != kSyscallErrorFault ||
+      SpawnFile(reinterpret_cast<const char*>(usertest::kKernelAddress), 4,
+                0) != kSyscallErrorFault ||
+      SpawnFile(reinterpret_cast<const char*>(kNonCanonicalAddress), 4, 0) !=
+          kSyscallErrorFault ||
+      SpawnFile(reinterpret_cast<const char*>(kUnmappedUserAddress), 4, 0) !=
+          kSyscallErrorFault ||
+      SpawnFile("/prog", -1, 0) != kSyscallErrorInvalid ||
+      SpawnFile(with_nul, 3, 0) != kSyscallErrorInvalid ||
+      SpawnFile("", 0, 0) != kSyscallErrorNoEntry ||
+      SpawnFile("/no_such_prog", 0) != kSyscallErrorNoEntry ||
+      SpawnFile("/prog/child", 0) != kSyscallErrorNotDir ||
+      SpawnFile(long_path, kFsMaxPathLength + 1, 0) !=
+          kSyscallErrorNameTooLong ||
+      SpawnFile(long_comp, kFsMaxNameLength + 2, 0) !=
+          kSyscallErrorNameTooLong ||
+      SpawnFile("/", 0) != kSyscallErrorIsDir ||
+      SpawnFile("/dir", 0) != kSyscallErrorIsDir) {
+    return 2;
+  }
+
+  // 2. Non-ELF and rejected ELF formats/segments -> `kSyscallErrorExecFormat`.
+  {
+    const int64_t empty_fd =
+        Open("/empty", kFsOpenWrite | kFsOpenCreate | kFsOpenTruncate);
+    const int64_t text_fd =
+        Open("/text", kFsOpenWrite | kFsOpenCreate | kFsOpenTruncate);
+    if (empty_fd < 0 || text_fd < 0 || Close(empty_fd) != 0 ||
+        FileWrite(text_fd, "not an elf\n", 11) != 11 || Close(text_fd) != 0) {
+      return 3;
+    }
+    if (SpawnFile("/empty", 0) != kSyscallErrorExecFormat ||
+        SpawnFile("/text", 0) != kSyscallErrorExecFormat) {
+      return 4;
+    }
+    (void)Unlink("/empty");
+    (void)Unlink("/text");
+  }
+
+  // Base valid single-segment header & phdr for negative format mutations.
+  const TestElf64Phdr valid_code_phdr{
+      .type = 1,
+      .flags = 5,
+      .offset = 0x200,
+      .vaddr = 0xFFFFFFFF80000000ULL,
+      .paddr = 0xFFFFFFFF80000000ULL,
+      .filesz = 0x100,
+      .memsz = 0x100,
+  };
+  // Shared object (ET_DYN).
+  {
+    TestElf64Header dyn_hdr{};
+    dyn_hdr.type = 3;
+    if (!WriteCustomElf(dyn_hdr, &valid_code_phdr, 1, 0x300) ||
+        SpawnFile("/bad_elf", 0) != kSyscallErrorExecFormat) {
+      return 5;
+    }
+  }
+  // Dynamic executable with PT_INTERP.
+  {
+    const TestElf64Phdr phdrs[2] = {
+        valid_code_phdr,
+        {.type = 3, .flags = 4, .offset = 0x200, .filesz = 8, .memsz = 8},
+    };
+    if (!WriteCustomElf(TestElf64Header{}, phdrs, 2, 0x300) ||
+        SpawnFile("/bad_elf", 0) != kSyscallErrorExecFormat) {
+      return 6;
+    }
+  }
+  // Writable + executable segment (PF_R | PF_W | PF_X = 7).
+  {
+    TestElf64Phdr wx = valid_code_phdr;
+    wx.flags = 7;
+    if (!WriteCustomElf(TestElf64Header{}, &wx, 1, 0x300) ||
+        SpawnFile("/bad_elf", 0) != kSyscallErrorExecFormat) {
+      return 7;
+    }
+  }
+  // Segment overlapping the reserved user stack, the anonymous MemMap window,
+  // and exceeding `kUserProgramMaxPages` (4096 pages).
+  const uint64_t bad_vaddrs[2] = {
+      usertest::kStackTop - 0x1000,
+      0xFFFFB00000000000ULL,
+  };
+  for (const uint64_t bad_vaddr : bad_vaddrs) {
+    TestElf64Phdr overlap = valid_code_phdr;
+    overlap.vaddr = bad_vaddr;
+    overlap.paddr = bad_vaddr;
+    TestElf64Header hdr{};
+    hdr.entry = bad_vaddr;
+    if (!WriteCustomElf(hdr, &overlap, 1, 0x300) ||
+        SpawnFile("/bad_elf", 0) != kSyscallErrorExecFormat) {
+      return 8;
+    }
+  }
+  {
+    TestElf64Phdr huge = valid_code_phdr;
+    huge.memsz = 4097ULL * 0x1000ULL;
+    if (!WriteCustomElf(TestElf64Header{}, &huge, 1, 0x300) ||
+        SpawnFile("/bad_elf", 0) != kSyscallErrorExecFormat) {
+      return 9;
+    }
+  }
+  // Segment whose `offset + filesz` runs past the end of the file, and two
+  // non-page-aligned segments that share a 4 KiB page.
+  {
+    TestElf64Phdr cut = valid_code_phdr;
+    cut.filesz = 0x200;
+    cut.memsz = 0x200;
+    const TestElf64Phdr same_page[2] = {
+        valid_code_phdr,
+        {.type = 1,
+         .flags = 4,
+         .offset = 0x200,
+         .vaddr = 0xFFFFFFFF80000800ULL,
+         .paddr = 0xFFFFFFFF80000800ULL,
+         .filesz = 8,
+         .memsz = 8},
+    };
+    if (!WriteCustomElf(TestElf64Header{}, &cut, 1, 0x300) ||
+        SpawnFile("/bad_elf", 0) != kSyscallErrorExecFormat ||
+        !WriteCustomElf(TestElf64Header{}, same_page, 2, 0x300) ||
+        SpawnFile("/bad_elf", 0) != kSyscallErrorExecFormat) {
+      return 10;
+    }
+  }
+  (void)Unlink("/bad_elf");
+
+  // 3. `args` / `argc` validation, valid execution, `(argc, argv)` passing
+  //    (odd, even, empty-string, and max-limits), and `#UD` fault handling.
+  {
+    const char ok_str[] = "ok";
+    const char nul_str[4] = {'a', 'b', '\0', 'c'};
+    char big_a[512];
+    char big_b[513];
+    for (int i = 0; i < 512; ++i) {
+      big_a[i] = 'a';
+    }
+    for (int i = 0; i < 513; ++i) {
+      big_b[i] = 'b';
+    }
+    const SyscallArgSlice ok_slice{
+        .ptr = reinterpret_cast<uintptr_t>(ok_str),
+        .len = 2,
+    };
+    const SyscallArgSlice neg_len_slice{
+        .ptr = reinterpret_cast<uintptr_t>(ok_str),
+        .len = -1,
+    };
+    const SyscallArgSlice null_ptr_slice{.ptr = 0, .len = 2};
+    const SyscallArgSlice kernel_ptr_slice{
+        .ptr = usertest::kKernelAddress,
+        .len = 2,
+    };
+    const SyscallArgSlice unmapped_ptr_slice{
+        .ptr = kUnmappedUserAddress,
+        .len = 2,
+    };
+    const SyscallArgSlice nul_byte_slice{
+        .ptr = reinterpret_cast<uintptr_t>(nul_str),
+        .len = 4,
+    };
+    const SyscallArgSlice too_long_slices[2] = {
+        {.ptr = reinterpret_cast<uintptr_t>(big_a), .len = 512},
+        {.ptr = reinterpret_cast<uintptr_t>(big_b), .len = 513},
+    };
+    if (SpawnFile("/prog", 5, &ok_slice, -1, 0) != kSyscallErrorInvalid ||
+        SpawnFile("/prog", 5, &ok_slice, kSyscallSpawnMaxArgs + 1, 0) !=
+            kSyscallErrorInvalid ||
+        SpawnFile("/prog", 5, nullptr, 1, 0) != kSyscallErrorFault ||
+        SpawnFile(
+            "/prog", 5,
+            reinterpret_cast<const SyscallArgSlice*>(usertest::kKernelAddress),
+            1, 0) != kSyscallErrorFault ||
+        SpawnFile(
+            "/prog", 5,
+            reinterpret_cast<const SyscallArgSlice*>(kUnmappedUserAddress), 1,
+            0) != kSyscallErrorFault ||
+        SpawnFile("/prog", 5, &neg_len_slice, 1, 0) != kSyscallErrorInvalid ||
+        SpawnFile("/prog", 5, &null_ptr_slice, 1, 0) != kSyscallErrorFault ||
+        SpawnFile("/prog", 5, &kernel_ptr_slice, 1, 0) != kSyscallErrorFault ||
+        SpawnFile("/prog", 5, &unmapped_ptr_slice, 1, 0) !=
+            kSyscallErrorFault ||
+        SpawnFile("/prog", 5, &nul_byte_slice, 1, 0) != kSyscallErrorInvalid ||
+        SpawnFile("/prog", 5, too_long_slices, 2, 0) != kSyscallErrorInvalid) {
+      return 28;
+    }
+  }
+  {
+    // When `argc == 0`, `args` is ignored even if it is not a user address.
+    const int64_t pid = SpawnFile(
+        "/prog", 5,
+        reinterpret_cast<const SyscallArgSlice*>(usertest::kKernelAddress), 0,
+        23);
+    if (pid < 1) {
+      return 11;
+    }
+    const StatusOr<UserProgramResult> res = Wait(pid);
+    if (!res.ok() || res->outcome != UserProgramOutcome::kExited ||
+        res->exit_status != 123) {
+      return 12;
+    }
+  }
+  {
+    // Odd `argc` (with an empty string), even `argc`, and
+    // `kSyscallSpawnMaxArgs` totaling exactly `kSyscallSpawnMaxArgBytes` bytes.
+    const char* const odd_argv[3] = {"/prog", "", "alpha"};
+    const int64_t odd_pid = SpawnFile("/prog", 3, odd_argv);
+    const StatusOr<UserProgramResult> odd_res =
+        (odd_pid >= 1) ? Wait(odd_pid) : StatusOr<UserProgramResult>(-1);
+    if (!odd_res.ok() || odd_res->outcome != UserProgramOutcome::kExited ||
+        odd_res->exit_status != 100 + ExpectedArgvTag(3, odd_argv)) {
+      return 29;
+    }
+
+    const char* const even_argv[4] = {"/prog", "one", "two", "three"};
+    const int64_t even_pid = SpawnFile("/prog", 4, even_argv);
+    const StatusOr<UserProgramResult> even_res =
+        (even_pid >= 1) ? Wait(even_pid) : StatusOr<UserProgramResult>(-1);
+    if (!even_res.ok() || even_res->outcome != UserProgramOutcome::kExited ||
+        even_res->exit_status != 100 + ExpectedArgvTag(4, even_argv)) {
+      return 29;
+    }
+
+    constexpr int kChunkLen = kSyscallSpawnMaxArgBytes / kSyscallSpawnMaxArgs;
+    static_assert(kChunkLen * kSyscallSpawnMaxArgs == kSyscallSpawnMaxArgBytes);
+    char max_storage[kSyscallSpawnMaxArgs][kChunkLen + 1];
+    const char* max_argv[kSyscallSpawnMaxArgs];
+    SyscallArgSlice max_slices[kSyscallSpawnMaxArgs];
+    for (int i = 0; i < kSyscallSpawnMaxArgs; ++i) {
+      for (int j = 0; j < kChunkLen; ++j) {
+        max_storage[i][j] = static_cast<char>('a' + ((i + j) % 26));
+      }
+      max_storage[i][kChunkLen] = '\0';
+      max_argv[i] = max_storage[i];
+      max_slices[i] = SyscallArgSlice{
+          .ptr = reinterpret_cast<uintptr_t>(max_storage[i]),
+          .len = kChunkLen,
+      };
+    }
+    const int64_t max_pid =
+        SpawnFile("/prog", 5, max_slices, kSyscallSpawnMaxArgs, 7);
+    const StatusOr<UserProgramResult> max_res =
+        (max_pid >= 1) ? Wait(max_pid) : StatusOr<UserProgramResult>(-1);
+    if (!max_res.ok() || max_res->outcome != UserProgramOutcome::kExited ||
+        max_res->exit_status !=
+            107 + ExpectedArgvTag(kSyscallSpawnMaxArgs, max_argv)) {
+      return 30;
+    }
+  }
+  {
+    const int64_t pid = SpawnFile("/prog", 0xDEAD);
+    if (pid < 1) {
+      return 13;
+    }
+    const StatusOr<UserProgramResult> res = Wait(pid);
+    if (!res.ok() || res->outcome != UserProgramOutcome::kFaulted ||
+        res->fault_vector != 6) {
+      return 14;
+    }
+  }
+
+  // 4. `SpawnFile()` does not consume any of the caller's `kMaxOpenFiles`
+  //    descriptors: it succeeds even when all 32 are open.
+  {
+    int fds[kMaxOpenFiles];
+    for (int i = 0; i < kMaxOpenFiles; ++i) {
+      fds[i] = static_cast<int>(Open("/prog", kFsOpenRead));
+      if (fds[i] < 0) {
+        return 15;
+      }
+    }
+    if (Open("/prog", kFsOpenRead) != kSyscallErrorTooManyFiles) {
+      return 16;
+    }
+    const int64_t pid = SpawnFile("/prog", 9);
+    for (int i = 0; i < kMaxOpenFiles; ++i) {
+      if (Close(fds[i]) != 0) {
+        return 17;
+      }
+    }
+    if (pid < 1) {
+      return 18;
+    }
+    const StatusOr<UserProgramResult> res = Wait(pid);
+    if (!res.ok() || res->outcome != UserProgramOutcome::kExited ||
+        res->exit_status != 109) {
+      return 19;
+    }
+  }
+
+  // 5. All `kMaxUserChildProcesses` slots full -> `kSyscallErrorBusy`.
+  {
+    int64_t pids[kMaxUserChildProcesses];
+    for (int i = 0; i < kMaxUserChildProcesses; ++i) {
+      pids[i] = SpawnFile("/prog", static_cast<uint64_t>(i));
+      if (pids[i] < 1) {
+        return 20;
+      }
+    }
+    if (SpawnFile("/prog", 99) != kSyscallErrorBusy) {
+      return 21;
+    }
+    for (int i = 0; i < kMaxUserChildProcesses; ++i) {
+      const StatusOr<UserProgramResult> res = Wait(pids[i]);
+      if (!res.ok() || res->outcome != UserProgramOutcome::kExited ||
+          res->exit_status != 100 + i) {
+        return 22;
+      }
+    }
+  }
+
+  // 6. Orphaned spinning `SpawnFile()` grandchild is killed and reaped when
+  //    its parent exits.
+  {
+    const int64_t helper_pid =
+        Spawn("usertest",
+              usertest::FsChecksArg(FsTestSubmode::kSpawnFileOrphanSpinner));
+    if (helper_pid < 1) {
+      return 23;
+    }
+    const StatusOr<UserProgramResult> res = Wait(helper_pid);
+    if (!res.ok() || res->outcome != UserProgramOutcome::kExited ||
+        res->exit_status != 0) {
+      return 24;
+    }
+  }
+
+  // 7. Renaming and unlinking after `SpawnFile()` returns leaves the already
+  //    loaded child process unaffected.
+  if (Rename("/prog", "/dir/moved_prog") != 0) {
+    return 25;
+  }
+  {
+    const int64_t pid = SpawnFile("/dir/moved_prog", 50);
+    if (pid < 1 || Unlink("/dir/moved_prog") != 0 || Unlink("/dir") != 0) {
+      return 26;
+    }
+    const StatusOr<UserProgramResult> res = Wait(pid);
+    if (!res.ok() || res->outcome != UserProgramOutcome::kExited ||
+        res->exit_status != 150) {
+      return 27;
+    }
   }
   return 0;
 }
@@ -3706,6 +4749,22 @@ static int64_t RunFsChecks(const uint64_t arg) {
       return RunFsFailedOpenOnly();
     case FsTestSubmode::kMalformedServer:
       return RunFsMalformedServer();
+    case FsTestSubmode::kVerifyRootfs:
+      return RunFsVerifyRootfs();
+    case FsTestSubmode::kInterleavedServers:
+      return RunFsInterleavedServers();
+    case FsTestSubmode::kSpawnFileSuite:
+      return RunFsSpawnFileSuite();
+    case FsTestSubmode::kSpawnFileNoServer:
+      return RunFsSpawnFileNoServer();
+    case FsTestSubmode::kSpawnFileOrphanSpinner:
+      return RunFsSpawnFileOrphanSpinner();
+    case FsTestSubmode::kOpenWaitOnly:
+      return RunFsOpenWaitOnly();
+    case FsTestSubmode::kSpawnFileWaitOnly:
+      return RunFsSpawnFileWaitOnly();
+    case FsTestSubmode::kCloseErrorOnly:
+      return RunFsCloseErrorOnly();
   }
   return usertest::kBadSubmodeStatus;
 }

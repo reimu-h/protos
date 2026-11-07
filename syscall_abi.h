@@ -155,7 +155,12 @@ enum class IpcMessageKind : uint32_t {
   // received one of its calls (on `kIpcPortFs`: while it may have had files
   // open), so that the server can drop what it keeps for the client. `token`,
   // `size` and `reply_cap` are 0, and the server doesn't reply. It comes before
-  // the calls that are queued when it is posted.
+  // the calls that are queued when it is posted. A process makes one call at a
+  // time, and if it ends in the middle of one, the kernel cancels the call
+  // before it posts the notification. So a call of `client_id` that the server
+  // has received and not answered yet when the notification comes was
+  // canceled: `IpcReply()` drops its reply, and a server that answers calls
+  // out of order should drop what it keeps for that call too.
   kClientDisconnect = 2,
 };
 
@@ -236,6 +241,50 @@ static_assert(offsetof(FsDirEntry, reserved) == 9);
 static_assert(offsetof(FsDirEntry, name_len) == 12);
 static_assert(offsetof(FsDirEntry, name) == 16);
 static_assert(std::has_unique_object_representations_v<FsDirEntry>);
+
+// The longest boot module name (`BootModuleInfo::name`), without the NUL
+// terminator.
+constexpr int64_t kBootModuleMaxNameLength = 63;
+
+// A boot module, a file that the boot loader loaded into memory next to the
+// kernel, as `BootModuleInfo()` writes it to user memory. Like
+// `UserProgramResult`, it has no implicit padding.
+struct BootModuleInfo {
+  // Size in bytes.
+  int64_t size = 0;
+  // The module's name: the last word (words are separated by spaces and tabs)
+  // of the command line that the boot loader passed with it, cut to
+  // `kBootModuleMaxNameLength` bytes and followed by NUL bytes through the end
+  // of the array. GRUB 2 passes only the arguments after the file name of a
+  // `module2` or `module` command, so `module2 /boot/rootfs.tar rootfs` names
+  // the module `rootfs`, and so does a loader that passes the file name first,
+  // as QEMU's `-initrd` and GRUB Legacy do (`/boot/rootfs.tar rootfs`).
+  char name[kBootModuleMaxNameLength + 1] = {};
+};
+static_assert(sizeof(BootModuleInfo) == 72);
+static_assert(alignof(BootModuleInfo) == 8);
+static_assert(offsetof(BootModuleInfo, size) == 0);
+static_assert(offsetof(BootModuleInfo, name) == 8);
+static_assert(std::has_unique_object_representations_v<BootModuleInfo>);
+
+// The name of the boot module that holds the boot filesystem: a POSIX ustar
+// archive whose directories and regular files `ramfs` creates when it starts
+// (`kDriverArgNormal`), so that the filesystem starts with them. The build
+// packs the repository's `rootfs/` directory into it.
+constexpr char kRootfsBootModuleName[] = "rootfs";
+
+// One non-NUL-terminated byte slice passed as an argument string to
+// `SpawnFile()`, which copies and NUL-terminates each argument onto the child's
+// initial stack (`argv[0 .. argc - 1]`, followed by `argv[argc] == nullptr`).
+struct SyscallArgSlice {
+  uint64_t ptr = 0;
+  int64_t len = 0;
+};
+static_assert(sizeof(SyscallArgSlice) == 16);
+static_assert(alignof(SyscallArgSlice) == 8);
+static_assert(offsetof(SyscallArgSlice, ptr) == 0);
+static_assert(offsetof(SyscallArgSlice, len) == 8);
+static_assert(std::has_unique_object_representations_v<SyscallArgSlice>);
 
 // Exit(status): ends the program with exit status `status` (rdi, int64_t).
 // Does not return.
@@ -387,16 +436,17 @@ constexpr int64_t kSyscallIpcRecv = 21;
 // `token` (rsi) that the caller received on port `port` (rdi): the client's
 // IpcCall() returns `status` (r8) with the `reply_size` (r10) bytes at
 // `reply_buf` (rdx) as its reply. `status` is either `>= 0` or a
-// `kSyscallError*` value with `reply_size == 0`. Returns 0, also if the client
-// was killed after the call was received (the reply is then dropped; the
-// kernel remembers the 64 most recent such calls of each port, and answering
-// an older one fails with `kSyscallErrorInvalid`). Fails with
-// `kSyscallErrorInvalid` unless `0 <= port < kIpcPortCount`, `token` names a
-// call received on `port` and not answered yet, `status` is valid and
-// `0 <= reply_size <=` the call's `IpcReceivedMessage::reply_cap` (the call
-// then stays unanswered), with `kSyscallErrorFault` if user code may not read
-// all of the reply, and with `kSyscallErrorAccess` if the caller doesn't own
-// `port`.
+// `kSyscallError*` value with `reply_size == 0`. Returns 0, also if the reply
+// is dropped because the client was killed after the call was received, which
+// is the case for every call that is still unanswered when the client's
+// `IpcMessageKind::kClientDisconnect` comes (the kernel remembers the 64 most
+// recent such calls of each port, and answering an older one fails with
+// `kSyscallErrorInvalid`). Fails with `kSyscallErrorInvalid` unless
+// `0 <= port < kIpcPortCount`, `token` names a call received on `port` and not
+// answered yet, `status` is valid and `0 <= reply_size <=` the call's
+// `IpcReceivedMessage::reply_cap` (the call then stays unanswered), with
+// `kSyscallErrorFault` if user code may not read all of the reply, and with
+// `kSyscallErrorAccess` if the caller doesn't own `port`.
 constexpr int64_t kSyscallIpcReply = 22;
 // IpcCall(port, req_buf, req_size, reply_buf, reply_cap, out_reply_size):
 // sends the `req_size` (rdx) bytes at `req_buf` (rsi) as a call to the owner
@@ -538,9 +588,46 @@ constexpr int64_t kSyscallUnlink = 33;
 // regular file's path ends with '/'; and with `kSyscallErrorNotEmpty` if the
 // directory to replace has entries.
 constexpr int64_t kSyscallRename = 34;
+// BootModuleInfo(index, out_info): returns the number of boot modules (files
+// that the boot loader loaded next to the kernel, such as the boot filesystem
+// `kRootfsBootModuleName`) when `index` (rdi) and `out_info` (rsi) are both 0;
+// otherwise writes the `BootModuleInfo` of module `index` to `out_info` and
+// returns the number of modules. Fails with `kSyscallErrorInvalid` unless
+// `0 <= index <` the number of modules, and otherwise with
+// `kSyscallErrorFault` if user code may not write all of `out_info`.
+// Driver-only.
+constexpr int64_t kSyscallBootModuleInfo = 35;
+// BootModuleRead(index, offset, buffer, size): copies up to `size` (r10) bytes
+// of boot module `index` (rdi), from byte `offset` (rsi) on, to `buffer`
+// (rdx), and returns their number (`0` at or past the end of the module).
+// Fails with `kSyscallErrorInvalid` unless `0 <= index <` the number of
+// modules, `offset >= 0` and `0 <= size <= kSyscallBootModuleReadMaxSize`, and
+// otherwise with `kSyscallErrorFault` if `size > 0` and user code may not
+// write all of the `size` bytes at `buffer`. Driver-only.
+constexpr int64_t kSyscallBootModuleRead = 36;
+// SpawnFile(path, path_len, args, argc, arg): reads the ELF executable at the
+// path of `path_len` (rsi) bytes at `path` (rdi) from the filesystem server,
+// copies the `argc` (r10) `SyscallArgSlice` strings at `args` (rdx) onto the
+// child's initial user stack as NUL-terminated `argv[0 .. argc - 1]` (with
+// `argv[argc] == nullptr`), starts the child in a new unprivileged
+// (`kUserCapNone`) user process with `arg` (r8) in rdi, `argc` in rsi and
+// `argv` in rdx, and returns the child's process ID
+// (`1 <= pid <= kMaxUserChildProcesses`), without taking one of the caller's
+// open file descriptors. Fails with the path and server errors of the
+// filesystem system calls (and `kSyscallErrorFileTableFull` if the server's
+// table of open files is full); with `kSyscallErrorInvalid` unless
+// `0 <= argc <= kSyscallSpawnMaxArgs`, each slice has `len >= 0` with no NUL
+// byte, and the sum of slice lengths is at most `kSyscallSpawnMaxArgBytes`;
+// with `kSyscallErrorFault` if user code may not read the slice array or each
+// slice's bytes; with `kSyscallErrorBusy` if all `kMaxUserChildProcesses`
+// child slots of the caller are in use; with `kSyscallErrorIsDir` if the path
+// names a directory; with `kSyscallErrorExecFormat` if the file is not a valid
+// user-space ELF executable (elf.h, user_mode.h) or ends before its segments
+// do; and with `kSyscallErrorNoMemory` if memory or tasks run out.
+constexpr int64_t kSyscallSpawnFile = 37;
 
 // Total number of defined system calls (`0 .. kSyscallCount - 1`).
-constexpr int64_t kSyscallCount = 35;
+constexpr int64_t kSyscallCount = 38;
 
 // The most bytes that one Write() writes.
 constexpr int64_t kSyscallWriteMaxSize = 4096;
@@ -550,9 +637,12 @@ constexpr int64_t kSyscallSpinMaxSize = 4096;
 constexpr int64_t kSyscallSpinMaxTicks = 1000000;
 // The most bytes that one Read() reads.
 constexpr int64_t kSyscallReadMaxSize = 4096;
-// The longest program name that Spawn() accepts, and the most unwaited child
+// The longest program name that Spawn() accepts, the most arguments and total
+// argument bytes that SpawnFile() accepts, and the most unwaited child
 // processes that one process may have at a time.
 constexpr int64_t kSyscallSpawnMaxNameLength = 64;
+constexpr int64_t kSyscallSpawnMaxArgs = 16;
+constexpr int64_t kSyscallSpawnMaxArgBytes = 1024;
 constexpr int64_t kMaxUserChildProcesses = 8;
 
 // Driver syscall limits, flags and modes.
@@ -597,6 +687,9 @@ constexpr int64_t kSyscallIpcTimeoutMaxTicks = 1000000;
 constexpr int64_t kSyscallMemMapMaxSize = 1LL << 20;
 constexpr int64_t kSyscallMemMapMaxTotalSize = 64LL << 20;
 
+// The most bytes that one BootModuleRead() copies.
+constexpr int64_t kSyscallBootModuleReadMaxSize = 4096;
+
 // Filesystem limits, `Open()` flags, and `Seek()` modes.
 constexpr int kMaxOpenFiles = 32;
 constexpr int64_t kSyscallFsMaxIoSize = 4096;
@@ -636,6 +729,7 @@ constexpr int64_t kFsSeekEnd = 2;  // SEEK_END: offset from end of file
 constexpr int64_t kSyscallErrorPermission = -1;      // EPERM: not allowed
 constexpr int64_t kSyscallErrorNoEntry = -2;         // ENOENT: no such entry
 constexpr int64_t kSyscallErrorIo = -5;              // EIO: I/O or RPC error
+constexpr int64_t kSyscallErrorExecFormat = -8;      // ENOEXEC: bad executable
 constexpr int64_t kSyscallErrorBadFd = -9;           // EBADF: bad descriptor
 constexpr int64_t kSyscallErrorNoMemory = -12;       // ENOMEM: out of memory
 constexpr int64_t kSyscallErrorAccess = -13;         // EACCES: access denied
@@ -667,12 +761,17 @@ constexpr uint64_t kUserCapSpawnDrivers = 1ULL << 1;
 //   before starting the shell.
 // - `kInitArgStartFs`: spawn `ramfs` via `SpawnDriver` before starting the
 //   shell even when hardware drivers are omitted (for isolated tests).
+// - `kInitArgEmptyFs`: start `ramfs` with `kRamfsArgEmpty`, so that the
+//   filesystem starts empty instead of with the boot filesystem (for tests).
 constexpr uint64_t kInitArgStartDrivers = 1ULL << 0;
 constexpr uint64_t kInitArgStartFs = 1ULL << 1;
+constexpr uint64_t kInitArgEmptyFs = 1ULL << 2;
 
 // Standard argument modes for driver processes (`Main(uint64_t arg)`).
 // - `kDriverArgNormal` (0): normal interrupt-driven daemon loop (exits with 0
-//   if no matching hardware devices are present).
+//   if no matching hardware devices are present). `ramfs` first creates the
+//   files of the boot filesystem (`kRootfsBootModuleName`), if the boot loader
+//   loaded it.
 // - `kDriverArgExitAfterReady` (1): claims all matching devices, completes
 //   two-phase hardware bring-up and one initial interrupt poll, then exits
 //   with status 0 (or non-zero if any discovered device failed).
@@ -683,10 +782,13 @@ constexpr uint64_t kInitArgStartFs = 1ULL << 1;
 //   firmware/SMM ownership handoff and halts any running controller without
 //   issuing a full hardware reset, then exits with status 0 so legacy-port
 //   drivers (such as `ps2kbd` on `0x60`/`0x64`) can safely probe afterwards.
+// - `kRamfsArgEmpty` (4, `ramfs` only): like `kDriverArgNormal`, but the
+//   filesystem starts empty, without the boot filesystem (for tests).
 constexpr uint64_t kDriverArgNormal = 0;
 constexpr uint64_t kDriverArgExitAfterReady = 1;
 constexpr uint64_t kDriverArgFaultAfterReady = 2;
 constexpr uint64_t kDriverArgHandoffOnly = 3;
+constexpr uint64_t kRamfsArgEmpty = 4;
 
 // Exit status of a driver program started without `kUserCapDriver`, that is by
 // `Spawn()` (as `sh`'s `run <program>` does) rather than by `SpawnDriver()`:
@@ -701,10 +803,12 @@ constexpr bool SyscallIsError(const int64_t result) {
   return result >= -4095 && result < 0;
 }
 
-// True if system call `number` requires `kUserCapDriver` (`8..15` or `17..19`).
+// True if system call `number` requires `kUserCapDriver` (`8..15`, `17..19`
+// or `35..36`).
 constexpr bool SyscallIsDriverOnly(const int64_t number) {
   return (number >= kSyscallPciInfo && number <= kSyscallConsolePush) ||
-         (number >= kSyscallIsaClaim && number <= kSyscallIsaIrqAlloc);
+         (number >= kSyscallIsaClaim && number <= kSyscallIsaIrqAlloc) ||
+         (number >= kSyscallBootModuleInfo && number <= kSyscallBootModuleRead);
 }
 
 // True if a process with `capabilities` is allowed to invoke system call

@@ -2,20 +2,22 @@
 // (kernel.cpp). It greets from user mode, starts the user-space hardware
 // drivers (`usbkbd` and `ps2kbd`) if `kInitArgStartDrivers` is set in `arg`,
 // and the `ramfs` filesystem server if `kInitArgStartDrivers` or
-// `kInitArgStartFs` is set, waiting until ramfs serves requests. It then
-// spawns the interactive shell (sh), waits for the shell to finish, and exits
-// with 0 if the shell exited with 0. Otherwise it exits with:
+// `kInitArgStartFs` is set (with `kRamfsArgEmpty` if `kInitArgEmptyFs` is set,
+// so that the filesystem starts empty instead of with the boot filesystem),
+// waiting until ramfs serves requests. It then spawns the interactive shell
+// (sh), waits for the shell to finish, and exits with 0 if the shell exited
+// with 0. Otherwise it exits with:
 //   1 if it does not run in ring 3;
 //   2 if it can't print;
 //   3 if it can't spawn sh;
 //   4 if waiting for sh fails;
-//   5 if sh faulted or was killed;
+//   5 if sh faulted, was killed, or failed to load;
 //   6 if sh exited with a status other than 0;
 //   7 if it can't spawn usbkbd (for the handoff or as the driver);
 //   8 if it can't spawn ps2kbd.
 // If ramfs can't be spawned or doesn't serve requests within
-// `kRamfsReadyTimeoutTicks`, init says so and starts the shell anyway (its
-// filesystem commands fail while no ramfs runs).
+// `kRamfsReadyTimeoutTicks`, init says so and why, and starts the shell anyway
+// (its filesystem commands fail while no ramfs runs).
 
 #include <cstdint>
 
@@ -25,9 +27,12 @@
 namespace protos::user {
 
 // How long init waits for ramfs to serve requests: far longer than ramfs
-// takes to start, and no longer than the boot self-tests wait for a process
-// to end (at least 2 s), so that they see what init does without ramfs.
+// takes to start, yet short enough that a boot whose ramfs doesn't come up
+// still reaches the shell soon.
 constexpr int64_t kRamfsReadyTimeoutTicks = 2 * kSyscallTicksPerSecond;
+
+// StartRamfs()'s result when ramfs doesn't serve requests in time.
+constexpr int64_t kRamfsTimedOut = 1;
 
 static int CurrentPrivilegeLevel() {
   uint16_t cs = 0;
@@ -35,27 +40,61 @@ static int CurrentPrivilegeLevel() {
   return cs & 3;
 }
 
-// Spawns ramfs and waits until it answers a Stat() of the root, for at most
-// kRamfsReadyTimeoutTicks. Returns false if ramfs can't be spawned or isn't
-// ready in time. A Stat() that ramfs has received but doesn't answer waits
-// for it (Stat() has no timeout).
-static bool StartRamfs() {
-  if (SpawnDriver("ramfs", kDriverArgNormal) < 0) {
-    return false;
+// Spawns ramfs in `mode` (`kDriverArgNormal` or `kRamfsArgEmpty`) and waits
+// until it answers a Stat() of the root, for at most kRamfsReadyTimeoutTicks.
+// Returns 0 once ramfs is ready, SpawnDriver()'s error if ramfs can't be
+// spawned, or `kRamfsTimedOut` if it isn't ready in time. A Stat() that ramfs
+// has received but doesn't answer waits for it (Stat() has no timeout), as
+// does one that comes while ramfs creates the files of the boot filesystem.
+static int64_t StartRamfs(const uint64_t mode) {
+  const int64_t pid = SpawnDriver("ramfs", mode);
+  if (pid < 0) {
+    return pid;
   }
   const int64_t deadline = GetTicks() + kRamfsReadyTimeoutTicks;
   FsStat root_stat{};
   // Stat() fails with kSyscallErrorNoDevice until ramfs claims its port.
   while (Stat("/", &root_stat) != 0) {
     if (GetTicks() >= deadline) {
-      return false;
+      return kRamfsTimedOut;
     }
     // A sleep of about a timer tick (4 ms), for want of a sleep system call:
     // a Spin() of no bytes for one tick busy-waits in the kernel, where the
     // scheduler may switch init out, until a timer interrupt interrupts it.
     (void)SpinOnBuffer(nullptr, 0, 1);
   }
-  return true;
+  return 0;
+}
+
+// Says why init continues without ramfs, for StartRamfs()'s result `rc`, in
+// one line: "[INIT] ramfs not ready (timed out); continuing without a
+// filesystem", or "(spawn error -1)" and so on for a SpawnDriver() error.
+static void ReportRamfsNotReady(const int64_t rc) {
+  constexpr int kLineCapacity = 96;
+  char line[kLineCapacity] = {};
+  int length = 0;
+  const auto append = [&line, &length](const char* const text) {
+    for (int i = 0; text[i] != '\0' && length < kLineCapacity - 1; ++i) {
+      line[length++] = text[i];
+    }
+  };
+  append("[INIT] ramfs not ready (");
+  if (rc == kRamfsTimedOut) {
+    append("timed out");
+  } else {
+    append("spawn error -");
+    // The digits of the error's magnitude, from the end of `digits`.
+    char digits[21] = {};
+    int pos = 20;
+    uint64_t magnitude = 0 - static_cast<uint64_t>(rc);
+    do {
+      digits[--pos] = static_cast<char>('0' + magnitude % 10);
+      magnitude /= 10;
+    } while (magnitude != 0);
+    append(&digits[pos]);
+  }
+  append("); continuing without a filesystem\n");
+  (void)Print(line);
 }
 
 int64_t Main(const uint64_t arg) {
@@ -90,11 +129,16 @@ int64_t Main(const uint64_t arg) {
   }
   // Like a keyboard, the filesystem is optional: without it, the shell still
   // runs its other commands.
-  if ((arg & (kInitArgStartDrivers | kInitArgStartFs)) != 0 && !StartRamfs()) {
-    (void)Print("[INIT] ramfs not ready; continuing without a filesystem\n");
+  const uint64_t ramfs_mode =
+      (arg & kInitArgEmptyFs) != 0 ? kRamfsArgEmpty : kDriverArgNormal;
+  if ((arg & (kInitArgStartDrivers | kInitArgStartFs)) != 0) {
+    const int64_t ramfs_rc = StartRamfs(ramfs_mode);
+    if (ramfs_rc != 0) {
+      ReportRamfsNotReady(ramfs_rc);
+    }
   }
-  const int64_t sh_pid =
-      Spawn("sh", arg & ~(kInitArgStartDrivers | kInitArgStartFs));
+  const int64_t sh_pid = Spawn(
+      "sh", arg & ~(kInitArgStartDrivers | kInitArgStartFs | kInitArgEmptyFs));
   if (sh_pid < 0) {
     return 3;
   }

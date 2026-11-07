@@ -35,6 +35,14 @@ static int64_t ShellSysSpawn(void* const /*ctx*/,     //
   return Spawn(name, name_len, arg);
 }
 
+static int64_t ShellSysSpawnFile(void* const /*ctx*/,                //
+                                 const char* const path,             //
+                                 const int64_t path_len,             //
+                                 const SyscallArgSlice* const args,  //
+                                 const int64_t argc) {
+  return SpawnFile(path, path_len, args, argc);
+}
+
 static StatusOr<UserProgramResult> ShellSysWait(void* const /*ctx*/,
                                                 const int64_t pid) {
   return Wait(pid);
@@ -109,6 +117,7 @@ int64_t Main(const uint64_t /*arg*/) {
       .write = ShellSysWrite,
       .get_cpu = ShellSysGetCpu,
       .spawn = ShellSysSpawn,
+      .spawn_file = ShellSysSpawnFile,
       .wait = ShellSysWait,
       .open = ShellSysOpen,
       .close = ShellSysClose,

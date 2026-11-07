@@ -21,6 +21,8 @@ namespace {
 
 static_assert(kIpcPortCount > 0 && kIpcPortCount <= 32);
 static_assert(kIpcDisconnectRingCapacity >= kTaskStackSlotCount);
+// The `IpcReply()` documentation in syscall_abi.h states this number.
+static_assert(kIpcCanceledTokenRingCapacity == 64);
 
 enum class TxState : uint8_t {
   kQueued = 0,
@@ -167,7 +169,10 @@ std::shared_ptr<IpcEnvironment> g_ipc_env;
 struct IpcPort {
   IrqSpinLock lock;
   uintptr_t owner = kIpcNoOwner;
-  uint64_t next_token = 1;
+  // 0, not 1: `AllocateTokenLocked()` skips 0, so the first token is 1 either
+  // way, and with every field zero, `g_ports` goes to `.bss` instead of taking
+  // up room in the kernel image's `.data`.
+  uint64_t next_token = 0;
   ServerWaiterList server_waiters;
   TxList queued_list;
   TxList in_service_list;
@@ -416,11 +421,13 @@ int64_t IpcCall(const int64_t port,                         //
     if (p.owner == kIpcNoOwner) {
       return kSyscallErrorNoDevice;
     }
-    if (caller_owner_token != kIpcNoOwner && p.owner == caller_owner_token) {
-      return kSyscallErrorDeadlock;
-    }
+    // Before the deadlock check: a call for an owner that has ended is stale
+    // also when the caller has claimed the port since.
     if (expected_owner != kIpcNoOwner && p.owner != expected_owner) {
       return kSyscallErrorStale;
+    }
+    if (caller_owner_token != kIpcNoOwner && p.owner == caller_owner_token) {
+      return kSyscallErrorDeadlock;
     }
     if (should_stop != nullptr && should_stop(stop_ctx)) {
       return kSyscallErrorInvalid;

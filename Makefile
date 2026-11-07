@@ -74,14 +74,17 @@ endif
 TEST_COMMON_CXXFLAGS := -std=c++20 -Wall -Wextra $(WERROR_FLAG) $(PROJECT_INCLUDE_FLAGS) -pthread -MMD -MP
 TEST_COMMON_LDFLAGS := -lgmock_main -lgmock -lgtest -pthread
 
-# User programs (user/): freestanding static executables for user space, which
-# the kernel image embeds (user_programs.S). user/user.ld links them in the top
-# 2 GiB of the address space, which the kernel code model addresses. Unlike the
-# kernel, they may use the x87/MMX/SSE registers, and the AVX registers in
-# inline assembly, which the kernel keeps for each process (user_mode.h), so
-# GCC may use SSE in them. GCC must not turn their loops into calls of the
-# memory functions that user/crt.cpp defines with such loops.
-USER_PROGRAMS := init sh usertest usbkbd ps2kbd ramfs
+# User programs (user/): freestanding static executables for user space, either
+# embedded in the kernel image (user_programs.S) or packed into /bin/ in the
+# boot filesystem ($(ROOTFS_TAR)). user/user.ld links them in the top 2 GiB of
+# the address space, which the kernel code model addresses. Unlike the kernel,
+# they may use the x87/MMX/SSE registers, and the AVX registers in inline
+# assembly, which the kernel keeps for each process (user_mode.h), so GCC may
+# use SSE in them. GCC must not turn their loops into calls of the memory
+# functions that user/crt.cpp defines with such loops.
+EMBEDDED_USER_PROGRAMS := init sh usertest usbkbd ps2kbd ramfs
+ROOTFS_PROGRAMS := hello
+USER_PROGRAMS := $(EMBEDDED_USER_PROGRAMS) $(ROOTFS_PROGRAMS)
 USER_CXXFLAGS := -m64 -masm=intel -std=c++20 -O2 -Wall -Wextra $(WERROR_FLAG) \
                  $(ARCH_CXXFLAGS) -ffreestanding -nostdlib -fno-builtin \
                  -fno-exceptions -fno-rtti -mno-red-zone \
@@ -90,7 +93,7 @@ USER_CXXFLAGS := -m64 -masm=intel -std=c++20 -O2 -Wall -Wextra $(WERROR_FLAG) \
                  -fno-tree-loop-distribute-patterns \
                  -U_GLIBCXX_ASSERTIONS -fcf-protection=none \
                  $(PROJECT_INCLUDE_FLAGS) -I$(BUILD_DIR)/include
-USER_LDFLAGS := -m elf_x86_64 -z max-page-size=0x1000 -z noexecstack \
+USER_LDFLAGS := -m elf_x86_64 -n -s -z max-page-size=0x1000 -z noexecstack \
                 -static -nostdlib -T user/user.ld
 USER_HDRS := status_or.h syscall_abi.h fs_protocol.h user/syscall.h \
              user/sh/sh_lib.h user/usertest/usertest.h \
@@ -98,8 +101,11 @@ USER_HDRS := status_or.h syscall_abi.h fs_protocol.h user/syscall.h \
              user/usbkbd/xhci_context.h user/usbkbd/xhci_controller.h \
              user/usbkbd/xhci_platform.h user/usbkbd/xhci_regs.h \
              user/usbkbd/xhci_ring.h user/ps2kbd/ps2_scancode.h \
-             user/ps2kbd/i8042.h user/ramfs/ramfs.h
-USER_ELFS := $(patsubst %,$(BUILD_DIR)/user/%.elf,$(USER_PROGRAMS))
+             user/ps2kbd/i8042.h user/ramfs/ramfs.h user/ramfs/tar.h \
+             user/ramfs/rootfs.h user/ramfs/boot_module_source.h
+EMBEDDED_USER_ELFS := $(patsubst %,$(BUILD_DIR)/user/%.elf,$(EMBEDDED_USER_PROGRAMS))
+ROOTFS_PROGRAM_ELFS := $(patsubst %,$(BUILD_DIR)/user/%.elf,$(ROOTFS_PROGRAMS))
+USER_ELFS := $(EMBEDDED_USER_ELFS) $(ROOTFS_PROGRAM_ELFS)
 
 TEST_BUILD_MODES := debug opt
 TEST_BUILD_FLAGS_debug := -O0 -g3 -fno-omit-frame-pointer -D_GLIBCXX_ASSERTIONS
@@ -316,6 +322,7 @@ NEED_GTEST := $(filter-out run-deflake_test,$(filter test $(UNIT_TEST_ONLY_GOALS
 NEED_PYTHON := $(filter test unit-test test-host run-deflake_test run-boot-test,$(GOALS))
 NEED_QEMU := $(filter test run run-boot-test,$(GOALS))
 NEED_KERNEL_TOOLS := $(filter-out clean docker-build docker-test $(UNIT_TEST_ONLY_GOALS),$(GOALS))
+HAVE_HOST_GNU_TAR := $(if $(NEED_KERNEL_TOOLS),$(shell tar --format=ustar --sort=name --owner=0 --group=0 --numeric-owner --mtime=@0 --mode=u=rwX,go=rX,ug-s --hard-dereference -cf /dev/null -T /dev/null >/dev/null 2>&1 && echo 1))
 
 ifneq ($(IN_DOCKER),)
 USE_DOCKER := 0
@@ -324,7 +331,8 @@ MISSING_HOST_DEPS := $(call missing_bins,$(if $(filter-out run-deflake_test,$(GO
     $(if $(NEED_PYTHON),python3) \
     $(if $(NEED_KERNEL_TOOLS),$(AS) $(LD) xorriso mformat) \
     $(if $(NEED_QEMU),qemu-system-x86_64)) \
-    $(if $(NEED_KERNEL_TOOLS),$(if $(HOST_GRUB_MKRESCUE),,grub-mkrescue) \
+    $(if $(NEED_KERNEL_TOOLS),$(if $(HAVE_HOST_GNU_TAR),,GNU-tar>=1.28) \
+        $(if $(HOST_GRUB_MKRESCUE),,grub-mkrescue) \
         $(if $(HAVE_HOST_GRUB_PC),,grub-pc-bin) \
         $(if $(HAVE_HOST_GRUB_EFI),,grub-efi-amd64-bin)) \
     $(if $(NEED_GTEST),$(if $(HAVE_HOST_GTEST),,gtest/gmock-headers))
@@ -473,28 +481,92 @@ $(BUILD_DIR)/user/$(1).elf: $(BUILD_DIR)/user/$(1)/$(1).o $(BUILD_DIR)/user/crt.
 endef
 $(foreach p,$(USER_PROGRAMS),$(eval $(call DEFINE_USER_PROGRAM,$(p))))
 
-$(BUILD_DIR)/user_programs.o: $(USER_ELFS)
+$(BUILD_DIR)/user_programs.o: $(EMBEDDED_USER_ELFS)
 
 $(BUILD_DIR)/kernel.bin: $(OBJS) linker.ld $(KERNEL_CONFIG_STAMP) $(DOCKER_DEPS) | $(BUILD_DIR)
 	$(DOCKER_RUN) $(LD) $(LDFLAGS) $(OBJS) -o $@
 
+# The boot filesystem: the directories and files of rootfs/ in a POSIX ustar
+# archive, which GRUB loads next to the kernel as the boot module named
+# $(ROOTFS_MODULE_NAME) (kRootfsBootModuleName in syscall_abi.h) and whose
+# contents ramfs creates when it starts. The tar options (GNU tar 1.28 or
+# newer) make the archive depend only on the names, contents and executable
+# bits of the files, and store a hard link as a copy of its file.
+# The recipe fails for what ramfs can't hold (anything but directories and
+# regular files, such as symbolic links; names of more than 63 bytes,
+# `kFsMaxNameLength`; and files larger than 32 MiB, `kFsMaxFileSize`), and for
+# names with white space, which `sh` splits words on.
+# Paths must also fit the ustar format, or tar fails: any path of up to 190
+# bytes below rootfs/ does, and a longer one, of up to 254 bytes, only if tar
+# can split `./<path>` (with a '/' after a directory's name) at a '/' into at
+# most 155 bytes before it and 100 after it. ramfs must have room for all of
+# them (README.md).
+ROOTFS_DIR := rootfs
+ROOTFS_TAR := $(BUILD_DIR)/rootfs.tar
+ROOTFS_MODULE_NAME := rootfs
+# Rebuild when anything under rootfs/ is newer than $(ROOTFS_TAR) (or when
+# $(ROOTFS_TAR) is missing) without passing rootfs/ file names to make, so
+# names with make syntax characters (':', ';', '|', '(', '\\', ...) build
+# cleanly. Edits update file mtimes; additions, deletions and renames update the
+# containing directory's mtime. Must be evaluated after ROOTFS_TAR is set.
+ROOTFS_CHANGED := $(if $(wildcard $(ROOTFS_TAR)),$(shell LC_ALL=C find $(ROOTFS_DIR) -newer $(ROOTFS_TAR) 2>/dev/null | head -n 1),1)
+# A find -name pattern that matches names of more than 63 bytes: 64 '?', each
+# one byte in the C locale, then '*'.
+ROOTFS_Q8 := ????????
+ROOTFS_LONG_NAME := $(ROOTFS_Q8)$(ROOTFS_Q8)$(ROOTFS_Q8)$(ROOTFS_Q8)$(ROOTFS_Q8)$(ROOTFS_Q8)$(ROOTFS_Q8)$(ROOTFS_Q8)*
+
+$(ROOTFS_TAR): $(if $(ROOTFS_CHANGED),FORCE) $(ROOTFS_PROGRAM_ELFS) Makefile $(DOCKER_DEPS) | $(BUILD_DIR)
+	@unfit="$$(LC_ALL=C find $(ROOTFS_DIR) \( ! -type d ! -type f \) \
+		-o -name '*[[:space:]]*' -o -name '$(ROOTFS_LONG_NAME)')"; \
+	if [ -n "$$unfit" ]; then \
+		echo "$(ROOTFS_DIR)/ may hold only directories and regular files," \
+			"with names of at most 63 bytes and no white space, unlike:" >&2; \
+		echo "$$unfit" >&2; \
+		exit 1; \
+	fi
+	@oversized="$$(LC_ALL=C find $(ROOTFS_DIR) -type f -size +33554432c)"; \
+	if [ -n "$$oversized" ]; then \
+		echo "$(ROOTFS_DIR)/ files may be at most 32 MiB (33554432 bytes)," \
+			"unlike:" >&2; \
+		echo "$$oversized" >&2; \
+		exit 1; \
+	fi
+	rm -rf $@.dir $@.tmp
+	cp -R $(ROOTFS_DIR) $@.dir
+	mkdir -p $@.dir/bin
+	@for p in $(ROOTFS_PROGRAMS); do \
+		if [ -e "$@.dir/bin/$$p" ]; then \
+			echo "$(ROOTFS_DIR)/bin/$$p collides with ROOTFS_PROGRAMS" >&2; \
+			rm -rf $@.dir; \
+			exit 1; \
+		fi; \
+		cp $(BUILD_DIR)/user/$$p.elf "$@.dir/bin/$$p"; \
+	done
+	$(DOCKER_RUN) tar --format=ustar --sort=name --owner=0 --group=0 \
+		--numeric-owner --mtime=@0 --mode=u=rwX,go=rX,ug-s \
+		--hard-dereference -C $@.dir -cf $@.tmp .
+	rm -rf $@.dir
+	mv $@.tmp $@
+
 # $(call MAKE_ISO,iso_path,multiboot_command)
 # Builds a GRUB rescue ISO (bootable via legacy BIOS and UEFI) that loads
-# kernel.bin with the given GRUB multiboot command (multiboot2 or multiboot).
+# kernel.bin with the given GRUB multiboot command (multiboot2 or multiboot),
+# and rootfs.tar as a module with the matching module command.
 define MAKE_ISO
 	$(if $(filter 0,$(USE_DOCKER)),$(if $(and $(HAVE_HOST_GRUB_PC),$(HAVE_HOST_GRUB_EFI)),,$(error Missing host GRUB platform modules (need both i386-pc and x86_64-efi, e.g. grub-pc-bin and grub-efi-amd64-bin))))
 	rm -rf $(1).dir
 	mkdir -p $(1).dir/boot/grub
 	cp $(BUILD_DIR)/kernel.bin $(1).dir/boot/kernel.bin
-	printf 'set timeout=0\nset default=0\n\nmenuentry "x86-64 Kernel" {\n    if [ "$${grub_platform}" = "efi" ]; then\n        insmod all_video\n    fi\n    $(2) /boot/kernel.bin\n    if [ "$${grub_platform}" = "pc" ]; then\n        set gfxpayload=text\n    fi\n    boot\n}\n' > $(1).dir/boot/grub/grub.cfg
+	cp $(ROOTFS_TAR) $(1).dir/boot/rootfs.tar
+	printf 'set timeout=0\nset default=0\n\nmenuentry "x86-64 Kernel" {\n    if [ "$${grub_platform}" = "efi" ]; then\n        insmod all_video\n    fi\n    $(2) /boot/kernel.bin\n    $(if $(filter multiboot2,$(2)),module2,module) /boot/rootfs.tar $(ROOTFS_MODULE_NAME)\n    if [ "$${grub_platform}" = "pc" ]; then\n        set gfxpayload=text\n    fi\n    boot\n}\n' > $(1).dir/boot/grub/grub.cfg
 	$(DOCKER_RUN) $(GRUB_MKRESCUE) -o $(1) $(1).dir
 	rm -rf $(1).dir
 endef
 
-$(KERNEL_ISO): $(BUILD_DIR)/kernel.bin Makefile $(DOCKER_DEPS) | $(BUILD_DIR)
+$(KERNEL_ISO): $(BUILD_DIR)/kernel.bin $(ROOTFS_TAR) Makefile $(DOCKER_DEPS) | $(BUILD_DIR)
 	$(call MAKE_ISO,$@,multiboot2)
 
-$(KERNEL_MB1_ISO): $(BUILD_DIR)/kernel.bin Makefile $(DOCKER_DEPS) | $(BUILD_DIR)
+$(KERNEL_MB1_ISO): $(BUILD_DIR)/kernel.bin $(ROOTFS_TAR) Makefile $(DOCKER_DEPS) | $(BUILD_DIR)
 	$(call MAKE_ISO,$@,multiboot)
 
 # Unit-test objects. Each source of a unit test is compiled on its own into

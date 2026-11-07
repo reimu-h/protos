@@ -289,11 +289,11 @@ TEST(ElfTest, RejectsSegmentsWithBadAddressesOrContents) {
   constexpr uint64_t kData = kText + 0x3000;
   EXPECT_THAT(with_data_segment(0x3000, kData, 0x10, 0x10),
               t::Eq(ElfError::kNone));
-  // Contents up to the end of the file.
+  // Contents up to the end of the file, and a non-page-aligned segment vaddr.
   EXPECT_THAT(with_data_segment(0x3000, kData, 0x1000, 0x1000),
               t::Eq(ElfError::kNone));
-  EXPECT_THAT(with_data_segment(0x3000, kData + 8, 0x10, 0x10),
-              t::Eq(ElfError::kBadSegment));
+  EXPECT_THAT(with_data_segment(0x3008, kData + 8, 0x10, 0x10),
+              t::Eq(ElfError::kNone));
   EXPECT_THAT(with_data_segment(0x3000, kData, 0x20, 0x10),
               t::Eq(ElfError::kBadSegment));
   EXPECT_THAT(with_data_segment(0x3000, kData, 0x1001, 0x2000),
@@ -348,11 +348,23 @@ TEST(ElfTest, RejectsSegmentsThatSharePages) {
   EXPECT_THAT(with_data_at(kText), t::Eq(ElfError::kOverlappingSegments));
   EXPECT_THAT(with_data_at(kText - 0x1000), t::Eq(ElfError::kNone));
 
-  // A segment that covers another one from below.
+  // A segment that covers another one from below, and two unaligned segments
+  // inside the same page vs on adjacent pages.
   std::vector<TestProgramHeader> segments = ValidSegments();
   segments[2] = Segment(kRead | kWrite, 0x3000, kText - 0x1000, 0x10, 0x10000);
   EXPECT_THAT(ParseError(BuildElf(ValidHeader(), segments)),
               t::Eq(ElfError::kOverlappingSegments));
+
+  segments = ValidSegments();
+  segments[1] = Segment(kRead, 0x2100, kText + 0x2100, 0x20, 0x20);
+  segments[2] = Segment(kRead | kWrite, 0x3800, kText + 0x2800, 0x20, 0x20);
+  EXPECT_THAT(ParseError(BuildElf(ValidHeader(), segments)),
+              t::Eq(ElfError::kOverlappingSegments));
+
+  segments[1] = Segment(kRead, 0x2FF0, kText + 0x2FF0, 0x10, 0x10);
+  segments[2] = Segment(kRead | kWrite, 0x3008, kText + 0x3008, 0x20, 0x20);
+  EXPECT_THAT(ParseError(BuildElf(ValidHeader(), segments)),
+              t::Eq(ElfError::kNone));
 }
 
 TEST(ElfTest, RejectsEntryPointsOutsideTheCode) {
@@ -381,6 +393,91 @@ TEST(ElfTest, ChecksItsArguments) {
                "Check failed: size >= 0");
   EXPECT_DEATH((void)ElfParseExecutable(nullptr, 64),
                "Check failed: data != nullptr");
+  EXPECT_DEATH((void)ElfParseExecutable(64, nullptr, nullptr),
+               "Check failed: read_fn != nullptr");
+}
+
+struct StreamContext {
+  std::vector<uint8_t> file;
+  int reads = 0;
+  int fail_call = -1;
+  int64_t fail_rc = 0;
+};
+
+static int64_t StreamRead(void* const raw_ctx,   //
+                          const int64_t offset,  //
+                          void* const buffer,    //
+                          const int64_t size) {
+  StreamContext* const ctx = static_cast<StreamContext*>(raw_ctx);
+  const int call = ctx->reads++;
+  if (call == ctx->fail_call) {
+    return ctx->fail_rc;
+  }
+  const int64_t file_size = static_cast<int64_t>(ctx->file.size());
+  EXPECT_GE(offset, 0);
+  EXPECT_GT(size, 0);
+  if (offset + size > file_size) {
+    return 1;
+  }
+  std::memcpy(buffer, ctx->file.data() + offset, size);
+  return 0;
+}
+
+TEST(ElfTest,
+     StreamingReaderParsesHeadersInOneReadOrInBatchesAndReportsErrors) {
+  // Normal layout (3 program headers at offset 64): one read of <= 512 bytes.
+  {
+    StreamContext ctx{.file = BuildElf(ValidHeader(), ValidSegments())};
+    int64_t read_error = -99;
+    const StatusOr<ElfExecutable, ElfError> exe = ElfParseExecutable(
+        static_cast<int64_t>(ctx.file.size()), StreamRead, &ctx, &read_error);
+    ASSERT_TRUE(exe.ok());
+    EXPECT_THAT(read_error, t::Eq(0));
+    EXPECT_THAT(ctx.reads, t::Eq(1));
+    EXPECT_THAT(exe->segment_count, t::Eq(3));
+  }
+
+  // Program headers placed past the first 512 bytes, with > 8 headers so
+  // multiple batches are fetched.
+  {
+    TestElfHeader header = ValidHeader();
+    header.program_header_offset = 0x400;
+    std::vector<TestProgramHeader> segments;
+    for (int i = 0; i < 10; ++i) {
+      TestProgramHeader note;
+      note.type = kNote;
+      segments.push_back(note);
+    }
+    const std::vector<TestProgramHeader> valid = ValidSegments();
+    segments.insert(segments.end(), valid.begin(), valid.end());
+    StreamContext ctx{.file = BuildElf(header, segments)};
+    int64_t read_error = -99;
+    const StatusOr<ElfExecutable, ElfError> exe = ElfParseExecutable(
+        static_cast<int64_t>(ctx.file.size()), StreamRead, &ctx, &read_error);
+    ASSERT_TRUE(exe.ok());
+    EXPECT_THAT(read_error, t::Eq(0));
+    EXPECT_THAT(ctx.reads, t::Eq(3));
+    EXPECT_THAT(exe->segment_count, t::Eq(3));
+
+    // Read error on the initial header read and on a later batch read.
+    for (const int fail_call : {0, 2}) {
+      ctx.reads = 0;
+      ctx.fail_call = fail_call;
+      ctx.fail_rc = -5;
+      const StatusOr<ElfExecutable, ElfError> failed = ElfParseExecutable(
+          static_cast<int64_t>(ctx.file.size()), StreamRead, &ctx, &read_error);
+      EXPECT_THAT(failed.status(), t::Eq(ElfError::kReadError));
+      EXPECT_THAT(read_error, t::Eq(-5));
+
+      // Early EOF (> 0) from `read_fn` is reported as `ElfError::kTruncated`.
+      ctx.reads = 0;
+      ctx.fail_rc = 1;
+      const StatusOr<ElfExecutable, ElfError> truncated = ElfParseExecutable(
+          static_cast<int64_t>(ctx.file.size()), StreamRead, &ctx, &read_error);
+      EXPECT_THAT(truncated.status(), t::Eq(ElfError::kTruncated));
+      EXPECT_THAT(read_error, t::Eq(0));
+    }
+  }
 }
 
 }  // namespace

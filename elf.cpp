@@ -69,6 +69,10 @@ static T ReadAt(const uint8_t* const data, const uint64_t offset) {
   return value;
 }
 
+static uint64_t SegmentPageStart(const ElfSegment& segment) {
+  return segment.vaddr & ~kPageMask;
+}
+
 // Returns the end of the last page that `segment` overlaps. It does not
 // overflow: user space ends at a page boundary.
 static uint64_t SegmentPageEnd(const ElfSegment& segment) {
@@ -77,15 +81,15 @@ static uint64_t SegmentPageEnd(const ElfSegment& segment) {
 }
 
 static bool SharePage(const ElfSegment& a, const ElfSegment& b) {
-  return a.vaddr < SegmentPageEnd(b) && b.vaddr < SegmentPageEnd(a);
+  return SegmentPageStart(a) < SegmentPageEnd(b) &&
+         SegmentPageStart(b) < SegmentPageEnd(a);
 }
 
 // Checks the loadable segment `header`, whose memory size is not 0, of a file
 // of `file_size` bytes.
 static StatusOr<ElfSegment, ElfError> ParseSegment(
     const Elf64ProgramHeader& header, const uint64_t file_size) {
-  if ((header.vaddr & kPageMask) != 0 || header.file_size > header.mem_size ||
-      header.offset > file_size ||
+  if (header.file_size > header.mem_size || header.offset > file_size ||
       header.file_size > file_size - header.offset) {
     return ElfError::kBadSegment;
   }
@@ -109,17 +113,57 @@ static StatusOr<ElfSegment, ElfError> ParseSegment(
   return out;
 }
 
+static int64_t ReadMemory(void* const ctx,       //
+                          const int64_t offset,  //
+                          void* const buffer,    //
+                          const int64_t size) {
+  __builtin_memcpy(buffer, static_cast<const uint8_t*>(ctx) + offset, size);
+  return 0;
+}
+
 }  // namespace
 
 StatusOr<ElfExecutable, ElfError> ElfParseExecutable(const uint8_t* const data,
                                                      const int64_t size) {
   DCHECK(size >= 0);
   DCHECK(data != nullptr || size == 0);
+  return ElfParseExecutable(size, ReadMemory, const_cast<uint8_t*>(data));
+}
+
+StatusOr<ElfExecutable, ElfError> ElfParseExecutable(
+    const int64_t size,       //
+    const ElfReadFn read_fn,  //
+    void* const ctx,          //
+    int64_t* const out_read_error) {
+  DCHECK(size >= 0);
+  DCHECK(read_fn != nullptr);
+  if (out_read_error != nullptr) {
+    *out_read_error = 0;
+  }
   const uint64_t file_size = static_cast<uint64_t>(size);
   if (file_size < sizeof(Elf64Header)) {
     return ElfError::kTruncated;
   }
-  const Elf64Header header = ReadAt<Elf64Header>(data, 0);
+
+  // Holds the ELF header and up to 8 program headers right after it, so that a
+  // normal executable is parsed with one read.
+  constexpr int64_t kProgramHeaderBatch = 8;
+  constexpr int64_t kHeadSize =
+      sizeof(Elf64Header) + kProgramHeaderBatch * sizeof(Elf64ProgramHeader);
+  uint8_t head[kHeadSize];
+  const int64_t head_len = (size < kHeadSize) ? size : kHeadSize;
+  const int64_t head_rc = read_fn(ctx, 0, head, head_len);
+  if (head_rc < 0) {
+    if (out_read_error != nullptr) {
+      *out_read_error = head_rc;
+    }
+    return ElfError::kReadError;
+  }
+  if (head_rc > 0) {
+    return ElfError::kTruncated;
+  }
+
+  const Elf64Header header = ReadAt<Elf64Header>(head, 0);
   for (int i = 0; i < 4; ++i) {
     if (header.ident[i] != kMagic[i]) {
       return ElfError::kNotElf64;
@@ -143,12 +187,48 @@ StatusOr<ElfExecutable, ElfError> ElfParseExecutable(const uint8_t* const data,
     return ElfError::kTruncated;
   }
 
+  const uint64_t ph_end = header.program_header_offset +
+                          static_cast<uint64_t>(header.program_header_count) *
+                              sizeof(Elf64ProgramHeader);
+  const bool ph_in_head = ph_end <= static_cast<uint64_t>(head_len);
+  uint8_t batch[kProgramHeaderBatch * sizeof(Elf64ProgramHeader)];
+  int batch_start = 0;
+  int batch_count = 0;
+
   ElfExecutable executable;
   executable.entry = header.entry;
   for (int i = 0; i < header.program_header_count; ++i) {
-    const Elf64ProgramHeader program_header = ReadAt<Elf64ProgramHeader>(
-        data, header.program_header_offset +
-                  static_cast<uint64_t>(i) * sizeof(Elf64ProgramHeader));
+    Elf64ProgramHeader program_header{};
+    if (ph_in_head) {
+      program_header = ReadAt<Elf64ProgramHeader>(
+          head, header.program_header_offset +
+                    static_cast<uint64_t>(i) * sizeof(Elf64ProgramHeader));
+    } else {
+      if (i >= batch_start + batch_count) {
+        batch_start = i;
+        const int remaining = header.program_header_count - i;
+        batch_count =
+            (remaining < kProgramHeaderBatch) ? remaining : kProgramHeaderBatch;
+        const int64_t batch_offset = static_cast<int64_t>(
+            header.program_header_offset +
+            static_cast<uint64_t>(batch_start) * sizeof(Elf64ProgramHeader));
+        const int64_t batch_bytes =
+            batch_count * static_cast<int64_t>(sizeof(Elf64ProgramHeader));
+        const int64_t batch_rc = read_fn(ctx, batch_offset, batch, batch_bytes);
+        if (batch_rc < 0) {
+          if (out_read_error != nullptr) {
+            *out_read_error = batch_rc;
+          }
+          return ElfError::kReadError;
+        }
+        if (batch_rc > 0) {
+          return ElfError::kTruncated;
+        }
+      }
+      program_header = ReadAt<Elf64ProgramHeader>(
+          batch,
+          static_cast<uint64_t>(i - batch_start) * sizeof(Elf64ProgramHeader));
+    }
     if (program_header.type == kSegmentDynamic ||
         program_header.type == kSegmentInterpreter) {
       return ElfError::kNotExecutable;

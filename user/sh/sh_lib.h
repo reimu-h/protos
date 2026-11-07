@@ -13,12 +13,17 @@
 
 namespace protos::sh {
 
-constexpr int kShellMaxLineLength = 128;
+// The longest line that the shell runs, in characters: room for any command
+// with two operands of `kFsMaxPathLength` bytes, such as `cp` and `mv`. The
+// shell refuses a longer line ("sh: line too long") rather than run part of it.
+constexpr int kShellMaxLineLength = 1024;
+static_assert(kShellMaxLineLength >= 8 + 2 * (kFsMaxPathLength + 1));
 constexpr int kShellMaxTokens = 16;
-// Room for the longest line that the shell writes: an error message about a
-// path of `kFsMaxPathLength` bytes that the shell built (`cp` and `mv` into a
-// directory).
-constexpr int kShellOutputBufferSize = 320;
+// Room for the longest line that the shell builds in one buffer: the words
+// of a line (echo, write and append), or an error message about one of them.
+// Commands with an unbounded number of entries, like `programs`, flush in
+// pieces.
+constexpr int kShellOutputBufferSize = kShellMaxLineLength + 64;
 constexpr const char* kShellPrompt = "sh> ";
 // The words of any line that the shell reads, with a newline, fit in a
 // `ShellOutBuffer` (echo, write and append).
@@ -47,11 +52,16 @@ enum class ShellCharAction : uint8_t {
 struct ShellLineEditor {
   char buffer[kShellMaxLineLength + 1] = {};
   int length = 0;
+  // Whether the line lost a printable character that didn't fit in `buffer`
+  // (which isn't echoed), so that the shell must not run it. Backspace doesn't
+  // bring the character back, so it doesn't clear this.
+  bool overflowed = false;
   bool last_was_cr = false;
 
   void ResetLine() {
     length = 0;
     buffer[0] = '\0';
+    overflowed = false;
   }
 
   ShellCharAction FeedChar(char* const io_ch) {
@@ -86,6 +96,7 @@ struct ShellLineEditor {
         *io_ch = normalized;
         return ShellCharAction::kEchoChar;
       }
+      overflowed = true;
     }
     return ShellCharAction::kNone;
   }
@@ -249,6 +260,11 @@ struct ShellOutBuffer {
   char data[kShellOutputBufferSize] = {};
   int length = 0;
 
+  void Clear() {
+    length = 0;
+    data[0] = '\0';
+  }
+
   void AppendChar(const char ch) {
     if (length < kShellOutputBufferSize - 1) {
       data[length++] = ch;
@@ -321,6 +337,8 @@ struct ShellEnv {
   int (*get_cpu)(void* ctx) = nullptr;
   int64_t (*spawn)(void* ctx, const char* name, int64_t name_len,
                    uint64_t arg) = nullptr;
+  int64_t (*spawn_file)(void* ctx, const char* path, int64_t path_len,
+                        const SyscallArgSlice* args, int64_t argc) = nullptr;
   StatusOr<UserProgramResult> (*wait)(void* ctx, int64_t pid) = nullptr;
   int64_t (*open)(void* ctx, const char* path, int64_t path_len,
                   uint64_t flags) = nullptr;
@@ -360,6 +378,8 @@ inline const char* FsErrorDescription(const int64_t rc) {
       return "no such file or directory";
     case kSyscallErrorIo:
       return "io error";
+    case kSyscallErrorExecFormat:
+      return "executable format error";
     case kSyscallErrorBadFd:
       return "bad file descriptor";
     case kSyscallErrorNoMemory:
@@ -425,6 +445,19 @@ inline void WriteFsError(const ShellEnv& env,         //
   WriteBuf(env, err);
 }
 
+// Writes "sh: <path>: <message>\n" for filesystem error `rc`.
+inline void WritePathError(const ShellEnv& env,     //
+                           const ShellToken& path,  //
+                           const int64_t rc) {
+  ShellOutBuffer err;
+  err.AppendStr("sh: ");
+  err.AppendBytes(path.ptr, path.length);
+  err.AppendStr(": ");
+  AppendFsErrorMessage(err, rc);
+  err.AppendChar('\n');
+  WriteBuf(env, err);
+}
+
 // Returns `count` limited to `[0, max]`. The shell clamps the counts that the
 // callbacks return to the bounds of its buffers because host tests plug fakes
 // into `ShellEnv`.
@@ -470,8 +503,9 @@ inline void ListDirectory(const ShellEnv& env, const ShellToken& path) {
 // that isn't a directory, then the entries of each one that is
 // (ListDirectory()). With several operands, as in POSIX ls, each directory's
 // entries follow a "<path>:" line, and a blank line separates the groups of
-// lines: the paths, and each directory. Errors, written in operand order with
-// the paths, belong to no group.
+// lines: the paths, and each directory. Errors of Stat() go in operand order
+// with the paths but make no group by themselves (no blank line follows
+// them), and errors in listing a directory go in its group.
 inline void RunLs(const ShellEnv& env, const ShellCommand& cmd) {
   const bool fs_available = env.stat != nullptr && env.open != nullptr &&
                             env.read_dir != nullptr && env.close != nullptr;
@@ -750,6 +784,11 @@ inline void CopyFile(const ShellEnv& env,    //
   (void)env.close(env.ctx, in);
 }
 
+// Returns whether path component `name` is `.` or `..`.
+inline bool IsDotOrDotDot(const ShellToken& name) {
+  return TokenEquals(name, ".") || TokenEquals(name, "..");
+}
+
 // `mv` of one file or directory: renames `src` to `dst` (Rename()), replacing
 // a file or empty directory there.
 inline void MoveFile(const ShellEnv& env,    //
@@ -761,12 +800,21 @@ inline void MoveFile(const ShellEnv& env,    //
     WriteFsError(env, "mv", src, src_rc);
     return;
   }
-  // `src` exists, so an error is about `dst` but for rare cases (`src` is the
-  // root, or a directory that would move into itself).
   const int64_t rc =
       env.rename(env.ctx, src.ptr, src.length, dst.ptr, dst.length);
   if (rc < 0) {
-    WriteFsError(env, "mv", dst, rc);
+    // `src` exists, so an error is about `dst`, except two that Rename()
+    // returns for either path. `kSyscallErrorBusy` means that `src` is the
+    // root: RunTransfer() moves a source into the root, not onto it.
+    // `kSyscallErrorInvalid` means that a last component is `.` or `..`, or
+    // that directory `src` would move into itself or a subdirectory: it is
+    // about `dst` only if the last component of `dst` is `.` or `..` and that
+    // of `src` isn't.
+    const bool about_src =
+        rc == kSyscallErrorBusy ||
+        (rc == kSyscallErrorInvalid && (IsDotOrDotDot(LastComponent(src)) ||
+                                        !IsDotOrDotDot(LastComponent(dst))));
+    WriteFsError(env, "mv", about_src ? src : dst, rc);
   }
 }
 
@@ -909,7 +957,7 @@ inline StatusOr<int64_t> ExecuteLine(const ShellEnv& env,     //
              "built-in commands: help echo cpu programs run exit\n"
              "built-in file commands: ls cat stat mkdir rm touch write append "
              "cp mv\n"
-             "user programs: init sh usertest\n");
+             "user programs: init sh usertest, or files in /bin or by path\n");
     return kStatusError;
   }
 
@@ -1028,6 +1076,45 @@ inline StatusOr<int64_t> ExecuteLine(const ShellEnv& env,     //
 
   if (TokenEquals(first, "programs")) {
     WriteStr(env, "programs: init sh usertest\n");
+    if (env.open != nullptr && env.read_dir != nullptr &&
+        env.close != nullptr) {
+      const int64_t fd =
+          env.open(env.ctx, "/bin", 4, kFsOpenRead | kFsOpenDirectory);
+      if (fd >= 0) {
+        ShellOutBuffer bin_line;
+        bin_line.AppendStr("/bin:");
+        bool any = false;
+        for (;;) {
+          FsDirEntry entries[kShellReadDirBatch]{};
+          const int64_t rc =
+              env.read_dir(env.ctx, fd, entries, kShellReadDirBatch);
+          if (rc <= 0) {
+            break;
+          }
+          const int count = ClampCount(rc, kShellReadDirBatch);
+          for (int i = 0; i < count; ++i) {
+            if (entries[i].type == FsNodeType::kRegular) {
+              const int name_len =
+                  ClampCount(entries[i].name_len, kFsMaxNameLength);
+              // Leave room for `' '` + `name_len` + the closing `'\n'`.
+              if (bin_line.length + 1 + name_len + 1 >=
+                  kShellOutputBufferSize) {
+                WriteBuf(env, bin_line);
+                bin_line.Clear();
+              }
+              bin_line.AppendChar(' ');
+              bin_line.AppendBytes(entries[i].name, name_len);
+              any = true;
+            }
+          }
+        }
+        (void)env.close(env.ctx, fd);
+        if (any) {
+          bin_line.AppendChar('\n');
+          WriteBuf(env, bin_line);
+        }
+      }
+    }
     return kStatusError;
   }
 
@@ -1045,102 +1132,293 @@ inline StatusOr<int64_t> ExecuteLine(const ShellEnv& env,     //
     return kStatusError;
   }
 
-  ShellToken prog_token;
-  uint64_t prog_arg = 0;
+  const auto has_slash = [](const ShellToken& token) {
+    for (int i = 0; i < token.length; ++i) {
+      if (token.ptr[i] == '/') {
+        return true;
+      }
+    }
+    return false;
+  };
+  const auto parse_optional_arg = [&](const int arg_index,
+                                      uint64_t* const out_arg) {
+    if (cmd.truncated || cmd.token_count > arg_index + 1) {
+      WriteStr(env, "sh: too many arguments\n");
+      return false;
+    }
+    if (cmd.token_count == arg_index + 1) {
+      const StatusOr<uint64_t> parsed = ParseProgramArg(cmd.tokens[arg_index]);
+      if (!parsed.ok()) {
+        ShellOutBuffer err;
+        err.AppendStr("sh: invalid argument: ");
+        err.AppendBytes(cmd.tokens[arg_index].ptr,
+                        cmd.tokens[arg_index].length);
+        err.AppendChar('\n');
+        WriteBuf(env, err);
+        return false;
+      }
+      *out_arg = *parsed;
+    } else {
+      *out_arg = 0;
+    }
+    return true;
+  };
+  const auto make_bin_path = [](const ShellToken& name,
+                                char (&buf)[5 + kFsMaxNameLength]) {
+    buf[0] = '/';
+    buf[1] = 'b';
+    buf[2] = 'i';
+    buf[3] = 'n';
+    buf[4] = '/';
+    for (int i = 0; i < name.length; ++i) {
+      buf[5 + i] = name.ptr[i];
+    }
+    return ShellToken{buf, 5 + name.length};
+  };
+  const auto make_arg_slices = [](const ShellToken* const tokens,
+                                  const int count,
+                                  SyscallArgSlice(&out)[kShellMaxTokens]) {
+    for (int i = 0; i < count; ++i) {
+      out[i] = SyscallArgSlice{
+          .ptr = reinterpret_cast<uintptr_t>(tokens[i].ptr),
+          .len = tokens[i].length,
+      };
+    }
+  };
+  const auto is_embedded_program = [](const ShellToken& token) {
+    return IsKnownUserProgram(token) || TokenEquals(token, "usbkbd") ||
+           TokenEquals(token, "ps2kbd") || TokenEquals(token, "ramfs");
+  };
+  const auto is_missing_bin_error = [](const int64_t rc) {
+    return rc == kSyscallErrorNoEntry || rc == kSyscallErrorNoDevice ||
+           rc == kSyscallErrorNotDir;
+  };
+  const auto wait_and_report = [&](const ShellToken& display_name,
+                                   const int64_t pid) {
+    const StatusOr<UserProgramResult> result = env.wait(env.ctx, pid);
+    if (!result.ok()) {
+      WriteStr(env, "sh: wait error\n");
+      return;
+    }
+    ShellOutBuffer report;
+    report.AppendStr("sh: ");
+    report.AppendBytes(display_name.ptr, display_name.length);
+    switch (result->outcome) {
+      case UserProgramOutcome::kExited:
+        report.AppendStr(" exited with status ");
+        report.AppendInt64Dec(result->exit_status);
+        break;
+      case UserProgramOutcome::kFaulted:
+        report.AppendStr(" faulted vector=");
+        report.AppendInt64Dec(result->fault_vector);
+        report.AppendStr(" error=");
+        report.AppendHex64(result->fault_error_code);
+        break;
+      case UserProgramOutcome::kKilled:
+        report.AppendStr(" killed");
+        break;
+      case UserProgramOutcome::kLoadFailed:
+        report.AppendStr(" load error");
+        break;
+    }
+    report.AppendChar('\n');
+    WriteBuf(env, report);
+  };
+
   if (TokenEquals(first, "run")) {
     if (cmd.token_count < 2) {
-      WriteStr(env, "sh: usage: run <program> [arg]\n");
+      WriteStr(env, "sh: usage: run <program> [arg ...]\n");
       return kStatusError;
     }
-    if (cmd.token_count > 3) {
-      WriteStr(env, "sh: too many arguments\n");
+    const ShellToken& prog_token = cmd.tokens[1];
+    if (has_slash(prog_token)) {
+      if (cmd.truncated) {
+        WriteStr(env, "sh: too many arguments\n");
+        return kStatusError;
+      }
+      if (env.spawn_file == nullptr) {
+        WriteFsError(env, "run", prog_token, kSyscallErrorNoDevice);
+        return kStatusError;
+      }
+      if (env.wait == nullptr) {
+        WriteStr(env, "sh: spawn unavailable\n");
+        return kStatusError;
+      }
+      SyscallArgSlice args[kShellMaxTokens]{};
+      const int argc = cmd.token_count - 1;
+      make_arg_slices(&cmd.tokens[1], argc, args);
+      const int64_t pid = env.spawn_file(env.ctx, prog_token.ptr,
+                                         prog_token.length, args, argc);
+      if (pid < 0) {
+        WriteFsError(env, "run", prog_token, pid);
+        return kStatusError;
+      }
+      wait_and_report(prog_token, pid);
       return kStatusError;
     }
-    prog_token = cmd.tokens[1];
-    if (cmd.token_count == 3) {
-      const StatusOr<uint64_t> parsed_arg = ParseProgramArg(cmd.tokens[2]);
-      if (!parsed_arg.ok()) {
+
+    if ((env.spawn == nullptr && env.spawn_file == nullptr) ||
+        env.wait == nullptr) {
+      WriteStr(env, "sh: spawn unavailable\n");
+      return kStatusError;
+    }
+    if (is_embedded_program(prog_token) || env.spawn_file == nullptr) {
+      uint64_t prog_arg = 0;
+      if (!parse_optional_arg(2, &prog_arg)) {
+        return kStatusError;
+      }
+      const int64_t pid =
+          (env.spawn != nullptr)
+              ? env.spawn(env.ctx, prog_token.ptr, prog_token.length, prog_arg)
+              : kSyscallErrorInvalid;
+      if (pid < 0) {
         ShellOutBuffer err;
-        err.AppendStr("sh: invalid argument: ");
-        err.AppendBytes(cmd.tokens[2].ptr, cmd.tokens[2].length);
+        err.AppendStr("sh: unknown program: ");
+        err.AppendBytes(prog_token.ptr, prog_token.length);
         err.AppendChar('\n');
         WriteBuf(env, err);
         return kStatusError;
       }
-      prog_arg = *parsed_arg;
+      wait_and_report(prog_token, pid);
+      return kStatusError;
     }
-  } else if (IsKnownUserProgram(first)) {
-    if (cmd.token_count > 2) {
+
+    int64_t pid = kSyscallErrorInvalid;
+    if (env.spawn != nullptr && !cmd.truncated && cmd.token_count <= 3) {
+      StatusOr<uint64_t> parsed = uint64_t{0};
+      if (cmd.token_count == 3) {
+        parsed = ParseProgramArg(cmd.tokens[2]);
+      }
+      if (parsed.ok()) {
+        pid = env.spawn(env.ctx, prog_token.ptr, prog_token.length, *parsed);
+      }
+    }
+    if (pid < 0 && prog_token.length <= kFsMaxNameLength) {
+      char bin_buf[5 + kFsMaxNameLength];
+      const ShellToken bin_token = make_bin_path(prog_token, bin_buf);
+      if (cmd.truncated) {
+        if (env.stat != nullptr) {
+          FsStat st{};
+          if (env.stat(env.ctx, bin_token.ptr, bin_token.length, &st) == 0) {
+            WriteStr(env, "sh: too many arguments\n");
+            return kStatusError;
+          }
+        }
+      } else {
+        SyscallArgSlice args[kShellMaxTokens]{};
+        const int argc = cmd.token_count - 1;
+        make_arg_slices(&cmd.tokens[1], argc, args);
+        pid = env.spawn_file(env.ctx, bin_token.ptr, bin_token.length, args,
+                             argc);
+        if (pid < 0 && !is_missing_bin_error(pid)) {
+          WriteFsError(env, "run", bin_token, pid);
+          return kStatusError;
+        }
+      }
+    }
+    if (pid < 0) {
+      ShellOutBuffer err;
+      err.AppendStr("sh: unknown program: ");
+      err.AppendBytes(prog_token.ptr, prog_token.length);
+      err.AppendChar('\n');
+      WriteBuf(env, err);
+      return kStatusError;
+    }
+    wait_and_report(prog_token, pid);
+    return kStatusError;
+  }
+
+  if (has_slash(first)) {
+    if (cmd.truncated) {
       WriteStr(env, "sh: too many arguments\n");
       return kStatusError;
     }
-    prog_token = first;
-    if (cmd.token_count == 2) {
-      const StatusOr<uint64_t> parsed_arg = ParseProgramArg(cmd.tokens[1]);
-      if (!parsed_arg.ok()) {
-        ShellOutBuffer err;
-        err.AppendStr("sh: invalid argument: ");
-        err.AppendBytes(cmd.tokens[1].ptr, cmd.tokens[1].length);
-        err.AppendChar('\n');
-        WriteBuf(env, err);
+    if (env.spawn_file == nullptr) {
+      WritePathError(env, first, kSyscallErrorNoDevice);
+      return kStatusError;
+    }
+    if (env.wait == nullptr) {
+      WriteStr(env, "sh: spawn unavailable\n");
+      return kStatusError;
+    }
+    SyscallArgSlice args[kShellMaxTokens]{};
+    make_arg_slices(&cmd.tokens[0], cmd.token_count, args);
+    const int64_t pid =
+        env.spawn_file(env.ctx, first.ptr, first.length, args, cmd.token_count);
+    if (pid < 0) {
+      WritePathError(env, first, pid);
+      return kStatusError;
+    }
+    wait_and_report(first, pid);
+    return kStatusError;
+  }
+
+  if (IsKnownUserProgram(first)) {
+    uint64_t prog_arg = 0;
+    if (!parse_optional_arg(1, &prog_arg)) {
+      return kStatusError;
+    }
+    if (env.spawn == nullptr || env.wait == nullptr) {
+      WriteStr(env, "sh: spawn unavailable\n");
+      return kStatusError;
+    }
+    const int64_t pid = env.spawn(env.ctx, first.ptr, first.length, prog_arg);
+    if (pid < 0) {
+      ShellOutBuffer err;
+      err.AppendStr("sh: unknown program: ");
+      err.AppendBytes(first.ptr, first.length);
+      err.AppendChar('\n');
+      WriteBuf(env, err);
+      return kStatusError;
+    }
+    wait_and_report(first, pid);
+    return kStatusError;
+  }
+
+  if (env.spawn_file != nullptr && env.wait != nullptr &&
+      first.length <= kFsMaxNameLength) {
+    char bin_buf[5 + kFsMaxNameLength];
+    const ShellToken bin_token = make_bin_path(first, bin_buf);
+    if (!cmd.truncated) {
+      SyscallArgSlice args[kShellMaxTokens]{};
+      make_arg_slices(&cmd.tokens[0], cmd.token_count, args);
+      const int64_t pid = env.spawn_file(
+          env.ctx, bin_token.ptr, bin_token.length, args, cmd.token_count);
+      if (pid > 0) {
+        wait_and_report(first, pid);
         return kStatusError;
       }
-      prog_arg = *parsed_arg;
+      if (!is_missing_bin_error(pid)) {
+        WritePathError(env, bin_token, pid);
+        return kStatusError;
+      }
+    } else if (env.stat != nullptr) {
+      FsStat st{};
+      if (env.stat(env.ctx, bin_token.ptr, bin_token.length, &st) == 0) {
+        WriteStr(env, "sh: too many arguments\n");
+        return kStatusError;
+      }
     }
-  } else {
-    ShellOutBuffer err;
-    err.AppendStr("sh: unknown command: ");
-    err.AppendBytes(first.ptr, first.length);
-    err.AppendChar('\n');
-    WriteBuf(env, err);
-    return kStatusError;
   }
 
-  if (env.spawn == nullptr || env.wait == nullptr) {
-    WriteStr(env, "sh: spawn unavailable\n");
-    return kStatusError;
-  }
-  const int64_t pid =
-      env.spawn(env.ctx, prog_token.ptr, prog_token.length, prog_arg);
-  if (pid < 0) {
-    ShellOutBuffer err;
-    err.AppendStr("sh: unknown program: ");
-    err.AppendBytes(prog_token.ptr, prog_token.length);
-    err.AppendChar('\n');
-    WriteBuf(env, err);
-    return kStatusError;
-  }
-
-  const StatusOr<UserProgramResult> result = env.wait(env.ctx, pid);
-  if (!result.ok()) {
-    WriteStr(env, "sh: wait error\n");
-    return kStatusError;
-  }
-
-  ShellOutBuffer report;
-  report.AppendStr("sh: ");
-  report.AppendBytes(prog_token.ptr, prog_token.length);
-  switch (result->outcome) {
-    case UserProgramOutcome::kExited:
-      report.AppendStr(" exited with status ");
-      report.AppendInt64Dec(result->exit_status);
-      break;
-    case UserProgramOutcome::kFaulted:
-      report.AppendStr(" faulted vector=");
-      report.AppendInt64Dec(result->fault_vector);
-      report.AppendStr(" error=");
-      report.AppendHex64(result->fault_error_code);
-      break;
-    case UserProgramOutcome::kKilled:
-      report.AppendStr(" killed");
-      break;
-    case UserProgramOutcome::kLoadFailed:
-      report.AppendStr(" load error");
-      break;
-  }
-  report.AppendChar('\n');
-  WriteBuf(env, report);
+  ShellOutBuffer err;
+  err.AppendStr("sh: unknown command: ");
+  err.AppendBytes(first.ptr, first.length);
+  err.AppendChar('\n');
+  WriteBuf(env, err);
   return kStatusError;
+}
+
+// Runs the line in `editor` (ExecuteLine()), unless it lost characters that
+// didn't fit (`ShellLineEditor::overflowed`), which the shell reports instead.
+// Returns the exit status if the shell should exit, else `kStatusError`.
+inline StatusOr<int64_t> SubmitLine(const ShellEnv& env,
+                                    const ShellLineEditor& editor) {
+  if (editor.overflowed) {
+    WriteStr(env, "sh: line too long\n");
+    return kStatusError;
+  }
+  return ExecuteLine(env, editor.buffer, editor.length);
 }
 
 // Runs the interactive Read-Eval-Print Loop until `exit` is executed or `read`
@@ -1153,10 +1431,9 @@ inline int64_t RunShell(const ShellEnv& env) {
     char ch = 0;
     const int64_t n = (env.read != nullptr) ? env.read(env.ctx, &ch, 1) : 0;
     if (n <= 0) {
-      if (editor.length > 0) {
+      if (editor.length > 0 || editor.overflowed) {
         WriteStr(env, "\n");
-        const StatusOr<int64_t> exit_status =
-            ExecuteLine(env, editor.buffer, editor.length);
+        const StatusOr<int64_t> exit_status = SubmitLine(env, editor);
         if (exit_status.ok()) {
           return *exit_status;
         }
@@ -1179,8 +1456,7 @@ inline int64_t RunShell(const ShellEnv& env) {
         break;
       case ShellCharAction::kSubmitLine: {
         WriteStr(env, "\n");
-        const StatusOr<int64_t> exit_status =
-            ExecuteLine(env, editor.buffer, editor.length);
+        const StatusOr<int64_t> exit_status = SubmitLine(env, editor);
         editor.ResetLine();
         if (exit_status.ok()) {
           return *exit_status;

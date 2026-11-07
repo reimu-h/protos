@@ -3,10 +3,13 @@
 #include <gmock/gmock.h>
 #include <gtest/gtest.h>
 
+#include <algorithm>
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
+#include <iterator>
 #include <limits>
+#include <map>
 #include <memory>
 #include <set>
 #include <string>
@@ -318,6 +321,51 @@ TEST_F(RamfsTest, OpenFlagsAndAccessModes) {
 
   ASSERT_EQ(UnlinkStr("/f"), 0);
   ASSERT_EQ(UnlinkStr("/d"), 0);
+  EXPECT_EQ(alloc_.live_blocks(), 0);
+}
+
+TEST_F(RamfsTest, TruncateLeavesOtherHandlesPastTheEndOfFile) {
+  // `writer` writes a block and 5 bytes, and `reader` reads the block.
+  uint64_t writer = 0;
+  uint64_t reader = 0;
+  ASSERT_EQ(OpenStr(1, "/f", kFsOpenReadWrite | kFsOpenCreate, &writer), 0);
+  ASSERT_EQ(OpenStr(1, "/f", kFsOpenRead, &reader), 0);
+  std::vector<char> buf(static_cast<size_t>(kBlockSize), 'o');
+  ASSERT_EQ(fs_->Write(1, writer, buf.data(), kBlockSize), kBlockSize);
+  ASSERT_EQ(fs_->Write(1, writer, "old!!", 5), 5);
+  ASSERT_EQ(fs_->Read(1, reader, buf.data(), kBlockSize), kBlockSize);
+  EXPECT_EQ(alloc_.live_blocks(), 3);  // The root's DirBlock and 2 of `/f`.
+
+  // Another client's Open() truncates the file and frees its blocks. Both
+  // handles keep their offsets, past the end of the file now.
+  uint64_t truncating = 0;
+  ASSERT_EQ(OpenStr(2, "/f", kFsOpenWrite | kFsOpenTruncate, &truncating), 0);
+  ASSERT_EQ(fs_->Close(2, truncating), 0);
+  FsStat st{};
+  ASSERT_EQ(StatStr("/f", &st), 0);
+  EXPECT_EQ(st.size, 0);
+  EXPECT_EQ(alloc_.live_blocks(), 1);
+  EXPECT_EQ(fs_->Seek(1, writer, 0, kFsSeekCur), kBlockSize + 5);
+  EXPECT_EQ(fs_->Seek(1, reader, 0, kFsSeekCur), kBlockSize);
+
+  // `reader` reads nothing and stays where it is.
+  EXPECT_EQ(fs_->Read(1, reader, buf.data(), kBlockSize), 0);
+  EXPECT_EQ(fs_->Seek(1, reader, 0, kFsSeekCur), kBlockSize);
+
+  // `writer` writes after a hole of zeros, whose first block takes no space.
+  ASSERT_EQ(fs_->Write(1, writer, "new", 3), 3);
+  ASSERT_EQ(StatStr("/f", &st), 0);
+  EXPECT_EQ(st.size, kBlockSize + 8);
+  EXPECT_EQ(alloc_.live_blocks(), 2);
+  ASSERT_EQ(fs_->Read(1, reader, buf.data(), kBlockSize), 8);
+  EXPECT_EQ(std::string(buf.data(), 8), std::string(5, '\0') + "new");
+  ASSERT_EQ(fs_->Seek(1, reader, 0, kFsSeekSet), 0);
+  ASSERT_EQ(fs_->Read(1, reader, buf.data(), kBlockSize), kBlockSize);
+  EXPECT_THAT(buf, t::Each('\0'));
+
+  ASSERT_EQ(fs_->Close(1, writer), 0);
+  ASSERT_EQ(fs_->Close(1, reader), 0);
+  ASSERT_EQ(UnlinkStr("/f"), 0);
   EXPECT_EQ(alloc_.live_blocks(), 0);
 }
 
@@ -738,6 +786,43 @@ TEST_F(RamfsTest, ReadDirAcrossChangesBetweenPages) {
   ASSERT_EQ(fs_->Close(1, dir_h), 0);
 }
 
+TEST_F(RamfsTest, ReadDirContinuesAfterTheDirectoryIsRenamed) {
+  ASSERT_EQ(MkDirStr("/d"), 0);
+  ASSERT_EQ(MkDirStr("/other"), 0);
+  ASSERT_EQ(MkDirStr("/other/empty"), 0);
+  std::vector<std::string> names;
+  for (int i = 0; i < 10; ++i) {
+    names.push_back("e" + std::to_string(i));
+    ASSERT_EQ(CreateFile("/d/" + names.back()), 0);
+  }
+  uint64_t dir_h = 0;
+  ASSERT_EQ(OpenStr(1, "/d", kFsOpenRead | kFsOpenDirectory, &dir_h), 0);
+
+  // Between pages, the directory moves within its parent, to another
+  // directory, and onto an empty directory, which it replaces. Each entry
+  // appears once, in order.
+  std::vector<std::string> seen = ReadDirNames(dir_h, 3);
+  for (const auto& [old_path, new_path] :
+       std::vector<std::pair<std::string, std::string>>{
+           {"/d", "/renamed"},
+           {"/renamed", "/other/moved"},
+           {"/other/moved", "/other/empty"},
+       }) {
+    ASSERT_EQ(RenameStr(old_path, new_path), 0);
+    const std::vector<std::string> page = ReadDirNames(dir_h, 3);
+    seen.insert(seen.end(), page.begin(), page.end());
+  }
+  EXPECT_EQ(seen, names);
+  EXPECT_EQ(ReadDirNames(dir_h, kSyscallFsMaxDirEntries),
+            std::vector<std::string>{});
+
+  // The handle follows the directory to its new path.
+  ASSERT_EQ(CreateFile("/other/empty/late"), 0);
+  EXPECT_EQ(ReadDirNames(dir_h, kSyscallFsMaxDirEntries),
+            std::vector<std::string>{"late"});
+  ASSERT_EQ(fs_->Close(1, dir_h), 0);
+}
+
 TEST_F(RamfsTest, UnlinkedOrReplacedOpenDirectoryReadsAsEmpty) {
   ASSERT_EQ(MkDirStr("/gone"), 0);
   uint64_t gone_h = 0;
@@ -910,6 +995,60 @@ TEST_F(RamfsTest, RenameCrossDirOverwriteAndCycleDetection) {
   EXPECT_EQ(fs_->ActiveFnodeCount(), 1);
 }
 
+TEST_F(RamfsTest, RenameThroughTheSourceIsNotAMoveIntoItself) {
+  ASSERT_EQ(MkDirStr("/a"), 0);
+  ASSERT_EQ(MkDirStr("/a/sub"), 0);
+  FsStat a_st{};
+  ASSERT_EQ(StatStr("/a", &a_st), 0);
+
+  // `/a/../b` passes through `/a` but names `/b`, outside of `/a`: the
+  // directory moves, and the root keeps one subdirectory.
+  ASSERT_EQ(RenameStr("/a", "/a/../b"), 0);
+  FsStat st{};
+  EXPECT_EQ(StatStr("/a", &st), kSyscallErrorNoEntry);
+  ASSERT_EQ(StatStr("/b", &st), 0);
+  EXPECT_EQ(st.fnode_id, a_st.fnode_id);
+  ASSERT_EQ(StatStr("/b/sub/..", &st), 0);
+  EXPECT_EQ(st.fnode_id, a_st.fnode_id);
+  ASSERT_EQ(StatStr("/", &st), 0);
+  EXPECT_EQ(st.nlink, 3);
+
+  // A new path may also pass through a subdirectory of the source, but one
+  // that leads back into the source is a move into itself.
+  ASSERT_EQ(RenameStr("/b", "/b/sub/../../c"), 0);
+  EXPECT_EQ(RenameStr("/c", "/c/sub/../d"), kSyscallErrorInvalid);
+  ASSERT_EQ(StatStr("/c/sub", &st), 0);
+  EXPECT_EQ(StatStr("/c/d", &st), kSyscallErrorNoEntry);
+  EXPECT_EQ(fs_->ActiveFnodeCount(), 3);
+}
+
+TEST_F(RamfsTest, RenameOfRegularFileWithTrailingSlashFailsWithNotDir) {
+  uint64_t h = 0;
+  ASSERT_EQ(OpenStr(1, "/f", kFsOpenWrite | kFsOpenCreate, &h), 0);
+  ASSERT_EQ(fs_->Write(1, h, "f", 1), 1);
+  ASSERT_EQ(fs_->Close(1, h), 0);
+  ASSERT_EQ(CreateFile("/g"), 0);
+
+  // Neither path of a regular file may end with '/', whether or not the new
+  // path exists, and the failures change nothing.
+  EXPECT_EQ(RenameStr("/f", "/new/"), kSyscallErrorNotDir);
+  EXPECT_EQ(RenameStr("/f", "/g/"), kSyscallErrorNotDir);
+  EXPECT_EQ(RenameStr("/f/", "/new"), kSyscallErrorNotDir);
+  FsStat st{};
+  EXPECT_EQ(StatStr("/new", &st), kSyscallErrorNoEntry);
+  ASSERT_EQ(StatStr("/f", &st), 0);
+  EXPECT_EQ(st.size, 1);
+  ASSERT_EQ(StatStr("/g", &st), 0);
+  EXPECT_EQ(st.size, 0);
+  EXPECT_EQ(fs_->ActiveFnodeCount(), 3);
+
+  // A directory's paths may end with '/'.
+  ASSERT_EQ(MkDirStr("/d"), 0);
+  ASSERT_EQ(RenameStr("/d/", "/e/"), 0);
+  ASSERT_EQ(StatStr("/e", &st), 0);
+  EXPECT_EQ(st.type, FsNodeType::kDirectory);
+}
+
 TEST_F(RamfsTest, OutOfSpaceRollbackLeavesZeroLeakedBlocks) {
   uint64_t h = 0;
   ASSERT_EQ(OpenStr(1, "/oom", kFsOpenReadWrite | kFsOpenCreate, &h), 0);
@@ -996,6 +1135,1221 @@ TEST_F(RamfsTest, OutOfSpaceShortWriteAndSingleIndirectRollback) {
   ASSERT_EQ(fs_->Close(1, h), 0);
   ASSERT_EQ(UnlinkStr("/f"), 0);
   EXPECT_EQ(alloc_.live_blocks(), 0);
+}
+
+// Deterministic splitmix64 generator, so that every run of the randomized test
+// performs the same operations.
+class TestRng {
+ public:
+  explicit TestRng(const uint64_t seed) : state_(seed) {}
+
+  // Returns a pseudo-random value in [0, bound).
+  int64_t Uniform(const int64_t bound) {
+    state_ += 0x9E3779B97F4A7C15ULL;
+    uint64_t z = state_;
+    z = (z ^ (z >> 30)) * 0xBF58476D1CE4E5B9ULL;
+    z = (z ^ (z >> 27)) * 0x94D049BB133111EBULL;
+    z ^= z >> 31;
+    return static_cast<int64_t>(z % static_cast<uint64_t>(bound));
+  }
+
+  // Returns true with probability 1 / `n`.
+  bool OneIn(const int64_t n) { return Uniform(n) == 0; }
+
+ private:
+  uint64_t state_;
+};
+
+// A reference model of `FileSystem` for `RamfsModelTest`: the tree, the file
+// contents and the handles in standard containers, with the behavior that
+// syscall_abi.h and ramfs.h document; where several errors apply, it returns
+// the one that `FileSystem` checks first. It also counts the blocks that
+// `FileSystem` allocates, to predict out-of-space failures under a block limit:
+// a regular file takes its data blocks and the indirect blocks that map them,
+// and a directory one `DirBlock` while it has entries (the test keeps
+// directories far smaller than a `DirBlock`). The test never passes invalid
+// client IDs, flags or sizes, which the tests above cover.
+class FsModel {
+ public:
+  static constexpr int kRoot = 0;
+
+  struct Entry {
+    std::string name;
+    int node = -1;
+    // Larger than the cookies of the entries added to the directory before.
+    int64_t cookie = 0;
+  };
+
+  struct Node {
+    FsNodeType type = FsNodeType::kNone;
+    // The fnode ID that `FileSystem` gave the node (the test learns it).
+    uint64_t fnode_id = 0;
+    // The directory with the node's entry, and the entry's name.
+    int parent = kRoot;
+    std::string name;
+    // False once the node's entry is gone (never for the root).
+    bool linked = true;
+    int open_refs = 0;
+    // Directories: the entries in cookie order.
+    std::vector<Entry> entries;
+    int64_t next_cookie = 1;
+    // Regular files: the size, and the blocks written since the file was
+    // created or truncated, by index. All other bytes read as zeros.
+    int64_t size = 0;
+    std::map<int64_t, std::vector<uint8_t>> blocks;
+  };
+
+  struct Handle {
+    uint64_t client = 0;
+    int node = -1;
+    uint64_t flags = 0;
+    // A regular file's offset, or the cookie of the last entry that
+    // ReadDir() returned.
+    int64_t offset = 0;
+  };
+
+  FsModel() {
+    Node& root = nodes_[kRoot];
+    root.type = FsNodeType::kDirectory;
+    root.fnode_id = 1;
+  }
+
+  // The operations of `FileSystem`: each returns what `FileSystem` should
+  // return and, on success, changes the model the same way. Open() takes the
+  // handle that `FileSystem` returned, and Open() and MkDir() store the file
+  // or directory that they create in `created()`.
+  int64_t Open(const uint64_t client,    //
+               const std::string& path,  //
+               const uint64_t flags,     //
+               const uint64_t handle) {
+    created_ = -1;
+    if (std::ssize(handles_) >= kMaxOpenHandles) {
+      return kSyscallErrorFileTableFull;
+    }
+    const Parsed p = Resolve(path);
+    if (p.error < 0) {
+      return p.error;
+    }
+    const bool want_write = (flags & kFsOpenAccessMask) != kFsOpenRead;
+    const bool want_create = (flags & kFsOpenCreate) != 0;
+    const bool want_dir = (flags & kFsOpenDirectory) != 0;
+    int idx = p.name.empty() ? p.dir : Lookup(p.dir, p.name);
+    if (idx >= 0) {
+      Node& node = nodes_.at(idx);
+      if (want_create && (flags & kFsOpenExclusive) != 0) {
+        return kSyscallErrorExists;
+      }
+      if (node.type == FsNodeType::kDirectory) {
+        if (want_write || want_create ||
+            (flags & (kFsOpenTruncate | kFsOpenAppend)) != 0) {
+          return kSyscallErrorIsDir;
+        }
+      } else if (want_dir || p.trailing_slash) {
+        return kSyscallErrorNotDir;
+      } else if ((flags & kFsOpenTruncate) != 0) {
+        node.size = 0;
+        node.blocks.clear();
+      }
+    } else {
+      if (!want_create) {
+        return kSyscallErrorNoEntry;
+      }
+      if (want_dir || p.trailing_slash) {
+        return kSyscallErrorIsDir;
+      }
+      if (!CanAddNode(p.dir)) {
+        return kSyscallErrorNoSpace;
+      }
+      idx = AddNode(FsNodeType::kRegular, p.dir, p.name);
+    }
+    ++nodes_.at(idx).open_refs;
+    handles_[handle] = Handle{.client = client, .node = idx, .flags = flags};
+    return 0;
+  }
+
+  int64_t Close(const uint64_t client, const uint64_t handle) {
+    const Handle* const h = FindHandle(client, handle);
+    if (h == nullptr) {
+      return kSyscallErrorBadFd;
+    }
+    const int idx = h->node;
+    handles_.erase(handle);
+    --nodes_.at(idx).open_refs;
+    MaybeDrop(idx);
+    return 0;
+  }
+
+  void CloseAllForClient(const uint64_t client) {
+    std::vector<uint64_t> client_handles;
+    for (const auto& [handle, h] : handles_) {
+      if (h.client == client) {
+        client_handles.push_back(handle);
+      }
+    }
+    for (const uint64_t handle : client_handles) {
+      Close(client, handle);
+    }
+  }
+
+  int64_t Read(const uint64_t client,  //
+               const uint64_t handle,  //
+               const int64_t size,     //
+               std::vector<uint8_t>* const out) {
+    out->clear();
+    Handle* const h = FindHandle(client, handle);
+    if (h == nullptr) {
+      return kSyscallErrorBadFd;
+    }
+    const Node& file = nodes_.at(h->node);
+    if (file.type == FsNodeType::kDirectory) {
+      return kSyscallErrorIsDir;
+    }
+    if ((h->flags & kFsOpenAccessMask) == kFsOpenWrite) {
+      return kSyscallErrorBadFd;
+    }
+    const int64_t n = std::clamp<int64_t>(file.size - h->offset, 0, size);
+    out->resize(static_cast<size_t>(n));
+    for (int64_t done = 0; done < n;) {
+      const int64_t pos = h->offset + done;
+      const int64_t chunk = std::min(n - done, kBlockSize - pos % kBlockSize);
+      const auto it = file.blocks.find(pos / kBlockSize);
+      if (it != file.blocks.end()) {
+        std::copy_n(it->second.begin() + pos % kBlockSize,  //
+                    chunk,                                  //
+                    out->begin() + done);
+      }
+      done += chunk;
+    }
+    h->offset += n;
+    return n;
+  }
+
+  int64_t Write(const uint64_t client,  //
+                const uint64_t handle,  //
+                const std::vector<uint8_t>& data) {
+    Handle* const h = FindHandle(client, handle);
+    if (h == nullptr) {
+      return kSyscallErrorBadFd;
+    }
+    Node& file = nodes_.at(h->node);
+    if (file.type == FsNodeType::kDirectory) {
+      return kSyscallErrorIsDir;
+    }
+    if ((h->flags & kFsOpenAccessMask) == kFsOpenRead) {
+      return kSyscallErrorBadFd;
+    }
+    if (data.empty()) {
+      return 0;
+    }
+    const int64_t pos =
+        ((h->flags & kFsOpenAppend) != 0) ? file.size : h->offset;
+    if (pos >= kFsMaxFileSize) {
+      return kSyscallErrorFileTooBig;
+    }
+    // The write stops at the first block whose blocks don't fit.
+    const int64_t limit = std::min(std::ssize(data), kFsMaxFileSize - pos);
+    int64_t free_blocks = FreeBlocks();
+    int64_t done = 0;
+    while (done < limit) {
+      const int64_t block = (pos + done) / kBlockSize;
+      const int64_t offset = (pos + done) % kBlockSize;
+      const int64_t chunk = std::min(limit - done, kBlockSize - offset);
+      const int64_t cost = BlockCost(file, block);
+      if (cost > free_blocks) {
+        break;
+      }
+      free_blocks -= cost;
+      std::vector<uint8_t>& bytes = file.blocks[block];
+      bytes.resize(static_cast<size_t>(kBlockSize));
+      std::copy_n(data.begin() + done, chunk, bytes.begin() + offset);
+      done += chunk;
+    }
+    if (done == 0) {
+      return kSyscallErrorNoSpace;
+    }
+    h->offset = pos + done;
+    file.size = std::max(file.size, h->offset);
+    return done;
+  }
+
+  // The test seeks a directory only with `(0, kFsSeekSet)` or invalid
+  // arguments: the position that `(0, kFsSeekCur)` returns is opaque.
+  int64_t Seek(const uint64_t client,  //
+               const uint64_t handle,  //
+               const int64_t offset,   //
+               const int64_t whence) {
+    Handle* const h = FindHandle(client, handle);
+    if (h == nullptr) {
+      return kSyscallErrorBadFd;
+    }
+    const Node& node = nodes_.at(h->node);
+    if (node.type == FsNodeType::kDirectory) {
+      if (offset != 0 || whence != kFsSeekSet) {
+        return kSyscallErrorInvalid;
+      }
+      h->offset = 0;
+      return 0;
+    }
+    int64_t base = 0;
+    if (whence == kFsSeekCur) {
+      base = h->offset;
+    } else if (whence == kFsSeekEnd) {
+      base = node.size;
+    } else if (whence != kFsSeekSet) {
+      return kSyscallErrorInvalid;
+    }
+    if (offset < -base || offset > kFsMaxFileSize - base) {
+      return kSyscallErrorInvalid;
+    }
+    h->offset = base + offset;
+    return h->offset;
+  }
+
+  int64_t Stat(const std::string& path, FsStat* const out) const {
+    const Parsed p = Resolve(path);
+    if (p.error < 0) {
+      return p.error;
+    }
+    const int idx = p.name.empty() ? p.dir : Lookup(p.dir, p.name);
+    if (idx < 0) {
+      return kSyscallErrorNoEntry;
+    }
+    if (p.trailing_slash && !IsDir(idx)) {
+      return kSyscallErrorNotDir;
+    }
+    *out = StatOf(idx);
+    return 0;
+  }
+
+  int64_t ReadDir(const uint64_t client,      //
+                  const uint64_t handle,      //
+                  const int64_t max_entries,  //
+                  std::vector<FsDirEntry>* const out) {
+    out->clear();
+    Handle* const h = FindHandle(client, handle);
+    if (h == nullptr) {
+      return kSyscallErrorBadFd;
+    }
+    const Node& dir = nodes_.at(h->node);
+    if (dir.type != FsNodeType::kDirectory) {
+      return kSyscallErrorNotDir;
+    }
+    for (const Entry& entry : dir.entries) {
+      if (std::ssize(*out) == max_entries) {
+        break;
+      }
+      if (entry.cookie > h->offset) {
+        out->push_back(DirEntry(entry));
+        h->offset = entry.cookie;
+      }
+    }
+    return std::ssize(*out);
+  }
+
+  int64_t MkDir(const std::string& path) {
+    created_ = -1;
+    const Parsed p = Resolve(path);
+    if (p.error < 0) {
+      return p.error;
+    }
+    if (p.name.empty() || Lookup(p.dir, p.name) >= 0) {
+      return kSyscallErrorExists;
+    }
+    if (!CanAddNode(p.dir)) {
+      return kSyscallErrorNoSpace;
+    }
+    AddNode(FsNodeType::kDirectory, p.dir, p.name);
+    return 0;
+  }
+
+  int64_t Unlink(const std::string& path) {
+    const Parsed p = Resolve(path);
+    if (p.error < 0) {
+      return p.error;
+    }
+    if (p.name.empty()) {
+      return p.root_only ? kSyscallErrorBusy : kSyscallErrorInvalid;
+    }
+    const int idx = Lookup(p.dir, p.name);
+    if (idx < 0) {
+      return kSyscallErrorNoEntry;
+    }
+    if (IsDir(idx)) {
+      if (!nodes_.at(idx).entries.empty()) {
+        return kSyscallErrorNotEmpty;
+      }
+    } else if (p.trailing_slash) {
+      return kSyscallErrorNotDir;
+    }
+    RemoveEntry(p.dir, p.name);
+    Unlinked(idx);
+    return 0;
+  }
+
+  int64_t Rename(const std::string& old_path, const std::string& new_path) {
+    const Parsed from = Resolve(old_path);
+    if (from.error < 0) {
+      return from.error;
+    }
+    if (from.name.empty()) {
+      return from.root_only ? kSyscallErrorBusy : kSyscallErrorInvalid;
+    }
+    const Parsed to = Resolve(new_path);
+    if (to.error < 0) {
+      return to.error;
+    }
+    if (to.name.empty()) {
+      return to.root_only ? kSyscallErrorBusy : kSyscallErrorInvalid;
+    }
+    const int src = Lookup(from.dir, from.name);
+    if (src < 0) {
+      return kSyscallErrorNoEntry;
+    }
+    if (!IsDir(src) && (from.trailing_slash || to.trailing_slash)) {
+      return kSyscallErrorNotDir;
+    }
+    if (IsDir(src) && IsInside(to.dir, src)) {
+      return kSyscallErrorInvalid;
+    }
+    const int dst = Lookup(to.dir, to.name);
+    if (dst == src) {
+      return 0;
+    }
+    if (dst >= 0) {
+      if (IsDir(src) && !IsDir(dst)) {
+        return kSyscallErrorNotDir;
+      }
+      if (!IsDir(src) && IsDir(dst)) {
+        return kSyscallErrorIsDir;
+      }
+      if (IsDir(dst) && !nodes_.at(dst).entries.empty()) {
+        return kSyscallErrorNotEmpty;
+      }
+      RemoveEntry(to.dir, to.name);
+      Unlinked(dst);
+    } else if (nodes_.at(to.dir).entries.empty() && FreeBlocks() <= 0) {
+      return kSyscallErrorNoSpace;
+    }
+    RemoveEntry(from.dir, from.name);
+    AddEntry(to.dir, to.name, src);
+    return 0;
+  }
+
+  // The file or directory that the last Open() or MkDir() created, or -1.
+  int created() const { return created_; }
+
+  const Node& node(const int idx) const { return nodes_.at(idx); }
+
+  void set_fnode_id(const int idx, const uint64_t fnode_id) {
+    nodes_.at(idx).fnode_id = fnode_id;
+  }
+
+  // The open handles, by `FileSystem`'s handle.
+  const std::map<uint64_t, Handle>& handles() const { return handles_; }
+
+  // The block limit, like `CountingBlockAllocator::set_max_blocks()`.
+  int64_t max_blocks() const { return max_blocks_; }
+  void set_max_blocks(const int64_t max_blocks) { max_blocks_ = max_blocks; }
+
+  // The number of files and directories that are linked or open.
+  int64_t FnodeCount() const { return std::ssize(nodes_); }
+
+  // The number of blocks that `FileSystem` holds.
+  int64_t LiveBlocks() const {
+    int64_t count = 0;
+    for (const auto& [idx, node] : nodes_) {
+      if (node.type == FsNodeType::kRegular) {
+        count += FileBlocks(node);
+      } else if (!node.entries.empty()) {
+        ++count;
+      }
+    }
+    return count;
+  }
+
+  // The linked files and directories, each after its parent.
+  std::vector<int> Tree() const {
+    std::vector<int> nodes = {kRoot};
+    for (int i = 0; i < std::ssize(nodes); ++i) {
+      for (const Entry& entry : nodes_.at(nodes[i]).entries) {
+        nodes.push_back(entry.node);
+      }
+    }
+    return nodes;
+  }
+
+  // The names on the path of the linked file or directory `idx`.
+  std::vector<std::string> PathNames(int idx) const {
+    std::vector<std::string> names;
+    for (; idx != kRoot; idx = nodes_.at(idx).parent) {
+      names.insert(names.begin(), nodes_.at(idx).name);
+    }
+    return names;
+  }
+
+  std::string PathOf(const int idx) const {
+    std::string path;
+    for (const std::string& name : PathNames(idx)) {
+      path += "/" + name;
+    }
+    return path.empty() ? "/" : path;
+  }
+
+  // What Stat() returns for the linked file or directory `idx`.
+  FsStat StatOf(const int idx) const {
+    const Node& node = nodes_.at(idx);
+    if (!IsDir(idx)) {
+      return FsStat{
+          .type = node.type,
+          .fnode_id = node.fnode_id,
+          .size = node.size,
+          .nlink = 1,
+      };
+    }
+    const int64_t subdirs = std::ranges::count_if(
+        node.entries, [&](const Entry& entry) { return IsDir(entry.node); });
+    return FsStat{
+        .type = node.type,
+        .fnode_id = node.fnode_id,
+        .size =
+            std::ssize(node.entries) * static_cast<int64_t>(sizeof(FsDirEntry)),
+        .nlink = 2 + subdirs,
+    };
+  }
+
+  // What ReadDir() returns for `entry`.
+  FsDirEntry DirEntry(const Entry& entry) const {
+    FsDirEntry out{};
+    out.fnode_id = nodes_.at(entry.node).fnode_id;
+    out.type = nodes_.at(entry.node).type;
+    out.name_len = static_cast<int32_t>(entry.name.size());
+    std::memcpy(out.name, entry.name.data(), entry.name.size());
+    return out;
+  }
+
+ private:
+  // The first blocks that the single-indirect and the double-indirect block
+  // map.
+  static constexpr int64_t kFirstSingleBlock = kDirectBlocks;
+  static constexpr int64_t kFirstDoubleBlock =
+      kDirectBlocks + kPtrsPerIndirectBlock;
+
+  // A resolved path: its last component `name` in directory `dir`, or an
+  // empty `name` if the path names `dir` itself (with only '/'s, or with a
+  // last component `.` or `..`); or a negative `error`.
+  struct Parsed {
+    int64_t error = 0;
+    int dir = kRoot;
+    std::string name;
+    bool root_only = false;
+    bool trailing_slash = false;
+  };
+
+  Parsed Resolve(const std::string& path) const {
+    Parsed p;
+    if (path.empty()) {
+      p.error = kSyscallErrorNoEntry;
+      return p;
+    }
+    p.trailing_slash = (path.back() == '/');
+    std::vector<std::string> names;
+    std::string name;
+    for (const char c : path + "/") {
+      if (c != '/') {
+        name += c;
+      } else if (!name.empty()) {
+        names.push_back(name);
+        name.clear();
+      }
+    }
+    p.root_only = names.empty();
+    for (int i = 0; i < std::ssize(names); ++i) {
+      if (names[i] == "..") {
+        p.dir = nodes_.at(p.dir).parent;
+      } else if (names[i] != ".") {
+        if (i == std::ssize(names) - 1) {
+          p.name = names[i];
+          break;
+        }
+        const int child = Lookup(p.dir, names[i]);
+        if (child < 0) {
+          p.error = kSyscallErrorNoEntry;
+          break;
+        }
+        if (!IsDir(child)) {
+          p.error = kSyscallErrorNotDir;
+          break;
+        }
+        p.dir = child;
+      }
+    }
+    return p;
+  }
+
+  int Lookup(const int dir, const std::string& name) const {
+    for (const Entry& entry : nodes_.at(dir).entries) {
+      if (entry.name == name) {
+        return entry.node;
+      }
+    }
+    return -1;
+  }
+
+  bool IsDir(const int idx) const {
+    return nodes_.at(idx).type == FsNodeType::kDirectory;
+  }
+
+  // Whether directory `dir` is `ancestor` or inside it.
+  bool IsInside(int dir, const int ancestor) const {
+    for (; dir != ancestor; dir = nodes_.at(dir).parent) {
+      if (dir == kRoot) {
+        return false;
+      }
+    }
+    return true;
+  }
+
+  Handle* FindHandle(const uint64_t client, const uint64_t handle) {
+    const auto it = handles_.find(handle);
+    if (it == handles_.end() || it->second.client != client) {
+      return nullptr;
+    }
+    return &it->second;
+  }
+
+  // The number of blocks that `FileSystem` may still allocate.
+  int64_t FreeBlocks() const {
+    return (max_blocks_ < 0) ? kInt64Max : max_blocks_ - LiveBlocks();
+  }
+
+  // Whether a new file or directory fits into the fnode table and into
+  // directory `dir`, which needs a `DirBlock` for it if it is empty.
+  bool CanAddNode(const int dir) const {
+    return FnodeCount() < kMaxFnodes &&
+           (!nodes_.at(dir).entries.empty() || FreeBlocks() > 0);
+  }
+
+  int AddNode(const FsNodeType type, const int dir, const std::string& name) {
+    const int idx = next_node_++;
+    nodes_[idx].type = type;
+    AddEntry(dir, name, idx);
+    created_ = idx;
+    return idx;
+  }
+
+  // Adds the entry `name` for `idx` to directory `dir`, with a new cookie.
+  void AddEntry(const int dir, const std::string& name, const int idx) {
+    Node& d = nodes_.at(dir);
+    d.entries.push_back(
+        Entry{.name = name, .node = idx, .cookie = d.next_cookie++});
+    Node& node = nodes_.at(idx);
+    node.parent = dir;
+    node.name = name;
+  }
+
+  void RemoveEntry(const int dir, const std::string& name) {
+    std::erase_if(nodes_.at(dir).entries,
+                  [&](const Entry& entry) { return entry.name == name; });
+  }
+
+  // Marks `idx`, whose entry is gone, as removed.
+  void Unlinked(const int idx) {
+    nodes_.at(idx).linked = false;
+    MaybeDrop(idx);
+  }
+
+  // Drops `idx`, with its blocks, once it is neither linked nor open.
+  void MaybeDrop(const int idx) {
+    const Node& node = nodes_.at(idx);
+    if (!node.linked && node.open_refs == 0) {
+      nodes_.erase(idx);
+    }
+  }
+
+  // Whether `file` has data blocks in [first, end).
+  static bool HasBlocks(const Node& file,     //
+                        const int64_t first,  //
+                        const int64_t end) {
+    const auto it = file.blocks.lower_bound(first);
+    return it != file.blocks.end() && it->first < end;
+  }
+
+  // The blocks of `file`: its data blocks, the single-indirect block while it
+  // maps data blocks, and the double-indirect block and its second-level
+  // blocks while they do.
+  static int64_t FileBlocks(const Node& file) {
+    int64_t count = std::ssize(file.blocks);
+    if (HasBlocks(file, kFirstSingleBlock, kFirstDoubleBlock)) {
+      ++count;
+    }
+    // The data blocks of a second-level block come one after another.
+    int64_t last_second_level = -1;
+    for (auto it = file.blocks.lower_bound(kFirstDoubleBlock);
+         it != file.blocks.end(); ++it) {
+      const int64_t second_level =
+          (it->first - kFirstDoubleBlock) / kPtrsPerIndirectBlock;
+      if (second_level != last_second_level) {
+        // With the double-indirect block for the first second-level block.
+        count += (last_second_level < 0) ? 2 : 1;
+        last_second_level = second_level;
+      }
+    }
+    return count;
+  }
+
+  // The number of blocks that a write into block `block` of `file` allocates:
+  // the data block and the indirect blocks that would map it, if missing.
+  static int64_t BlockCost(const Node& file, const int64_t block) {
+    if (file.blocks.contains(block)) {
+      return 0;
+    }
+    if (block < kFirstSingleBlock) {
+      return 1;
+    }
+    if (block < kFirstDoubleBlock) {
+      return HasBlocks(file, kFirstSingleBlock, kFirstDoubleBlock) ? 1 : 2;
+    }
+    const int64_t first_of_second_level =
+        block - (block - kFirstDoubleBlock) % kPtrsPerIndirectBlock;
+    const bool has_double = HasBlocks(file, kFirstDoubleBlock, kInt64Max);
+    const bool has_second_level =
+        HasBlocks(file,                   //
+                  first_of_second_level,  //
+                  first_of_second_level + kPtrsPerIndirectBlock);
+    return 1 + (has_double ? 0 : 1) + (has_second_level ? 0 : 1);
+  }
+
+  // The linked or open files and directories, by a number that is never
+  // reused.
+  std::map<int, Node> nodes_;
+  std::map<uint64_t, Handle> handles_;
+  int next_node_ = kRoot + 1;
+  int created_ = -1;
+  int64_t max_blocks_ = -1;
+};
+
+// Runs random operations on `FileSystem` and on `FsModel` and compares their
+// results and, after each operation, the tree (Stat() of every file and
+// directory, and ReadDir() of every directory) and the numbers of open
+// handles, fnodes and blocks. Paths name files and directories of the tree or
+// new entries in its directories, sometimes with a `.` component, a detour
+// through `<name>/..` or a trailing '/'. Reads and writes often seek first,
+// writes favor the first blocks that the single-indirect and double-indirect
+// blocks map and the file size limit, and phases with a block limit inject
+// out-of-space failures.
+class RamfsModelTest : public RamfsTest {
+ protected:
+  // The names of entries: few, so that no directory needs a second
+  // `DirBlock`, not even with the extra entry during a Rename() within it.
+  static constexpr const char* kNames[] = {"a", "b", "c", "d", "e"};
+  static_assert(std::ssize(kNames) < DirBlock::kSlotsPerBlock);
+  // Clients 1 to `kClients` open files, and `kCheckClient` checks the tree.
+  static constexpr int kClients = 3;
+  static constexpr uint64_t kCheckClient = kClients + 1;
+  // Beyond these, the test closes instead of opening, and removes instead of
+  // creating.
+  static constexpr int kMaxHandles = 16;
+  static constexpr int kMaxTreeNodes = 24;
+  // Writes often seek to within a block of the start of one of these blocks:
+  // the first one, the first ones that the single-indirect block, the
+  // double-indirect block and its second and third second-level blocks map,
+  // and the one at `kFsMaxFileSize`.
+  static constexpr int64_t kWriteTargetBlocks[] = {
+      0,
+      kDirectBlocks,
+      kDirectBlocks + kPtrsPerIndirectBlock,
+      kDirectBlocks + 2 * kPtrsPerIndirectBlock,
+      kDirectBlocks + 3 * kPtrsPerIndirectBlock,
+      kFsMaxFileSize / kBlockSize,
+  };
+
+  // What RandomPath() names: a file or directory of the tree, a regular file
+  // of the tree (or a new entry if there is none), a directory of the tree,
+  // or a new entry (a random name in a directory of the tree).
+  enum class PathTo { kNode, kFile, kDir, kName };
+  // Which handles PickHandle() prefers.
+  enum class Prefer { kAny, kReadableFile, kWritableFile, kDirectory };
+
+  struct ClientHandle {
+    uint64_t client = 0;
+    uint64_t handle = 0;
+  };
+
+  // Runs one random operation.
+  void RandomStep(TestRng& rng) {
+    const int64_t pick = rng.Uniform(100);
+    const int64_t handles = std::ssize(model_.handles());
+    const bool crowded = std::ssize(model_.Tree()) > kMaxTreeNodes;
+    if (pick < 2) {
+      ToggleBlockLimit(rng);
+    } else if (pick < 3) {
+      DoCloseAllForClient(RandomClient(rng));
+    } else if (handles == 0 || (pick < 17 && handles < kMaxHandles)) {
+      RandomOpen(rng, crowded);
+    } else if (pick < 24) {
+      const ClientHandle h = PickHandle(rng, Prefer::kAny);
+      DoClose(h.client, h.handle);
+    } else if (pick < 44) {
+      RandomWrite(rng);
+    } else if (pick < 56) {
+      RandomRead(rng);
+    } else if (pick < 61) {
+      RandomSeek(rng);
+    } else if (pick < 67) {
+      static constexpr int64_t kMaxEntries[] = {0, 1, 2, 3,
+                                                kSyscallFsMaxDirEntries};
+      const ClientHandle h = PickHandle(rng, Prefer::kDirectory);
+      const int64_t max_entries =
+          kMaxEntries[rng.Uniform(std::ssize(kMaxEntries))];
+      DoReadDir(h.client, h.handle, max_entries);
+    } else if (pick < 72) {
+      DoStat(RandomPath(rng, rng.OneIn(2) ? PathTo::kNode : PathTo::kName));
+    } else if (pick < 76 && !crowded) {
+      DoMkDir(RandomPath(rng, rng.OneIn(8) ? PathTo::kNode : PathTo::kName));
+    } else if (pick < 86) {
+      DoUnlink(RandomPath(rng, rng.OneIn(8) ? PathTo::kName : PathTo::kNode));
+    } else {
+      const std::string old_path =
+          RandomPath(rng, rng.OneIn(8) ? PathTo::kName : PathTo::kNode);
+      // Sometimes a path through the source, like `/a/../b` for `/a`.
+      const std::string new_path =
+          rng.OneIn(8)
+              ? old_path + "/../" + RandomName(rng)
+              : RandomPath(rng, rng.OneIn(3) ? PathTo::kFile : PathTo::kName);
+      DoRename(old_path, new_path);
+    }
+  }
+
+  // Starts a phase with room for at most 3 more blocks, or ends it.
+  void ToggleBlockLimit(TestRng& rng) {
+    const int max_blocks =
+        (model_.max_blocks() < 0)
+            ? static_cast<int>(model_.LiveBlocks() + rng.Uniform(4))
+            : -1;
+    alloc_.set_max_blocks(max_blocks);
+    model_.set_max_blocks(max_blocks);
+  }
+
+  void RandomOpen(TestRng& rng, const bool crowded) {
+    const uint64_t client = RandomClient(rng);
+    if (rng.OneIn(5)) {
+      const uint64_t flags =
+          kFsOpenRead | (rng.OneIn(2) ? kFsOpenDirectory : 0);
+      DoOpen(client, RandomPath(rng, PathTo::kDir), flags);
+      return;
+    }
+    static constexpr uint64_t kAccessModes[] = {kFsOpenRead, kFsOpenWrite,
+                                                kFsOpenReadWrite};
+    const uint64_t access = kAccessModes[rng.Uniform(std::ssize(kAccessModes))];
+    uint64_t flags = access;
+    if (rng.OneIn(2)) {
+      flags |= kFsOpenCreate;
+      if (rng.OneIn(4)) {
+        flags |= kFsOpenExclusive;
+      }
+    }
+    if (access != kFsOpenRead && rng.OneIn(4)) {
+      flags |= kFsOpenTruncate;
+    }
+    if (rng.OneIn(4)) {
+      flags |= kFsOpenAppend;
+    }
+    if (rng.OneIn(16)) {
+      flags |= kFsOpenDirectory;
+    }
+    PathTo to = PathTo::kFile;
+    if (!crowded && rng.OneIn(2)) {
+      to = PathTo::kName;
+    } else if (rng.OneIn(8)) {
+      to = PathTo::kNode;
+    }
+    DoOpen(client, RandomPath(rng, to), flags);
+  }
+
+  void RandomWrite(TestRng& rng) {
+    const ClientHandle h = PickHandle(rng, Prefer::kWritableFile);
+    if (rng.OneIn(2)) {
+      const int64_t block =
+          kWriteTargetBlocks[rng.Uniform(std::ssize(kWriteTargetBlocks))];
+      const int64_t offset =
+          block * kBlockSize + rng.Uniform(2 * kBlockSize + 1) - kBlockSize;
+      DoSeek(h.client, h.handle, offset, kFsSeekSet);
+    }
+    const int64_t size = rng.OneIn(2) ? kSyscallFsMaxIoSize
+                                      : rng.Uniform(kSyscallFsMaxIoSize + 1);
+    // Bytes that differ from write to write, and from the zeros of holes.
+    const int64_t tag = rng.Uniform(251);
+    std::vector<uint8_t> data(static_cast<size_t>(size));
+    for (int64_t i = 0; i < size; ++i) {
+      data[static_cast<size_t>(i)] =
+          static_cast<uint8_t>(1 + (tag + 7 * i) % 251);
+    }
+    DoWrite(h.client, h.handle, data);
+  }
+
+  void RandomRead(TestRng& rng) {
+    const ClientHandle h = PickHandle(rng, Prefer::kReadableFile);
+    if (rng.OneIn(2)) {
+      DoSeek(h.client, h.handle, rng.Uniform(FileSize(h) + 1), kFsSeekSet);
+    }
+    const int64_t size = rng.OneIn(2) ? kSyscallFsMaxIoSize
+                                      : rng.Uniform(kSyscallFsMaxIoSize + 1);
+    DoRead(h.client, h.handle, size);
+  }
+
+  void RandomSeek(TestRng& rng) {
+    const ClientHandle h = PickHandle(rng, Prefer::kAny);
+    const auto it = model_.handles().find(h.handle);
+    if (it != model_.handles().end() &&
+        model_.node(it->second.node).type == FsNodeType::kDirectory) {
+      // Rewinds or fails: the position that `(0, kFsSeekCur)` returns is
+      // opaque.
+      static constexpr std::pair<int64_t, int64_t> kDirSeeks[] = {
+          {0, kFsSeekSet}, {1, kFsSeekSet}, {0, kFsSeekEnd}, {-1, kFsSeekCur}};
+      const auto& [offset, whence] =
+          kDirSeeks[rng.Uniform(std::ssize(kDirSeeks))];
+      DoSeek(h.client, h.handle, offset, whence);
+      return;
+    }
+    static constexpr int64_t kWhences[] = {kFsSeekSet, kFsSeekCur, kFsSeekEnd};
+    const int64_t whence = kWhences[rng.Uniform(std::ssize(kWhences))];
+    const int64_t offset = (whence == kFsSeekSet)
+                               ? rng.Uniform(FileSize(h) + 2)
+                               : rng.Uniform(2 * kBlockSize + 1) - kBlockSize;
+    DoSeek(h.client, h.handle, offset, whence);
+  }
+
+  // The size of the file of handle `h`, or 0 if `h` isn't open.
+  int64_t FileSize(const ClientHandle& h) const {
+    const auto it = model_.handles().find(h.handle);
+    return (it == model_.handles().end()) ? 0
+                                          : model_.node(it->second.node).size;
+  }
+
+  static uint64_t RandomClient(TestRng& rng) {
+    return 1 + static_cast<uint64_t>(rng.Uniform(kClients));
+  }
+
+  static std::string RandomName(TestRng& rng) {
+    return kNames[rng.Uniform(std::ssize(kNames))];
+  }
+
+  // Returns a path to what `to` says, sometimes with a `.` component, a
+  // detour through `<name>/..` or a trailing '/'.
+  std::string RandomPath(TestRng& rng, const PathTo to) const {
+    std::vector<int> nodes;
+    for (const int node : model_.Tree()) {
+      const bool is_dir = model_.node(node).type == FsNodeType::kDirectory;
+      if (to == PathTo::kNode || (to == PathTo::kFile ? !is_dir : is_dir)) {
+        nodes.push_back(node);
+      }
+    }
+    if (nodes.empty()) {
+      return RandomPath(rng, PathTo::kName);
+    }
+    std::vector<std::string> names =
+        model_.PathNames(nodes[rng.Uniform(std::ssize(nodes))]);
+    if (to == PathTo::kName) {
+      names.push_back(RandomName(rng));
+    }
+    if (rng.OneIn(16)) {
+      names.insert(names.begin() + rng.Uniform(std::ssize(names) + 1), ".");
+    }
+    if (rng.OneIn(16)) {
+      const std::string detour = RandomName(rng);
+      names.insert(names.begin() + rng.Uniform(std::ssize(names) + 1),
+                   {detour, ".."});
+    }
+    std::string path;
+    for (const std::string& name : names) {
+      path += "/" + name;
+    }
+    if (path.empty() || rng.OneIn(8)) {
+      path += "/";
+    }
+    return path;
+  }
+
+  // Returns an open handle with its client, most often one that `prefer`
+  // describes; or sometimes a closed handle, or an open one with another
+  // client, which fail with `kSyscallErrorBadFd`.
+  ClientHandle PickHandle(TestRng& rng, const Prefer prefer) const {
+    if (!closed_.empty() && rng.OneIn(32)) {
+      return closed_[rng.Uniform(std::ssize(closed_))];
+    }
+    std::vector<ClientHandle> all;
+    std::vector<ClientHandle> preferred;
+    for (const auto& [handle, h] : model_.handles()) {
+      all.push_back({h.client, handle});
+      if (IsPreferred(h, prefer)) {
+        preferred.push_back({h.client, handle});
+      }
+    }
+    ClientHandle picked = (preferred.empty() || rng.OneIn(16))
+                              ? all[rng.Uniform(std::ssize(all))]
+                              : preferred[rng.Uniform(std::ssize(preferred))];
+    if (rng.OneIn(32)) {
+      picked.client = picked.client % kClients + 1;
+    }
+    return picked;
+  }
+
+  bool IsPreferred(const FsModel::Handle& h, const Prefer prefer) const {
+    const bool is_dir = model_.node(h.node).type == FsNodeType::kDirectory;
+    const uint64_t access = h.flags & kFsOpenAccessMask;
+    switch (prefer) {
+      case Prefer::kAny:
+        return true;
+      case Prefer::kReadableFile:
+        return !is_dir && access != kFsOpenWrite;
+      case Prefer::kWritableFile:
+        return !is_dir && access != kFsOpenRead;
+      case Prefer::kDirectory:
+        return is_dir;
+    }
+    return false;
+  }
+
+  // The operations: each runs on both `FileSystem` and the model and compares
+  // the results.
+  void DoOpen(const uint64_t client,    //
+              const std::string& path,  //
+              const uint64_t flags) {
+    SCOPED_TRACE(t::Message() << "Open(" << client << ", \"" << path << "\", 0x"
+                              << std::hex << flags << ")");
+    FsOpenReply reply{};
+    const int64_t rc =
+        fs_->Open(client, path.data(), std::ssize(path), flags, &reply);
+    if (rc == 0) {
+      // Each Open() returns a new handle.
+      ASSERT_NE(reply.handle, 0u);
+      ASSERT_TRUE(handles_seen_.insert(reply.handle).second) << reply.handle;
+    }
+    ASSERT_EQ(rc, model_.Open(client, path, flags, reply.handle));
+    if (rc == 0) {
+      ASSERT_EQ(reply.type,
+                model_.node(model_.handles().at(reply.handle).node).type);
+      if (model_.created() >= 0) {
+        LearnFnodeId(model_.created());
+      }
+    }
+  }
+
+  void DoClose(const uint64_t client, const uint64_t handle) {
+    SCOPED_TRACE(t::Message() << "Close(" << client << ", " << handle << ")");
+    const int64_t rc = fs_->Close(client, handle);
+    ASSERT_EQ(rc, model_.Close(client, handle));
+    if (rc == 0) {
+      closed_.push_back({client, handle});
+    }
+  }
+
+  void DoCloseAllForClient(const uint64_t client) {
+    for (const auto& [handle, h] : model_.handles()) {
+      if (h.client == client) {
+        closed_.push_back({client, handle});
+      }
+    }
+    fs_->CloseAllForClient(client);
+    model_.CloseAllForClient(client);
+  }
+
+  void DoRead(const uint64_t client,  //
+              const uint64_t handle,  //
+              const int64_t size) {
+    SCOPED_TRACE(t::Message()
+                 << "Read(" << client << ", " << handle << ", " << size << ")");
+    std::vector<uint8_t> data(static_cast<size_t>(size));
+    const int64_t rc = fs_->Read(client, handle, data.data(), size);
+    std::vector<uint8_t> want;
+    ASSERT_EQ(rc, model_.Read(client, handle, size, &want));
+    data.resize(want.size());
+    ASSERT_TRUE(data == want) << "The data differs.";
+  }
+
+  void DoWrite(const uint64_t client,  //
+               const uint64_t handle,  //
+               const std::vector<uint8_t>& data) {
+    SCOPED_TRACE(t::Message() << "Write(" << client << ", " << handle << ", "
+                              << data.size() << " bytes)");
+    ASSERT_EQ(fs_->Write(client, handle, data.data(), std::ssize(data)),
+              model_.Write(client, handle, data));
+  }
+
+  void DoSeek(const uint64_t client,  //
+              const uint64_t handle,  //
+              const int64_t offset,   //
+              const int64_t whence) {
+    SCOPED_TRACE(t::Message() << "Seek(" << client << ", " << handle << ", "
+                              << offset << ", " << whence << ")");
+    ASSERT_EQ(fs_->Seek(client, handle, offset, whence),
+              model_.Seek(client, handle, offset, whence));
+  }
+
+  void DoReadDir(const uint64_t client,  //
+                 const uint64_t handle,  //
+                 const int64_t max_entries) {
+    SCOPED_TRACE(t::Message() << "ReadDir(" << client << ", " << handle << ", "
+                              << max_entries << ")");
+    std::vector<FsDirEntry> entries(static_cast<size_t>(max_entries));
+    const int64_t rc =
+        fs_->ReadDir(client, handle, entries.data(), max_entries);
+    std::vector<FsDirEntry> want;
+    ASSERT_EQ(rc, model_.ReadDir(client, handle, max_entries, &want));
+    for (int i = 0; i < std::ssize(want); ++i) {
+      ASSERT_NO_FATAL_FAILURE(AssertSameEntry(entries[static_cast<size_t>(i)],
+                                              want[static_cast<size_t>(i)]));
+    }
+  }
+
+  void DoStat(const std::string& path) {
+    SCOPED_TRACE(t::Message() << "Stat(\"" << path << "\")");
+    FsStat st{};
+    FsStat want{};
+    const int64_t rc = StatStr(path, &st);
+    ASSERT_EQ(rc, model_.Stat(path, &want));
+    if (rc == 0) {
+      AssertSameStat(st, want);
+    }
+  }
+
+  void DoMkDir(const std::string& path) {
+    SCOPED_TRACE(t::Message() << "MkDir(\"" << path << "\")");
+    const int64_t rc = MkDirStr(path);
+    ASSERT_EQ(rc, model_.MkDir(path));
+    if (rc == 0) {
+      LearnFnodeId(model_.created());
+    }
+  }
+
+  void DoUnlink(const std::string& path) {
+    SCOPED_TRACE(t::Message() << "Unlink(\"" << path << "\")");
+    ASSERT_EQ(UnlinkStr(path), model_.Unlink(path));
+  }
+
+  void DoRename(const std::string& old_path, const std::string& new_path) {
+    SCOPED_TRACE(t::Message()
+                 << "Rename(\"" << old_path << "\", \"" << new_path << "\")");
+    ASSERT_EQ(RenameStr(old_path, new_path), model_.Rename(old_path, new_path));
+  }
+
+  // Learns the fnode ID of `node`, which the operation created, and checks
+  // that no file or directory had it before.
+  void LearnFnodeId(const int node) {
+    FsStat st{};
+    ASSERT_EQ(StatStr(model_.PathOf(node), &st), 0);
+    ASSERT_TRUE(fnode_ids_seen_.insert(st.fnode_id).second)
+        << "fnode ID " << st.fnode_id << " is reused.";
+    model_.set_fnode_id(node, st.fnode_id);
+  }
+
+  static void AssertSameStat(const FsStat& st, const FsStat& want) {
+    ASSERT_EQ(st.type, want.type);
+    ASSERT_EQ(st.fnode_id, want.fnode_id);
+    ASSERT_EQ(st.size, want.size);
+    ASSERT_EQ(st.nlink, want.nlink);
+  }
+
+  // Also checks the NUL bytes after the name and the reserved bytes.
+  static void AssertSameEntry(const FsDirEntry& entry, const FsDirEntry& want) {
+    ASSERT_EQ(std::memcmp(&entry, &want, sizeof(FsDirEntry)), 0)
+        << "fnode " << entry.fnode_id << " instead of " << want.name
+        << " (fnode " << want.fnode_id << ")";
+  }
+
+  // Compares Stat() of the file or directory `node` at `path` and, for a
+  // directory, ReadDir() of it and everything below it with the model.
+  void VerifyTree(const int node, const std::string& path) {
+    FsStat st{};
+    ASSERT_EQ(StatStr(path, &st), 0) << path;
+    ASSERT_NO_FATAL_FAILURE(AssertSameStat(st, model_.StatOf(node))) << path;
+    if (st.type != FsNodeType::kDirectory) {
+      return;
+    }
+    uint64_t h = 0;
+    ASSERT_EQ(OpenStr(kCheckClient, path, kFsOpenRead | kFsOpenDirectory, &h),
+              0)
+        << path;
+    FsDirEntry entries[kSyscallFsMaxDirEntries]{};
+    const int64_t count =
+        fs_->ReadDir(kCheckClient, h, entries, kSyscallFsMaxDirEntries);
+    ASSERT_EQ(fs_->Close(kCheckClient, h), 0);
+    const std::vector<FsModel::Entry>& want = model_.node(node).entries;
+    ASSERT_EQ(count, std::ssize(want)) << path;
+    for (int i = 0; i < count; ++i) {
+      ASSERT_NO_FATAL_FAILURE(AssertSameEntry(
+          entries[i], model_.DirEntry(want[static_cast<size_t>(i)])))
+          << path;
+    }
+    for (const FsModel::Entry& entry : want) {
+      ASSERT_NO_FATAL_FAILURE(VerifyTree(
+          entry.node, (node == FsModel::kRoot ? "" : path) + "/" + entry.name));
+    }
+  }
+
+  // Compares the tree and the numbers of open handles, fnodes and blocks with
+  // the model.
+  void VerifyAll() {
+    ASSERT_NO_FATAL_FAILURE(VerifyTree(FsModel::kRoot, "/"));
+    ASSERT_EQ(fs_->ActiveHandleCount(), std::ssize(model_.handles()));
+    ASSERT_EQ(fs_->ActiveFnodeCount(), model_.FnodeCount());
+    ASSERT_EQ(alloc_.live_blocks(), model_.LiveBlocks());
+  }
+
+  // Reads back the blocks of every file of the tree. Then closes all handles
+  // and removes the tree without room for another block: neither allocates.
+  void VerifyFilesAndRemoveAll() {
+    for (const int node : model_.Tree()) {
+      const FsModel::Node& file = model_.node(node);
+      if (file.type != FsNodeType::kRegular) {
+        continue;
+      }
+      const std::string path = model_.PathOf(node);
+      uint64_t h = 0;
+      ASSERT_EQ(OpenStr(kCheckClient, path, kFsOpenRead, &h), 0) << path;
+      for (const auto& [block, bytes] : file.blocks) {
+        const int64_t offset = block * kBlockSize;
+        const int64_t size = std::min(kBlockSize, file.size - offset);
+        std::vector<uint8_t> data(static_cast<size_t>(size));
+        ASSERT_EQ(fs_->Seek(kCheckClient, h, offset, kFsSeekSet), offset);
+        ASSERT_EQ(fs_->Read(kCheckClient, h, data.data(), size), size);
+        ASSERT_TRUE(std::equal(data.begin(), data.end(), bytes.begin()))
+            << path << " block " << block;
+      }
+      ASSERT_EQ(fs_->Close(kCheckClient, h), 0);
+    }
+
+    alloc_.set_max_blocks(alloc_.live_blocks());
+    model_.set_max_blocks(model_.LiveBlocks());
+    for (int client = 1; client <= kClients; ++client) {
+      DoCloseAllForClient(static_cast<uint64_t>(client));
+    }
+    const std::vector<int> nodes = model_.Tree();
+    for (int i = static_cast<int>(std::ssize(nodes)) - 1; i > 0; --i) {
+      ASSERT_NO_FATAL_FAILURE(DoUnlink(model_.PathOf(nodes[i])));
+    }
+  }
+
+  FsModel model_;
+  // Every handle that Open() returned and every fnode ID that Stat() showed.
+  std::set<uint64_t> handles_seen_;
+  std::set<uint64_t> fnode_ids_seen_ = {1};
+  std::vector<ClientHandle> closed_;
+};
+
+TEST_F(RamfsModelTest, RandomOperationsMatchAReferenceModel) {
+  constexpr uint64_t kSeed = 2026;
+  constexpr int kSteps = 3000;
+  TestRng rng(kSeed);
+  for (int step = 0; step < kSteps; ++step) {
+    SCOPED_TRACE(t::Message() << "seed " << kSeed << ", step " << step);
+    ASSERT_NO_FATAL_FAILURE(RandomStep(rng));
+    ASSERT_NO_FATAL_FAILURE(VerifyAll());
+  }
+  ASSERT_NO_FATAL_FAILURE(VerifyFilesAndRemoveAll());
+  EXPECT_EQ(alloc_.live_blocks(), 0);
+  EXPECT_EQ(fs_->ActiveFnodeCount(), 1);
+  EXPECT_EQ(fs_->ActiveHandleCount(), 0);
 }
 
 // Returns the request `hdr` followed by `tail`.
@@ -1102,8 +2456,12 @@ class RamfsRpcTest : public RamfsTest {
     return reply;
   }
 
-  // Fills the reply buffer with a pattern that `ReplyBufUntouched()` checks.
-  void PoisonReplyBuf() { std::memset(raw_reply_, 0xA5, sizeof(raw_reply_)); }
+  // Fills the reply buffer with a pattern that `ReplyBufUntouched()` checks,
+  // and sets `reply_size_` to -1, which `DispatchRpc()` must overwrite.
+  void PoisonReplyBuf() {
+    std::memset(raw_reply_, 0xA5, sizeof(raw_reply_));
+    reply_size_ = -1;
+  }
 
   bool ReplyBufUntouched() const {
     for (const uint8_t byte : raw_reply_) {
@@ -1112,6 +2470,16 @@ class RamfsRpcTest : public RamfsTest {
       }
     }
     return true;
+  }
+
+  // Expects `DispatchRpc()` to reject `req` with `kSyscallErrorInvalid`,
+  // without reporting or writing reply bytes. `what` names the request in
+  // failure messages.
+  void ExpectInvalid(const std::vector<uint8_t>& req, const std::string& what) {
+    PoisonReplyBuf();
+    EXPECT_EQ(Dispatch(req), kSyscallErrorInvalid) << what;
+    EXPECT_EQ(reply_size_, 0) << what;
+    EXPECT_TRUE(ReplyBufUntouched()) << what;
   }
 
   alignas(8) uint8_t raw_reply_[kIpcMaxMessageSize + 8] = {};
@@ -1179,7 +2547,8 @@ TEST_F(RamfsRpcTest, RejectsMalformedRequestsWithoutSideEffects) {
   ASSERT_EQ(OpenStr(kClient, "/", kFsOpenRead | kFsOpenDirectory, &dir_h), 0);
 
   // No room for the opcode, no request, and `kNone` or unknown opcodes.
-  EXPECT_EQ(Dispatch({1, 2}), kSyscallErrorInvalid);
+  ExpectInvalid({1, 2}, "2-byte request");
+  PoisonReplyBuf();
   EXPECT_EQ(DispatchRpc(*fs_,                //
                         kClient,             //
                         nullptr,             //
@@ -1187,109 +2556,123 @@ TEST_F(RamfsRpcTest, RejectsMalformedRequestsWithoutSideEffects) {
                         reply_buf_,          //
                         kIpcMaxMessageSize,  //
                         &reply_size_),
-            kSyscallErrorInvalid);
-  EXPECT_EQ(Dispatch(Req(FsRpcOp::kNone)), kSyscallErrorInvalid);
-  EXPECT_EQ(Dispatch(Req(FsPathRequest{.op = FsRpcOp::kNone, .path_len = 2},
-                         std::string("/g"))),
-            kSyscallErrorInvalid);
-  EXPECT_EQ(Dispatch(Req(static_cast<FsRpcOp>(11))), kSyscallErrorInvalid);
-  EXPECT_EQ(Dispatch(Req(static_cast<FsRpcOp>(0xFFFFFFFF))),
-            kSyscallErrorInvalid);
+            kSyscallErrorInvalid)
+      << "null request";
+  EXPECT_EQ(reply_size_, 0) << "null request";
+  EXPECT_TRUE(ReplyBufUntouched()) << "null request";
+  ExpectInvalid(Req(FsRpcOp::kNone), "kNone");
+  ExpectInvalid(Req(FsPathRequest{.op = FsRpcOp::kNone, .path_len = 2},
+                    std::string("/g")),
+                "kNone with a path");
+  ExpectInvalid(Req(static_cast<FsRpcOp>(11)), "opcode 11");
+  ExpectInvalid(Req(static_cast<FsRpcOp>(0xFFFFFFFF)), "opcode 0xFFFFFFFF");
 
   // Fixed-size requests one byte short or long.
-  for (const std::vector<uint8_t>& req :
-       {CloseReq(h), ReadReq(h, 1), SeekReq(h, 0, kFsSeekSet),
-        ReadDirReq(dir_h, 1)}) {
-    const std::vector<uint8_t> shorter(req.begin(), req.end() - 1);
+  for (const auto& [name, req] :
+       std::vector<std::pair<std::string, std::vector<uint8_t>>>{
+           {"Close", CloseReq(h)},
+           {"Read", ReadReq(h, 1)},
+           {"Seek", SeekReq(h, 0, kFsSeekSet)},
+           {"ReadDir", ReadDirReq(dir_h, 1)},
+       }) {
     std::vector<uint8_t> longer = req;
     longer.push_back(0);
-    EXPECT_EQ(Dispatch(shorter), kSyscallErrorInvalid);
-    EXPECT_EQ(Dispatch(longer), kSyscallErrorInvalid);
+    ExpectInvalid(std::vector<uint8_t>(req.begin(), req.end() - 1),
+                  name + " one byte short");
+    ExpectInvalid(longer, name + " one byte long");
   }
   // Headers of variable-size requests one byte short.
-  for (const std::vector<uint8_t>& req :
-       {Req(FsOpenRequest{.op = FsRpcOp::kOpen}),
-        Req(FsWriteRequest{.op = FsRpcOp::kWrite, .handle = h}),
-        Req(FsPathRequest{.op = FsRpcOp::kStat}),
-        Req(FsRenameRequest{.op = FsRpcOp::kRename})}) {
-    EXPECT_EQ(Dispatch(std::vector<uint8_t>(req.begin(), req.end() - 1)),
-              kSyscallErrorInvalid);
+  for (const auto& [name, req] :
+       std::vector<std::pair<std::string, std::vector<uint8_t>>>{
+           {"Open", Req(FsOpenRequest{.op = FsRpcOp::kOpen})},
+           {"Write", Req(FsWriteRequest{.op = FsRpcOp::kWrite, .handle = h})},
+           {"Stat", Req(FsPathRequest{.op = FsRpcOp::kStat})},
+           {"Rename", Req(FsRenameRequest{.op = FsRpcOp::kRename})},
+       }) {
+    ExpectInvalid(std::vector<uint8_t>(req.begin(), req.end() - 1),
+                  name + " header one byte short");
   }
 
   // Non-zero reserved fields.
-  EXPECT_EQ(Dispatch(Req(FsCloseRequest{
-                .op = FsRpcOp::kClose, .reserved = 1, .handle = h})),
-            kSyscallErrorInvalid);
-  EXPECT_EQ(Dispatch(Req(FsReadRequest{
-                .op = FsRpcOp::kRead, .reserved = 1, .handle = h, .size = 1})),
-            kSyscallErrorInvalid);
-  EXPECT_EQ(
-      Dispatch(Req(
+  ExpectInvalid(
+      Req(FsCloseRequest{.op = FsRpcOp::kClose, .reserved = 1, .handle = h}),
+      "Close with reserved 1");
+  ExpectInvalid(
+      Req(FsReadRequest{
+          .op = FsRpcOp::kRead, .reserved = 1, .handle = h, .size = 1}),
+      "Read with reserved 1");
+  ExpectInvalid(
+      Req(
           FsWriteRequest{
               .op = FsRpcOp::kWrite, .reserved = 1, .handle = h, .size = 1},
-          std::string("x"))),
-      kSyscallErrorInvalid);
-  EXPECT_EQ(Dispatch(Req(FsRenameRequest{.op = FsRpcOp::kRename,
-                                         .old_len = 2,
-                                         .new_len = 2,
-                                         .reserved = 1},
-                         std::string("/f/g"))),
-            kSyscallErrorInvalid);
+          std::string("x")),
+      "Write with reserved 1");
+  ExpectInvalid(Req(FsRenameRequest{.op = FsRpcOp::kRename,
+                                    .old_len = 2,
+                                    .new_len = 2,
+                                    .reserved = 1},
+                    std::string("/f/g")),
+                "Rename with reserved 1");
 
   // Path lengths that are negative or don't match the request size.
   for (const int32_t path_len : {-1, 1, 3, kInt32Max}) {
-    EXPECT_EQ(Dispatch(Req(FsOpenRequest{.op = FsRpcOp::kOpen,
-                                         .path_len = path_len,
-                                         .flags = kFsOpenRead},
-                           std::string("/f"))),
-              kSyscallErrorInvalid);
-    for (const FsRpcOp op :
-         {FsRpcOp::kStat, FsRpcOp::kMkDir, FsRpcOp::kUnlink}) {
-      EXPECT_EQ(Dispatch(Req(FsPathRequest{.op = op, .path_len = path_len},
-                             std::string("/g"))),
-                kSyscallErrorInvalid);
+    const std::string with_len = " with path_len " + std::to_string(path_len);
+    ExpectInvalid(Req(FsOpenRequest{.op = FsRpcOp::kOpen,
+                                    .path_len = path_len,
+                                    .flags = kFsOpenRead},
+                      std::string("/f")),
+                  "Open" + with_len);
+    for (const auto& [op, name] : std::vector<std::pair<FsRpcOp, std::string>>{
+             {FsRpcOp::kStat, "Stat"},
+             {FsRpcOp::kMkDir, "MkDir"},
+             {FsRpcOp::kUnlink, "Unlink"},
+         }) {
+      ExpectInvalid(
+          Req(FsPathRequest{.op = op, .path_len = path_len}, std::string("/g")),
+          name + with_len);
     }
   }
-  EXPECT_EQ(Dispatch(Req(FsOpenRequest{.op = FsRpcOp::kOpen, .path_len = -1})),
-            kSyscallErrorInvalid);
+  ExpectInvalid(Req(FsOpenRequest{.op = FsRpcOp::kOpen, .path_len = -1}),
+                "Open with path_len -1 and no path");
 
   // Write sizes that are out of range or don't match the data.
   for (const int64_t size :
        {int64_t{-1}, int64_t{3}, int64_t{5}, kInt64Max, kInt64Min}) {
-    EXPECT_EQ(
-        Dispatch(Req(
-            FsWriteRequest{.op = FsRpcOp::kWrite, .handle = h, .size = size},
-            std::string("abcd"))),
-        kSyscallErrorInvalid);
+    ExpectInvalid(
+        Req(FsWriteRequest{.op = FsRpcOp::kWrite, .handle = h, .size = size},
+            std::string("abcd")),
+        "Write with size " + std::to_string(size) + " and 4 data bytes");
   }
-  EXPECT_EQ(Dispatch(Req(FsWriteRequest{
-                .op = FsRpcOp::kWrite, .handle = h, .size = kInt64Max})),
-            kSyscallErrorInvalid);
+  ExpectInvalid(Req(FsWriteRequest{
+                    .op = FsRpcOp::kWrite, .handle = h, .size = kInt64Max}),
+                "Write with size kInt64Max and no data");
   const std::string too_much(static_cast<size_t>(kSyscallFsMaxIoSize + 1), 'x');
-  EXPECT_EQ(Dispatch(WriteReq(h, too_much)), kSyscallErrorInvalid);
+  ExpectInvalid(WriteReq(h, too_much),
+                "Write of kSyscallFsMaxIoSize + 1 bytes");
 
   // Rename lengths that are negative or don't add up to the request size.
   for (const auto& [old_len, new_len] :
        std::vector<std::pair<int32_t, int32_t>>{
            {-1, 5}, {5, -1}, {2, 1}, {2, 3}, {kInt32Max, kInt32Max}}) {
-    EXPECT_EQ(Dispatch(Req(FsRenameRequest{.op = FsRpcOp::kRename,
-                                           .old_len = old_len,
-                                           .new_len = new_len},
-                           std::string("/f/g"))),
-              kSyscallErrorInvalid);
+    ExpectInvalid(Req(FsRenameRequest{.op = FsRpcOp::kRename,
+                                      .old_len = old_len,
+                                      .new_len = new_len},
+                      std::string("/f/g")),
+                  "Rename with old_len " + std::to_string(old_len) +
+                      " and new_len " + std::to_string(new_len));
   }
 
   // Read sizes and ReadDir counts out of range.
   for (const int64_t size :
        {int64_t{-1}, kSyscallFsMaxIoSize + 1, kInt64Max, kInt64Min}) {
-    EXPECT_EQ(Dispatch(ReadReq(h, size)), kSyscallErrorInvalid);
+    ExpectInvalid(ReadReq(h, size), "Read with size " + std::to_string(size));
   }
   for (const int32_t max_entries :
        {int32_t{-1}, static_cast<int32_t>(kSyscallFsMaxDirEntries + 1),
         kInt32Max}) {
-    EXPECT_EQ(Dispatch(ReadDirReq(dir_h, max_entries)), kSyscallErrorInvalid);
+    ExpectInvalid(ReadDirReq(dir_h, max_entries),
+                  "ReadDir with max_entries " + std::to_string(max_entries));
   }
-  EXPECT_EQ(reply_size_, 0);
 
   // Nothing changed: no file was created, renamed or removed, no data was
   // written, and neither offset moved.
@@ -1403,6 +2786,201 @@ TEST_F(RamfsRpcTest, RejectsRequestsWhoseReplyMayExceedReplyCap) {
             kSyscallErrorInvalid);
   EXPECT_EQ(fs_->ActiveHandleCount(), 1);
   EXPECT_EQ(Dispatch(CloseReq(dir_h), 0), 0);
+}
+
+TEST_F(RamfsRpcTest, ServeOneHandlesRecvErrorsDisconnectsCapAndReplyFallback) {
+  struct FakeIpc {
+    int64_t recv_rc = 0;
+    IpcReceivedMessage recv_msg{};
+    std::vector<uint8_t> recv_payload;
+    std::vector<int64_t> reply_results;
+
+    struct SentReply {
+      int64_t port = -1;
+      uint64_t token = 0;
+      std::vector<uint8_t> bytes;
+      int64_t status = 0;
+    };
+    std::vector<SentReply> replies;
+    int64_t last_recv_port = -1;
+    int64_t last_recv_timeout = 0;
+
+    static int64_t Recv(void* const ctx,                    //
+                        const int64_t port,                 //
+                        void* const buf,                    //
+                        const int64_t cap,                  //
+                        IpcReceivedMessage* const out_msg,  //
+                        const int64_t timeout_ticks) {
+      auto* const self = static_cast<FakeIpc*>(ctx);
+      self->last_recv_port = port;
+      self->last_recv_timeout = timeout_ticks;
+      if (self->recv_rc <= 0) {
+        return self->recv_rc;
+      }
+      const int64_t copy_len = std::min<int64_t>(
+          cap, static_cast<int64_t>(self->recv_payload.size()));
+      if (copy_len > 0) {
+        std::memcpy(buf, self->recv_payload.data(),
+                    static_cast<size_t>(copy_len));
+      }
+      *out_msg = self->recv_msg;
+      out_msg->size = copy_len;
+      return self->recv_rc;
+    }
+
+    static int64_t Reply(void* const ctx,        //
+                         const int64_t port,     //
+                         const uint64_t token,   //
+                         const void* const buf,  //
+                         const int64_t size,     //
+                         const int64_t status) {
+      auto* const self = static_cast<FakeIpc*>(ctx);
+      SentReply sent;
+      sent.port = port;
+      sent.token = token;
+      sent.status = status;
+      if (size > 0 && buf != nullptr) {
+        const auto* const bytes = static_cast<const uint8_t*>(buf);
+        sent.bytes.assign(bytes, bytes + size);
+      }
+      self->replies.push_back(std::move(sent));
+      if (!self->reply_results.empty()) {
+        const int64_t res = self->reply_results.front();
+        self->reply_results.erase(self->reply_results.begin());
+        return res;
+      }
+      return 0;
+    }
+  };
+
+  FakeIpc ipc;
+  const ServeEnv env{
+      .ctx = &ipc,
+      .recv = &FakeIpc::Recv,
+      .reply = &FakeIpc::Reply,
+  };
+  uint8_t req_buf[kIpcMaxMessageSize] = {};
+  uint8_t reply_buf[kIpcMaxMessageSize] = {};
+
+  // Fatal recv errors stop the serve loop; transient ones keep going.
+  ipc.recv_rc = kSyscallErrorAccess;
+  EXPECT_FALSE(ServeOne(*fs_, env, req_buf, sizeof(req_buf), reply_buf,
+                        sizeof(reply_buf)));
+  EXPECT_EQ(ipc.last_recv_port, kIpcPortFs);
+  EXPECT_EQ(ipc.last_recv_timeout, -1);
+
+  ipc.recv_rc = kSyscallErrorInvalid;
+  EXPECT_FALSE(ServeOne(*fs_, env, req_buf, sizeof(req_buf), reply_buf,
+                        sizeof(reply_buf)));
+
+  for (const int64_t transient : {int64_t{0}, kSyscallErrorNoMemory}) {
+    ipc.recv_rc = transient;
+    EXPECT_TRUE(ServeOne(*fs_, env, req_buf, sizeof(req_buf), reply_buf,
+                         sizeof(reply_buf)));
+  }
+  EXPECT_TRUE(ipc.replies.empty());
+
+  // kCall opens a file and replies with FsOpenReply.
+  ipc.recv_rc = 1;
+  ipc.recv_payload = OpenReq("/a", kFsOpenReadWrite | kFsOpenCreate);
+  ipc.recv_msg = IpcReceivedMessage{
+      .token = 11,
+      .client_id = kClient,
+      .size = static_cast<int64_t>(ipc.recv_payload.size()),
+      .kind = IpcMessageKind::kCall,
+      .reply_cap = static_cast<int32_t>(sizeof(FsOpenReply)),
+  };
+  EXPECT_TRUE(ServeOne(*fs_, env, req_buf, sizeof(req_buf), reply_buf,
+                       sizeof(reply_buf)));
+  ASSERT_EQ(ipc.replies.size(), 1u);
+  EXPECT_EQ(ipc.replies[0].port, kIpcPortFs);
+  EXPECT_EQ(ipc.replies[0].token, 11u);
+  EXPECT_EQ(ipc.replies[0].status, 0);
+  ASSERT_EQ(ipc.replies[0].bytes.size(), sizeof(FsOpenReply));
+  EXPECT_EQ(fs_->ActiveHandleCount(), 1);
+
+  // Open a handle for a second client directly so disconnect isolation shows.
+  uint64_t other_h = 0;
+  ASSERT_EQ(OpenStr(kClient + 1, "/a", kFsOpenRead, &other_h), 0);
+  EXPECT_EQ(fs_->ActiveHandleCount(), 2);
+
+  // kClientDisconnect closes only that client's handles and sends no reply.
+  ipc.replies.clear();
+  ipc.recv_payload.clear();
+  ipc.recv_msg = IpcReceivedMessage{
+      .token = 0,
+      .client_id = kClient,
+      .size = 0,
+      .kind = IpcMessageKind::kClientDisconnect,
+      .reply_cap = 0,
+  };
+  EXPECT_TRUE(ServeOne(*fs_, env, req_buf, sizeof(req_buf), reply_buf,
+                       sizeof(reply_buf)));
+  EXPECT_TRUE(ipc.replies.empty());
+  EXPECT_EQ(fs_->ActiveHandleCount(), 1);
+
+  // Clamps reply_cap to min(msg.reply_cap, reply_buf_cap) before dispatching.
+  ipc.recv_payload = PathReq(FsRpcOp::kStat, "/a");
+  ipc.recv_msg = IpcReceivedMessage{
+      .token = 12,
+      .client_id = kClient + 1,
+      .size = static_cast<int64_t>(ipc.recv_payload.size()),
+      .kind = IpcMessageKind::kCall,
+      .reply_cap = static_cast<int32_t>(sizeof(FsStat)),
+  };
+  EXPECT_TRUE(ServeOne(*fs_, env, req_buf, sizeof(req_buf), reply_buf,
+                       /*reply_buf_cap=*/sizeof(FsStat) - 1));
+  ASSERT_EQ(ipc.replies.size(), 1u);
+  EXPECT_EQ(ipc.replies[0].status, kSyscallErrorInvalid);
+  EXPECT_TRUE(ipc.replies[0].bytes.empty());
+
+  ipc.replies.clear();
+  ipc.recv_msg.token = 13;
+  ipc.recv_msg.reply_cap = static_cast<int32_t>(sizeof(FsStat) - 1);
+  EXPECT_TRUE(ServeOne(*fs_, env, req_buf, sizeof(req_buf), reply_buf,
+                       sizeof(reply_buf)));
+  ASSERT_EQ(ipc.replies.size(), 1u);
+  EXPECT_EQ(ipc.replies[0].status, kSyscallErrorInvalid);
+
+  // When the primary reply fails, ServeOne falls back to kSyscallErrorIo.
+  ipc.replies.clear();
+  ipc.reply_results = {kSyscallErrorInvalid, 0};
+  ipc.recv_msg.token = 14;
+  ipc.recv_msg.reply_cap = static_cast<int32_t>(sizeof(FsStat));
+  EXPECT_TRUE(ServeOne(*fs_, env, req_buf, sizeof(req_buf), reply_buf,
+                       sizeof(reply_buf)));
+  ASSERT_EQ(ipc.replies.size(), 2u);
+  EXPECT_EQ(ipc.replies[0].token, 14u);
+  EXPECT_EQ(ipc.replies[0].status, 0);
+  EXPECT_EQ(ipc.replies[0].bytes.size(), sizeof(FsStat));
+  EXPECT_EQ(ipc.replies[1].token, 14u);
+  EXPECT_EQ(ipc.replies[1].status, kSyscallErrorIo);
+  EXPECT_TRUE(ipc.replies[1].bytes.empty());
+
+  EXPECT_EQ(fs_->Close(kClient + 1, other_h), 0);
+}
+
+TEST_F(RamfsTest, RenameWithinOneDirectoryHandlesBlockGrowthAndShrink) {
+  ASSERT_EQ(MkDirStr("/d"), 0);
+  // Fill one DirBlock completely, rename the last slot into a new name (forcing
+  // InsertInDir to append a second block), then rename that entry onto the
+  // first entry (freeing the second block cleanly).
+  const int count = DirBlock::kSlotsPerBlock;
+  for (int i = 0; i < count; ++i) {
+    ASSERT_EQ(CreateFile("/d/f" + std::to_string(i)), 0);
+  }
+  const int blocks_full = alloc_.live_blocks();
+  const std::string last = "/d/f" + std::to_string(count - 1);
+  ASSERT_EQ(RenameStr(last, "/d/moved"), 0);
+  EXPECT_EQ(alloc_.live_blocks(), blocks_full + 1);
+  FsStat st{};
+  EXPECT_EQ(StatStr(last, &st), kSyscallErrorNoEntry);
+  EXPECT_EQ(StatStr("/d/moved", &st), 0);
+
+  ASSERT_EQ(RenameStr("/d/moved", "/d/f0"), 0);
+  EXPECT_EQ(alloc_.live_blocks(), blocks_full);
+  EXPECT_EQ(StatStr("/d/moved", &st), kSyscallErrorNoEntry);
+  EXPECT_EQ(StatStr("/d/f0", &st), 0);
 }
 
 TEST(SlabBlockAllocatorTest, BatchesSlabsFallsBackToSingleBlocksAndRezeroes) {

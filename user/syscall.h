@@ -2,6 +2,7 @@
 #define PROTOS_USER_SYSCALL_H_
 
 #include <cstdint>
+#include <type_traits>
 
 #include "status_or.h"
 #include "syscall_abi.h"
@@ -142,6 +143,85 @@ inline int64_t Spawn(const char* const name, const uint64_t arg = 0) {
     ++length;
   }
   return Spawn(name, length, arg);
+}
+
+// Starts the ELF executable at the path of `path_len` bytes at `path` in a new
+// unprivileged child user process with `args[0 .. argc - 1]` as its `argv` and
+// `arg` in its rdi, and returns the child's process ID
+// (`1 <= pid <= kMaxUserChildProcesses`), or an error.
+inline int64_t SpawnFile(const char* const path,             //
+                         const int64_t path_len,             //
+                         const SyscallArgSlice* const args,  //
+                         const int64_t argc,                 //
+                         const uint64_t arg = 0) {
+  return Syscall5(kSyscallSpawnFile,                  //
+                  reinterpret_cast<uintptr_t>(path),  //
+                  static_cast<uint64_t>(path_len),    //
+                  reinterpret_cast<uintptr_t>(args),  //
+                  static_cast<uint64_t>(argc),        //
+                  arg);
+}
+
+inline int64_t SpawnFile(const char* const path,  //
+                         const int64_t path_len,  //
+                         const uint64_t arg) {
+  return SpawnFile(path, path_len, nullptr, 0, arg);
+}
+
+// Convenience overload for null-terminated `path` with optional `arg` (and
+// `argc == 0`).
+inline int64_t SpawnFile(const char* const path, const uint64_t arg = 0) {
+  if (path == nullptr) {
+    return SpawnFile(nullptr, 1, nullptr, 0, arg);
+  }
+  int64_t length = 0;
+  while (path[length] != '\0') {
+    ++length;
+  }
+  return SpawnFile(path, length, nullptr, 0, arg);
+}
+
+// Convenience overload for null-terminated `path` and `argc` null-terminated
+// `argv` strings (`0 <= argc <= kSyscallSpawnMaxArgs`). Constrained to actual
+// string-array pointers so integer `arg` literals (`0`) resolve to the
+// `(path, path_len, arg)` overload above.
+template <typename ArgvPtr>
+  requires(std::is_pointer_v<ArgvPtr> &&
+           std::is_convertible_v<ArgvPtr, const char* const*>)
+inline int64_t SpawnFile(const char* const path,  //
+                         const int64_t argc,      //
+                         const ArgvPtr argv,      //
+                         const uint64_t arg = 0) {
+  int64_t path_len = 1;
+  if (path != nullptr) {
+    path_len = 0;
+    while (path[path_len] != '\0') {
+      ++path_len;
+    }
+  }
+  const char* const* const strings = argv;
+  if (argc <= 0 || argc > kSyscallSpawnMaxArgs || strings == nullptr) {
+    return SpawnFile(path,                                               //
+                     path_len,                                           //
+                     reinterpret_cast<const SyscallArgSlice*>(strings),  //
+                     argc,                                               //
+                     arg);
+  }
+  SyscallArgSlice slices[kSyscallSpawnMaxArgs]{};
+  for (int64_t i = 0; i < argc; ++i) {
+    if (strings[i] == nullptr) {
+      return kSyscallErrorFault;
+    }
+    int64_t len = 0;
+    while (strings[i][len] != '\0') {
+      ++len;
+    }
+    slices[i] = SyscallArgSlice{
+        .ptr = reinterpret_cast<uintptr_t>(strings[i]),
+        .len = len,
+    };
+  }
+  return SpawnFile(path, path_len, slices, argc, arg);
 }
 
 // Waits until child process `pid` has ended and returns its
@@ -477,10 +557,67 @@ inline int64_t Rename(const char* const old_path, const char* const new_path) {
                 new_path == nullptr ? 1 : StringLength(new_path));
 }
 
-// Each user program defines its main function, which the entry point
-// (user/crt.cpp) calls with the argument that the kernel passed in rdi. The
-// program exits with the status that it returns.
+// Boot module system calls (syscall_abi.h), which only drivers may make.
+inline int64_t GetBootModuleCount() {
+  return Syscall(kSyscallBootModuleInfo, 0, 0);
+}
+
+inline StatusOr<BootModuleInfo> GetBootModuleInfo(const int64_t index) {
+  BootModuleInfo info{};
+  const int64_t rc = Syscall(kSyscallBootModuleInfo,        //
+                             static_cast<uint64_t>(index),  //
+                             reinterpret_cast<uintptr_t>(&info));
+  if (SyscallIsError(rc)) {
+    return rc;
+  }
+  return info;
+}
+
+// Copies up to `size` bytes of boot module `index`, from byte `offset` on, to
+// `buffer`, and returns their number (0 at the end of the module), or an
+// error.
+inline int64_t ReadBootModule(const int64_t index,   //
+                              const int64_t offset,  //
+                              void* const buffer,    //
+                              const int64_t size) {
+  return Syscall4(kSyscallBootModuleRead,               //
+                  static_cast<uint64_t>(index),         //
+                  static_cast<uint64_t>(offset),        //
+                  reinterpret_cast<uintptr_t>(buffer),  //
+                  static_cast<uint64_t>(size));
+}
+
+// Returns the index of the first boot module whose name is the
+// null-terminated `name`, `kSyscallErrorNoEntry` if no module has that name,
+// or the error of a boot module system call.
+inline int64_t FindBootModule(const char* const name) {
+  const int64_t count = GetBootModuleCount();
+  if (SyscallIsError(count)) {
+    return count;
+  }
+  for (int64_t index = 0; index < count; ++index) {
+    const StatusOr<BootModuleInfo> info = GetBootModuleInfo(index);
+    if (!info.ok()) {
+      return info.status();
+    }
+    int64_t i = 0;
+    while (i < kBootModuleMaxNameLength && name[i] != '\0' &&
+           info->name[i] == name[i]) {
+      ++i;
+    }
+    if (info->name[i] == name[i]) {
+      return index;
+    }
+  }
+  return kSyscallErrorNoEntry;
+}
+
+// Each user program defines either `Main(int argc, char** argv)` (command-line
+// programs in `/bin/`) or `Main(uint64_t arg)` (drivers, `init`, `sh` and
+// `usertest`). The entry point (user/crt.cpp) calls whichever one the program
+// defines and exits with the status that it returns.
 int64_t Main(uint64_t arg);
+int64_t Main(int argc, char** argv);
 
 // The size of `g_initial_fpu_state`: the legacy region and the header of an
 // XSAVE area and the AVX state, which follows them in the standard format.

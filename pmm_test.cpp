@@ -105,6 +105,20 @@ static void AddRegion(const uintptr_t base,  //
   ++g_env.map.region_count;
 }
 
+// Appends the boot module `[start, end)` named `name` to the memory map that
+// the fake parser hands to `PmmInit`.
+static void AddBootModule(const uintptr_t start,  //
+                          const uintptr_t end,    //
+                          const std::string& name) {
+  BootModule& module = g_env.map.modules[g_env.map.module_count];
+  ++g_env.map.module_count;
+  module = {};
+  module.start = start;
+  module.end = end;
+  ASSERT_THAT(name.size(), t::Lt(sizeof(module.name)));
+  std::memcpy(module.name, name.data(), name.size());
+}
+
 // Returns a memory map with `regions`, as the Multiboot parser builds it.
 static MultibootMemoryMap MakeMemoryMap(
     const std::vector<MemoryRegion>& regions) {
@@ -269,9 +283,9 @@ TEST(PmmDeathTest, InitPanicsWithoutUsableMemory) {
   ResetFakeEnv(64);
   g_env.fail_extend_map = true;
   AddRegion(FrameAddr(20), 16 * kPageSize, kMemoryTypeAvailable);
-  EXPECT_DEATH(PmmInit(0, 0),
-               "Check failed: PagingExtendIdentityMap\\(g_max_managed_phys_addr"
-               "\\) at");
+  EXPECT_DEATH(
+      PmmInit(0, 0),
+      "Check failed: PagingExtendIdentityMap\\(identity_map_end\\) at");
 }
 
 TEST(PmmTest, InitPassesMultibootArgumentsToParser) {
@@ -820,6 +834,49 @@ TEST(PmmTest, RangeIsValidUsableRamValidation) {
   EXPECT_FALSE(PmmRangeIsValidUsableRam(FrameAddr(54), 4 * kPageSize));
 }
 
+TEST(PmmTest, InitReservesBootModulesAndIdentityMapsThem) {
+  ResetFakeEnv(140);
+  AddRegion(FrameAddr(0), 128 * kPageSize, kMemoryTypeAvailable);
+  // A module whose end lies inside frame 42 reserves frames [40, 43).
+  AddBootModule(FrameAddr(40), FrameAddr(42) + 100, "rootfs");
+  // An empty module reserves nothing.
+  AddBootModule(FrameAddr(60), FrameAddr(60), "empty");
+  // A module at the top of RAM, above the highest usable frame.
+  AddBootModule(FrameAddr(120), FrameAddr(128), "top");
+  PmmInit(0, 0);
+
+  ASSERT_THAT(PmmBootModuleCount(), t::Eq(3));
+  EXPECT_THAT(PmmBootModule(0).start, t::Eq(FrameAddr(40)));
+  EXPECT_THAT(PmmBootModule(0).end, t::Eq(FrameAddr(42) + 100));
+  EXPECT_THAT(std::string(PmmBootModule(0).name), t::Eq("rootfs"));
+  EXPECT_THAT(std::string(PmmBootModule(1).name), t::Eq("empty"));
+  EXPECT_THAT(PmmBootModule(2).end, t::Eq(FrameAddr(128)));
+
+  // Usable: [0, 16), [20, 40) and [43, 120), around the kernel image at
+  // [16, 20) and the modules.
+  constexpr int64_t kUsableFrames = 16 + 20 + 77;
+  EXPECT_THAT(PmmFreeFrameCount(), t::Eq(kUsableFrames));
+  EXPECT_THAT(PmmMaxPhysicalAddress(), t::Eq(FrameAddr(120)));
+  // The identity map reaches the end of the top module all the same.
+  EXPECT_THAT(g_env.extend_map_calls, t::Eq(1));
+  EXPECT_THAT(g_env.last_extend_max_phys, t::Eq(FrameAddr(128)));
+  for (const int64_t frame : {40, 41, 42, 120, 127}) {
+    EXPECT_FALSE(PmmRangeIsValidUsableRam(FrameAddr(frame), kPageSize))
+        << "frame " << frame;
+  }
+  EXPECT_TRUE(PmmRangeIsValidUsableRam(FrameAddr(43), kPageSize));
+  EXPECT_TRUE(PmmRangeIsValidUsableRam(FrameAddr(60), kPageSize));
+
+  // No allocation returns a module's frame.
+  for (int64_t i = 0; i < kUsableFrames; ++i) {
+    const uintptr_t frame = PmmAllocFrame();
+    ASSERT_THAT(frame, t::Ne(0u));
+    EXPECT_FALSE(frame >= FrameAddr(40) && frame < FrameAddr(43))
+        << "frame " << (frame - FakeRamBase()) / kPageSize;
+  }
+  EXPECT_THAT(PmmAllocFrame(), t::Eq(0u));
+}
+
 TEST(PmmTest, HighFragmentationStressAndFullCoalescence) {
   ResetFakeEnv(2048);
   constexpr int64_t kArenaStartFrame = 32;
@@ -1127,6 +1184,22 @@ TEST(PmmTest, CollectUsableIntervalsCarvesLowMemoryKernelAndBootStructures) {
                              PmmIntervalForTest{FrameAddr(32), FrameAddr(40)},
                              PmmIntervalForTest{FrameAddr(41), FrameAddr(50)},
                              PmmIntervalForTest{FrameAddr(53), FrameAddr(64)}));
+}
+
+TEST(PmmTest, CollectUsableIntervalsCarvesEveryPageThatABootModuleTouches) {
+  ResetFakeEnv(0);
+  MultibootMemoryMap map = MakeMemoryMap({
+      {0x200000, 64 * kPageSize, kMemoryTypeAvailable},
+  });
+  // Touches pages 4 to 6 of the region.
+  map.modules[0] = {0x204000 + 8, 0x206000 + 8, "a"};
+  // Empty, so it touches no page.
+  map.modules[1] = {0x220000, 0x220000, "b"};
+  map.modules[2] = {0x23F000, 0x240000, "c"};
+  map.module_count = 3;
+  EXPECT_THAT(PmmCollectUsableIntervalsForTest(map),
+              t::ElementsAre(PmmIntervalForTest{0x200000, 0x204000},
+                             PmmIntervalForTest{0x207000, 0x23F000}));
 }
 
 // Runs `PmmFreeFrameList()` with the frames at `frame_indices` on another

@@ -1,0 +1,37 @@
+The shell (sh)
+
+sh reads one command per line. Words are separated by spaces or tabs; there
+is no quoting, no redirection and no pipes. Paths are resolved from / whether
+or not they start with /, and . and .. work as usual. A line holds at most
+1024 characters: sh refuses a longer one ("sh: line too long") rather than
+run part of it. On the VGA console, backspace erases across wrapped lines; on
+a serial terminal, backspace cannot move past the start of a screen row.
+
+Built-in commands:
+  help                     list the commands
+  echo [word ...]          print the words (at most 15)
+  cpu                      print the CPU that sh runs on
+  programs                 list the embedded and /bin user programs
+  run <program> [arg ...]  run a program (embedded, /bin, or path) and report
+  <program> [arg ...]      run an embedded or /bin program, or a path with /
+  exit [status]            end the shell
+
+Embedded programs (init, sh, usertest) take at most one argument: a number,
+or for usertest an alias (exit, syscalls, fault, ud2, buffers); programs in
+/bin and path programs take word arguments (at most 16 words on a line).
+
+File commands:
+  ls [path ...]            list directories (subdirectories end with /)
+  cat <path> ...           print files
+  stat <path> ...          describe files and directories
+  mkdir <path> ...         create directories
+  rm <path> ...            remove files and empty directories
+  touch <path> ...         create empty files where nothing exists yet
+  write <path> [word ...]  make a file hold one line of the words
+  append <path> [word ...] add a line of the words to the end of a file
+  cp <source> ... <target> copy files (into <target> if it is a directory)
+  mv <source> ... <target> move or rename files and directories
+
+ls lists / when it gets no path, and prints each path that isn't a directory.
+The file commands take at most 15 operands (paths and words): they refuse a
+line with more ("sh: too many arguments") rather than skip some.

@@ -9,12 +9,13 @@
 #include "status_or.h"
 #include "syscall_abi.h"
 
-// Freestanding, header-only in-memory filesystem core (`ramfs::FileSystem`) and
-// wire-protocol RPC dispatcher (`ramfs::DispatchRpc`) for `user/ramfs`.
-// Parameterized over `ramfs::BlockAllocator` so host unit tests can exercise
-// path resolution, sparse and indirect block trees, directory cookies, atomic
-// rename, unlink-while-open, client-disconnect reclamation, and out-of-space
-// rollback without system calls.
+// Freestanding, header-only in-memory filesystem core (`ramfs::FileSystem`),
+// wire-protocol RPC dispatcher (`ramfs::DispatchRpc`), and single-message
+// server loop step (`ramfs::ServeOne`) for `user/ramfs`. Parameterized over
+// `ramfs::BlockAllocator` and `ramfs::ServeEnv` so host unit tests can
+// exercise path resolution, sparse and indirect block trees, directory
+// cookies, atomic rename, unlink-while-open, client-disconnect reclamation,
+// out-of-space rollback, and the server loop without system calls.
 
 namespace protos::ramfs {
 
@@ -1490,6 +1491,75 @@ inline int64_t DispatchRpc(FileSystem& fs,                //
   }
   // `kNone` and unknown opcodes.
   return kSyscallErrorInvalid;
+}
+
+// IPC callbacks used by `ServeOne()` so host unit tests can test the server's
+// message loop without system calls.
+struct ServeEnv {
+  void* ctx = nullptr;
+  int64_t (*recv)(void* ctx,                    //
+                  int64_t port,                 //
+                  void* buf,                    //
+                  int64_t cap,                  //
+                  IpcReceivedMessage* out_msg,  //
+                  int64_t timeout_ticks) = nullptr;
+  int64_t (*reply)(void* ctx,        //
+                   int64_t port,     //
+                   uint64_t token,   //
+                   const void* buf,  //
+                   int64_t size,     //
+                   int64_t status) = nullptr;
+};
+
+// Receives and serves one message on `kIpcPortFs`. Returns true to keep
+// serving (also after a timeout or transient `recv` error), or false if `recv`
+// fails with `kSyscallErrorAccess` or `kSyscallErrorInvalid` (so every later
+// receive would fail the same way) or if an argument is invalid.
+inline bool ServeOne(FileSystem& fs,            //
+                     const ServeEnv& env,       //
+                     uint8_t* const req_buf,    //
+                     const int64_t req_cap,     //
+                     uint8_t* const reply_buf,  //
+                     const int64_t reply_buf_cap) {
+  if (env.recv == nullptr || env.reply == nullptr || req_buf == nullptr ||
+      req_cap <= 0 || reply_buf == nullptr || reply_buf_cap <= 0) {
+    return false;
+  }
+  IpcReceivedMessage msg{};
+  const int64_t rc = env.recv(env.ctx, kIpcPortFs, req_buf, req_cap, &msg, -1);
+  if (rc == kSyscallErrorAccess || rc == kSyscallErrorInvalid) {
+    // Every later IpcRecv() would fail the same way.
+    return false;
+  }
+  if (rc <= 0) {
+    // No message, or another error: receive again.
+    return true;
+  }
+  if (msg.kind == IpcMessageKind::kClientDisconnect) {
+    fs.CloseAllForClient(msg.client_id);
+    return true;
+  }
+  if (msg.kind == IpcMessageKind::kCall) {
+    // The longest reply that both the client and `reply_buf` take.
+    const int64_t reply_cap =
+        msg.reply_cap < reply_buf_cap ? msg.reply_cap : reply_buf_cap;
+    int64_t reply_size = 0;
+    const int64_t status = DispatchRpc(fs,             //
+                                       msg.client_id,  //
+                                       req_buf,        //
+                                       msg.size,       //
+                                       reply_buf,      //
+                                       reply_cap,      //
+                                       &reply_size);
+    const int64_t reply_rc = env.reply(env.ctx, kIpcPortFs, msg.token,
+                                       reply_buf, reply_size, status);
+    if (reply_rc != 0) {
+      // Fail the call rather than leave the client waiting for a reply.
+      (void)env.reply(env.ctx, kIpcPortFs, msg.token, nullptr, 0,
+                      kSyscallErrorIo);
+    }
+  }
+  return true;
 }
 
 }  // namespace protos::ramfs

@@ -561,5 +561,62 @@ TEST(VgaTest, BackspaceMovesCursorLeftWithinRowAndAllowsOverwriting) {
   EXPECT_THAT(std::memcmp(g_fb32_a, g_fb32_b, sizeof(g_fb32_a)), t::Eq(0));
 }
 
+TEST(VgaTest, BackspaceMovesAcrossWrappedRowsAndScrolls) {
+  ResetEnv();
+  AttachAndClear(kFb32A);
+
+  // Fill row 0 up to column 79 with 'A', then 'Z' at column 79 wraps cursor
+  // to (1, 0). "\b \b" erases 'Z' at (0, 79) and leaves the cursor at (0, 79).
+  VgaWrite((std::string(79, 'A') + "Z").c_str());
+  EXPECT_THAT(VgaGetCursorRow(), t::Eq(1));
+  EXPECT_THAT(VgaGetCursorCol(), t::Eq(0));
+  EXPECT_THAT(CellRows(kFb32A, 0, 79), t::Contains(".######."));
+  VgaWrite("\b \b");
+  EXPECT_THAT(VgaGetCursorRow(), t::Eq(0));
+  EXPECT_THAT(VgaGetCursorCol(), t::Eq(79));
+  EXPECT_THAT(CellRows(kFb32A, 0, 79), t::Each(t::Eq("........")));
+
+  // Multi-row wrap plus several consecutive erases back across the wrap.
+  VgaClear();
+  VgaWrite((std::string(79, ' ') + "XY").c_str());
+  EXPECT_THAT(VgaGetCursorRow(), t::Eq(1));
+  EXPECT_THAT(VgaGetCursorCol(), t::Eq(1));
+  VgaWrite("\b \b\b \b");
+  EXPECT_THAT(VgaGetCursorRow(), t::Eq(0));
+  EXPECT_THAT(VgaGetCursorCol(), t::Eq(79));
+  EXPECT_THAT(CellRows(kFb32A, 0, 79), t::Each(t::Eq("........")));
+  EXPECT_THAT(CellRows(kFb32A, 1, 0), t::Each(t::Eq("........")));
+
+  // A tab that wraps to column 0 of the next row also allows backspace back.
+  VgaClear();
+  VgaWrite((std::string(72, ' ') + "\t").c_str());
+  EXPECT_THAT(VgaGetCursorRow(), t::Eq(1));
+  EXPECT_THAT(VgaGetCursorCol(), t::Eq(0));
+  VgaPutc('\b');
+  EXPECT_THAT(VgaGetCursorRow(), t::Eq(0));
+  EXPECT_THAT(VgaGetCursorCol(), t::Eq(79));
+
+  // Wrapping at the bottom row (24 -> scroll) keeps wrap tracking for row 24,
+  // while shifting the top-most line's flag away and keeping '\n' non-wrapped.
+  VgaClear();
+  for (int r = 0; r < 24; ++r) {
+    VgaPutc('\n');
+  }
+  EXPECT_THAT(VgaGetCursorRow(), t::Eq(24));
+  VgaWrite((std::string(79, ' ') + "Z").c_str());
+  EXPECT_THAT(VgaGetCursorRow(), t::Eq(24));
+  EXPECT_THAT(VgaGetCursorCol(), t::Eq(0));
+  EXPECT_THAT(CellRows(kFb32A, 23, 79), t::Contains(".######."));
+  VgaWrite("\b \b");
+  EXPECT_THAT(VgaGetCursorRow(), t::Eq(23));
+  EXPECT_THAT(VgaGetCursorCol(), t::Eq(79));
+  EXPECT_THAT(CellRows(kFb32A, 23, 79), t::Each(t::Eq("........")));
+
+  // After a newline, backspace at column 0 stays a no-op.
+  VgaWrite("\n\b");
+  EXPECT_THAT(VgaGetCursorRow(), t::Eq(24));
+  EXPECT_THAT(VgaGetCursorCol(), t::Eq(0));
+}
+
 }  // namespace
 }  // namespace protos

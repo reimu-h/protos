@@ -22,6 +22,10 @@ IrqSpinLock g_vga_lock;
 int g_cursor_row = 0;
 int g_cursor_col = 0;
 char g_text_shadow[kVgaHeight][kVgaWidth];
+// Whether row `r` (`r > 0`) started because row `r - 1` wrapped past column
+// `kVgaWidth - 1`, rather than from `'\n'` or `VgaClear()`, so `'\b'` at
+// column 0 moves back to `(r - 1, kVgaWidth - 1)`.
+bool g_row_wrapped[kVgaHeight] = {};
 
 // Whether the screen is in VGA text mode (VgaEnableLegacyText()), so that the
 // text buffer at 0xB8000 and the CRT controller exist.
@@ -300,10 +304,23 @@ static void ScrollUpOneRow() {
     for (int c = 0; c < kVgaWidth; ++c) {
       WriteCell(r, c, g_text_shadow[r + 1][c]);
     }
+    g_row_wrapped[r] = g_row_wrapped[r + 1];
   }
+  g_row_wrapped[0] = false;
+  g_row_wrapped[kVgaHeight - 1] = false;
   for (int c = 0; c < kVgaWidth; ++c) {
     WriteCell(kVgaHeight - 1, c, ' ');
   }
+}
+
+static void AdvanceRow(const bool wrapped) {
+  g_cursor_col = 0;
+  ++g_cursor_row;
+  if (g_cursor_row >= kVgaHeight) {
+    ScrollUpOneRow();
+    g_cursor_row = kVgaHeight - 1;
+  }
+  g_row_wrapped[g_cursor_row] = wrapped;
 }
 
 static void VgaPutcLocked(const char ch) {
@@ -320,16 +337,14 @@ static void VgaPutcLocked(const char ch) {
   if (ch == '\b') {
     if (g_cursor_col > 0) {
       --g_cursor_col;
+    } else if (g_cursor_row > 0 && g_row_wrapped[g_cursor_row]) {
+      --g_cursor_row;
+      g_cursor_col = kVgaWidth - 1;
     }
     return;
   }
   if (ch == '\n') {
-    g_cursor_col = 0;
-    ++g_cursor_row;
-    if (g_cursor_row >= kVgaHeight) {
-      ScrollUpOneRow();
-      g_cursor_row = kVgaHeight - 1;
-    }
+    AdvanceRow(/*wrapped=*/false);
     return;
   }
   if (ch == '\t') {
@@ -338,12 +353,7 @@ static void VgaPutcLocked(const char ch) {
       WriteCell(g_cursor_row, g_cursor_col, ' ');
       ++g_cursor_col;
       if (g_cursor_col >= kVgaWidth) {
-        g_cursor_col = 0;
-        ++g_cursor_row;
-        if (g_cursor_row >= kVgaHeight) {
-          ScrollUpOneRow();
-          g_cursor_row = kVgaHeight - 1;
-        }
+        AdvanceRow(/*wrapped=*/true);
         break;
       }
     }
@@ -352,12 +362,7 @@ static void VgaPutcLocked(const char ch) {
   WriteCell(g_cursor_row, g_cursor_col, ch);
   ++g_cursor_col;
   if (g_cursor_col >= kVgaWidth) {
-    g_cursor_col = 0;
-    ++g_cursor_row;
-    if (g_cursor_row >= kVgaHeight) {
-      ScrollUpOneRow();
-      g_cursor_row = kVgaHeight - 1;
-    }
+    AdvanceRow(/*wrapped=*/true);
   }
 }
 
@@ -378,6 +383,7 @@ void VgaClear() {
   g_cursor_row = 0;
   g_cursor_col = 0;
   for (int r = 0; r < kVgaHeight; ++r) {
+    g_row_wrapped[r] = false;
     for (int c = 0; c < kVgaWidth; ++c) {
       WriteCell(r, c, ' ');
     }
@@ -423,12 +429,14 @@ static void PanicPutcAt(const char ch, int* const row, int* const col) {
     *col = 0;
     return;
   }
+  bool wrapped = false;
   if (ch != '\n') {
     WriteCell(*row, *col, (ch == '\t') ? ' ' : ch);
     ++*col;
     if (*col < kVgaWidth) {
       return;
     }
+    wrapped = true;
   }
   *col = 0;
   if (*row + 1 < kVgaHeight) {
@@ -436,6 +444,7 @@ static void PanicPutcAt(const char ch, int* const row, int* const col) {
   } else {
     ScrollUpOneRow();
   }
+  g_row_wrapped[*row] = wrapped;
 }
 
 void VgaPanicWrite(const char* const str) {

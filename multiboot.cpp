@@ -210,6 +210,127 @@ static bool IsEfiTag(const uint32_t type) {
          type == kMultiboot2TagEfi64ImageHandle;
 }
 
+static bool IsCommandLineSpace(const char c) { return c == ' ' || c == '\t'; }
+
+// The most bytes of a Multiboot1 module's command line string that the parser
+// reads, looking for its NUL terminator.
+constexpr int64_t kMaxMultiboot1ModuleStringBytes = 4096;
+
+// Copies the last word (words are separated by spaces and tabs) of the command
+// line at `cmdline`, which ends at its first NUL byte or after `max_length`
+// bytes, to `name`: at most `kBootModuleNameSize - 1` bytes of it, followed by
+// NUL bytes through the end of `name`. `cmdline` may be null if `max_length`
+// is 0.
+static void CopyBootModuleName(const char* const cmdline,  //
+                               const int64_t max_length,   //
+                               char (&name)[kBootModuleNameSize]) {
+  int64_t word_start = 0;
+  int64_t word_end = 0;
+  int64_t i = 0;
+  while (i < max_length && cmdline[i] != '\0') {
+    if (IsCommandLineSpace(cmdline[i])) {
+      ++i;
+      continue;
+    }
+    word_start = i;
+    while (i < max_length && cmdline[i] != '\0' &&
+           !IsCommandLineSpace(cmdline[i])) {
+      ++i;
+    }
+    word_end = i;
+  }
+  const int64_t word_length = word_end - word_start;
+  const int64_t length = (word_length < kBootModuleNameSize - 1)
+                             ? word_length
+                             : kBootModuleNameSize - 1;
+  for (int64_t j = 0; j < kBootModuleNameSize; ++j) {
+    name[j] = (j < length) ? cmdline[word_start + j] : '\0';
+  }
+}
+
+// Appends the boot module `[start, end)` with an empty name to `*out_map` and
+// returns it, or returns nullptr without recording it if it starts at 0, ends
+// before it starts or past `max_physical_addr`, or `kMaxBootModules` modules
+// are recorded already.
+static BootModule* AddBootModule(MultibootMemoryMap* const out_map,  //
+                                 const uint64_t start,               //
+                                 const uint64_t end,                 //
+                                 const uintptr_t max_physical_addr) {
+  if (out_map->module_count >= kMaxBootModules || start == 0 || end < start ||
+      end > max_physical_addr) {
+    return nullptr;
+  }
+  BootModule* const module = &out_map->modules[out_map->module_count];
+  ++out_map->module_count;
+  module->start = start;
+  module->end = end;
+  for (char& c : module->name) {
+    c = '\0';
+  }
+  return module;
+}
+
+static void LogBootModule(const BootModule& module) {
+  ConsoleWrite("[PMM] boot module: base=");
+  ConsoleWriteHex(module.start);
+  ConsoleWrite(" len=");
+  ConsoleWriteHex(module.end - module.start);
+  ConsoleWrite(" name=");
+  ConsoleWrite(module.name);
+  ConsoleWrite("\n");
+}
+
+// Records the boot modules of the Multiboot1 module list of `mods_count`
+// entries at `mods_phys` in `*out_map` (see `AddBootModule()`), and logs them
+// if `log_boot`. Records nothing if the list is empty or larger than
+// `kMaxMultibootStructureBytes`, or reaches past `max_physical_addr`, or
+// cannot be mapped. A module whose command line string starts at or past
+// `max_physical_addr`, or cannot be mapped, gets an empty name; a string
+// without a terminating NUL before `max_physical_addr` is cut there.
+static void RecordMultiboot1Modules(const uintptr_t mods_phys,          //
+                                    const int64_t mods_count,           //
+                                    const uintptr_t max_physical_addr,  //
+                                    const bool log_boot,                //
+                                    MultibootMemoryMap* const out_map) {
+  constexpr int64_t kEntrySize = sizeof(Multiboot1Module);
+  if (mods_phys == 0 || mods_count <= 0 ||
+      mods_count > kMaxMultibootStructureBytes / kEntrySize) {
+    return;
+  }
+  const int64_t mods_bytes = mods_count * kEntrySize;
+  if (mods_phys >= max_physical_addr ||
+      (max_physical_addr - mods_phys) < static_cast<uintptr_t>(mods_bytes) ||
+      !PagingMapBootstrapRange(mods_phys, mods_bytes)) {
+    return;
+  }
+  const Multiboot1Module* const mods =
+      reinterpret_cast<const Multiboot1Module*>(mods_phys);
+  for (int64_t i = 0; i < mods_count; ++i) {
+    BootModule* const module = AddBootModule(out_map,            //
+                                             mods[i].mod_start,  //
+                                             mods[i].mod_end,    //
+                                             max_physical_addr);
+    if (module == nullptr) {
+      continue;
+    }
+    const uintptr_t string_phys = mods[i].string;
+    if (string_phys != 0 && string_phys < max_physical_addr) {
+      const uintptr_t available = max_physical_addr - string_phys;
+      const int64_t string_bytes =
+          (available < static_cast<uintptr_t>(kMaxMultiboot1ModuleStringBytes))
+              ? static_cast<int64_t>(available)
+              : kMaxMultiboot1ModuleStringBytes;
+      if (PagingMapBootstrapRange(string_phys, string_bytes)) {
+        CopyBootModuleName(reinterpret_cast<const char*>(string_phys),
+                           string_bytes, module->name);
+      }
+    }
+    if (log_boot) {
+      LogBootModule(*module);
+    }
+  }
+}
+
 }  // namespace
 
 static bool RecordMmapEntryImpl(MultibootMemoryMap* const out_map,  //
@@ -336,6 +457,7 @@ static bool ParseMemoryMapImpl(const uint32_t multiboot_magic,
   out_map->mb_reserved_end = 0;
   out_map->mb1_mmap_reserved_start = 0;
   out_map->mb1_mmap_reserved_end = 0;
+  out_map->module_count = 0;
   out_map->fb_addr = 0;
   out_map->fb_pitch = 0;
   out_map->fb_width = 0;
@@ -374,6 +496,7 @@ static bool ParseMemoryMapImpl(const uint32_t multiboot_magic,
     constexpr int64_t kMmapTagSize = sizeof(Multiboot2TagMmap);
     constexpr int64_t kMmapEntrySize = sizeof(Multiboot2MmapEntry);
     constexpr int64_t kFbTagSize = sizeof(Multiboot2TagFramebuffer);
+    constexpr int64_t kModuleTagSize = sizeof(Multiboot2TagModule);
     for (Multiboot2TagIterator it(mapped->data, mapped->total_size); !it.Done();
          it.Next()) {
       const Multiboot2Tag& tag = it.tag();
@@ -401,6 +524,23 @@ static bool ParseMemoryMapImpl(const uint32_t multiboot_magic,
       } else if (tag.type == kMultiboot2TagFramebuffer &&
                  tag_size >= kFbTagSize) {
         RecordFramebuffer(Multiboot2FramebufferFields(tag), out_map);
+      } else if (tag.type == kMultiboot2TagModule &&
+                 tag_size >= kModuleTagSize) {
+        const Multiboot2TagModule* const module_tag =
+            reinterpret_cast<const Multiboot2TagModule*>(&tag);
+        BootModule* const module = AddBootModule(out_map,                //
+                                                 module_tag->mod_start,  //
+                                                 module_tag->mod_end,    //
+                                                 max_physical_addr);
+        if (module != nullptr) {
+          // The command line fills the rest of the tag.
+          CopyBootModuleName(
+              reinterpret_cast<const char*>(module_tag) + kModuleTagSize,
+              tag_size - kModuleTagSize, module->name);
+          if (log_boot) {
+            LogBootModule(*module);
+          }
+        }
       }
     }
   } else if (multiboot_magic == kMultiboot1Magic) {
@@ -419,6 +559,13 @@ static bool ParseMemoryMapImpl(const uint32_t multiboot_magic,
             info_phys + kMultiboot1InfoWithFramebufferSize;
         RecordFramebuffer(Multiboot1FramebufferFields(*fb_info), out_map);
       }
+    }
+    if ((info->flags & kMultiboot1FlagMods) != 0) {
+      RecordMultiboot1Modules(info->mods_addr,    //
+                              info->mods_count,   //
+                              max_physical_addr,  //
+                              log_boot,           //
+                              out_map);
     }
     if ((info->flags & kMultiboot1FlagMmap) != 0) {
       const int64_t mmap_length = info->mmap_length;

@@ -13,14 +13,16 @@
 
 .text
 
-/* void UserModeEnter(uint64_t rip, uint64_t rsp, uint64_t arg,
- *                    UserProcess* process)
- *   rdi = entry point, rsi = user stack pointer, rdx = argument for the
- *   program (its rdi), rcx = process
+/* void UserModeEnter(uint64_t rip, uint64_t rsp, uint64_t rdi_arg,
+ *                    uint64_t rsi_arg, uint64_t rdx_arg, UserProcess* process)
+ *   rdi = entry point, rsi = user stack pointer, rdx = rdi for the program,
+ *   rcx = rsi (`argc`) for the program, r8 = rdx (`argv`) for the program,
+ *   r9 = process
  *
  * Saves the kernel context on the task's kernel stack and enters user mode at
- * `rip` with stack pointer `rsp`, rdi = `arg`, and every other general-purpose
- * register 0. Returns when UserModeExit() resumes the saved context.
+ * `rip` with stack pointer `rsp`, rdi = `rdi_arg`, rsi = `rsi_arg`,
+ * rdx = `rdx_arg`, and every other general-purpose register 0. Returns when
+ * UserModeExit() resumes the saved context.
  *
  * The saved context, from the lowest address up, is: `process`, a pad word,
  * RFLAGS, r15, r14, r13, r12, rbx, rbp, and the return address. The address
@@ -40,7 +42,7 @@ UserModeEnter:
     push r15
     pushfq
     sub rsp, 8
-    push rcx
+    push r9
 
     /* With interrupts disabled from here on, the task stays on this CPU, whose
      * TSS.rsp0 must point at the saved context when the CPU enters user mode. */
@@ -48,6 +50,8 @@ UserModeEnter:
     mov r12, rdi
     mov r13, rsi
     mov r14, rdx
+    mov r15, rcx
+    mov rbx, r8
     mov rdi, rsp
     call UserModeSetKernelStack
 
@@ -59,11 +63,11 @@ UserModeEnter:
     push r12
 
     mov rdi, r14
+    mov rsi, r15
+    mov rdx, rbx
     xor eax, eax
     xor ebx, ebx
     xor ecx, ecx
-    xor edx, edx
-    xor esi, esi
     xor ebp, ebp
     xor r8d, r8d
     xor r9d, r9d

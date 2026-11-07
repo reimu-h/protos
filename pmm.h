@@ -28,6 +28,7 @@
 
 namespace protos {
 
+struct BootModule;
 struct MultibootMemoryMap;
 
 // Physical frame size (4 KiB).
@@ -37,17 +38,18 @@ constexpr int64_t kPageSize = 4096;
 constexpr uintptr_t kLowerMemoryLimit = 0x100000;
 
 // Parses the Multiboot memory map, carves out lower memory, the kernel image,
-// the framebuffer, and the Multiboot information structures (the info block
-// and, for Multiboot1, the memory map buffer), extends the identity mapping
-// across usable physical RAM, and populates the intrusive Red-Black Tree of
-// free frame runs. Logs the memory map and RAM totals to the console and, if
-// the bootloader provided a linear framebuffer, switches the VGA console to it
+// the framebuffer, the boot modules, and the Multiboot information structures
+// (the info block and, for Multiboot1, the memory map buffer), extends the
+// identity mapping across usable physical RAM and the boot modules, and
+// populates the intrusive Red-Black Tree of free frame runs. Logs the memory
+// map, the boot modules and RAM totals to the console and, if the bootloader
+// provided a linear framebuffer, switches the VGA console to it
 // (`VgaInitFramebuffer`). Panics via `CHECK` if the memory map cannot be
 // parsed, no usable physical frames are available, or identity mapping fails.
 //
-// Multiboot modules and the Multiboot1 command line and boot loader name
-// strings are not reserved: their memory is handed out like any other free RAM
-// and gets overwritten. Booting with modules requires reserving them first.
+// The Multiboot1 command line and boot loader name strings and module list are
+// not reserved: their memory is handed out like any other free RAM and gets
+// overwritten (the parser copies the module names).
 void PmmInit(uint32_t multiboot_magic, uint64_t multiboot_info_addr);
 
 // Returns true once `PmmInit` has set up the frame allocator.
@@ -95,9 +97,21 @@ struct PmmFrameList {
 void PmmFreeFrameList(PmmFrameList* list);
 
 // Returns true if `[addr, addr + size)` lies strictly within a usable RAM
-// region above 1 MiB and does not overlap the kernel image, framebuffer, or
-// Multiboot data.
+// region above 1 MiB and does not overlap the kernel image, framebuffer, boot
+// modules, or Multiboot data.
 bool PmmRangeIsValidUsableRam(uintptr_t addr, int64_t size);
+
+// Returns the number of boot modules that `PmmInit` found (at most
+// `kMaxBootModules`, multiboot.h).
+int PmmBootModuleCount();
+
+// Returns boot module `index` (`0 <= index < PmmBootModuleCount()`, `DCHECK`).
+// Its memory `[start, end)` stays reserved and identity-mapped, so the kernel
+// can read the module's bytes at their physical addresses from any CPU. A
+// module below 1 MiB (GRUB on UEFI machines puts small ones there) lies in
+// lower memory, which the frame allocator never hands out; `SmpInit` puts back
+// the bytes that the AP startup trampoline overwrites there.
+const BootModule& PmmBootModule(int index);
 
 // Returns the exclusive upper bound (end address) of the highest usable
 // physical RAM interval found by `PmmInit`; the highest managed frame starts

@@ -381,6 +381,7 @@ REQUIRED_MARKERS=(
   "[TEST] ipc_subsystem: PASS"
   "[TEST] ramfs_driver_lifecycle: PASS"
   "[TEST] filesystem_end_to_end: PASS"
+  "[TEST] rootfs_boot_module: PASS"
   "[TEST] user_mode_kill_edge_cases: PASS"
   "[TEST] user_mode_syscall_buffer_checks: PASS"
   "[TEST] user_mode_fpu_lifecycle: PASS"
@@ -412,11 +413,15 @@ USB_MULTI_ARGS=(
   -device usb-kbd,bus=xhci1.0,port=1,id=kbd1,usb_version=1
 )
 
-# init's greeting and the kernel's report of its end, the marker of the ramfs
-# filesystem server, and init's report that ramfs did not get ready
-# (verify_init_ramfs).
+# init's greeting and the kernel's report of its end; the markers of the ramfs
+# filesystem server: its report of the boot filesystem that it loaded (which
+# must match ROOTFS_CLEAN_RE, an extended regular expression: no member
+# skipped, no error and no damage) and that it is ready; and init's report
+# that ramfs did not get ready (verify_init_ramfs).
 INIT_HELLO_MARKER="[INIT] hello from ring 3"
 INIT_EXITED_MARKER="[INIT] exited with status"
+ROOTFS_MARKER="[RAMFS] rootfs: files="
+ROOTFS_CLEAN_RE='\[RAMFS\] rootfs: files=[0-9]+ dirs=[0-9]+ skipped=0 errors=0$'
 RAMFS_READY_MARKER="[RAMFS] ready"
 RAMFS_NOT_READY_MARKER="[INIT] ramfs not ready"
 
@@ -759,27 +764,50 @@ verify_serial_log() {
   fi
 }
 
-# Checks init's ramfs in the serial log $1: init never reported that ramfs did
-# not get ready, and in a boot without the interactive session ($2 is 0),
-# where init runs before the boot self-tests (which run ramfs again and print
-# its marker several times), ramfs reported ready between init's greeting and
-# init's end. (The USB session checks the marker of the interactive session.)
+# Checks init's ramfs in the serial log $1 of a boot without the interactive
+# session ($2 is 0), where init runs before the boot self-tests, which run
+# ramfs and init again and print the same markers (even init's report that
+# ramfs did not get ready). In init's session, from init's greeting to the
+# kernel's report of its end: init never reported that ramfs did not get
+# ready, ramfs reported ready, and before that, once, that it loaded the boot
+# filesystem with no member skipped, no error and no damage. (In the
+# interactive session the boot self-tests run first; the USB session checks
+# the init session after them.)
 verify_init_ramfs() {
   local log="$1" interactive="$2"
-  if grep -aFq -- "${RAMFS_NOT_READY_MARKER}" "${log}"; then
-    echo "FAIL: init reported that ramfs did not get ready ('${RAMFS_NOT_READY_MARKER}')." >&2
-    return 1
-  fi
   if [[ "${interactive}" == "1" ]]; then
     return 0
   fi
-  local hello ready exited
+  local hello exited session=""
   hello="$(grep -an -m1 -F -- "${INIT_HELLO_MARKER}" "${log}" | cut -d: -f1 || true)"
-  ready="$(grep -an -m1 -F -- "${RAMFS_READY_MARKER}" "${log}" | cut -d: -f1 || true)"
   exited="$(grep -an -m1 -F -- "${INIT_EXITED_MARKER}" "${log}" | cut -d: -f1 || true)"
-  if [[ -z "${hello}" || -z "${ready}" || -z "${exited}" ]] ||
-     ((ready < hello || ready > exited)); then
+  if [[ -n "${hello}" && -n "${exited}" ]] && ((hello <= exited)); then
+    session="$(sed -n "${hello},${exited}p" "${log}" | tr -d '\r')"
+  fi
+  if grep -aFq -- "${RAMFS_NOT_READY_MARKER}" <<<"${session}"; then
+    echo "FAIL: init reported that ramfs did not get ready ('${RAMFS_NOT_READY_MARKER}')." >&2
+    return 1
+  fi
+  local ready
+  ready="$(grep -an -m1 -F -- "${RAMFS_READY_MARKER}" <<<"${session}" | cut -d: -f1 || true)"
+  if [[ -z "${ready}" ]]; then
     echo "FAIL: Missing '${RAMFS_READY_MARKER}' of init's ramfs between '${INIT_HELLO_MARKER}' and '${INIT_EXITED_MARKER}' in serial output." >&2
+    return 1
+  fi
+  local before_ready rootfs_count rootfs
+  before_ready="$(head -n "${ready}" <<<"${session}")"
+  rootfs_count="$(grep -aFc -- "${ROOTFS_MARKER}" <<<"${before_ready}" || true)"
+  if [[ "${rootfs_count}" -eq 0 ]]; then
+    echo "FAIL: Missing '${ROOTFS_MARKER}' of init's ramfs between '${INIT_HELLO_MARKER}' and '${RAMFS_READY_MARKER}' in serial output (init's ramfs did not load the boot filesystem)." >&2
+    return 1
+  fi
+  if [[ "${rootfs_count}" -ne 1 ]]; then
+    echo "FAIL: Expected one '${ROOTFS_MARKER}' line of init's ramfs between '${INIT_HELLO_MARKER}' and '${RAMFS_READY_MARKER}' in serial output, found ${rootfs_count}." >&2
+    return 1
+  fi
+  rootfs="$(grep -aF -- "${ROOTFS_MARKER}" <<<"${before_ready}")"
+  if ! grep -aEq -- "${ROOTFS_CLEAN_RE}" <<<"${rootfs}"; then
+    echo "FAIL: init's ramfs did not load the boot filesystem cleanly (expected 'skipped=0 errors=0' and no damage): '${rootfs}'." >&2
     return 1
   fi
 }
@@ -1226,14 +1254,16 @@ stop_qemu_and_recheck_log() {
 # and keys typed over the i8042 PS/2 keyboard (ps2kbd); a
 # full-speed keyboard hot-plugged on the last root port (symbols, rollover),
 # unplugged and attached again (Tab, spaces, digits); a second, high-speed
-# keyboard; a line of exactly 128 characters plus two dropped ones; help, an
-# unknown command and usertest 0.
+# keyboard; a 128-character line; a line of exactly the shell's 1024-character
+# limit plus two characters typed into the serial console, which the shell
+# refuses ('sh: line too long'); help, an unknown command and usertest 0.
 # uefi: a random token and Shift with Backspace corrections on the full-speed
 # keyboard of the MSI-only controller; that keyboard unplugged, then symbols
 # and Caps Lock (Tab separator) on the root controller's only keyboard; serial
 # input; the bridged keyboard attached again at high speed and the root one
-# unplugged, then a 128-character line on it; a full-speed keyboard hot-plugged
-# on another bridged port; help, an unknown command and usertest 0.
+# unplugged, then a 128-character line on it; the serial line of the shell's
+# limit plus two characters; a full-speed keyboard hot-plugged on another
+# bridged port; help, an unknown command and usertest 0.
 # Returns 0 if all of it passed; 2 if the serial log shows a failure line,
 # which the caller reports like a failed boot; otherwise prints
 # 'FAIL: usb_<scenario>: <detail>' (details on the lines after it) on stderr
@@ -1277,7 +1307,17 @@ POLL = 0.01
 # 16 and drops the rest): the harness waits for the shell's echo after every
 # key that types a character.
 MAX_UNPOLLED = 12
-LINE_MAX = 128  # the shell's line limit (kShellMaxLineLength in user/sh/sh_lib.h)
+# The most characters typed into the serial console before the harness waits
+# for their echo: QEMU writes the guest's output to the socket a byte at a
+# time, so a few hundred bytes that the harness has not read yet fill it.
+# QEMU's 16550 then stalls the guest's output, which the kernel drops after a
+# while, and QEMU's log repeats each byte that it has to retry.
+SERIAL_PART = 64
+LINE_MAX = 1024  # the shell's line limit (kShellMaxLineLength in user/sh/sh_lib.h)
+# The characters of the longest line typed over USB, far below LINE_MAX: a key
+# takes tens of milliseconds there, so the line that reaches the limit goes
+# through the serial console (in parts of SERIAL_PART).
+LONG_LINE = 128
 ECHO_MAX_TOKENS = 16  # the shell's token limit (kShellMaxTokens)
 
 COMPLETION = "[TEST] ALL BOOT SELF-TESTS PASSED"
@@ -1290,12 +1330,15 @@ PS2_READY = "[PS2KBD] controller i8042 ready (irq1)"
 NO_PS2 = "[PS2KBD] no i8042 controller found"
 RAMFS_READY = "[RAMFS] ready"
 RAMFS_NOT_READY = "[INIT] ramfs not ready"
+ROOTFS = "[RAMFS] rootfs: files="
 STRESS = "[STRESS]"
 PROMPT = "sh> "
+# What the shell prints instead of running a line that lost characters.
+LINE_TOO_LONG = "sh: line too long"
 HELP_LINES = (
     "built-in commands: help echo cpu programs run exit",
     "built-in file commands: ls cat stat mkdir rm touch write append cp mv",
-    "user programs: init sh usertest",
+    "user programs: init sh usertest, or files in /bin or by path",
 )
 SCRIPTED_ECHO = "boot_sh_ok"
 USERTEST_RE = re.compile(r"sh: usertest exited with status -?[0-9]+")
@@ -1309,6 +1352,12 @@ DETACHED_RE = re.compile(r"\[USBKBD\] keyboard detached: (%s) port (%s)$" %
                          (BDF, PORT_PATH))
 PS2_READY_RE = re.compile(re.escape(PS2_READY) + r"$")
 RAMFS_READY_RE = re.compile(re.escape(RAMFS_READY) + r"$")
+# ramfs's report of the boot filesystem that it loaded, and that report for a
+# load with no member skipped, no error and no damage (ROOTFS_CLEAN_RE in
+# test_boot.sh).
+ROOTFS_RE = re.compile(re.escape(ROOTFS) + r".*$")
+ROOTFS_CLEAN_RE = re.compile(
+    re.escape(ROOTFS) + r"[0-9]+ dirs=[0-9]+ skipped=0 errors=0$")
 # A kernel or driver log line. Typed text never has "[" before a letter.
 LOG_LINE_RE = re.compile(r"\[[A-Z][A-Za-z0-9_]*\][^\n]*\n")
 # Text that typed lines must not contain: what test_boot.sh and deflake.py
@@ -1441,24 +1490,31 @@ class KeyboardModel:
 
 class ShellModel:
     """The line editor of sh (user/sh/sh_lib.h): printable characters are echoed
-    up to the line limit and later ones dropped silently, Tab becomes a space,
-    Backspace (0x08 or 0x7F) erases one character with "\\b \\b" (nothing on an
-    empty line), CR or LF submits the line (LF right after CR is ignored), and
-    the serial console turns the echoed LF into CR LF."""
+    up to the line limit and later ones dropped without echo, Tab becomes a
+    space, Backspace (0x08 or 0x7F) erases one character with "\\b \\b"
+    (nothing on an empty line), CR or LF submits the line (LF right after CR is
+    ignored), and the serial console turns the echoed LF into CR LF. The shell
+    refuses a line that lost a character, even if Backspace shortened it
+    since: it prints LINE_TOO_LONG instead of running it."""
 
     def __init__(self, other=None):
         self.buf = list(other.buf) if other else []
+        self.overflowed = other.overflowed if other else False
         self.last_cr = other.last_cr if other else False
 
     def feed(self, ch):
-        """Returns (echo, the submitted line or None)."""
+        """Returns (echo, the submitted line or None). The echo of the CR or
+        LF that ends a refused line includes the shell's report, and the
+        line is None."""
         if ch == "\n" and self.last_cr:
             self.last_cr = False
             return "", None
         self.last_cr = ch == "\r"
         if ch in "\r\n":
-            line = "".join(self.buf)
-            self.buf = []
+            line, overflowed = "".join(self.buf), self.overflowed
+            self.buf, self.overflowed = [], False
+            if overflowed:
+                return "\r\n" + LINE_TOO_LONG + "\r\n", None
             return "\r\n", line
         if ch in "\b\x7f":
             if self.buf:
@@ -1467,9 +1523,11 @@ class ShellModel:
             return "", None
         if ch == "\t":
             ch = " "
-        if " " <= ch <= "~" and len(self.buf) < LINE_MAX:
-            self.buf.append(ch)
-            return ch, None
+        if " " <= ch <= "~":
+            if len(self.buf) < LINE_MAX:
+                self.buf.append(ch)
+                return ch, None
+            self.overflowed = True
         return "", None
 
 
@@ -1746,7 +1804,7 @@ class Session:
         if (READY_RE.search(s) or ATTACHED_RE.search(s) or
                 DETACHED_RE.search(s) or NO_CONTROLLERS in s or
                 PS2_READY_RE.search(s) or NO_PS2 in s or
-                RAMFS_READY_RE.search(s)):
+                ROOTFS_RE.search(s) or RAMFS_READY_RE.search(s)):
             raise Failure(self.scenario, "unexpected driver marker in the "
                           "serial log", ["line: %r" % s])
         say("USB note: log line during the session: %r" % s)
@@ -1867,7 +1925,8 @@ class Session:
             shell = ShellModel(self.shell)
             plan = Plan(chunks, kbd, shell)
             if len(plan.lines) != 1:
-                raise RuntimeError("a planned line must end with one Enter")
+                raise RuntimeError("a planned line must fit the line limit and "
+                                   "end with one Enter")
             output = echo_output(plan.lines[0])
             if output != expected:
                 raise RuntimeError("the models give %r for a line that should "
@@ -2135,8 +2194,9 @@ class Session:
 
     def check_ready(self):
         """Checks the markers of the drivers and of ramfs in the init session
-        against the controllers and cold-plugged keyboards of the pass, and
-        that ramfs reported ready once."""
+        against the controllers and cold-plugged keyboards of the pass, that
+        ramfs reported once that it loaded the boot filesystem with no member
+        skipped, no error and no damage, and that it reported ready once."""
         self.scenario = "usb_ready"
         ready_count = 2 if MULTI else 1
         kbd_count = 3 if MULTI else 1
@@ -2146,18 +2206,31 @@ class Session:
             ready = [m for m in map(READY_RE.search, lines) if m]
             ps2_ready = [m.group(0) for m in map(PS2_READY_RE.search, lines)
                          if m]
+            # ramfs reports the boot filesystem before it reports ready.
+            rootfs = [m.group(0) for m in map(ROOTFS_RE.search, lines) if m]
             ramfs_ready = [m.group(0) for m in map(RAMFS_READY_RE.search, lines)
                            if m]
             attached = [m for m in map(ATTACHED_RE.search, lines) if m]
             if (len(ready) >= ready_count and len(ps2_ready) >= 1 and
                     len(ramfs_ready) >= 1 and len(attached) >= kbd_count):
-                return ready, ps2_ready, ramfs_ready, attached
+                return ready, ps2_ready, rootfs, ramfs_ready, attached
             return None
 
-        ready, ps2_ready, ramfs_ready, attached = self.wait_for(
+        ready, ps2_ready, rootfs, ramfs_ready, attached = self.wait_for(
             "the drivers' 'controller ... ready' and 'keyboard attached' "
             "markers and '%s' in the init session" % RAMFS_READY,
             SESSION_READY_TIMEOUT, markers)
+        if not rootfs:
+            raise Failure("usb_ready", "init's ramfs reported ready without "
+                          "'%s' (it did not load the boot filesystem)" % ROOTFS)
+        if len(rootfs) != 1:
+            raise Failure("usb_ready", "expected one '%s' line in the init "
+                          "session, found %d" % (ROOTFS, len(rootfs)),
+                          ["lines: %r" % rootfs])
+        if not ROOTFS_CLEAN_RE.search(rootfs[0]):
+            raise Failure("usb_ready", "init's ramfs did not load the boot "
+                          "filesystem cleanly (expected 'skipped=0 errors=0' "
+                          "and no damage)", ["line: %r" % rootfs[0]])
         try:
             self.qmp = Qmp(QMP_PATH)
             pci = self.qmp.execute("query-pci")
@@ -2223,7 +2296,8 @@ class Session:
                               "attached markers: %r" % [m.group(0)
                                                         for m in attached]])
         self.initial_markers = ([m.group(0) for m in ready] + ps2_ready +
-                                ramfs_ready + [m.group(0) for m in attached])
+                                rootfs + ramfs_ready +
+                                [m.group(0) for m in attached])
         say("USB session: %s." % "; ".join(self.initial_markers))
 
     def settle(self):
@@ -2266,7 +2340,7 @@ class Session:
         markers = []
         for line in complete_lines(self.log[:end_of_session], self.s0):
             match = (READY_RE.search(line) or PS2_READY_RE.search(line) or
-                     RAMFS_READY_RE.search(line) or
+                     ROOTFS_RE.search(line) or RAMFS_READY_RE.search(line) or
                      ATTACHED_RE.search(line) or DETACHED_RE.search(line))
             if match:
                 markers.append(match.group(0))
@@ -2362,13 +2436,46 @@ class Session:
         return chunks, r6 + l2.upper() + digits + " " + r4a + " " + r4b
 
     @staticmethod
-    def long_line(overflow):
-        """A line of exactly the shell's 128-character limit, plus `overflow`
-        characters after it, which the shell drops without echo."""
+    def long_line():
+        """A line of LONG_LINE characters, far below the shell's limit."""
         content = shuffled(DIGITS) + shuffled(LETTERS) + rand(
-            LINE_MAX - len("echo ") - len(DIGITS) - len(LETTERS))
-        chunks = keys("echo " + content) + keys(rand(overflow)) + ENTER
-        return chunks, content
+            LONG_LINE - len("echo ") - len(DIGITS) - len(LETTERS))
+        return keys("echo " + content) + ENTER, content
+
+    def serial_line_too_long(self, scenario):
+        """An echo command of exactly the shell's line limit plus two more
+        characters, typed into the serial console in parts of SERIAL_PART,
+        each after the echo of the one before: the shell echoes the line up
+        to its limit, drops the rest without echo and refuses the line
+        instead of running it."""
+        self.scenario = scenario
+        for _ in range(200):
+            content, extra = rand(LINE_MAX - len("echo ")), rand(2)
+            if acceptable(content + extra):
+                break
+        else:
+            raise RuntimeError("could not generate a line without reserved text")
+        line = "echo " + content
+        refusal = "\r\n" + LINE_TOO_LONG + "\r\n"
+        shell = ShellModel(self.shell)
+        echo = "".join(shell.feed(ch)[0] for ch in line + extra + "\r")
+        if echo != line + refusal:
+            raise RuntimeError("the shell model does not refuse the line that "
+                               "is too long")
+        started = time.monotonic()
+        for i in range(0, len(line), SERIAL_PART):
+            part = line[i:i + SERIAL_PART]
+            self.cursor = self.serial_type(
+                part, self.cursor, part,
+                "the echo of characters %d-%d of the line that is too long" % (
+                    i + 1, i + len(part)))
+        self.cursor = self.serial_type(
+            extra + "\r", self.cursor, refusal + PROMPT,
+            "the shell's report that the line is too long and the next prompt")
+        self.shell = shell
+        say("USB %s: typed a %d-character line and %r into the serial "
+            "console; the shell refused it (%.1f s)." % (
+                scenario, LINE_MAX, extra, time.monotonic() - started))
 
     def mixed_line(self, scenario):
         """One command line typed partly over USB and partly into the serial
@@ -2477,8 +2584,9 @@ class Session:
         self.plug("usb_second_keyboard", "xhci0", 2, "kbd_hs", False)
         self.echo_line("usb_second_keyboard", lambda: self.token_line(12),
                        "the token line")
-        self.echo_line("usb_long_line", lambda: self.long_line(2),
+        self.echo_line("usb_long_line", self.long_line,
                        "the 128-character line")
+        self.serial_line_too_long("usb_serial_too_long")
         # Single USB hub + downstream keyboard (the only attached keyboard).
         self.unplug("usb_hub_single", "kbd_hs")
         self.unplug("usb_hub_single", "kbd_fs")
@@ -2541,8 +2649,9 @@ class Session:
         self.plug("usb_replug", "xhci1", 1, "kbd1", False)
         self.unplug("usb_bridged_controller", "kbd0")
         self.require_only("kbd1")
-        self.echo_line("usb_bridged_controller", lambda: self.long_line(0),
+        self.echo_line("usb_bridged_controller", self.long_line,
                        "the 128-character line")
+        self.serial_line_too_long("usb_serial_too_long")
         # A full-speed keyboard hot-plugged on a fresh port of the bridged
         # controller (both keyboards are on that controller).
         self.plug("usb_hotplug_add", "xhci1", 3, "kbd_br", True)

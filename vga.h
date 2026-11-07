@@ -19,7 +19,9 @@ namespace protos {
 void VgaClear();
 
 // Writes a single character to the console at the current cursor position,
-// advancing the cursor and scrolling as needed.
+// advancing the cursor and scrolling as needed. Backspace (`'\b'`) moves left
+// within a row, or to the last column of the row above when the current row
+// wrapped from it (not after `'\n'` or at row 0).
 void VgaPutc(char ch);
 
 // Writes a null-terminated string to the console at the current cursor

@@ -4014,8 +4014,11 @@ static bool TestUserModePrograms() {
   // two guard pages) parse cleanly in `ElfParseExecutable()` but fail in
   // `UserProcess::Load()` with `kLoadFailed`.
   static_assert(UserSegmentRangeAllowed(0xFFFFFFFF80000000ULL, kPageSize));
+  static_assert(UserSegmentRangeAllowed(0xFFFFFFFF80000123ULL, 100));
   static_assert(
       UserSegmentRangeAllowed(kUserStackRegionBase - kPageSize, kPageSize));
+  static_assert(UserSegmentRangeAllowed(kUserStackRegionBase - 100, 100));
+  static_assert(!UserSegmentRangeAllowed(kUserStackRegionBase - 100, 101));
   static_assert(!UserSegmentRangeAllowed(kUserStackRegionBase - kPageSize,
                                          kPageSize + 1));
   static_assert(!UserSegmentRangeAllowed(kUserStackRegionBase, kPageSize));
@@ -4025,7 +4028,7 @@ static bool TestUserModePrograms() {
   static_assert(!UserSegmentRangeAllowed(kUserAnonWindowBase, kPageSize));
   {
     struct MinimalElf {
-      uint8_t bytes[128] = {};
+      uint8_t bytes[136] = {};
     };
     auto build_one_page_elf = [](const uintptr_t vaddr) -> MinimalElf {
       struct Header {
@@ -4056,6 +4059,10 @@ static bool TestUserModePrograms() {
       };
       static_assert(sizeof(Header) == 64);
       static_assert(sizeof(Phdr) == 56);
+      // `xor eax, eax; mov edi, 55; int 0x80` -> `Exit(55)`.
+      constexpr uint8_t kExit55[9] = {
+          0x31, 0xC0, 0xBF, 55, 0x00, 0x00, 0x00, 0xCD, 0x80,
+      };
       MinimalElf out{};
       Header hdr{};
       hdr.ident[0] = 0x7F;
@@ -4079,14 +4086,28 @@ static bool TestUserModePrograms() {
       phdr.offset = sizeof(Header) + sizeof(Phdr);
       phdr.vaddr = vaddr;
       phdr.paddr = vaddr;
-      phdr.filesz = 1;
-      phdr.memsz = kPageSize;
+      phdr.filesz = sizeof(kExit55);
+      phdr.memsz = sizeof(kExit55);
       phdr.align = kPageSize;
       __builtin_memcpy(out.bytes, &hdr, sizeof(hdr));
       __builtin_memcpy(out.bytes + sizeof(hdr), &phdr, sizeof(phdr));
-      out.bytes[sizeof(hdr) + sizeof(phdr)] = 0xC3;  // ret
+      __builtin_memcpy(out.bytes + sizeof(hdr) + sizeof(phdr), kExit55,
+                       sizeof(kExit55));
       return out;
     };
+    // A compact executable with a non-page-aligned `p_vaddr` loads and runs.
+    {
+      const MinimalElf unaligned = build_one_page_elf(0xFFFFFFFF80000078ULL);
+      SELFTEST_EXPECT(
+          ElfParseExecutable(unaligned.bytes, sizeof(unaligned.bytes)).ok());
+      const std::unique_ptr<UserProcess> process = UserProcess::Start(
+          UserProgram{unaligned.bytes, sizeof(unaligned.bytes)}, 0);
+      SELFTEST_EXPECT(process != nullptr);
+      SELFTEST_EXPECT(
+          WaitForProcesses(&process, 1, HasEnded, WaitMode::kYield));
+      result = process->Wait();
+      SELFTEST_EXPECT(ExitedWith(result, 55));
+    }
     const uintptr_t forbidden_addrs[] = {
         kDriverMmioWindowBase, kDriverDmaWindowBase, kUserAnonWindowBase,
         kUserStackRegionBase,  kUserStackTop,
@@ -7950,14 +7971,15 @@ static bool PrepareDeviceForDriverTests(const char* const test_name,
 
 // Verifies capability separation and EPERM gating:
 // - An unprivileged process (`kUserCapNone`) receives `kSyscallErrorPermission`
-//   on every privileged syscall (`7..15` and `17..19`) and on
+//   on every privileged syscall (`7..15`, `17..19` and `35..36`) and on
 //   `IpcListen(kIpcPortFs)`, succeeds on `kSyscallGetTicks` (`16`), and
 //   receives `kSyscallErrorNoSys` on `kSyscallCount`/`-1`.
 // - A `kUserCapSpawnDrivers` process receives `kSyscallErrorPermission` on
-//   driver syscalls `8..15` and `17..19` and on `IpcListen(kIpcPortFs)`,
-//   succeeds on `kSyscallSpawnDriver`, and its spawned driver child runs with
-//   `kUserCapDriver` (succeeds on `pci_info` and `get_ticks`, and gets
-//   `kSyscallErrorPermission` on `spawn_driver`).
+//   driver syscalls `8..15`, `17..19` and `35..36` and on
+//   `IpcListen(kIpcPortFs)`, succeeds on `kSyscallSpawnDriver`, and its spawned
+//   driver child runs with `kUserCapDriver` (succeeds on `pci_info`,
+//   `get_ticks` and `boot_module_info`, and gets `kSyscallErrorPermission` on
+//   `spawn_driver`).
 // - A child spawned via `kSyscallSpawn` from either a `kUserCapSpawnDrivers`
 //   or a `kUserCapDriver` process receives `kUserCapNone`.
 // - A `kUserCapDriver` process validates `kSyscallConsolePush` error cases and
@@ -9559,10 +9581,41 @@ static bool TestIpcSubsystem() {
     SELFTEST_EXPECT(ExitedWith(server->Wait(), 0));
   }
   SELFTEST_EXPECT(VerifyIpcReleased(pmm_free_before, heap_free_before));
+
+  // 7. MemMap() 1 MiB maximum per call and 64 MiB cumulative limit, and
+  //    physical-memory exhaustion rollback without leaking frames.
+  SELFTEST_EXPECT(pmm_free_before >= 20000);
+  SELFTEST_EXPECT(RunUserTestWithCaps(
+      usertest::IpcChecksArg(IpcTestSubmode::kMemMapLimits, kIpcTestPort),
+      kUserCapNone,  //
+      &result));
+  SELFTEST_EXPECT(ExitedWith(result, 0));
+  SELFTEST_EXPECT(VerifyIpcReleased(pmm_free_before, heap_free_before));
+
+  {
+    const std::unique_ptr<UserProcess> client =
+        StartIpcTest(IpcTestSubmode::kMemMapPmmRollback);
+    SELFTEST_EXPECT(client != nullptr);
+    SELFTEST_EXPECT(WaitUntilParked(client, [](const UserProcessStats& stats) {
+      return stats.syscalls >= 2 && stats.in_syscall;
+    }));
+    const uintptr_t spare0 = PmmAllocFrame();
+    const uintptr_t spare1 = PmmAllocFrame();
+    SELFTEST_EXPECT(spare0 != 0 && spare1 != 0);
+    const uintptr_t drained = DrainAllPmmFrames();
+    PmmFreeFrame(spare0);
+    PmmFreeFrame(spare1);
+    ConsolePushInput("x", 1);
+    const bool ended = WaitForProcesses(&client, 1, HasEnded, WaitMode::kYield);
+    FreeDrainedPmmFrames(drained);
+    SELFTEST_EXPECT(ended);
+    SELFTEST_EXPECT(ExitedWith(client->Wait(), 0));
+  }
+  SELFTEST_EXPECT(VerifyIpcReleased(pmm_free_before, heap_free_before));
   return true;
 }
 
-// Starts ramfs as a driver in `mode` (`kDriverArg*`).
+// Starts ramfs as a driver in `mode` (`kDriverArg*` or `kRamfsArgEmpty`).
 static std::unique_ptr<UserProcess> StartRamfs(const uint64_t mode) {
   return UserProcess::Start(RamfsProgram(), mode, kUserCapDriver);
 }
@@ -9764,6 +9817,25 @@ constexpr char kFsShellTranscript[] =
     "sh> exit 0\n";
 constexpr int64_t kFsShellTranscriptSize =
     static_cast<int64_t>(sizeof(kFsShellTranscript)) - 1;
+// The shell session of TestFilesystemEndToEnd() without a filesystem: init,
+// which may not spawn drivers, reports that it can't start ramfs because
+// SpawnDriver() fails with kSyscallErrorPermission, and the shell that it
+// starts anyway reports the filesystem unavailable.
+constexpr char kNoFsShellScript[] = "ls\n/bin/hello\nexit 0\n";
+constexpr int64_t kNoFsShellScriptSize =
+    static_cast<int64_t>(sizeof(kNoFsShellScript)) - 1;
+constexpr char kNoFsShellTranscript[] =
+    "[INIT] hello from ring 3\n"
+    "[INIT] ramfs not ready (spawn error -1); continuing without a "
+    "filesystem\n"
+    "sh> ls\n"
+    "sh: ls: /: filesystem unavailable\n"
+    "sh> /bin/hello\n"
+    "sh: /bin/hello: filesystem unavailable\n"
+    "sh> exit 0\n";
+static_assert(kSyscallErrorPermission == -1);
+constexpr int64_t kNoFsShellTranscriptSize =
+    static_cast<int64_t>(sizeof(kNoFsShellTranscript)) - 1;
 
 static FsDirEntry MakeTestDirEntry(const uint64_t fnode_id,  //
                                    const FsNodeType type,    //
@@ -9904,6 +9976,49 @@ static bool TestFsMalformedRepliesAndDisconnectScoping() {
         mock_fs.Reply(kIpcPortFs, msg.token, &entry, sizeof(entry), 1) == 0);
   }
 
+  // Regular file handle for FileRead, FileWrite, Seek malformed-reply tests.
+  const FsOpenReply file_reply{.handle = 8, .type = FsNodeType::kRegular};
+  SELFTEST_EXPECT(
+      ReceiveMockFsCall(mock_fs, client, req_buf, sizeof(req_buf), &msg));
+  SELFTEST_EXPECT(mock_fs.Reply(kIpcPortFs,          //
+                                msg.token,           //
+                                &file_reply,         //
+                                sizeof(file_reply),  //
+                                0) == 0);
+
+  // Malformed FileRead (status > size; reply_size != status).
+  SELFTEST_EXPECT(
+      ReceiveMockFsCall(mock_fs, client, req_buf, sizeof(req_buf), &msg));
+  SELFTEST_EXPECT(mock_fs.Reply(kIpcPortFs, msg.token, "abcd", 4, 5) == 0);
+  SELFTEST_EXPECT(
+      ReceiveMockFsCall(mock_fs, client, req_buf, sizeof(req_buf), &msg));
+  SELFTEST_EXPECT(mock_fs.Reply(kIpcPortFs, msg.token, "ab", 2, 3) == 0);
+
+  // Malformed FileWrite (status > size; status 0 for size > 0).
+  for (const int64_t bad_write_status : {int64_t{5}, int64_t{0}}) {
+    SELFTEST_EXPECT(
+        ReceiveMockFsCall(mock_fs, client, req_buf, sizeof(req_buf), &msg));
+    SELFTEST_EXPECT(mock_fs.Reply(kIpcPortFs, msg.token, nullptr, 0,
+                                  bad_write_status) == 0);
+  }
+
+  // Malformed Seek (wrong kFsSeekSet offset, > kFsMaxFileSize, nonzero dir
+  // kFsSeekSet).
+  for (const int64_t bad_seek_status :
+       {int64_t{5}, kFsMaxFileSize + 1, int64_t{1}}) {
+    SELFTEST_EXPECT(
+        ReceiveMockFsCall(mock_fs, client, req_buf, sizeof(req_buf), &msg));
+    SELFTEST_EXPECT(
+        mock_fs.Reply(kIpcPortFs, msg.token, nullptr, 0, bad_seek_status) == 0);
+  }
+
+  // Malformed positive status on MkDir, Unlink, Rename.
+  for (int i = 0; i < 3; ++i) {
+    SELFTEST_EXPECT(
+        ReceiveMockFsCall(mock_fs, client, req_buf, sizeof(req_buf), &msg));
+    SELFTEST_EXPECT(mock_fs.Reply(kIpcPortFs, msg.token, nullptr, 0, 1) == 0);
+  }
+
   SELFTEST_EXPECT(WaitUntilParked(client, [](const UserProcessStats& stats) {
     return stats.syscalls >= usertest::kMalformedServerReadSyscall &&
            stats.in_syscall;
@@ -9926,18 +10041,282 @@ static bool TestFsMalformedRepliesAndDisconnectScoping() {
   return true;
 }
 
+// Receives the next message on the mock filesystem server `server`, which must
+// be an Open() call of `client`'s, answers it with `handle` for a regular file,
+// and stores the caller's client ID in `*out_client_id`.
+static bool AnswerMockFsOpen(IpcContext& server,                          //
+                             const std::unique_ptr<UserProcess>& client,  //
+                             const uint64_t handle,                       //
+                             uint64_t* const out_client_id) {
+  static uint8_t req_buf[kIpcMaxMessageSize];
+  IpcReceivedMessage msg{};
+  SELFTEST_EXPECT(
+      ReceiveMockFsCall(server, client, req_buf, sizeof(req_buf), &msg));
+  FsOpenRequest request{};
+  SELFTEST_EXPECT(msg.size >= static_cast<int64_t>(sizeof(request)));
+  __builtin_memcpy(&request, req_buf, sizeof(request));
+  SELFTEST_EXPECT(request.op == FsRpcOp::kOpen);
+  const FsOpenReply reply{.handle = handle, .type = FsNodeType::kRegular};
+  SELFTEST_EXPECT(
+      server.Reply(kIpcPortFs, msg.token, &reply, sizeof(reply), 0) == 0);
+  *out_client_id = msg.client_id;
+  return true;
+}
+
+// Counts `kClientDisconnect` notifications received by `server` until `client`
+// ends (and any still queued afterwards), asserting every message received is a
+// `kClientDisconnect` for `client_id`.
+static bool DrainMockFsDisconnects(
+    IpcContext& server,                          //
+    const std::unique_ptr<UserProcess>& client,  //
+    const uint64_t client_id,                    //
+    int* const out_count) {
+  static uint8_t req_buf[kIpcMaxMessageSize];
+  IpcReceivedMessage msg{};
+  TaskScheduler* const scheduler = GetTaskScheduler();
+  const TscDeadline deadline(kSelfTestWaitTimeoutTscCycles);
+  int disconnects = 0;
+  for (;;) {
+    const bool ended = HasEnded(client->stats());
+    for (;;) {
+      const int64_t rc = server.Recv(kIpcPortFs,       //
+                                     req_buf,          //
+                                     sizeof(req_buf),  //
+                                     &msg,             //
+                                     0,                //
+                                     nullptr,          //
+                                     nullptr);
+      if (rc == 0) {
+        break;
+      }
+      SELFTEST_EXPECT(rc == 1);
+      SELFTEST_EXPECT(msg.kind == IpcMessageKind::kClientDisconnect);
+      SELFTEST_EXPECT(msg.client_id == client_id);
+      ++disconnects;
+    }
+    if (ended) {
+      break;
+    }
+    SELFTEST_EXPECT(!deadline.Expired());
+    scheduler->Yield();
+  }
+  *out_count = disconnects;
+  return true;
+}
+
+// Verifies that when a client exits whose descriptors name a replacement
+// server on `kIpcPortFs`, the server that it replaced and the replacement
+// again (usertest's kInterleavedServers), the replacement receives a single
+// `kClientDisconnect` for it.
+static bool TestFsDisconnectOncePerServer() {
+  using usertest::FsTestSubmode;
+  IpcContext first_fs;
+  SELFTEST_EXPECT(first_fs.Listen(kIpcPortFs, kUserCapDriver) == 0);
+  const std::unique_ptr<UserProcess> client = UserProcess::Start(
+      UserTestProgram(),
+      usertest::FsChecksArg(FsTestSubmode::kInterleavedServers));
+  SELFTEST_EXPECT(client != nullptr);
+  // Descriptors 0-2 on the first server.
+  uint64_t client_id = 0;
+  for (int i = 1; i <= 3; ++i) {
+    SELFTEST_EXPECT(AnswerMockFsOpen(first_fs,                  //
+                                     client,                    //
+                                     static_cast<uint64_t>(i),  //
+                                     &client_id));
+  }
+  SELFTEST_EXPECT(WaitUntilParked(client, [](const UserProcessStats& stats) {
+    return stats.syscalls >= usertest::kInterleavedServersReadSyscall &&
+           stats.in_syscall;
+  }));
+  SELFTEST_EXPECT(first_fs.Release() == 1);
+
+  // The replacement serves the files that the client opens with descriptors
+  // 0 and 2 once it has closed them.
+  IpcContext second_fs;
+  SELFTEST_EXPECT(second_fs.Listen(kIpcPortFs, kUserCapDriver) == 0);
+  ConsolePushInput("x", 1);
+  for (int i = 1; i <= 2; ++i) {
+    uint64_t caller_id = 0;
+    SELFTEST_EXPECT(AnswerMockFsOpen(second_fs,                 //
+                                     client,                    //
+                                     static_cast<uint64_t>(i),  //
+                                     &caller_id));
+    SELFTEST_EXPECT(caller_id == client_id);
+  }
+
+  int disconnects = 0;
+  SELFTEST_EXPECT(
+      DrainMockFsDisconnects(second_fs, client, client_id, &disconnects));
+  SELFTEST_EXPECT(ExitedWith(client->Wait(), 0));
+  SELFTEST_EXPECT(disconnects == 1);
+  SELFTEST_EXPECT(second_fs.Release() == 1);
+  return true;
+}
+
+// Exercises the `fs_cleanup_server_` exit-disconnect branches: a client killed
+// while the server has its Open() in service (with a late reply dropped after
+// the kill), a client killed mid-SpawnFile() after Open() succeeded so
+// CloseFsHandle() cannot reach the server, and a client whose Close() failed.
+static bool TestFsCleanupDisconnectOnKillAndCloseError() {
+  using usertest::FsTestSubmode;
+  static uint8_t req_buf[kIpcMaxMessageSize];
+  IpcReceivedMessage msg{};
+
+  IpcContext mock_fs;
+  SELFTEST_EXPECT(mock_fs.Listen(kIpcPortFs, kUserCapDriver) == 0);
+
+  // 1. Client killed after server popped Open(); late reply is dropped, and
+  //    server still gets kClientDisconnect.
+  {
+    const std::unique_ptr<UserProcess> client = UserProcess::Start(
+        UserTestProgram(), usertest::FsChecksArg(FsTestSubmode::kOpenWaitOnly));
+    SELFTEST_EXPECT(client != nullptr);
+    SELFTEST_EXPECT(
+        ReceiveMockFsCall(mock_fs, client, req_buf, sizeof(req_buf), &msg));
+    const uint64_t client_id = msg.client_id;
+    const uint64_t token = msg.token;
+    SELFTEST_EXPECT(WaitUntilParked(client, IsBlockedInIpcCall));
+    SELFTEST_EXPECT(KillWaitingProcess(client));
+    const FsOpenReply late_reply{.handle = 99, .type = FsNodeType::kRegular};
+    SELFTEST_EXPECT(mock_fs.Reply(kIpcPortFs,          //
+                                  token,               //
+                                  &late_reply,         //
+                                  sizeof(late_reply),  //
+                                  0) == 0);
+    int disconnects = 0;
+    SELFTEST_EXPECT(
+        DrainMockFsDisconnects(mock_fs, client, client_id, &disconnects));
+    SELFTEST_EXPECT(disconnects == 1);
+  }
+
+  // 2. Client killed during SpawnFile() after Open() succeeded (while blocked
+  //    in Seek). CloseFsHandle() cannot reach the server, so
+  //    `fs_cleanup_server_` triggers kClientDisconnect at exit.
+  {
+    const std::unique_ptr<UserProcess> client = UserProcess::Start(
+        UserTestProgram(),
+        usertest::FsChecksArg(FsTestSubmode::kSpawnFileWaitOnly));
+    SELFTEST_EXPECT(client != nullptr);
+    uint64_t client_id = 0;
+    SELFTEST_EXPECT(AnswerMockFsOpen(mock_fs, client, 11, &client_id));
+    SELFTEST_EXPECT(
+        ReceiveMockFsCall(mock_fs, client, req_buf, sizeof(req_buf), &msg));
+    SELFTEST_EXPECT(WaitUntilParked(client, IsBlockedInIpcCall));
+    SELFTEST_EXPECT(KillWaitingProcess(client));
+    int disconnects = 0;
+    SELFTEST_EXPECT(
+        DrainMockFsDisconnects(mock_fs, client, client_id, &disconnects));
+    SELFTEST_EXPECT(disconnects == 1);
+  }
+
+  // 3. Client exits normally after Close() failed with an error; with no open
+  //    descriptors left, `fs_cleanup_server_` sends kClientDisconnect.
+  {
+    const std::unique_ptr<UserProcess> client = UserProcess::Start(
+        UserTestProgram(),
+        usertest::FsChecksArg(FsTestSubmode::kCloseErrorOnly));
+    SELFTEST_EXPECT(client != nullptr);
+    uint64_t client_id = 0;
+    SELFTEST_EXPECT(AnswerMockFsOpen(mock_fs, client, 12, &client_id));
+    SELFTEST_EXPECT(
+        ReceiveMockFsCall(mock_fs, client, req_buf, sizeof(req_buf), &msg));
+    SELFTEST_EXPECT(
+        mock_fs.Reply(kIpcPortFs, msg.token, nullptr, 0, kSyscallErrorIo) == 0);
+    SELFTEST_EXPECT(WaitForProcesses(&client, 1, HasEnded, WaitMode::kYield));
+    int disconnects = 0;
+    SELFTEST_EXPECT(
+        DrainMockFsDisconnects(mock_fs, client, client_id, &disconnects));
+    SELFTEST_EXPECT(ExitedWith(client->Wait(), 0));
+    SELFTEST_EXPECT(disconnects == 1);
+  }
+
+  SELFTEST_EXPECT(mock_fs.Release() == 1);
+  return true;
+}
+
+// Runs init with `arg` and `capabilities` on the `script_size` bytes of
+// console input at `script`, and checks that init exits with 0 and that
+// `match_output(captured, captured_len, ctx)` accepts the console output (if
+// not, writes what the console printed to the serial port under `test_name`).
+static bool RunInitShellSession(const char* const test_name,  //
+                                const uint64_t arg,           //
+                                const uint64_t capabilities,  //
+                                const char* const script,     //
+                                const int64_t script_size,    //
+                                bool (*const match_output)(const char*, int64_t,
+                                                           const void*),  //
+                                const void* const ctx = nullptr) {
+  ConsoleResetOutputCapture();
+  ConsolePushInput(script, script_size);
+  bool init_ended = false;
+  UserProgramResult init_result{};
+  {
+    const std::unique_ptr<UserProcess> init =
+        UserProcess::Start(InitProgram(), arg, capabilities);
+    SELFTEST_EXPECT(init != nullptr);
+    init_ended = WaitForProcesses(&init, 1, HasEnded, WaitMode::kYield);
+    if (init_ended) {
+      init_result = init->Wait();
+    }
+  }
+  static char captured[4096];
+  const int64_t captured_len =
+      ConsoleCopyOutputCapture(captured, sizeof(captured));
+  const bool transcript_ok = match_output(captured, captured_len, ctx);
+  if (!transcript_ok) {
+    UartWrite("[TEST] ");
+    UartWrite(test_name);
+    UartWrite(": the shell session printed:\n");
+    UartWrite(captured);
+    UartWrite("\n");
+  }
+  SELFTEST_EXPECT(init_ended);
+  SELFTEST_EXPECT(ExitedWith(init_result, 0));
+  SELFTEST_EXPECT(transcript_ok);
+  return true;
+}
+
+static bool RunInitShellSessionExact(const char* const test_name,   //
+                                     const uint64_t arg,            //
+                                     const uint64_t capabilities,   //
+                                     const char* const script,      //
+                                     const int64_t script_size,     //
+                                     const char* const transcript,  //
+                                     const int64_t transcript_size) {
+  struct ExpectedTranscript {
+    const char* text;
+    int64_t size;
+  };
+  const ExpectedTranscript expected{transcript, transcript_size};
+  const auto match_exact = [](const char* const captured,
+                              const int64_t captured_len,
+                              const void* const raw_ctx) {
+    const ExpectedTranscript* const exp =
+        static_cast<const ExpectedTranscript*>(raw_ctx);
+    return captured_len == exp->size && ContainsSubstring(captured, exp->text);
+  };
+  return RunInitShellSession(test_name, arg, capabilities, script, script_size,
+                             match_exact, &expected);
+}
+
 // Checks the filesystem system calls against a mock server and ramfs end to
-// end:
+// end, each time with a ramfs that starts empty (kRamfsArgEmpty), and what
+// init and the shell do without a filesystem:
 // 0. Malformed server replies (`kSyscallErrorIo`), no spurious disconnect on a
-//    failed Open(), and no stale disconnect to a replacement server.
+//    failed Open(), no stale disconnect to a replacement server, and a single
+//    one to a replacement from a client whose descriptors alternate between
+//    it and the server that it replaced.
 // 1. usertest's kFullSuite (argument checks, file data, directories, unlink
 //    while open, and the files of processes that end with files open).
 // 2. ramfs replaced while a process has a file open (kStaleFd): the old
 //    descriptor fails with kSyscallErrorStale, Close() frees it, and the new
 //    ramfs serves new descriptors.
-// 3. A shell session: init (kInitArgStartFs) starts ramfs and the shell,
-//    whose `ls`, `cat`, `stat`, `mkdir`, `rm`, `touch`, `write`, `append`,
-//    `cp` and `mv` print and update files as expected.
+// 3. A shell session: init (kInitArgStartFs and kInitArgEmptyFs) starts ramfs
+//    and the shell, whose `ls`, `cat`, `stat`, `mkdir`, `rm`, `touch`,
+//    `write`, `append`, `cp` and `mv` print and update files as expected.
+// 4. A shell session without a filesystem: init (kInitArgStartFs) may not
+//    spawn drivers (kUserCapNone), so it reports why it can't start ramfs and
+//    starts the shell anyway, whose `ls` reports the filesystem unavailable.
 // Afterwards no port is claimed and every frame and heap byte is back.
 static bool TestFilesystemEndToEnd() {
   using usertest::FsTestSubmode;
@@ -9950,17 +10329,35 @@ static bool TestFilesystemEndToEnd() {
 
   SELFTEST_EXPECT(TestFsMalformedRepliesAndDisconnectScoping());
   SELFTEST_EXPECT(VerifyIpcReleased(pmm_free_before, heap_free_before));
+  SELFTEST_EXPECT(TestFsDisconnectOncePerServer());
+  SELFTEST_EXPECT(VerifyIpcReleased(pmm_free_before, heap_free_before));
+  SELFTEST_EXPECT(TestFsCleanupDisconnectOnKillAndCloseError());
+  SELFTEST_EXPECT(VerifyIpcReleased(pmm_free_before, heap_free_before));
+  {
+    UserProgramResult no_server_res{};
+    SELFTEST_EXPECT(RunUserTestWithCaps(
+        usertest::FsChecksArg(FsTestSubmode::kSpawnFileNoServer),  //
+        kUserCapDriver,                                            //
+        &no_server_res));
+    SELFTEST_EXPECT(ExitedWith(no_server_res, 0));
+  }
+  SELFTEST_EXPECT(VerifyIpcReleased(pmm_free_before, heap_free_before));
 
   {
-    const std::unique_ptr<UserProcess> ramfs = StartRamfs(kDriverArgNormal);
+    const std::unique_ptr<UserProcess> ramfs = StartRamfs(kRamfsArgEmpty);
     SELFTEST_EXPECT(ramfs != nullptr);
     SELFTEST_EXPECT(WaitUntilParked(ramfs, IsBlockedInIpcRecv));
 
-    // 1. The filesystem system calls.
+    // 1. The filesystem and `SpawnFile()` system calls.
     UserProgramResult result{};
     SELFTEST_EXPECT(RunUserTestWithCaps(
         usertest::FsChecksArg(FsTestSubmode::kFullSuite),  //
         kUserCapNone,                                      //
+        &result));
+    SELFTEST_EXPECT(ExitedWith(result, 0));
+    SELFTEST_EXPECT(RunUserTestWithCaps(
+        usertest::FsChecksArg(FsTestSubmode::kSpawnFileSuite),  //
+        kUserCapDriver | kUserCapSpawnDrivers,                  //
         &result));
     SELFTEST_EXPECT(ExitedWith(result, 0));
 
@@ -9976,7 +10373,7 @@ static bool TestFilesystemEndToEnd() {
     // ramfs, which answered the client, waits for the next request again.
     SELFTEST_EXPECT(WaitUntilParked(ramfs, IsBlockedInIpcRecv));
     SELFTEST_EXPECT(KillWaitingProcess(ramfs));
-    const std::unique_ptr<UserProcess> new_ramfs = StartRamfs(kDriverArgNormal);
+    const std::unique_ptr<UserProcess> new_ramfs = StartRamfs(kRamfsArgEmpty);
     SELFTEST_EXPECT(new_ramfs != nullptr);
     SELFTEST_EXPECT(WaitUntilParked(new_ramfs, IsBlockedInIpcRecv));
     ConsolePushInput("x", 1);
@@ -9988,33 +10385,211 @@ static bool TestFilesystemEndToEnd() {
   SELFTEST_EXPECT(VerifyIpcReleased(pmm_free_before, heap_free_before));
 
   // 3. The shell session, whose whole output the console captures.
-  ConsoleResetOutputCapture();
-  ConsolePushInput(kFsShellScript, kFsShellScriptSize);
-  bool init_ended = false;
-  UserProgramResult init_result{};
-  {
-    const std::unique_ptr<UserProcess> init = UserProcess::Start(
-        InitProgram(), kInitArgStartFs, kUserCapSpawnDrivers);
-    SELFTEST_EXPECT(init != nullptr);
-    init_ended = WaitForProcesses(&init, 1, HasEnded, WaitMode::kYield);
-    if (init_ended) {
-      init_result = init->Wait();
+  SELFTEST_EXPECT(
+      RunInitShellSessionExact("filesystem_end_to_end",            //
+                               kInitArgStartFs | kInitArgEmptyFs,  //
+                               kUserCapSpawnDrivers,               //
+                               kFsShellScript,                     //
+                               kFsShellScriptSize,                 //
+                               kFsShellTranscript,                 //
+                               kFsShellTranscriptSize));
+  SELFTEST_EXPECT(VerifyIpcReleased(pmm_free_before, heap_free_before));
+
+  // 4. The shell session without a filesystem.
+  SELFTEST_EXPECT(RunInitShellSessionExact("filesystem_end_to_end",  //
+                                           kInitArgStartFs,          //
+                                           kUserCapNone,             //
+                                           kNoFsShellScript,         //
+                                           kNoFsShellScriptSize,     //
+                                           kNoFsShellTranscript,     //
+                                           kNoFsShellTranscriptSize));
+  SELFTEST_EXPECT(VerifyIpcReleased(pmm_free_before, heap_free_before));
+  return true;
+}
+
+// Returns the index of the first boot module named `kRootfsBootModuleName`,
+// or -1 if there is none.
+static int FindRootfsBootModule() {
+  for (int i = 0; i < PmmBootModuleCount(); ++i) {
+    const char* const name = PmmBootModule(i).name;
+    int j = 0;
+    while (name[j] != '\0' && name[j] == kRootfsBootModuleName[j]) {
+      ++j;
+    }
+    if (name[j] == kRootfsBootModuleName[j]) {
+      return i;
     }
   }
-  static char captured[4096];
-  const int64_t captured_len =
-      ConsoleCopyOutputCapture(captured, sizeof(captured));
-  const bool transcript_ok = captured_len == kFsShellTranscriptSize &&
-                             ContainsSubstring(captured, kFsShellTranscript);
-  if (!transcript_ok) {
-    UartWrite("[TEST] filesystem_end_to_end: the shell session printed:\n");
-    UartWrite(captured);
-    UartWrite("\n");
+  return -1;
+}
+
+// The shell session of TestRootfsBootModule(): init starts ramfs with the boot
+// filesystem, checks `/bin/hello` and `/README.txt` with `ls`, lists
+// `programs`, runs `/bin/hello` with and without `(argc, argv)` arguments by
+// bare name, path and runtime copy, verifies non-ELF rejection on
+// `/README.txt`, and exits. Written so adding files to `rootfs/` or
+// `ROOTFS_PROGRAMS` doesn't break the test.
+constexpr char kRootfsShellScript[] =
+    "ls /bin/hello /README.txt\n"
+    "programs\n"
+    "hello\n"
+    "hello world from protos\n"
+    "/bin/hello one two\n"
+    "cp /bin/hello /h\n"
+    "/h copied ok\n"
+    "rm /h\n"
+    "/README.txt\n"
+    "exit 0\n";
+constexpr int64_t kRootfsShellScriptSize =
+    static_cast<int64_t>(sizeof(kRootfsShellScript)) - 1;
+
+static bool MatchRootfsShellTranscript(const char* const captured,
+                                       const int64_t captured_len,
+                                       const void* const /*ctx*/) {
+  auto consume_str = [&](int64_t* const pos, const char* const literal) {
+    for (int64_t i = 0; literal[i] != '\0'; ++i) {
+      if (*pos >= captured_len || captured[*pos] != literal[i]) {
+        return false;
+      }
+      ++*pos;
+    }
+    return true;
+  };
+  auto consume_digits = [&](int64_t* const pos) {
+    int64_t count = 0;
+    while (*pos < captured_len && captured[*pos] >= '0' &&
+           captured[*pos] <= '9') {
+      ++*pos;
+      ++count;
+    }
+    return count > 0;
+  };
+
+  int64_t pos = 0;
+  if (!consume_str(&pos, "[INIT] hello from ring 3\n[RAMFS] rootfs: files=") ||
+      !consume_digits(&pos) || !consume_str(&pos, " dirs=") ||
+      !consume_digits(&pos) ||
+      !consume_str(&pos,
+                   " skipped=0 errors=0\n"
+                   "[RAMFS] ready\n"
+                   "sh> ls /bin/hello /README.txt\n"
+                   "/bin/hello\n"
+                   "/README.txt\n"
+                   "sh> programs\n"
+                   "programs: init sh usertest\n"
+                   "/bin:")) {
+    return false;
   }
-  SELFTEST_EXPECT(init_ended);
-  SELFTEST_EXPECT(ExitedWith(init_result, 0));
-  SELFTEST_EXPECT(transcript_ok);
+
+  // The `/bin:` line may list any additional ROOTFS_PROGRAMS or rootfs/bin/
+  // entries, so check that `hello` appears as a space-delimited token on it.
+  bool found_hello = false;
+  while (pos < captured_len && captured[pos] != '\n') {
+    if (captured[pos] == ' ') {
+      ++pos;
+      const int64_t start = pos;
+      while (pos < captured_len && captured[pos] != ' ' &&
+             captured[pos] != '\n') {
+        ++pos;
+      }
+      if (pos - start == 5 && captured[start] == 'h' &&
+          captured[start + 1] == 'e' && captured[start + 2] == 'l' &&
+          captured[start + 3] == 'l' && captured[start + 4] == 'o') {
+        found_hello = true;
+      }
+    } else {
+      return false;
+    }
+  }
+  if (!found_hello || pos >= captured_len || captured[pos] != '\n') {
+    return false;
+  }
+  ++pos;
+
+  constexpr char kTail[] =
+      "sh> hello\n"
+      "hello from /bin/hello\n"
+      "sh: hello exited with status 0\n"
+      "sh> hello world from protos\n"
+      "hello: world from protos\n"
+      "sh: hello exited with status 0\n"
+      "sh> /bin/hello one two\n"
+      "hello: one two\n"
+      "sh: /bin/hello exited with status 0\n"
+      "sh> cp /bin/hello /h\n"
+      "sh> /h copied ok\n"
+      "hello: copied ok\n"
+      "sh: /h exited with status 0\n"
+      "sh> rm /h\n"
+      "sh> /README.txt\n"
+      "sh: /README.txt: executable format error\n"
+      "sh> exit 0\n";
+  return consume_str(&pos, kTail) && pos == captured_len;
+}
+
+// Checks the boot filesystem (`kRootfsBootModuleName`), which the build packs
+// into the boot image:
+// 1. The boot loader loaded it as a boot module that starts with a ustar
+//    header, and whose pages the PMM keeps out of the free frames and inside
+//    the identity map.
+// 2. usertest's kVerifyRootfs, run as a driver, checks the boot module system
+//    calls, that a ramfs started with kDriverArgNormal holds every directory
+//    and regular file of the archive with the archive's contents, and that
+//    `/bin/hello` runs via `SpawnFile()`.
+// 3. An init + sh session runs `/bin/hello` from the unpacked boot filesystem
+//    by bare name, by path and from a runtime copy.
+// Afterwards no port is claimed, every frame and heap byte is back, and the
+// module's bytes are unchanged.
+static bool TestRootfsBootModule() {
+  using usertest::FsTestSubmode;
+  const ScopedQuietConsole quiet_console;
+  SELFTEST_EXPECT(IpcClaimedPortCount() == 0);
+
+  const int index = FindRootfsBootModule();
+  SELFTEST_EXPECT(index >= 0);
+  const BootModule& module = PmmBootModule(index);
+  // At least a header and the two zero blocks that end an archive.
+  constexpr int64_t kTarBlockSize = 512;
+  const int64_t size = static_cast<int64_t>(module.end - module.start);
+  SELFTEST_EXPECT(size >= 3 * kTarBlockSize);
+  const uint8_t* const bytes = reinterpret_cast<const uint8_t*>(module.start);
+  constexpr int64_t kTarMagicOffset = 257;
+  constexpr char kTarMagic[] = "ustar";
+  for (int64_t i = 0; i < static_cast<int64_t>(sizeof(kTarMagic)) - 1; ++i) {
+    SELFTEST_EXPECT(bytes[kTarMagicOffset + i] == kTarMagic[i]);
+  }
+  const uintptr_t first_page =
+      module.start & ~static_cast<uintptr_t>(kPageSize - 1);
+  for (uintptr_t page = first_page; page < module.end; page += kPageSize) {
+    SELFTEST_EXPECT(!PmmRangeIsValidUsableRam(page, kPageSize));
+    SELFTEST_EXPECT(PagingIsIdentityMapped(page));
+  }
+  const int64_t checksum = SyscallSpinChecksum(bytes, size);
+
+  const int64_t pmm_free_before = PmmFreeFrameCount();
+  const int64_t heap_free_before = HeapTotalFreeBytes();
+  {
+    const std::unique_ptr<UserProcess> ramfs = StartRamfs(kDriverArgNormal);
+    SELFTEST_EXPECT(ramfs != nullptr);
+    SELFTEST_EXPECT(WaitUntilParked(ramfs, IsBlockedInIpcRecv));
+    UserProgramResult result{};
+    SELFTEST_EXPECT(RunUserTestWithCaps(
+        usertest::FsChecksArg(FsTestSubmode::kVerifyRootfs),  //
+        kUserCapDriver,                                       //
+        &result));
+    SELFTEST_EXPECT(ExitedWith(result, 0));
+    SELFTEST_EXPECT(WaitUntilParked(ramfs, IsBlockedInIpcRecv));
+    SELFTEST_EXPECT(KillWaitingProcess(ramfs));
+  }
   SELFTEST_EXPECT(VerifyIpcReleased(pmm_free_before, heap_free_before));
+  SELFTEST_EXPECT(RunInitShellSession("rootfs_boot_module",    //
+                                      kInitArgStartFs,         //
+                                      kUserCapSpawnDrivers,    //
+                                      kRootfsShellScript,      //
+                                      kRootfsShellScriptSize,  //
+                                      MatchRootfsShellTranscript));
+  SELFTEST_EXPECT(VerifyIpcReleased(pmm_free_before, heap_free_before));
+  SELFTEST_EXPECT(SyscallSpinChecksum(bytes, size) == checksum);
   return true;
 }
 
@@ -10066,6 +10641,7 @@ constexpr BootTest kBootTests[] = {
     {"ipc_subsystem", TestIpcSubsystem},
     {"ramfs_driver_lifecycle", TestRamfsDriverLifecycle},
     {"filesystem_end_to_end", TestFilesystemEndToEnd},
+    {"rootfs_boot_module", TestRootfsBootModule},
     // End-to-end tests.
     {"user_mode_kill_edge_cases", TestUserModeKillEdgeCases},
     {"user_mode_syscall_buffer_checks", TestUserModeSyscallBufferChecks},
