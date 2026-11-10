@@ -33,9 +33,10 @@ PROJECT_INCLUDE_FLAGS := -iquote .
 # compilers and clang/libc++ are not supported. The runtime support those
 # headers need is provided by heap.cpp (operator new/delete) and
 # cxx_runtime.cpp (mem* functions, __cxa_* hooks).
-# -fstack-clash-protection makes a function whose stack frame is larger than a
-# page touch the frame's pages in order, so that it can't step over the
-# unmapped guard page below a stack without faulting.
+# -fstack-clash-protection (also for the user programs, whose stacks have one
+# unmapped guard page below them in user_mode.h) makes a function whose stack
+# frame is larger than a page touch the frame's pages in order, so that it
+# can't step over the guard page below a stack without faulting.
 # -mgeneral-regs-only keeps the kernel off the x87/MMX/SSE/AVX registers, which
 # hold the values of the interrupted user program until the scheduler saves
 # them (fpu.h).
@@ -82,27 +83,31 @@ TEST_COMMON_LDFLAGS := -lgmock_main -lgmock -lgtest -pthread
 # assembly, which the kernel keeps for each process (user_mode.h), so GCC may
 # use SSE in them. GCC must not turn their loops into calls of the memory
 # functions that user/crt.cpp defines with such loops.
-EMBEDDED_USER_PROGRAMS := init sh usertest usbkbd ps2kbd ramfs
-ROOTFS_PROGRAMS := hello
+EMBEDDED_USER_PROGRAMS := init sh usertest usbkbd ps2kbd ramfs nvme
+ROOTFS_PROGRAMS := hello disk
 USER_PROGRAMS := $(EMBEDDED_USER_PROGRAMS) $(ROOTFS_PROGRAMS)
 USER_CXXFLAGS := -m64 -masm=intel -std=c++20 -O2 -Wall -Wextra $(WERROR_FLAG) \
                  $(ARCH_CXXFLAGS) -ffreestanding -nostdlib -fno-builtin \
                  -fno-exceptions -fno-rtti -mno-red-zone \
                  -fno-stack-protector -fno-pie \
+                 -fstack-clash-protection \
                  -mcmodel=kernel -fno-asynchronous-unwind-tables \
                  -fno-tree-loop-distribute-patterns \
                  -U_GLIBCXX_ASSERTIONS -fcf-protection=none \
                  $(PROJECT_INCLUDE_FLAGS) -I$(BUILD_DIR)/include
 USER_LDFLAGS := -m elf_x86_64 -n -s -z max-page-size=0x1000 -z noexecstack \
                 -static -nostdlib -T user/user.ld
-USER_HDRS := status_or.h syscall_abi.h fs_protocol.h user/syscall.h \
-             user/sh/sh_lib.h user/usertest/usertest.h \
-             user/usbkbd/usb_descriptors.h user/usbkbd/usb_hid.h \
-             user/usbkbd/xhci_context.h user/usbkbd/xhci_controller.h \
-             user/usbkbd/xhci_platform.h user/usbkbd/xhci_regs.h \
-             user/usbkbd/xhci_ring.h user/ps2kbd/ps2_scancode.h \
-             user/ps2kbd/i8042.h user/ramfs/ramfs.h user/ramfs/tar.h \
-             user/ramfs/rootfs.h user/ramfs/boot_module_source.h
+USER_HDRS := status_or.h syscall_abi.h fs_protocol.h block_protocol.h \
+             user/syscall.h user/block.h user/sh/sh_lib.h \
+             user/usertest/usertest.h user/usbkbd/usb_descriptors.h \
+             user/usbkbd/usb_hid.h user/usbkbd/xhci_context.h \
+             user/usbkbd/xhci_controller.h user/usbkbd/xhci_platform.h \
+             user/usbkbd/xhci_regs.h user/usbkbd/xhci_ring.h \
+             user/ps2kbd/ps2_scancode.h user/ps2kbd/i8042.h \
+             user/ramfs/ramfs.h user/ramfs/tar.h user/ramfs/rootfs.h \
+             user/ramfs/boot_module_source.h user/nvme/nvme_platform.h \
+             user/nvme/nvme_regs.h user/nvme/nvme_controller.h \
+             user/nvme/nvme_server.h user/disk/disk_lib.h
 EMBEDDED_USER_ELFS := $(patsubst %,$(BUILD_DIR)/user/%.elf,$(EMBEDDED_USER_PROGRAMS))
 ROOTFS_PROGRAM_ELFS := $(patsubst %,$(BUILD_DIR)/user/%.elf,$(ROOTFS_PROGRAMS))
 USER_ELFS := $(EMBEDDED_USER_ELFS) $(ROOTFS_PROGRAM_ELFS)
@@ -430,6 +435,8 @@ endif
 
 QEMU_RUN_FLAGS ?= -smp 4 -m 256M -serial mon:stdio
 QEMU_USB_FLAGS ?= -device qemu-xhci,id=xhci0 -device usb-kbd,bus=xhci0.0,port=1,id=kbd0
+QEMU_DISK_IMAGE ?= $(BUILD_DIR)/$(if $(filter 1,$(SELFTEST)),nvme-selftest.img,nvme.img)
+QEMU_DISK_FLAGS ?= -drive file=$(QEMU_DISK_IMAGE),format=raw,if=none,id=nvme0 -device nvme,drive=nvme0,serial=protos0
 QEMU_KVM_FLAGS := $(if $(filter 1,$(KVM)),-enable-kvm -cpu host)
 
 .PHONY: all clean test unit-test test-host docker-build docker-test run run-boot-test FORCE test-rbtree test-spinlock test-heap test-idt test-gdt test-pmm test-smp test-core-runqueue-scheduler test-work-stealing-scheduler test-join-lifecycle-scheduler test-preemptive-scheduler test-task test-task-stack test-stress
@@ -602,6 +609,8 @@ endef
 $(foreach b,$(TEST_BUILD_MODES),$(foreach s,$(TEST_SAN_MODES),$(eval $(call DEFINE_HOST_TEST_OBJECTS,$(b),$(s)))))
 
 # $(call DEFINE_HOST_TEST_VARIANT,test_name,build_mode,san_mode)
+# The test runs by its path in $(BUILD_DIR), which a host build may give as an
+# absolute path.
 define DEFINE_HOST_TEST_VARIANT
 HOST_TEST_OBJS_$(1)_$(2)_$(3) := $$(call host_test_objs,$(1),$(2)_$(3))
 
@@ -610,7 +619,7 @@ $(BUILD_DIR)/$(1)_$(2)_$(3): $$(HOST_TEST_OBJS_$(1)_$(2)_$(3)) $(HOST_TEST_OBJ_D
 
 .PHONY: run-$(1)-$(2)-$(3)
 run-$(1)-$(2)-$(3): $(BUILD_DIR)/$(1)_$(2)_$(3)
-	$$(DOCKER_RUN) env $$(TEST_SAN_ENV_$(3)) ./$(BUILD_DIR)/$(1)_$(2)_$(3)
+	$$(DOCKER_RUN) env $$(TEST_SAN_ENV_$(3)) $(BUILD_DIR)/$(1)_$(2)_$(3)
 
 HOST_TEST_BINS_$(1) += $(BUILD_DIR)/$(1)_$(2)_$(3)
 HOST_TEST_RUNS_$(1) += run-$(1)-$(2)-$(3)
@@ -673,12 +682,17 @@ run-boot-test: $(if $(BOOT_TEST_ISOS),,$(KERNEL_ISO) $(KERNEL_MB1_ISO)) $(DOCKER
 	$(if $(filter 1,$(SELFTEST)),,$(error run-boot-test needs the self-tests; do not set SELFTEST=0))
 	$(DOCKER_RUN) ./test_boot.sh $(BOOT_TEST_OPTS) $(or $(BOOT_TEST_ISOS),$(KERNEL_ISO) $(KERNEL_MB1_ISO))
 
+$(QEMU_DISK_IMAGE):
+	@mkdir -p $(@D)
+	rm -f -- $@.tmp
+	dd if=/dev/zero of=$@.tmp bs=1048576 count=16 && mv $@.tmp $@
+
 # Boots the kernel interactively; the serial console is attached to the
 # terminal (press Ctrl-A X to quit QEMU). KVM=1 enables KVM acceleration. The
 # `+` exempts QEMU from output synchronization (-O, which host builds turn on),
 # which would hold back its output until it exits.
-run: $(KERNEL_ISO) $(DOCKER_DEPS)
-	+$(DOCKER_RUN_INTERACTIVE) qemu-system-x86_64 $(QEMU_RUN_FLAGS) $(QEMU_USB_FLAGS) $(QEMU_KVM_FLAGS) \
+run: $(KERNEL_ISO) $(QEMU_DISK_IMAGE) $(DOCKER_DEPS)
+	+$(DOCKER_RUN_INTERACTIVE) qemu-system-x86_64 $(QEMU_RUN_FLAGS) $(QEMU_USB_FLAGS) $(QEMU_DISK_FLAGS) $(QEMU_KVM_FLAGS) \
 		$(if $(filter 1,$(USE_DOCKER)),-display none) -cdrom $(KERNEL_ISO)
 
 # The QEMU boot test is timing-sensitive, so it runs only after the unit tests

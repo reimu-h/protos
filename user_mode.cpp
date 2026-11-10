@@ -543,7 +543,7 @@ void UserProcess::Run() {
   for (int i = 0; i < fs_server_count; ++i) {
     IpcNotifyClientDisconnect(kIpcPortFs, ipc_client_id_, fs_servers[i]);
   }
-  for (int port = kIpcFirstUserPort; port < kIpcPortCount; ++port) {
+  for (int port = kIpcPortBlock; port < kIpcPortCount; ++port) {
     if (ipc_called_port_owners_[port] != kIpcNoOwner) {
       IpcNotifyClientDisconnect(port,            //
                                 ipc_client_id_,  //
@@ -676,6 +676,10 @@ void UserProcess::OnSyscall(InterruptFrame* const frame) {
         break;
       case kSyscallWait:
         ret = process->WaitChild(static_cast<int64_t>(frame->rdi), frame->rsi);
+        break;
+      case kSyscallTryWait:
+        ret =
+            process->TryWaitChild(static_cast<int64_t>(frame->rdi), frame->rsi);
         break;
       case kSyscallSpawnDriver:
         ret = process->Spawn(frame->rdi,                        //
@@ -1069,7 +1073,10 @@ int64_t UserProcess::Spawn(const uintptr_t name_ptr,  //
   return slot + 1;
 }
 
-int64_t UserProcess::WaitChild(const int64_t pid, const uintptr_t result_ptr) {
+int64_t UserProcess::ResolveWaitTarget(const int64_t pid,           //
+                                       const uintptr_t result_ptr,  //
+                                       int64_t* const out_slot,     //
+                                       UserProcess** const out_child) const {
   if (pid < 1 || pid > kMaxUserChildProcesses) {
     return kSyscallErrorInvalid;
   }
@@ -1081,7 +1088,42 @@ int64_t UserProcess::WaitChild(const int64_t pid, const uintptr_t result_ptr) {
   if (!MayWrite(result_ptr, sizeof(UserProgramResult))) {
     return kSyscallErrorFault;
   }
-  while (child->stats().end_tick < 0) {
+  *out_slot = slot;
+  *out_child = child;
+  return 0;
+}
+
+void UserProcess::ReapChild(const int64_t slot, const uintptr_t result_ptr) {
+  UserProcess* const child = children_[slot].get();
+  const UserProgramResult child_result = child->Wait();
+  children_[slot].reset();
+  // User space gets a copy built field by field in zeroed memory, as Linux
+  // clears a structure before it fills it for copy_to_user(): every byte that
+  // reaches user memory is one that the kernel chose, and the reserved fields
+  // are zero. (The struct has no padding either, syscall_abi.h.)
+  UserProgramResult user_result;
+  __builtin_memset(static_cast<void*>(&user_result), 0, sizeof(user_result));
+  user_result.outcome = child_result.outcome;
+  user_result.exit_status = child_result.exit_status;
+  user_result.fault_vector = child_result.fault_vector;
+  user_result.fault_error_code = child_result.fault_error_code;
+  user_result.fault_rip = child_result.fault_rip;
+  user_result.fault_address = child_result.fault_address;
+  WriteUserMemory(result_ptr, &user_result, sizeof(user_result));
+  if (IsKillRequested()) {
+    const ScopedIrqDisable irq_disable;
+    RecordKillNoticeIrqsOff();
+  }
+}
+
+int64_t UserProcess::WaitChild(const int64_t pid, const uintptr_t result_ptr) {
+  int64_t slot = -1;
+  UserProcess* child = nullptr;
+  const int64_t err = ResolveWaitTarget(pid, result_ptr, &slot, &child);
+  if (err != 0) {
+    return err;
+  }
+  while (!child->HasEnded()) {
     if (IsKillRequested()) {
       {
         const ScopedIrqDisable irq_disable;
@@ -1106,7 +1148,7 @@ int64_t UserProcess::WaitChild(const int64_t pid, const uintptr_t result_ptr) {
         const IrqSpinLockGuard guard(child->kill_lock_);
         child->exit_waiter_task_ = self;
       }
-      if (child->stats().end_tick < 0 && !IsKillRequested()) {
+      if (!child->HasEnded() && !IsKillRequested()) {
         scheduler->Block();
       }
       {
@@ -1117,26 +1159,23 @@ int64_t UserProcess::WaitChild(const int64_t pid, const uintptr_t result_ptr) {
       asm volatile("pause" : : : "memory");
     }
   }
-  const UserProgramResult child_result = child->Wait();
-  children_[slot].reset();
-  // User space gets a copy built field by field in zeroed memory, as Linux
-  // clears a structure before it fills it for copy_to_user(): every byte that
-  // reaches user memory is one that the kernel chose, and the reserved fields
-  // are zero. (The struct has no padding either, syscall_abi.h.)
-  UserProgramResult user_result;
-  __builtin_memset(static_cast<void*>(&user_result), 0, sizeof(user_result));
-  user_result.outcome = child_result.outcome;
-  user_result.exit_status = child_result.exit_status;
-  user_result.fault_vector = child_result.fault_vector;
-  user_result.fault_error_code = child_result.fault_error_code;
-  user_result.fault_rip = child_result.fault_rip;
-  user_result.fault_address = child_result.fault_address;
-  WriteUserMemory(result_ptr, &user_result, sizeof(user_result));
-  if (IsKillRequested()) {
-    const ScopedIrqDisable irq_disable;
-    RecordKillNoticeIrqsOff();
-  }
+  ReapChild(slot, result_ptr);
   return 0;
+}
+
+int64_t UserProcess::TryWaitChild(const int64_t pid,
+                                  const uintptr_t result_ptr) {
+  int64_t slot = -1;
+  UserProcess* child = nullptr;
+  const int64_t err = ResolveWaitTarget(pid, result_ptr, &slot, &child);
+  if (err != 0) {
+    return err;
+  }
+  if (!child->HasEnded()) {
+    return 0;
+  }
+  ReapChild(slot, result_ptr);
+  return 1;
 }
 
 int64_t UserProcess::PciInfo(const int64_t index,
@@ -1231,7 +1270,7 @@ int64_t UserProcess::IpcListen(const int64_t port) {
   if (port < 0 || port >= kIpcPortCount) {
     return kSyscallErrorInvalid;
   }
-  if (port == kIpcPortFs && (capabilities_ & kUserCapDriver) == 0) {
+  if (!MayListenOnIpcPort(capabilities_, port)) {
     return kSyscallErrorPermission;
   }
   const uintptr_t owner = IpcPortOwner(port);

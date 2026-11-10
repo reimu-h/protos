@@ -238,6 +238,14 @@ struct IpcPort {
   }
 
   void ClearDisconnectsLocked() {
+    DCHECK(disconnect_head >= 0 &&
+           disconnect_head < kIpcDisconnectRingCapacity);
+    DCHECK(disconnect_count >= 0 &&
+           disconnect_count <= kIpcDisconnectRingCapacity);
+    for (int i = 0; i < disconnect_count; ++i) {
+      const int idx = (disconnect_head + i) % kIpcDisconnectRingCapacity;
+      disconnect_ring[idx] = 0;
+    }
     disconnect_head = 0;
     disconnect_count = 0;
   }
@@ -498,7 +506,7 @@ int64_t IpcContext::Listen(const int64_t port, const uint64_t capabilities) {
   if (port < 0 || port >= kIpcPortCount) {
     return kSyscallErrorInvalid;
   }
-  if (port == kIpcPortFs && (capabilities & kUserCapDriver) == 0) {
+  if (!MayListenOnIpcPort(capabilities, port)) {
     return kSyscallErrorPermission;
   }
 

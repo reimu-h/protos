@@ -96,15 +96,40 @@ DEFAULT_DOCKER_IMAGE = "x86-64-kernel-build"
 # post-boot checks, draining after a failure, and a loaded host).
 TEST_BOOT_WATCHDOG_MARGIN_S = 120.0
 
+# The QEMU options that take no argument, in QEMU 7.2 (which the Docker image
+# has) and in QEMU 11: the parsers of QEMU command lines below take the word
+# after any other option for that option's argument.
 FLAG_OPTIONS: frozenset[str] = frozenset({
+    "-S",
+    "-audio-help",
+    "-daemonize",
     "-enable-kvm",
+    "-enable-sync-profile",
+    "-full-screen",
+    "-h",
+    "-help",
+    "-jitdump",
+    "-mem-prealloc",
+    "-no-acpi",
+    "-no-fd-bootchk",
+    "-no-hpet",
     "-no-reboot",
     "-no-shutdown",
-    "-nographic",
-    "-S",
-    "-snapshot",
+    "-no-user-config",
     "-nodefaults",
-    "-no-hpet",
+    "-nographic",
+    "-only-migratable",
+    "-perfmap",
+    "-portrait",
+    "-preconfig",
+    "-s",
+    "-singlestep",
+    "-snapshot",
+    "-usb",
+    "-version",
+    "-win2k-hack",
+    "-xen-attach",
+    "-xen-domid-restrict",
 })
 
 FORBIDDEN_OVERRIDE_OPTIONS: frozenset[str] = frozenset({
@@ -827,6 +852,11 @@ def expected_cpus(argv: Sequence[str]) -> int:
     return count
 
 
+def _is_qemu_program(word: str) -> bool:
+    """Whether `word` names a qemu-system-* program, with or without a path."""
+    return Path(word).name.startswith("qemu-system-")
+
+
 def apply_qemu_overrides(
     base: Sequence[str], overrides_str: str
 ) -> tuple[str, ...]:
@@ -838,7 +868,7 @@ def apply_qemu_overrides(
     if not override_words:
         raise ConfigError("--qemu-args must not be empty")
 
-    if Path(override_words[0]).name.startswith("qemu-system-"):
+    if _is_qemu_program(override_words[0]):
         raise ConfigError(
             "Pass only QEMU options to --qemu-args, or use --qemu-cmd for a full command"
         )
@@ -901,7 +931,7 @@ def parse_qemu_command(cmd_str: str) -> tuple[tuple[str, ...], Path]:
     serial_vals: list[str] = []
     has_display = False
     i = 1 if not words[0].startswith("-") else 0
-    if not Path(words[0]).name.startswith("qemu-system-"):
+    if not _is_qemu_program(words[0]):
         raise ConfigError(
             f"--qemu-cmd must start with a qemu-system-* binary, got '{words[0]}'"
         )
@@ -1554,7 +1584,8 @@ def stop_process_group(
                 timeout=10,
                 check=False,
             )
-        except OSError:
+        except (OSError, subprocess.TimeoutExpired):
+            # No docker, or a `docker kill` that hangs (and was killed).
             pass
 
     try:
@@ -2283,6 +2314,63 @@ def _docker_run_option(
     return None
 
 
+def _normalize_posix_path(path: str) -> str:
+    """Normalizes a path string and collapses POSIX leading '//' to '/'."""
+    norm = os.path.normpath(path)
+    if norm.startswith("//"):
+        norm = "/" + norm.lstrip("/")
+    return norm
+
+
+def _docker_to_host_path(path_str: str, repo: Path) -> Path:
+    """Maps a container '/workspace/...' or relative path to the host `repo`."""
+    norm = _normalize_posix_path(path_str)
+    if norm == "/workspace":
+        return repo
+    if norm.startswith("/workspace/"):
+        return repo / norm[len("/workspace/") :]
+    p = Path(path_str)
+    return p if p.is_absolute() else (repo / p)
+
+
+def _writable_run_drive_paths(
+    qemu_argv: tuple[str, ...], qemu_run_dir: str
+) -> list[str]:
+    if not qemu_run_dir:
+        return []
+    run_dir_norm = _normalize_posix_path(qemu_run_dir)
+    if run_dir_norm in (".", "..", "/"):
+        return []
+    prefix = run_dir_norm + os.sep
+    paths: list[str] = []
+    seen: set[str] = set()
+    for i in range(len(qemu_argv) - 1):
+        if qemu_argv[i] != "-drive":
+            continue
+        opts = qemu_argv[i + 1].split(",")
+        is_ro_or_snap = False
+        file_path = None
+        for opt in opts:
+            key, sep, val = opt.partition("=")
+            key_l = key.lower()
+            val_l = val.lower()
+            if key_l in ("readonly", "snapshot") and (
+                not sep or val_l in ("on", "true", "yes")
+            ):
+                is_ro_or_snap = True
+                break
+            if opt.startswith("file=") and file_path is None:
+                file_path = opt[len("file=") :]
+        if is_ro_or_snap or not file_path:
+            continue
+        norm_path = _normalize_posix_path(file_path)
+        if not norm_path.startswith(prefix) or norm_path in seen:
+            continue
+        seen.add(norm_path)
+        paths.append(file_path)
+    return paths
+
+
 def render_rerun_script(
     record: RunRecord,
     config: Config,
@@ -2317,6 +2405,11 @@ def render_rerun_script(
     # The serial log and the QEMU sockets go in test_boot.sh's directory for
     # the run, which it deleted at its end.
     qemu_run_dir = record.qemu_run_dir or "build"
+    drive_paths = (
+        _writable_run_drive_paths(qemu_argv, record.qemu_run_dir)
+        if record.qemu_run_dir
+        else []
+    )
     if config.mode == "docker":
         repo_iso_store = repo / "build" / "deflake" / "isos"
         lines.append(f"mkdir -p {shlex.quote(str(repo_iso_store))}")
@@ -2373,7 +2466,17 @@ def render_rerun_script(
                 image,
                 *qemu_argv,
             ]
-            lines.append(f"mkdir -p {shlex.quote(str(repo / qemu_run_dir))}")
+            host_run_dir = _docker_to_host_path(qemu_run_dir, repo)
+            lines.append(f"mkdir -p {shlex.quote(str(host_run_dir))}")
+            for dp in drive_paths:
+                host_dp = _docker_to_host_path(dp, repo)
+                if host_dp.parent != host_run_dir:
+                    lines.append(f"mkdir -p {shlex.quote(str(host_dp.parent))}")
+                qdp = shlex.quote(str(host_dp))
+                lines.append(
+                    f"rm -f -- {qdp} && dd if=/dev/zero of={qdp}"
+                    " bs=1048576 count=4 >/dev/null 2>&1 || exit 1"
+                )
             lines.append(f"# Harness command: {shlex.join(record.harness_argv)}")
             lines.extend(notes)
             lines.append(f"exec {shlex.join(docker_cmd)}")
@@ -2383,6 +2486,16 @@ def render_rerun_script(
     elif qemu_argv:
         lines.append(f"cd {shlex.quote(record.qemu_cwd)} || exit 1")
         lines.append(f"mkdir -p {shlex.quote(qemu_run_dir)}")
+        run_dir_path = Path(qemu_run_dir)
+        for dp in drive_paths:
+            dp_parent = Path(dp).parent
+            if dp_parent != run_dir_path:
+                lines.append(f"mkdir -p {shlex.quote(str(dp_parent))}")
+            qdp = shlex.quote(dp)
+            lines.append(
+                f"rm -f -- {qdp} && dd if=/dev/zero of={qdp}"
+                " bs=1048576 count=4 >/dev/null 2>&1 || exit 1"
+            )
         lines.append(f"# Harness command: {shlex.join(record.harness_argv)}")
         lines.extend(notes)
         lines.append(f"exec {shlex.join(qemu_argv)}")
@@ -2898,7 +3011,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
         "--out",
         type=str,
         default=None,
-        help="Session output directory (default: build/deflake/sessions/<UTC>).",
+        help="Session output directory, which must not hold a session yet (default: build/deflake/sessions/<UTC>).",
     )
     p.add_argument(
         "--iso-store",
@@ -3036,6 +3149,20 @@ def run_session(
         if args.out
         else (repo_root / "build" / "deflake" / "sessions" / session_id).resolve()
     )
+    # A session directory holds one session: every session numbers its runs
+    # from 0001 and removes the directory of a run that passes, so another
+    # session in it would replace or delete this one's failure artifacts and
+    # append its runs to this one's runs.jsonl.
+    earlier = [
+        name
+        for name in ("runs.jsonl", "session.json")
+        if (out_dir / name).exists()
+    ]
+    if earlier:
+        raise ConfigError(
+            f"Output directory '{out_dir}' already holds a session "
+            f"({', '.join(earlier)}); use a new directory"
+        )
     out_dir.mkdir(parents=True, exist_ok=True)
     iso_store = (
         Path(args.iso_store).resolve()
@@ -3326,7 +3453,9 @@ def main(argv: Sequence[str] | None = None) -> int:
         try:
             args = parser.parse_args(raw)
             for tc in trailing_custom:
-                if tc.startswith("qemu-system-"):
+                # A full command starts with the QEMU program, with or
+                # without a path, as --qemu-cmd takes it.
+                if _is_qemu_program(shlex.split(tc)[0]):
                     args.qemu_cmd.append(tc)
                 else:
                     args.qemu_args.append(tc)

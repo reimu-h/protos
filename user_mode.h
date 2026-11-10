@@ -282,6 +282,13 @@ class UserProcess {
   // any task while the object exists.
   UserProcessStats stats() const;
 
+  // Returns true once the process has ended (`RecordEnd()` has published a
+  // non-negative `end_tick_`, after the program's memory was freed). May be
+  // called by any task while the object exists, without taking any lock.
+  bool HasEnded() const {
+    return end_tick_.load(std::memory_order_acquire) >= 0;
+  }
+
  private:
   friend void UserModeInit();
 
@@ -354,7 +361,13 @@ class UserProcess {
                     uintptr_t args_ptr,  //
                     int64_t argc,        //
                     uint64_t arg);
+  int64_t ResolveWaitTarget(int64_t pid,           //
+                            uintptr_t result_ptr,  //
+                            int64_t* out_slot,     //
+                            UserProcess** out_child) const;
+  void ReapChild(int64_t slot, uintptr_t result_ptr);
   int64_t WaitChild(int64_t pid, uintptr_t result_ptr);
+  int64_t TryWaitChild(int64_t pid, uintptr_t result_ptr);
   int64_t PciInfo(int64_t index, uintptr_t info_ptr) const;
   int64_t DmaAlloc(int64_t size, uintptr_t phys_out_ptr, uint64_t flags);
   int64_t IrqWait(uint64_t mask, int64_t timeout_ticks);
@@ -500,10 +513,10 @@ class UserProcess {
   // Identifies the process as an IPC client (`IpcReceivedMessage::client_id`);
   // never reused.
   const uint64_t ipc_client_id_;
-  // For each port in `kIpcFirstUserPort .. kIpcPortCount - 1`, the owner token
-  // of the latest server that received a call from this process (`kIpcNoOwner`
-  // if none): if that server still owns the port when the process ends, it gets
-  // a disconnect notification.
+  // For each port in `kIpcPortBlock .. kIpcPortCount - 1`, the owner token of
+  // the latest server that received a call from this process (`kIpcNoOwner` if
+  // none): if that server still owns the port when the process ends, it gets a
+  // disconnect notification.
   uintptr_t ipc_called_port_owners_[kIpcPortCount] = {};
   // The anonymous memory window's next free address and the bytes mapped.
   uintptr_t next_anon_addr_ = kUserAnonWindowBase;
@@ -544,7 +557,8 @@ class UserProcess {
   std::atomic<int> kill_running_cpu_{-1};
   std::atomic<bool> kill_in_syscall_{false};
   std::atomic<int64_t> killer_steal_ns_at_kill_{-1};
-  // Written only by the task (and its interrupt handlers); read by stats().
+  // Written only by the task (and its interrupt handlers); read by stats() and
+  // HasEnded().
   std::atomic<int64_t> syscalls_switched_out_{0};
   std::atomic<int64_t> syscalls_migrated_{0};
   std::atomic<int64_t> syscall_timer_ticks_{0};

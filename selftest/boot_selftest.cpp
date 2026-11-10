@@ -6,6 +6,7 @@
 #include <new>
 
 #include "address_space.h"
+#include "block_protocol.h"
 #include "check.h"
 #include "console.h"
 #include "cpu.h"
@@ -2505,6 +2506,25 @@ class TickDeadline {
   const int64_t end_tick_;
 };
 
+// Calibrated process/mock-IPC wait timeout (`15 s` of measured CPU 0 TSC
+// cycles, floored at `kSelfTestWaitTimeoutTscCycles`) so QEMU TCG runs under
+// elevated host loadavg do not spuriously time out at 2-3 s while genuine
+// hangs still fail well below `BIOS_TIMEOUT_SECS`.
+constexpr int64_t kProcessWaitTimeoutTicks = 15 * kApicTimerTargetHz;
+
+static uint64_t CalibratedWaitTimeoutTscCycles(const int64_t ticks) {
+  const uint64_t per_tick = static_cast<uint64_t>(TscCyclesPerTick());
+  const uint64_t window_ticks = (ticks > 0) ? static_cast<uint64_t>(ticks) : 0;
+  uint64_t scaled = kSelfTestWaitTimeoutTscCycles;
+  if (window_ticks != 0 && per_tick <= UINT64_MAX / window_ticks) {
+    const uint64_t candidate = window_ticks * per_tick;
+    if (candidate > scaled) {
+      scaled = candidate;
+    }
+  }
+  return scaled;
+}
+
 // Owns the tasks of one phase of TestSchedulerBlockWake() and joins them when
 // it goes out of scope, also on an early `return false`. Its tasks block, so
 // they would never notice a stop flag by themselves: the group first sets
@@ -3831,7 +3851,8 @@ static bool WaitForProcesses(
     const Done done,                                      //
     const WaitMode mode) {
   TaskScheduler* const scheduler = GetTaskScheduler();
-  const TscDeadline deadline(kSelfTestWaitTimeoutTscCycles);
+  const TscDeadline deadline(
+      CalibratedWaitTimeoutTscCycles(kProcessWaitTimeoutTicks));
   for (;;) {
     bool all_done = true;
     for (int i = 0; i < count && all_done; ++i) {
@@ -7840,10 +7861,18 @@ static bool IsBlockedInIrqWait(const UserProcessStats& stats) {
 constexpr uint8_t kPciClassSerialBus = 0x0C;
 constexpr uint8_t kPciSubclassUsb = 0x03;
 constexpr uint8_t kPciProgIfXhci = 0x30;
+constexpr uint8_t kPciClassMassStorage = 0x01;
+constexpr uint8_t kPciSubclassNvm = 0x08;
+constexpr uint8_t kPciProgIfNvme = 0x02;
 
 static bool IsXhci(const PciDevice& dev) {
   return dev.class_code == kPciClassSerialBus &&
          dev.subclass == kPciSubclassUsb && dev.prog_if == kPciProgIfXhci;
+}
+
+static bool IsNvme(const PciDevice& dev) {
+  return dev.class_code == kPciClassMassStorage &&
+         dev.subclass == kPciSubclassNvm && dev.prog_if == kPciProgIfNvme;
 }
 
 // Whether the driver tests may claim `dev` and change its interrupt settings
@@ -7926,43 +7955,54 @@ static void FormatPciAddress(const PciAddress& address, char (&out)[8]) {
 }
 
 // Makes function `dev_idx` safe for the driver tests of `test_name`, which
-// claim it, enable its Bus Master and program its interrupts. An xHCI may
-// still run: firmware may have left it running, and so does a non-interactive
-// boot, whose init starts usbkbd and kills it when it ends. Its release clears
-// Bus Master but leaves the controller running on rings in memory that has
-// been freed since (the kernel can't stop a device by itself), and Bus Master
-// on would let it write that memory again. So an xHCI is first taken over
-// from firmware, halted and reset, as usbkbd does before it enables Bus Master
-// (usertest's kDriverXhciReset); it then stays halted, accessing no memory,
-// until a driver starts it again. Other functions need nothing: no driver of
-// this kernel runs them, and firmware stops their DMA before it hands the
-// machine over.
+// claim it, enable its Bus Master and program its interrupts. An xHCI or NVMe
+// controller may still run: firmware may have left it running, and so does a
+// non-interactive boot, whose init starts usbkbd and nvme and kills them when
+// it ends. Its release clears Bus Master but leaves the controller running on
+// rings in memory that has been freed since (the kernel can't stop a device by
+// itself), and Bus Master on would let it write that memory again. So an xHCI
+// is halted and reset (`kDriverXhciReset`), and an NVMe controller has `CC.EN`
+// cleared until `CSTS.RDY == 0` (`kDriverNvmeReset`), both before Bus Master
+// is touched again. Other functions need nothing: no driver of this kernel
+// runs them, and firmware stops their DMA before it hands the machine over.
 static bool PrepareDeviceForDriverTests(const char* const test_name,
                                         const int dev_idx) {
   const PciDevice* const dev = PciGetDevice(dev_idx);
   SELFTEST_EXPECT(dev != nullptr);
-  if (!IsXhci(*dev)) {
+  const bool is_xhci = IsXhci(*dev);
+  const bool is_nvme = IsNvme(*dev);
+  if (!is_xhci && !is_nvme) {
     return true;
   }
+  const usertest::Mode reset_mode = is_xhci ? usertest::Mode::kDriverXhciReset
+                                            : usertest::Mode::kDriverNvmeReset;
+  const int64_t was_running_status = is_xhci
+                                         ? usertest::kXhciResetWasRunningStatus
+                                         : usertest::kNvmeResetWasRunningStatus;
+  const int64_t not_decoding_status =
+      is_xhci ? usertest::kXhciResetNotDecodingStatus
+              : usertest::kNvmeResetNotDecodingStatus;
   UserProgramResult result{};
   SELFTEST_EXPECT(RunUserTestWithCaps(
-      usertest::DriverArg(usertest::Mode::kDriverXhciReset, 0, dev_idx),
-      kUserCapDriver, &result));
+      usertest::DriverArg(reset_mode, 0, dev_idx), kUserCapDriver, &result));
+  SELFTEST_EXPECT(PciClaimedCount() == 0);
+  SELFTEST_EXPECT(DeviceIrqUsedVectorCount() == 0);
   if (result.outcome == UserProgramOutcome::kExited &&
-      result.exit_status == usertest::kXhciResetWasRunningStatus) {
+      result.exit_status == was_running_status) {
     char address[8];
     FormatPciAddress(dev->address, address);
     LineBuffer line;
     line.Append("[TEST] ")
         .Append(test_name)
-        .Append(": halted and reset the running xHCI controller ")
+        .Append(is_xhci ? ": halted and reset the running xHCI controller "
+                        : ": disabled the running NVMe controller ")
         .Append(address)
         .Append("\n");
     UartWrite(line.c_str());
     return true;
   }
   if (result.outcome == UserProgramOutcome::kExited &&
-      result.exit_status == usertest::kXhciResetNotDecodingStatus) {
+      result.exit_status == not_decoding_status) {
     return true;
   }
   SELFTEST_EXPECT(ExitedWith(result, 0));
@@ -7972,13 +8012,15 @@ static bool PrepareDeviceForDriverTests(const char* const test_name,
 // Verifies capability separation and EPERM gating:
 // - An unprivileged process (`kUserCapNone`) receives `kSyscallErrorPermission`
 //   on every privileged syscall (`7..15`, `17..19` and `35..36`) and on
-//   `IpcListen(kIpcPortFs)`, succeeds on `kSyscallGetTicks` (`16`), and
-//   receives `kSyscallErrorNoSys` on `kSyscallCount`/`-1`.
+//   `IpcListen(kIpcPortFs)` / `IpcListen(kIpcPortBlock)`, succeeds on
+//   `kSyscallGetTicks` (`16`), and receives `kSyscallErrorNoSys` on
+//   `kSyscallCount`/`-1`.
 // - A `kUserCapSpawnDrivers` process receives `kSyscallErrorPermission` on
 //   driver syscalls `8..15`, `17..19` and `35..36` and on
-//   `IpcListen(kIpcPortFs)`, succeeds on `kSyscallSpawnDriver`, and its spawned
-//   driver child runs with `kUserCapDriver` (succeeds on `pci_info`,
-//   `get_ticks` and `boot_module_info`, and gets `kSyscallErrorPermission` on
+//   `IpcListen(kIpcPortFs)` / `IpcListen(kIpcPortBlock)`, succeeds on
+//   `kSyscallSpawnDriver`, and its spawned driver child runs with
+//   `kUserCapDriver` (succeeds on `pci_info`, `get_ticks` and
+//   `boot_module_info`, and gets `kSyscallErrorPermission` on
 //   `spawn_driver`).
 // - A child spawned via `kSyscallSpawn` from either a `kUserCapSpawnDrivers`
 //   or a `kUserCapDriver` process receives `kUserCapNone`.
@@ -7992,13 +8034,19 @@ static bool TestDriverPrivilege() {
   const int64_t heap_free_at_start = HeapTotalFreeBytes();
 
   UserProgramResult result{};
-  // Warm up the multi-level spawn_driver -> spawn chain before recording the
-  // exact PMM and heap baseline.
+  // Warm up the multi-level spawn_driver -> spawn chain and `IpcListen` buffer
+  // allocation before recording the exact PMM and heap baseline.
   SELFTEST_EXPECT(RunUserTestWithCaps(
       usertest::DriverArg(
           Mode::kDriverCapProbe,
           static_cast<uint8_t>(DriverCapProbeSubmode::kProbeSpawnerRole)),
       kUserCapSpawnDrivers, &result));
+  SELFTEST_EXPECT(ExitedWith(result, 0));
+  const uint64_t driver_role_arg = usertest::DriverArg(
+      Mode::kDriverCapProbe,
+      static_cast<uint8_t>(DriverCapProbeSubmode::kProbeDriverRole));
+  SELFTEST_EXPECT(
+      RunUserTestWithCaps(driver_role_arg, kUserCapDriver, &result));
   SELFTEST_EXPECT(ExitedWith(result, 0));
 
   const int64_t pmm_free_before = PmmFreeFrameCount();
@@ -8025,11 +8073,8 @@ static bool TestDriverPrivilege() {
 
   // (c) Direct `kUserCapDriver` process probing its own capability boundary and
   // its `spawn()` child's `kUserCapNone`.
-  SELFTEST_EXPECT(RunUserTestWithCaps(
-      usertest::DriverArg(
-          Mode::kDriverCapProbe,
-          static_cast<uint8_t>(DriverCapProbeSubmode::kProbeDriverRole)),
-      kUserCapDriver, &result));
+  SELFTEST_EXPECT(
+      RunUserTestWithCaps(driver_role_arg, kUserCapDriver, &result));
   SELFTEST_EXPECT(ExitedWith(result, 0));
 
   // (d) `kSyscallConsolePush` from `kUserCapDriver` feeds the console input
@@ -8052,6 +8097,7 @@ static bool TestDriverPrivilege() {
   }
   ConsoleClearInput();
 
+  SELFTEST_EXPECT(IpcClaimedPortCount() == 0);
   SELFTEST_EXPECT(PagingActiveRoot() == PagingKernelRoot());
   SELFTEST_EXPECT(PagingUserSpaceIsEmpty());
   SELFTEST_EXPECT(PmmFreeFrameCount() == pmm_free_before);
@@ -8661,8 +8707,10 @@ static bool TestDriverIrqWait() {
     ConsoleClearInput();
 
     // (c) Blocking wakeup: verify `BlockUntil` parks the task off the runqueue
-    // (0 task timer ticks across 20 global timer ticks) and wakes within `<= 2`
-    // task timer ticks when `SmpSendIpi(0, vec_k)` fires.
+    // (0 task timer ticks across 20 global timer ticks) and wakes within
+    // `<= kIrqWakeupMaxTaskTicks` task timer ticks when `SmpSendIpi(0, vec_k)`
+    // fires.
+    constexpr int64_t kIrqWakeupMaxTaskTicks = 10;
     ConsoleClearInput();
     {
       const std::unique_ptr<UserProcess> proc = UserProcess::Start(
@@ -8712,13 +8760,13 @@ static bool TestDriverIrqWait() {
               },
               WaitMode::kYield));
           SELFTEST_EXPECT(proc->stats().task_timer_ticks - task_ticks_before <=
-                          2);
+                          kIrqWakeupMaxTaskTicks);
           ConsolePushInput("G", 1);
         } else {
           SELFTEST_EXPECT(
               WaitForProcesses(&proc, 1, HasEnded, WaitMode::kYield));
           SELFTEST_EXPECT(proc->stats().task_timer_ticks - task_ticks_before <=
-                          2);
+                          kIrqWakeupMaxTaskTicks);
         }
       }
       SELFTEST_EXPECT(WaitForProcesses(&proc, 1, HasEnded, WaitMode::kYield));
@@ -8911,11 +8959,10 @@ static int FindClaimableXhciDevices(
   return found;
 }
 
-static bool VerifyXhciDevicesQuiescedAndReleased(
-    const int* const dev_indices,  //
-    const int dev_count,           //
-    const int64_t expected_pmm,    //
-    const int64_t expected_heap) {
+static bool VerifyPciDevicesQuiescedAndReleased(const int* const dev_indices,
+                                                const int dev_count,
+                                                const int64_t expected_pmm,
+                                                const int64_t expected_heap) {
   const DriverReleaseRecord rec = DriverLastReleaseRecord();
   SELFTEST_EXPECT(rec.quiesced_count == dev_count);
   SELFTEST_EXPECT(rec.freed_vectors >= 1 && rec.freed_vectors <= dev_count);
@@ -8956,6 +9003,27 @@ static bool VerifyXhciDevicesQuiescedAndReleased(
   SELFTEST_EXPECT(PmmFreeFrameCount() == expected_pmm);
   SELFTEST_EXPECT(HeapTotalFreeBytes() == expected_heap);
   return true;
+}
+
+static int FindClaimableNvmeDevices(
+    int (&out_indices)[kMaxSelfTestXhciControllers]) {
+  int found = 0;
+  const int count = PciDeviceCount();
+  for (int i = 0; i < count && found < kMaxSelfTestXhciControllers; ++i) {
+    const PciDevice* const dev = PciGetDevice(i);
+    if (dev == nullptr || !dev->claimable || !IsNvme(*dev)) {
+      continue;
+    }
+    const PciBar& bar0 = dev->bars[0];
+    const bool has_mem_bar0 =
+        (bar0.type == PciBarType::kMem32 || bar0.type == PciBarType::kMem64) &&
+        bar0.base != 0 && bar0.size >= 2 * kPageSize;
+    if (!has_mem_bar0) {
+      continue;
+    }
+    out_indices[found++] = i;
+  }
+  return found;
 }
 
 // Verifies the real `usbkbd` ring-3 driver binary across:
@@ -9031,7 +9099,7 @@ static bool TestUsbKbdDriverLifecycle() {
     SELFTEST_EXPECT(WaitForProcesses(&proc, 1, HasEnded, WaitMode::kYield));
     SELFTEST_EXPECT(ExitedWith(proc->Wait(), 0));
   }
-  SELFTEST_EXPECT(VerifyXhciDevicesQuiescedAndReleased(
+  SELFTEST_EXPECT(VerifyPciDevicesQuiescedAndReleased(
       xhci_indices, xhci_count, pmm_free_before, heap_free_before));
 
   // (b) Ring-3 fault (#UD) after re-claiming and starting all controllers.
@@ -9042,7 +9110,7 @@ static bool TestUsbKbdDriverLifecycle() {
     SELFTEST_EXPECT(WaitForProcesses(&proc, 1, HasEnded, WaitMode::kYield));
     SELFTEST_EXPECT(FaultedWith(proc->Wait(), kVectorInvalidOpcode, 0, 0));
   }
-  SELFTEST_EXPECT(VerifyXhciDevicesQuiescedAndReleased(
+  SELFTEST_EXPECT(VerifyPciDevicesQuiescedAndReleased(
       xhci_indices, xhci_count, pmm_free_before, heap_free_before));
 
   // (c) Normal daemon mode: re-claim after fault, settle initial port
@@ -9131,7 +9199,7 @@ static bool TestUsbKbdDriverLifecycle() {
     SELFTEST_EXPECT(kill_stats.kill_in_syscall);
     SELFTEST_EXPECT(KillTicks(kill_stats) <= 5 * kKillDeadlineTicks);
   }
-  SELFTEST_EXPECT(VerifyXhciDevicesQuiescedAndReleased(
+  SELFTEST_EXPECT(VerifyPciDevicesQuiescedAndReleased(
       xhci_indices, xhci_count, pmm_free_before, heap_free_before));
 
   // (d) Re-claim verification after Kill(): a freshly spawned `usbkbd` can
@@ -9143,7 +9211,7 @@ static bool TestUsbKbdDriverLifecycle() {
     SELFTEST_EXPECT(WaitForProcesses(&proc, 1, HasEnded, WaitMode::kYield));
     SELFTEST_EXPECT(ExitedWith(proc->Wait(), 0));
   }
-  SELFTEST_EXPECT(VerifyXhciDevicesQuiescedAndReleased(
+  SELFTEST_EXPECT(VerifyPciDevicesQuiescedAndReleased(
       xhci_indices, xhci_count, pmm_free_before, heap_free_before));
   ConsoleClearInput();
 
@@ -9413,6 +9481,7 @@ static bool KillWaitingProcess(const std::unique_ptr<UserProcess>& process) {
 static bool VerifyIpcReleased(const int64_t expected_pmm,
                               const int64_t expected_heap) {
   SELFTEST_EXPECT(IpcPortOwner(kIpcPortFs) == kIpcNoOwner);
+  SELFTEST_EXPECT(IpcPortOwner(kIpcPortBlock) == kIpcNoOwner);
   SELFTEST_EXPECT(IpcClaimedPortCount() == 0);
   SELFTEST_EXPECT(PagingActiveRoot() == PagingKernelRoot());
   SELFTEST_EXPECT(PagingUserSpaceIsEmpty());
@@ -9858,7 +9927,8 @@ static bool ReceiveMockFsCall(IpcContext& server,                        //
                               const int64_t buf_cap,                     //
                               IpcReceivedMessage* const out_msg) {
   TaskScheduler* const scheduler = GetTaskScheduler();
-  const TscDeadline deadline(kSelfTestWaitTimeoutTscCycles);
+  const TscDeadline deadline(
+      CalibratedWaitTimeoutTscCycles(kProcessWaitTimeoutTicks));
   for (;;) {
     const int64_t rc =
         server.Recv(kIpcPortFs, buf, buf_cap, out_msg, 0, nullptr, nullptr);
@@ -10074,7 +10144,8 @@ static bool DrainMockFsDisconnects(
   static uint8_t req_buf[kIpcMaxMessageSize];
   IpcReceivedMessage msg{};
   TaskScheduler* const scheduler = GetTaskScheduler();
-  const TscDeadline deadline(kSelfTestWaitTimeoutTscCycles);
+  const TscDeadline deadline(
+      CalibratedWaitTimeoutTscCycles(kProcessWaitTimeoutTicks));
   int disconnects = 0;
   for (;;) {
     const bool ended = HasEnded(client->stats());
@@ -10593,6 +10664,777 @@ static bool TestRootfsBootModule() {
   return true;
 }
 
+static std::unique_ptr<UserProcess> StartNvme(const uint64_t mode) {
+  return UserProcess::Start(NvmeProgram(), mode, kUserCapDriver);
+}
+
+static bool VerifyNvmeDevicesQuiescedAndReleased(const int* const dev_indices,
+                                                 const int dev_count,
+                                                 const int64_t expected_pmm,
+                                                 const int64_t expected_heap) {
+  SELFTEST_EXPECT(IpcPortOwner(kIpcPortBlock) == kIpcNoOwner);
+  SELFTEST_EXPECT(IpcClaimedPortCount() == 0);
+  return VerifyPciDevicesQuiescedAndReleased(dev_indices,   //
+                                             dev_count,     //
+                                             expected_pmm,  //
+                                             expected_heap);
+}
+
+// Verifies the real `nvme` ring-3 driver binary (`user/nvme/nvme.cpp`) across:
+// 0. Started without `kUserCapDriver`: exits with `kDriverExitNotDriver`.
+// 1. Systems without claimable NVMe controllers (`mb1`, `max`, `smep`): exits
+//    cleanly with status 0 in `kDriverArgNormal` and releases all resources.
+// 2. Systems with claimable NVMe controller(s) (`bios`, `uefi`):
+//    (a) Clean `exit(0)` after bring-up (`kDriverArgExitAfterReady`).
+//    (b) Ring-3 `#UD` fault after bring-up (`kDriverArgFaultAfterReady`).
+//    (c) Normal daemon mode (`kDriverArgNormal`): exclusive `kIpcPortBlock`,
+//        PCI ownership, Bus Master, IRQ allocation, `<= 2%` CPU ticks while
+//        parked in `IpcRecv()`, and `Kill()` teardown.
+//    (d) Re-claim after `Kill()` (`kDriverArgExitAfterReady`).
+static bool TestNvmeDriverLifecycle() {
+  const ScopedQuietConsole quiet_console;
+  TaskScheduler* const scheduler = GetTaskScheduler();
+  SELFTEST_EXPECT(scheduler != nullptr);
+  SELFTEST_EXPECT(PciClaimedCount() == 0);
+  SELFTEST_EXPECT(DeviceIrqUsedVectorCount() == 0);
+  SELFTEST_EXPECT(IpcClaimedPortCount() == 0);
+
+  int nvme_indices[kMaxSelfTestXhciControllers] = {};
+  const int nvme_count = FindClaimableNvmeDevices(nvme_indices);
+
+  const int64_t pmm_free_before = PmmFreeFrameCount();
+  const int64_t heap_free_before = HeapTotalFreeBytes();
+
+  // 0. Unprivileged spawn fails with `kDriverExitNotDriver`.
+  {
+    const std::unique_ptr<UserProcess> proc =
+        UserProcess::Start(NvmeProgram(), kDriverArgNormal, kUserCapNone);
+    SELFTEST_EXPECT(proc != nullptr);
+    SELFTEST_EXPECT(WaitForProcesses(&proc, 1, HasEnded, WaitMode::kYield));
+    SELFTEST_EXPECT(ExitedWith(proc->Wait(), kDriverExitNotDriver));
+  }
+  SELFTEST_EXPECT(PciClaimedCount() == 0);
+  SELFTEST_EXPECT(DeviceIrqUsedVectorCount() == 0);
+  SELFTEST_EXPECT(VerifyIpcReleased(pmm_free_before, heap_free_before));
+
+  if (nvme_count == 0) {
+    {
+      const std::unique_ptr<UserProcess> proc = StartNvme(kDriverArgNormal);
+      SELFTEST_EXPECT(proc != nullptr);
+      SELFTEST_EXPECT(WaitForProcesses(&proc, 1, HasEnded, WaitMode::kYield));
+      SELFTEST_EXPECT(ExitedWith(proc->Wait(), 0));
+    }
+    SELFTEST_EXPECT(PciClaimedCount() == 0);
+    SELFTEST_EXPECT(DeviceIrqUsedVectorCount() == 0);
+    SELFTEST_EXPECT(VerifyIpcReleased(pmm_free_before, heap_free_before));
+    UartWrite("[TEST] nvme_driver_lifecycle: controllers=0 status=no_nvme\n");
+    return true;
+  }
+
+  // (a) Clean exit(0) after full two-phase bring-up.
+  {
+    const std::unique_ptr<UserProcess> proc =
+        StartNvme(kDriverArgExitAfterReady);
+    SELFTEST_EXPECT(proc != nullptr);
+    SELFTEST_EXPECT(WaitForProcesses(&proc, 1, HasEnded, WaitMode::kYield));
+    SELFTEST_EXPECT(ExitedWith(proc->Wait(), 0));
+  }
+  SELFTEST_EXPECT(VerifyNvmeDevicesQuiescedAndReleased(
+      nvme_indices, nvme_count, pmm_free_before, heap_free_before));
+
+  // (b) Ring-3 fault (#UD) after controller bring-up.
+  {
+    const std::unique_ptr<UserProcess> proc =
+        StartNvme(kDriverArgFaultAfterReady);
+    SELFTEST_EXPECT(proc != nullptr);
+    SELFTEST_EXPECT(WaitForProcesses(&proc, 1, HasEnded, WaitMode::kYield));
+    SELFTEST_EXPECT(FaultedWith(proc->Wait(), kVectorInvalidOpcode, 0, 0));
+  }
+  SELFTEST_EXPECT(VerifyNvmeDevicesQuiescedAndReleased(
+      nvme_indices, nvme_count, pmm_free_before, heap_free_before));
+
+  // (c) Normal daemon mode: exclusive `kIpcPortBlock`, active PCI/IRQ
+  // ownership, `<= 2%` idle CPU ticks in `IpcRecv()`, and `Kill()` teardown.
+  // If all controllers have 0 namespaces, `nvme` exits 0 cleanly without
+  // claiming `kIpcPortBlock`.
+  constexpr int64_t kNvmeIdleWindowTicks = 150;
+  int64_t measured_driver_ticks = 0;
+  int64_t measured_total_ticks = 0;
+  bool no_namespaces = false;
+  {
+    const std::unique_ptr<UserProcess> proc = StartNvme(kDriverArgNormal);
+    SELFTEST_EXPECT(proc != nullptr);
+    const auto nvme_ready_or_ended = [](const UserProcessStats& s) {
+      return IsBlockedInIpcRecv(s) || HasEnded(s);
+    };
+    SELFTEST_EXPECT(
+        WaitForProcesses(&proc, 1, nvme_ready_or_ended, WaitMode::kYield));
+    if (HasEnded(proc->stats())) {
+      SELFTEST_EXPECT(ExitedWith(proc->Wait(), 0));
+      no_namespaces = true;
+    } else {
+      SELFTEST_EXPECT(IpcPortOwner(kIpcPortBlock) == proc->IpcOwnerToken());
+      SELFTEST_EXPECT(IpcClaimedPortCount() == 1);
+      {
+        IpcContext probe;
+        SELFTEST_EXPECT(probe.Listen(kIpcPortBlock, kUserCapDriver) ==
+                        kSyscallErrorBusy);
+        SELFTEST_EXPECT(probe.Listen(kIpcPortBlock, kUserCapNone) ==
+                        kSyscallErrorPermission);
+      }
+
+      const uintptr_t expected_owner = proc->OwnerToken();
+      int active_count = 0;
+      for (int i = 0; i < nvme_count; ++i) {
+        const int dev_idx = nvme_indices[i];
+        if (PciOwner(dev_idx) == expected_owner) {
+          const uint16_t cmd = PciConfigRead16(dev_idx, kPciCommandOffset);
+          SELFTEST_EXPECT((cmd & kPciCommandBusMaster) != 0);
+          ++active_count;
+        }
+      }
+      SELFTEST_EXPECT(active_count >= 1 && active_count <= nvme_count);
+      const int used_vectors = DeviceIrqUsedVectorCount();
+      SELFTEST_EXPECT(used_vectors >= active_count &&
+                      used_vectors <= nvme_count);
+
+      const TickDeadline idle_deadline(2 * kNvmeIdleWindowTicks);
+      const int64_t syscalls_before = proc->syscall_count();
+      const int64_t driver_ticks_before = proc->stats().task_timer_ticks;
+      const int64_t total_ticks_before = Cpu0TimerTicks();
+      bool checked_mid_window = false;
+      for (;;) {
+        const int64_t elapsed = Cpu0TimerTicks() - total_ticks_before;
+        if (elapsed >= kNvmeIdleWindowTicks) {
+          break;
+        }
+        if (!checked_mid_window && elapsed >= kNvmeIdleWindowTicks / 2) {
+          SELFTEST_EXPECT(proc->stats().blocked_in_ipc_recv);
+          checked_mid_window = true;
+        }
+        SELFTEST_EXPECT(!idle_deadline.Expired());
+        scheduler->Yield();
+      }
+
+      const UserProcessStats end_stats = proc->stats();
+      const int64_t total_ticks_after = Cpu0TimerTicks();
+      measured_driver_ticks = end_stats.task_timer_ticks - driver_ticks_before;
+      measured_total_ticks = total_ticks_after - total_ticks_before;
+
+      SELFTEST_EXPECT(end_stats.blocked_in_ipc_recv);
+      SELFTEST_EXPECT(end_stats.syscalls == syscalls_before);
+      SELFTEST_EXPECT(measured_driver_ticks * 100 <= measured_total_ticks * 2);
+      SELFTEST_EXPECT(KillWaitingProcess(proc));
+    }
+  }
+  SELFTEST_EXPECT(VerifyNvmeDevicesQuiescedAndReleased(
+      nvme_indices, nvme_count, pmm_free_before, heap_free_before));
+
+  // (d) Re-claim after Kill() / clean exit.
+  {
+    const std::unique_ptr<UserProcess> proc =
+        StartNvme(kDriverArgExitAfterReady);
+    SELFTEST_EXPECT(proc != nullptr);
+    SELFTEST_EXPECT(WaitForProcesses(&proc, 1, HasEnded, WaitMode::kYield));
+    SELFTEST_EXPECT(ExitedWith(proc->Wait(), 0));
+  }
+  SELFTEST_EXPECT(VerifyNvmeDevicesQuiescedAndReleased(
+      nvme_indices, nvme_count, pmm_free_before, heap_free_before));
+
+  LineBuffer summary;
+  summary.Append("[TEST] nvme_driver_lifecycle: controllers=")
+      .AppendDec(static_cast<uint64_t>(nvme_count));
+  if (no_namespaces) {
+    summary.Append(" status=no_namespaces\n");
+  } else {
+    summary.Append(" driver_ticks=")
+        .AppendDec(static_cast<uint64_t>(measured_driver_ticks))
+        .Append(" total_ticks=")
+        .AppendDec(static_cast<uint64_t>(measured_total_ticks))
+        .Append("\n");
+  }
+  UartWrite(summary.c_str());
+  return true;
+}
+
+struct QueryBlockContext {
+  uint32_t disk_index = 0;
+  int64_t rc = kSyscallErrorInvalid;
+  int64_t reply_size = 0;
+  BlockDeviceInfo info{};
+};
+
+static void QueryBlockWorker(void* const arg) {
+  QueryBlockContext* const ctx = static_cast<QueryBlockContext*>(arg);
+  const BlockGetInfoRequest req{
+      .op = BlockRpcOp::kGetInfo,
+      .disk_index = ctx->disk_index,
+  };
+  ctx->rc = IpcCall(kIpcPortBlock,      //
+                    /*client_id=*/1,    //
+                    kIpcNoOwner,        //
+                    kIpcNoOwner,        //
+                    &req,               //
+                    sizeof(req),        //
+                    &ctx->info,         //
+                    sizeof(ctx->info),  //
+                    &ctx->reply_size,   //
+                    nullptr,            //
+                    nullptr,            //
+                    nullptr,            //
+                    nullptr);
+}
+
+static bool QueryBlockDevice(const uint32_t disk_index,
+                             BlockDeviceInfo* const out_info,
+                             int64_t* const out_disk_count) {
+  TaskScheduler* const scheduler = GetTaskScheduler();
+  SELFTEST_EXPECT(scheduler != nullptr);
+  QueryBlockContext ctx{};
+  ctx.disk_index = disk_index;
+  // `bootstrap_task_` may not `Block()` in `IpcCall()`, so run on a worker.
+  Task* const task =
+      scheduler->CreateTaskOnCpu(QueryBlockWorker, &ctx, kDefaultTaskWeight, 0);
+  SELFTEST_EXPECT(task != nullptr);
+  scheduler->Join(task);
+  SELFTEST_EXPECT(ctx.rc >= 1 &&
+                  ctx.rc <= static_cast<int64_t>(UINT32_MAX) + 1);
+  SELFTEST_EXPECT(static_cast<uint64_t>(disk_index) <
+                  static_cast<uint64_t>(ctx.rc));
+  SELFTEST_EXPECT(ctx.reply_size == static_cast<int64_t>(sizeof(ctx.info)));
+  if (out_info != nullptr) {
+    *out_info = ctx.info;
+  }
+  if (out_disk_count != nullptr) {
+    *out_disk_count = ctx.rc;
+  }
+  return true;
+}
+
+static bool ReceiveMockBlockCall(IpcContext& server,                        //
+                                 const std::unique_ptr<UserProcess>& proc,  //
+                                 void* const buf,                           //
+                                 const int64_t buf_cap,                     //
+                                 IpcReceivedMessage* const out_msg) {
+  TaskScheduler* const scheduler = GetTaskScheduler();
+  const TscDeadline deadline(
+      CalibratedWaitTimeoutTscCycles(kProcessWaitTimeoutTicks));
+  for (;;) {
+    const int64_t rc =
+        server.Recv(kIpcPortBlock, buf, buf_cap, out_msg, 0, nullptr, nullptr);
+    if (rc == 1) {
+      return out_msg->kind == IpcMessageKind::kCall;
+    }
+    SELFTEST_EXPECT(rc == 0);
+    if (HasEnded(proc->stats())) {
+      LogUnexpectedResult(proc->Wait());
+      return false;
+    }
+    if (!SELFTEST_OK(!deadline.Expired())) {
+      WriteFailureReport("[TEST] mock block server wait timed out: FAIL\n");
+      return false;
+    }
+    scheduler->Yield();
+  }
+}
+
+static bool DrainMockBlockDisconnects(
+    IpcContext& server,                          //
+    const std::unique_ptr<UserProcess>& client,  //
+    const uint64_t client_id,                    //
+    int* const out_count) {
+  static uint8_t req_buf[kIpcMaxMessageSize];
+  IpcReceivedMessage msg{};
+  TaskScheduler* const scheduler = GetTaskScheduler();
+  const TscDeadline deadline(
+      CalibratedWaitTimeoutTscCycles(kProcessWaitTimeoutTicks));
+  int disconnects = 0;
+  for (;;) {
+    const bool ended = HasEnded(client->stats());
+    for (;;) {
+      const int64_t rc = server.Recv(kIpcPortBlock,    //
+                                     req_buf,          //
+                                     sizeof(req_buf),  //
+                                     &msg,             //
+                                     0,                //
+                                     nullptr,          //
+                                     nullptr);
+      if (rc == 0) {
+        break;
+      }
+      SELFTEST_EXPECT(rc == 1);
+      SELFTEST_EXPECT(msg.kind == IpcMessageKind::kClientDisconnect);
+      SELFTEST_EXPECT(msg.client_id == client_id);
+      ++disconnects;
+    }
+    if (ended) {
+      break;
+    }
+    SELFTEST_EXPECT(!deadline.Expired());
+    scheduler->Yield();
+  }
+  *out_count = disconnects;
+  return true;
+}
+
+static BlockDeviceInfo MakeMockBlockInfo() {
+  BlockDeviceInfo info{};
+  info.block_count = 64;
+  info.block_size = 512;
+  info.max_transfer_blocks = 8;
+  info.read_only = 0;
+  info.nsid = 1;
+  info.model[0] = 'M';
+  info.model[1] = 'o';
+  info.model[2] = 'c';
+  info.model[3] = 'k';
+  info.serial[0] = 'm';
+  info.serial[1] = '0';
+  return info;
+}
+
+// Runs hardware-independent `kIpcPortBlock` mock-server tests on every boot
+// pass: malformed server replies (`kSyscallErrorIo`), `kClientDisconnect` on
+// exit/kill, replacement-server disconnect scoping, server-kill mid-RPC
+// (`kSyscallErrorNoDevice`), and `kSyscallErrorDeadlock`.
+static bool TestBlockMockServerCases(const int64_t pmm_free_before,
+                                     const int64_t heap_free_before) {
+  using usertest::BlockTestSubmode;
+  static uint8_t req_buf[kIpcMaxMessageSize];
+  static uint8_t payload_buf[1024];
+  IpcReceivedMessage msg{};
+
+  // A. Malformed server replies (`kSyscallErrorIo`).
+  {
+    IpcContext mock_block;
+    SELFTEST_EXPECT(mock_block.Listen(kIpcPortBlock, kUserCapDriver) == 0);
+    const std::unique_ptr<UserProcess> client = UserProcess::Start(
+        UserTestProgram(),
+        usertest::BlockChecksArg(BlockTestSubmode::kMockMalformedReplies));
+    SELFTEST_EXPECT(client != nullptr);
+
+    // 1. Short reply_size (4 bytes).
+    SELFTEST_EXPECT(ReceiveMockBlockCall(mock_block,       //
+                                         client,           //
+                                         req_buf,          //
+                                         sizeof(req_buf),  //
+                                         &msg));
+    uint32_t short_word = 0;
+    SELFTEST_EXPECT(mock_block.Reply(kIpcPortBlock,       //
+                                     msg.token,           //
+                                     &short_word,         //
+                                     sizeof(short_word),  //
+                                     1) == 0);
+    const uint64_t client_id = msg.client_id;
+
+    // 2. status == 0 (disk_count < 1).
+    const BlockDeviceInfo valid_info = MakeMockBlockInfo();
+    SELFTEST_EXPECT(ReceiveMockBlockCall(mock_block,       //
+                                         client,           //
+                                         req_buf,          //
+                                         sizeof(req_buf),  //
+                                         &msg));
+    SELFTEST_EXPECT(mock_block.Reply(kIpcPortBlock,       //
+                                     msg.token,           //
+                                     &valid_info,         //
+                                     sizeof(valid_info),  //
+                                     0) == 0);
+
+    // 3..10. Malformed BlockDeviceInfo geometries and unterminated strings.
+    BlockDeviceInfo bad_infos[8]{};
+    for (int i = 0; i < 8; ++i) {
+      bad_infos[i] = valid_info;
+    }
+    bad_infos[0].block_size = 513;
+    bad_infos[1].block_size = 256;
+    bad_infos[2].block_size = 8192;
+    bad_infos[3].block_count = 0;
+    bad_infos[4].max_transfer_blocks = 0;
+    bad_infos[5].max_transfer_blocks = 16;
+    for (int i = 0; i < kBlockModelCapacity; ++i) {
+      bad_infos[6].model[i] = 'M';
+    }
+    for (int i = 0; i < kBlockSerialCapacity; ++i) {
+      bad_infos[7].serial[i] = 'S';
+    }
+    for (const BlockDeviceInfo& bad_info : bad_infos) {
+      SELFTEST_EXPECT(ReceiveMockBlockCall(mock_block,       //
+                                           client,           //
+                                           req_buf,          //
+                                           sizeof(req_buf),  //
+                                           &msg));
+      SELFTEST_EXPECT(mock_block.Reply(kIpcPortBlock,     //
+                                       msg.token,         //
+                                       &bad_info,         //
+                                       sizeof(bad_info),  //
+                                       1) == 0);
+    }
+
+    // 11..12. ReadBlocks: rc != block_count and unaligned reply_size.
+    for (int i = 0; i < 513; ++i) {
+      payload_buf[i] = 0;
+    }
+    SELFTEST_EXPECT(ReceiveMockBlockCall(mock_block,       //
+                                         client,           //
+                                         req_buf,          //
+                                         sizeof(req_buf),  //
+                                         &msg));
+    SELFTEST_EXPECT(
+        mock_block.Reply(kIpcPortBlock, msg.token, payload_buf, 512, 2) == 0);
+    SELFTEST_EXPECT(ReceiveMockBlockCall(mock_block,       //
+                                         client,           //
+                                         req_buf,          //
+                                         sizeof(req_buf),  //
+                                         &msg));
+    SELFTEST_EXPECT(
+        mock_block.Reply(kIpcPortBlock, msg.token, payload_buf, 513, 1) == 0);
+
+    // 13. ReadBlocksChecked: reply_size (1024) != expected_bytes (512).
+    SELFTEST_EXPECT(ReceiveMockBlockCall(mock_block,       //
+                                         client,           //
+                                         req_buf,          //
+                                         sizeof(req_buf),  //
+                                         &msg));
+    SELFTEST_EXPECT(
+        mock_block.Reply(kIpcPortBlock, msg.token, payload_buf, 1024, 1) == 0);
+
+    // 14. WriteBlocksWithScratch: rc != block_count.
+    SELFTEST_EXPECT(ReceiveMockBlockCall(mock_block,       //
+                                         client,           //
+                                         req_buf,          //
+                                         sizeof(req_buf),  //
+                                         &msg));
+    SELFTEST_EXPECT(mock_block.Reply(kIpcPortBlock, msg.token, nullptr, 0, 2) ==
+                    0);
+
+    // 15. FlushDisk: rc != 0.
+    SELFTEST_EXPECT(ReceiveMockBlockCall(mock_block,       //
+                                         client,           //
+                                         req_buf,          //
+                                         sizeof(req_buf),  //
+                                         &msg));
+    SELFTEST_EXPECT(mock_block.Reply(kIpcPortBlock, msg.token, nullptr, 0, 1) ==
+                    0);
+
+    int disconnects = 0;
+    SELFTEST_EXPECT(
+        DrainMockBlockDisconnects(mock_block, client, client_id, &disconnects));
+    SELFTEST_EXPECT(ExitedWith(client->Wait(), 0));
+    SELFTEST_EXPECT(disconnects == 1);
+    SELFTEST_EXPECT(mock_block.Release() == 1);
+  }
+  SELFTEST_EXPECT(VerifyIpcReleased(pmm_free_before, heap_free_before));
+
+  // B1. Normal client exit sends `kClientDisconnect` on `kIpcPortBlock`.
+  {
+    IpcContext mock_block;
+    SELFTEST_EXPECT(mock_block.Listen(kIpcPortBlock, kUserCapDriver) == 0);
+    const std::unique_ptr<UserProcess> client = UserProcess::Start(
+        UserTestProgram(),
+        usertest::BlockChecksArg(BlockTestSubmode::kMockClientGetInfoOnly));
+    SELFTEST_EXPECT(client != nullptr);
+    SELFTEST_EXPECT(ReceiveMockBlockCall(mock_block,       //
+                                         client,           //
+                                         req_buf,          //
+                                         sizeof(req_buf),  //
+                                         &msg));
+    const uint64_t client_id = msg.client_id;
+    const BlockDeviceInfo valid_info = MakeMockBlockInfo();
+    SELFTEST_EXPECT(mock_block.Reply(kIpcPortBlock,       //
+                                     msg.token,           //
+                                     &valid_info,         //
+                                     sizeof(valid_info),  //
+                                     1) == 0);
+    int disconnects = 0;
+    SELFTEST_EXPECT(
+        DrainMockBlockDisconnects(mock_block, client, client_id, &disconnects));
+    SELFTEST_EXPECT(ExitedWith(client->Wait(), 0));
+    SELFTEST_EXPECT(disconnects == 1);
+    SELFTEST_EXPECT(mock_block.Release() == 1);
+  }
+  SELFTEST_EXPECT(VerifyIpcReleased(pmm_free_before, heap_free_before));
+
+  // B2. Replacement server does not receive disconnect for predecessor's
+  // client.
+  {
+    IpcContext first_block;
+    SELFTEST_EXPECT(first_block.Listen(kIpcPortBlock, kUserCapDriver) == 0);
+    const std::unique_ptr<UserProcess> client = UserProcess::Start(
+        UserTestProgram(),
+        usertest::BlockChecksArg(BlockTestSubmode::kMockClientCallWait));
+    SELFTEST_EXPECT(client != nullptr);
+    SELFTEST_EXPECT(ReceiveMockBlockCall(first_block,      //
+                                         client,           //
+                                         req_buf,          //
+                                         sizeof(req_buf),  //
+                                         &msg));
+    SELFTEST_EXPECT(WaitUntilParked(client, IsBlockedInIpcCall));
+    SELFTEST_EXPECT(first_block.Release() == 1);
+
+    IpcContext second_block;
+    SELFTEST_EXPECT(second_block.Listen(kIpcPortBlock, kUserCapDriver) == 0);
+    SELFTEST_EXPECT(WaitForProcesses(&client, 1, HasEnded, WaitMode::kYield));
+    SELFTEST_EXPECT(ExitedWith(client->Wait(), -kSyscallErrorNoDevice));
+    SELFTEST_EXPECT(second_block.Recv(kIpcPortBlock,    //
+                                      req_buf,          //
+                                      sizeof(req_buf),  //
+                                      &msg,             //
+                                      0,                //
+                                      nullptr,          //
+                                      nullptr) == 0);
+    SELFTEST_EXPECT(second_block.Release() == 1);
+  }
+  SELFTEST_EXPECT(VerifyIpcReleased(pmm_free_before, heap_free_before));
+
+  // B3. Client killed mid-`IpcCall`: late Reply returns 0 and disconnect is
+  // delivered.
+  {
+    IpcContext mock_block;
+    SELFTEST_EXPECT(mock_block.Listen(kIpcPortBlock, kUserCapDriver) == 0);
+    const std::unique_ptr<UserProcess> client = UserProcess::Start(
+        UserTestProgram(),
+        usertest::BlockChecksArg(BlockTestSubmode::kMockClientCallWait));
+    SELFTEST_EXPECT(client != nullptr);
+    SELFTEST_EXPECT(ReceiveMockBlockCall(mock_block,       //
+                                         client,           //
+                                         req_buf,          //
+                                         sizeof(req_buf),  //
+                                         &msg));
+    const uint64_t client_id = msg.client_id;
+    const uint64_t token = msg.token;
+    SELFTEST_EXPECT(WaitUntilParked(client, IsBlockedInIpcCall));
+    SELFTEST_EXPECT(KillWaitingProcess(client));
+    const BlockDeviceInfo valid_info = MakeMockBlockInfo();
+    SELFTEST_EXPECT(mock_block.Reply(kIpcPortBlock,       //
+                                     token,               //
+                                     &valid_info,         //
+                                     sizeof(valid_info),  //
+                                     1) == 0);
+    int disconnects = 0;
+    SELFTEST_EXPECT(
+        DrainMockBlockDisconnects(mock_block, client, client_id, &disconnects));
+    SELFTEST_EXPECT(disconnects == 1);
+    SELFTEST_EXPECT(mock_block.Release() == 1);
+  }
+  SELFTEST_EXPECT(VerifyIpcReleased(pmm_free_before, heap_free_before));
+
+  // B4. Server killed mid-RPC unblocks both in-service and queued clients with
+  // `kSyscallErrorNoDevice`.
+  {
+    const std::unique_ptr<UserProcess> server = UserProcess::Start(
+        UserTestProgram(),
+        usertest::BlockChecksArg(BlockTestSubmode::kMockServerHoldCall),
+        kUserCapDriver);
+    SELFTEST_EXPECT(server != nullptr);
+    SELFTEST_EXPECT(WaitUntilParked(server, IsBlockedInIpcRecv));
+
+    const std::unique_ptr<UserProcess> in_service = UserProcess::Start(
+        UserTestProgram(),
+        usertest::BlockChecksArg(BlockTestSubmode::kMockClientCallWait));
+    SELFTEST_EXPECT(in_service != nullptr);
+    SELFTEST_EXPECT(WaitUntilParked(server, [](const UserProcessStats& stats) {
+      return stats.syscalls >= usertest::kBlockMockHoldCallParkedSyscall &&
+             stats.blocked_in_ipc_recv;
+    }));
+    SELFTEST_EXPECT(WaitUntilParked(in_service, IsBlockedInIpcCall));
+
+    const std::unique_ptr<UserProcess> queued = UserProcess::Start(
+        UserTestProgram(),
+        usertest::BlockChecksArg(BlockTestSubmode::kMockClientCallWait));
+    SELFTEST_EXPECT(queued != nullptr);
+    SELFTEST_EXPECT(WaitUntilParked(queued, IsBlockedInIpcCall));
+
+    SELFTEST_EXPECT(KillWaitingProcess(server));
+    SELFTEST_EXPECT(
+        WaitForProcesses(&in_service, 1, HasEnded, WaitMode::kYield));
+    SELFTEST_EXPECT(ExitedWith(in_service->Wait(), -kSyscallErrorNoDevice));
+    SELFTEST_EXPECT(WaitForProcesses(&queued, 1, HasEnded, WaitMode::kYield));
+    SELFTEST_EXPECT(ExitedWith(queued->Wait(), -kSyscallErrorNoDevice));
+  }
+  SELFTEST_EXPECT(VerifyIpcReleased(pmm_free_before, heap_free_before));
+
+  // C. `kSyscallErrorDeadlock` when owner calls `kIpcPortBlock`.
+  {
+    UserProgramResult result{};
+    SELFTEST_EXPECT(RunUserTestWithCaps(
+        usertest::BlockChecksArg(BlockTestSubmode::kMockDeadlock),  //
+        kUserCapDriver,                                             //
+        &result));
+    SELFTEST_EXPECT(ExitedWith(result, 0));
+  }
+  SELFTEST_EXPECT(VerifyIpcReleased(pmm_free_before, heap_free_before));
+  return true;
+}
+
+// Verifies block storage I/O end to end over `kIpcPortBlock` against mock
+// servers, `nvme`, and `/bin/disk`:
+// 1. With no block driver owning `kIpcPortBlock`, `kNoServer` sees
+//    `kSyscallErrorNoDevice`, and `TestBlockMockServerCases()` verifies
+//    malformed replies, `kClientDisconnect`, server/client kill, and deadlock.
+// 2. When claimable NVMe controller(s) exist with usable namespaces:
+//    - Starts `nvme`, loops `0..disk_count - 1` running unprivileged
+//      `kWriteReadVerify` (ACL, malformed RPC checks, single-block /
+//      max_transfer_blocks / last-LBA write + flush + read-back).
+//    - Kills `nvme` (clearing DMA rings/queues/Bus Master), starts a fresh
+//      `nvme`, and loops `0..disk_count - 1` running `kVerifyPersisted` to
+//      prove real disk persistence across controller reset and driver restart,
+//      then cleans up test LBAs.
+//    - Also runs `kCliDiskChecks` across `0..disk_count - 1` with `ramfs` +
+//      `nvme` and verifies `/bin/disk` stdout output via console capture.
+static bool TestNvmeBlockIo() {
+  using usertest::BlockTestSubmode;
+  const ScopedQuietConsole quiet_console;
+  SELFTEST_EXPECT(GetTaskScheduler() != nullptr);
+  SELFTEST_EXPECT(IpcClaimedPortCount() == 0);
+  SELFTEST_EXPECT(PciClaimedCount() == 0);
+  SELFTEST_EXPECT(DeviceIrqUsedVectorCount() == 0);
+
+  const int64_t pmm_free_before = PmmFreeFrameCount();
+  const int64_t heap_free_before = HeapTotalFreeBytes();
+
+  // 1. No block driver -> `kSyscallErrorNoDevice`, plus mock-server cases.
+  {
+    UserProgramResult result{};
+    SELFTEST_EXPECT(RunUserTestWithCaps(
+        usertest::BlockChecksArg(BlockTestSubmode::kNoServer),  //
+        kUserCapNone,                                           //
+        &result));
+    SELFTEST_EXPECT(ExitedWith(result, 0));
+  }
+  SELFTEST_EXPECT(VerifyIpcReleased(pmm_free_before, heap_free_before));
+  SELFTEST_EXPECT(TestBlockMockServerCases(pmm_free_before, heap_free_before));
+
+  int nvme_indices[kMaxSelfTestXhciControllers] = {};
+  const int nvme_count = FindClaimableNvmeDevices(nvme_indices);
+  if (nvme_count == 0) {
+    UartWrite("[TEST] nvme_block_io: skipped (no claimable NVMe controller)\n");
+    return true;
+  }
+
+  // 2a. First `nvme` instance: verify RPCs and write test patterns across all
+  // disks.
+  int64_t disk_count = 0;
+  bool no_namespaces = false;
+  {
+    const std::unique_ptr<UserProcess> nvme = StartNvme(kDriverArgNormal);
+    SELFTEST_EXPECT(nvme != nullptr);
+    const auto nvme_ready_or_ended = [](const UserProcessStats& s) {
+      return IsBlockedInIpcRecv(s) || HasEnded(s);
+    };
+    SELFTEST_EXPECT(
+        WaitForProcesses(&nvme, 1, nvme_ready_or_ended, WaitMode::kYield));
+    if (HasEnded(nvme->stats())) {
+      SELFTEST_EXPECT(ExitedWith(nvme->Wait(), 0));
+      no_namespaces = true;
+    } else {
+      SELFTEST_EXPECT(IpcPortOwner(kIpcPortBlock) == nvme->IpcOwnerToken());
+      SELFTEST_EXPECT(QueryBlockDevice(0, nullptr, &disk_count));
+
+      for (int64_t d = 0; d < disk_count; ++d) {
+        UserProgramResult result{};
+        const uint64_t arg = usertest::BlockChecksArg(
+            BlockTestSubmode::kWriteReadVerify, static_cast<uint32_t>(d));
+        SELFTEST_EXPECT(RunUserTestWithCaps(arg, kUserCapNone, &result));
+        SELFTEST_EXPECT(ExitedWith(result, 0));
+      }
+      SELFTEST_EXPECT(WaitUntilParked(nvme, IsBlockedInIpcRecv));
+      SELFTEST_EXPECT(KillWaitingProcess(nvme));
+    }
+  }
+  SELFTEST_EXPECT(VerifyNvmeDevicesQuiescedAndReleased(
+      nvme_indices, nvme_count, pmm_free_before, heap_free_before));
+  if (no_namespaces) {
+    SELFTEST_EXPECT(VerifyIpcReleased(pmm_free_before, heap_free_before));
+    UartWrite("[TEST] nvme_block_io: skipped (no usable NVMe namespaces)\n");
+    return true;
+  }
+
+  // 2b. Fresh `nvme` instance after reset: verify persistence + `/bin/disk`.
+  {
+    const std::unique_ptr<UserProcess> nvme = StartNvme(kDriverArgNormal);
+    SELFTEST_EXPECT(nvme != nullptr);
+    SELFTEST_EXPECT(WaitUntilParked(nvme, IsBlockedInIpcRecv));
+    SELFTEST_EXPECT(IpcPortOwner(kIpcPortBlock) == nvme->IpcOwnerToken());
+
+    int64_t disk_count_2b = 0;
+    SELFTEST_EXPECT(QueryBlockDevice(0, nullptr, &disk_count_2b));
+    SELFTEST_EXPECT(disk_count_2b == disk_count);
+
+    for (int64_t d = 0; d < disk_count; ++d) {
+      UserProgramResult result{};
+      const uint64_t arg = usertest::BlockChecksArg(
+          BlockTestSubmode::kVerifyPersisted, static_cast<uint32_t>(d));
+      SELFTEST_EXPECT(RunUserTestWithCaps(arg, kUserCapNone, &result));
+      SELFTEST_EXPECT(ExitedWith(result, 0));
+    }
+
+    SELFTEST_EXPECT(FindRootfsBootModule() >= 0);
+    {
+      const std::unique_ptr<UserProcess> ramfs = StartRamfs(kDriverArgNormal);
+      SELFTEST_EXPECT(ramfs != nullptr);
+      SELFTEST_EXPECT(WaitUntilParked(ramfs, IsBlockedInIpcRecv));
+
+      for (int64_t d = 0; d < disk_count; ++d) {
+        const uint32_t idx = static_cast<uint32_t>(d);
+        BlockDeviceInfo dev_info{};
+        SELFTEST_EXPECT(QueryBlockDevice(idx, &dev_info, nullptr));
+        const bool is_protos = IsBlockTestDiskSerial(dev_info.serial);
+
+        ConsoleResetOutputCapture();
+        UserProgramResult cli_result{};
+        const uint64_t arg =
+            usertest::BlockChecksArg(BlockTestSubmode::kCliDiskChecks, idx);
+        SELFTEST_EXPECT(RunUserTestWithCaps(arg, kUserCapNone, &cli_result));
+        SELFTEST_EXPECT(ExitedWith(cli_result, 0));
+
+        static char captured[8192];
+        const int64_t captured_len =
+            ConsoleCopyOutputCapture(captured, sizeof(captured));
+        SELFTEST_EXPECT(captured_len > 0);
+        SELFTEST_EXPECT(ContainsSubstring(captured, "blocks x "));
+        SELFTEST_EXPECT(ContainsSubstring(captured, "ro="));
+        SELFTEST_EXPECT(ContainsSubstring(
+            captured, "disk: read: invalid argument or LBA out of range\n"));
+        if (idx == 0) {
+          SELFTEST_EXPECT(ContainsSubstring(captured, "disk 0:"));
+          SELFTEST_EXPECT(ContainsSubstring(captured, "disk: usage:"));
+        }
+        if (is_protos && dev_info.read_only == 0) {
+          SELFTEST_EXPECT(
+              ContainsSubstring(captured, "wrote 1 block(s) at lba 2\n"));
+          SELFTEST_EXPECT(ContainsSubstring(
+              captured,
+              "0000: 68 65 6c 6c 6f 20 66 72 6f 6d 20 6e 76 6d 65 0a "
+              "|hello from nvme.|"));
+          SELFTEST_EXPECT(
+              ContainsSubstring(captured, "zeroed 1 block(s) at lba 2\n"));
+        } else if (is_protos) {
+          SELFTEST_EXPECT(ContainsSubstring(
+              captured, "disk: write: read-only or permission denied\n"));
+          SELFTEST_EXPECT(ContainsSubstring(
+              captured, "disk: zero: read-only or permission denied\n"));
+        }
+      }
+
+      SELFTEST_EXPECT(WaitUntilParked(ramfs, IsBlockedInIpcRecv));
+      SELFTEST_EXPECT(KillWaitingProcess(ramfs));
+    }
+
+    SELFTEST_EXPECT(WaitUntilParked(nvme, IsBlockedInIpcRecv));
+    SELFTEST_EXPECT(KillWaitingProcess(nvme));
+  }
+  SELFTEST_EXPECT(VerifyNvmeDevicesQuiescedAndReleased(
+      nvme_indices, nvme_count, pmm_free_before, heap_free_before));
+  SELFTEST_EXPECT(VerifyIpcReleased(pmm_free_before, heap_free_before));
+
+  LineBuffer summary;
+  summary.Append("[TEST] nvme_block_io: controllers=")
+      .AppendDec(static_cast<uint64_t>(nvme_count))
+      .Append(" status=ok\n");
+  UartWrite(summary.c_str());
+  return true;
+}
+
 struct BootTest {
   const char* name;
   bool (*run)();
@@ -10642,6 +11484,8 @@ constexpr BootTest kBootTests[] = {
     {"ramfs_driver_lifecycle", TestRamfsDriverLifecycle},
     {"filesystem_end_to_end", TestFilesystemEndToEnd},
     {"rootfs_boot_module", TestRootfsBootModule},
+    {"nvme_driver_lifecycle", TestNvmeDriverLifecycle},
+    {"nvme_block_io", TestNvmeBlockIo},
     // End-to-end tests.
     {"user_mode_kill_edge_cases", TestUserModeKillEdgeCases},
     {"user_mode_syscall_buffer_checks", TestUserModeSyscallBufferChecks},

@@ -17,11 +17,12 @@ struct Task;
 // notifications.
 //
 // A process claims a port with `IpcContext::Listen()` and owns it until its
-// `IpcContext` releases it. Port `kIpcPortFs` belongs to the user-space
-// filesystem server: only `kUserCapDriver` processes may claim it (callers of
-// `IpcCall()` enforce who may call it). A client's `IpcCall()` queues a
-// transaction on the port and blocks; the owner's `IpcContext::Recv()` moves
-// it to the port's in-service list and `IpcContext::Reply()` completes it.
+// `IpcContext` releases it. Ports `kIpcPortFs` and `kIpcPortBlock` belong to
+// user-space drivers: only `kUserCapDriver` processes may claim them (callers
+// of `IpcCall()` enforce who may call `kIpcPortFs`). A client's `IpcCall()`
+// queues a transaction on the port and blocks; the owner's `IpcContext::Recv()`
+// moves it to the port's in-service list and `IpcContext::Reply()` completes
+// it.
 //
 // Concurrency rules:
 // - Every function here may block or allocate, so callers run on a task with

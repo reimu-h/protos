@@ -7,11 +7,14 @@
 #include <cstdint>
 #include <memory>
 #include <new>
+#include <optional>
 #include <string>
 #include <type_traits>
 #include <vector>
 
+#include "block_protocol.h"
 #include "fs_protocol.h"
+#include "user/block.h"
 #include "user/ramfs/ramfs.h"
 #include "user/sh/sh_lib.h"
 #include "user_programs.h"
@@ -137,7 +140,8 @@ TEST(SyscallAbiTest, NumbersAndLimitsStayTheSame) {
   EXPECT_THAT(kSyscallBootModuleInfo, t::Eq(35));
   EXPECT_THAT(kSyscallBootModuleRead, t::Eq(36));
   EXPECT_THAT(kSyscallSpawnFile, t::Eq(37));
-  EXPECT_THAT(kSyscallCount, t::Eq(38));
+  EXPECT_THAT(kSyscallTryWait, t::Eq(38));
+  EXPECT_THAT(kSyscallCount, t::Eq(39));
   EXPECT_THAT(kIsaDeviceI8042, t::Eq(0));
   EXPECT_THAT(kIsaDeviceCount, t::Eq(1));
   EXPECT_THAT(kSyscallPortIoRead8, t::Eq(0));
@@ -187,8 +191,13 @@ TEST(SyscallAbiTest, NumbersAndLimitsStayTheSame) {
   EXPECT_THAT(kSyscallErrorNotEmpty, t::Eq(-39));
   EXPECT_THAT(kSyscallErrorStale, t::Eq(-116));
   EXPECT_THAT(kIpcPortFs, t::Eq(0));
-  EXPECT_THAT(kIpcFirstUserPort, t::Eq(1));
+  EXPECT_THAT(kIpcPortBlock, t::Eq(1));
+  EXPECT_THAT(kIpcFirstUserPort, t::Eq(2));
   EXPECT_THAT(kIpcPortCount, t::Eq(16));
+  EXPECT_THAT(kBlockMinBlockSize, t::Eq(512));
+  EXPECT_THAT(kBlockMaxIoBytes, t::Eq(4096));
+  EXPECT_THAT(kBlockModelCapacity, t::Eq(40));
+  EXPECT_THAT(kBlockSerialCapacity, t::Eq(24));
   EXPECT_THAT(kIpcMaxMessageSize, t::Eq(4352));
   EXPECT_THAT(kSyscallIpcTimeoutMaxTicks, t::Eq(1000000));
   EXPECT_THAT(kSyscallMemMapMaxSize, t::Eq(1LL << 20));
@@ -241,6 +250,15 @@ TEST(SyscallAbiTest, DriverAbiLayoutsAndHelpers) {
   EXPECT_FALSE(SyscallIsError(static_cast<int64_t>(0xFFFF900000000000ULL)));
   EXPECT_FALSE(SyscallIsError(static_cast<int64_t>(0xFFFFA00000000000ULL)));
   EXPECT_FALSE(SyscallIsError(static_cast<int64_t>(0xFFFFB00000000000ULL)));
+  // 64-bit values whose lower 32 bits lie in [-4095, -1] must not be treated
+  // as syscall errors via 32-bit truncation.
+  EXPECT_FALSE(SyscallIsError(-(int64_t{1} << 32) - 1));
+  EXPECT_FALSE(SyscallIsError(-(int64_t{1} << 32) - 22));
+  EXPECT_FALSE(SyscallIsError(-(int64_t{1} << 32) - 4095));
+  EXPECT_FALSE(SyscallIsError((int64_t{1} << 32) - 1));
+  EXPECT_FALSE(SyscallIsError((int64_t{1} << 32) - 22));
+  EXPECT_FALSE(SyscallIsError((int64_t{1} << 32) - 4095));
+  EXPECT_FALSE(SyscallIsError(static_cast<int64_t>(0xFFFF9000FFFFFFFFULL)));
 
   for (int64_t num = -1; num <= kSyscallCount + 2; ++num) {
     const bool expected = (num >= 8 && num <= 15) || (num >= 17 && num <= 19) ||
@@ -264,6 +282,46 @@ TEST(SyscallAbiTest, DriverAbiLayoutsAndHelpers) {
     EXPECT_TRUE(MayMakeSyscall(kUserCapDriver | kUserCapSpawnDrivers, num))
         << "syscall " << num;
   }
+  EXPECT_FALSE(SyscallIsDriverOnly(kSyscallTryWait));
+  EXPECT_TRUE(MayMakeSyscall(kUserCapNone, kSyscallTryWait));
+  EXPECT_FALSE(SyscallIsDriverOnly((int64_t{1} << 32) | kSyscallPciInfo));
+  EXPECT_FALSE(SyscallIsDriverOnly(-(int64_t{1} << 32) + kSyscallPciInfo));
+  EXPECT_FALSE(
+      SyscallIsDriverOnly((int64_t{1} << 32) | kSyscallBootModuleRead));
+  EXPECT_TRUE(
+      MayMakeSyscall(kUserCapNone, (int64_t{1} << 32) | kSyscallPciInfo));
+  EXPECT_TRUE(
+      MayMakeSyscall(kUserCapNone, -(int64_t{1} << 32) + kSyscallPciInfo));
+  EXPECT_TRUE(
+      MayMakeSyscall(kUserCapNone, (int64_t{1} << 32) | kSyscallSpawnDriver));
+  EXPECT_TRUE(
+      MayMakeSyscall(kUserCapNone, -(int64_t{1} << 32) + kSyscallSpawnDriver));
+
+  for (int64_t port = -1; port <= kIpcPortCount; ++port) {
+    const bool driver_port = (port == kIpcPortFs || port == kIpcPortBlock);
+    EXPECT_THAT(IpcPortRequiresDriverCap(port), t::Eq(driver_port))
+        << "port " << port;
+    EXPECT_THAT(MayListenOnIpcPort(kUserCapNone, port), t::Eq(!driver_port))
+        << "port " << port;
+    EXPECT_TRUE(MayListenOnIpcPort(kUserCapDriver, port)) << "port " << port;
+    EXPECT_THAT(MayListenOnIpcPort(kUserCapSpawnDrivers, port),
+                t::Eq(!driver_port))
+        << "port " << port;
+    EXPECT_TRUE(MayListenOnIpcPort(kUserCapDriver | kUserCapSpawnDrivers, port))
+        << "port " << port;
+  }
+  EXPECT_FALSE(IpcPortRequiresDriverCap((int64_t{1} << 32) | kIpcPortFs));
+  EXPECT_FALSE(IpcPortRequiresDriverCap((int64_t{1} << 32) | kIpcPortBlock));
+  EXPECT_FALSE(IpcPortRequiresDriverCap(-(int64_t{1} << 32) + kIpcPortFs));
+  EXPECT_FALSE(IpcPortRequiresDriverCap(-(int64_t{1} << 32) + kIpcPortBlock));
+  EXPECT_TRUE(
+      MayListenOnIpcPort(kUserCapNone, (int64_t{1} << 32) | kIpcPortFs));
+  EXPECT_TRUE(
+      MayListenOnIpcPort(kUserCapNone, (int64_t{1} << 32) | kIpcPortBlock));
+  EXPECT_TRUE(
+      MayListenOnIpcPort(kUserCapNone, -(int64_t{1} << 32) + kIpcPortFs));
+  EXPECT_TRUE(
+      MayListenOnIpcPort(kUserCapNone, -(int64_t{1} << 32) + kIpcPortBlock));
 
   const PciDeviceInfo info{};
   EXPECT_THAT(sizeof(info), t::Eq(176U));
@@ -297,6 +355,66 @@ TEST(SyscallAbiTest, IpcAndFsEnumsStayTheSame) {
   EXPECT_THAT(static_cast<uint32_t>(FsRpcOp::kMkDir), t::Eq(8U));
   EXPECT_THAT(static_cast<uint32_t>(FsRpcOp::kUnlink), t::Eq(9U));
   EXPECT_THAT(static_cast<uint32_t>(FsRpcOp::kRename), t::Eq(10U));
+}
+
+TEST(SyscallAbiTest, BlockProtocolEnumsAndLayoutsStayTheSame) {
+  EXPECT_TRUE((std::is_same_v<std::underlying_type_t<BlockRpcOp>, uint32_t>));
+  EXPECT_THAT(static_cast<uint32_t>(BlockRpcOp::kNone), t::Eq(0U));
+  EXPECT_THAT(static_cast<uint32_t>(BlockRpcOp::kGetInfo), t::Eq(1U));
+  EXPECT_THAT(static_cast<uint32_t>(BlockRpcOp::kRead), t::Eq(2U));
+  EXPECT_THAT(static_cast<uint32_t>(BlockRpcOp::kWrite), t::Eq(3U));
+  EXPECT_THAT(static_cast<uint32_t>(BlockRpcOp::kFlush), t::Eq(4U));
+
+  EXPECT_THAT(sizeof(BlockGetInfoRequest), t::Eq(8U));
+  EXPECT_THAT(alignof(BlockGetInfoRequest), t::Eq(4U));
+  EXPECT_THAT(offsetof(BlockGetInfoRequest, op), t::Eq(0U));
+  EXPECT_THAT(offsetof(BlockGetInfoRequest, disk_index), t::Eq(4U));
+  EXPECT_TRUE(std::has_unique_object_representations_v<BlockGetInfoRequest>);
+
+  EXPECT_THAT(sizeof(BlockDeviceInfo), t::Eq(88U));
+  EXPECT_THAT(alignof(BlockDeviceInfo), t::Eq(8U));
+  EXPECT_THAT(offsetof(BlockDeviceInfo, block_count), t::Eq(0U));
+  EXPECT_THAT(offsetof(BlockDeviceInfo, block_size), t::Eq(8U));
+  EXPECT_THAT(offsetof(BlockDeviceInfo, max_transfer_blocks), t::Eq(12U));
+  EXPECT_THAT(offsetof(BlockDeviceInfo, bus), t::Eq(16U));
+  EXPECT_THAT(offsetof(BlockDeviceInfo, device), t::Eq(17U));
+  EXPECT_THAT(offsetof(BlockDeviceInfo, function), t::Eq(18U));
+  EXPECT_THAT(offsetof(BlockDeviceInfo, read_only), t::Eq(19U));
+  EXPECT_THAT(offsetof(BlockDeviceInfo, nsid), t::Eq(20U));
+  EXPECT_THAT(offsetof(BlockDeviceInfo, model), t::Eq(24U));
+  EXPECT_THAT(offsetof(BlockDeviceInfo, serial), t::Eq(64U));
+  EXPECT_THAT(sizeof(BlockDeviceInfo::model),
+              t::Eq(static_cast<size_t>(kBlockModelCapacity)));
+  EXPECT_THAT(sizeof(BlockDeviceInfo::serial),
+              t::Eq(static_cast<size_t>(kBlockSerialCapacity)));
+  EXPECT_TRUE(std::has_unique_object_representations_v<BlockDeviceInfo>);
+
+  EXPECT_THAT(sizeof(BlockReadRequest), t::Eq(24U));
+  EXPECT_THAT(alignof(BlockReadRequest), t::Eq(8U));
+  EXPECT_THAT(offsetof(BlockReadRequest, op), t::Eq(0U));
+  EXPECT_THAT(offsetof(BlockReadRequest, disk_index), t::Eq(4U));
+  EXPECT_THAT(offsetof(BlockReadRequest, lba), t::Eq(8U));
+  EXPECT_THAT(offsetof(BlockReadRequest, block_count), t::Eq(16U));
+  EXPECT_THAT(offsetof(BlockReadRequest, reserved), t::Eq(20U));
+  EXPECT_TRUE(std::has_unique_object_representations_v<BlockReadRequest>);
+
+  EXPECT_THAT(sizeof(BlockWriteRequest), t::Eq(24U));
+  EXPECT_THAT(alignof(BlockWriteRequest), t::Eq(8U));
+  EXPECT_THAT(offsetof(BlockWriteRequest, op), t::Eq(0U));
+  EXPECT_THAT(offsetof(BlockWriteRequest, disk_index), t::Eq(4U));
+  EXPECT_THAT(offsetof(BlockWriteRequest, lba), t::Eq(8U));
+  EXPECT_THAT(offsetof(BlockWriteRequest, block_count), t::Eq(16U));
+  EXPECT_THAT(offsetof(BlockWriteRequest, reserved), t::Eq(20U));
+  EXPECT_TRUE(std::has_unique_object_representations_v<BlockWriteRequest>);
+  EXPECT_THAT(
+      static_cast<int64_t>(sizeof(BlockWriteRequest)) + kBlockMaxIoBytes,
+      t::Le(kIpcMaxMessageSize));
+
+  EXPECT_THAT(sizeof(BlockFlushRequest), t::Eq(8U));
+  EXPECT_THAT(alignof(BlockFlushRequest), t::Eq(4U));
+  EXPECT_THAT(offsetof(BlockFlushRequest, op), t::Eq(0U));
+  EXPECT_THAT(offsetof(BlockFlushRequest, disk_index), t::Eq(4U));
+  EXPECT_TRUE(std::has_unique_object_representations_v<BlockFlushRequest>);
 }
 
 TEST(SyscallAbiTest, IpcReceivedMessageLayoutStaysTheSame) {
@@ -351,9 +469,10 @@ static std::vector<uint8_t> ValueInitializedBytes() {
 }
 
 // Returns the bytes of a `T` that holds `op` in its first 4 bytes, like every
-// filesystem request header, and zeros in all others.
-template <typename T>
-static std::vector<uint8_t> OpcodeAndZeros(const FsRpcOp op) {
+// filesystem or block request header, and zeros in all others.
+template <typename T, typename Op>
+static std::vector<uint8_t> OpcodeAndZeros(const Op op) {
+  static_assert(sizeof(Op) == sizeof(uint32_t));
   std::vector<uint8_t> bytes(sizeof(T), 0);
   const uint32_t value = static_cast<uint32_t>(op);
   __builtin_memcpy(bytes.data(), &value, sizeof(value));
@@ -364,8 +483,8 @@ static std::vector<uint8_t> OpcodeAndZeros(const FsRpcOp op) {
 // filesystem server (`FsCloseRequest req{}` and so on, user_mode.cpp) and then
 // sets the opcode and the fields that the request uses, so the defaults are
 // what the server gets in every other byte: they must be zero, as the protocol
-// requires of reserved fields (fs_protocol.h). Likewise for the
-// `IpcReceivedMessage msg{}` that the kernel copies to an IpcRecv() caller.
+// requires of reserved fields (fs_protocol.h, block_protocol.h). Likewise for
+// `IpcReceivedMessage msg{}` and `BlockDeviceInfo info{}`.
 TEST(SyscallAbiTest, ValueInitializedHeadersHoldNothingButTheirOpcode) {
   EXPECT_THAT(
       ValueInitializedBytes<FsOpenRequest>(),
@@ -391,6 +510,19 @@ TEST(SyscallAbiTest, ValueInitializedHeadersHoldNothingButTheirOpcode) {
   EXPECT_THAT(
       ValueInitializedBytes<FsRenameRequest>(),
       t::ElementsAreArray(OpcodeAndZeros<FsRenameRequest>(FsRpcOp::kRename)));
+  EXPECT_THAT(ValueInitializedBytes<BlockGetInfoRequest>(),
+              t::ElementsAreArray(
+                  OpcodeAndZeros<BlockGetInfoRequest>(BlockRpcOp::kGetInfo)));
+  EXPECT_THAT(
+      ValueInitializedBytes<BlockReadRequest>(),
+      t::ElementsAreArray(OpcodeAndZeros<BlockReadRequest>(BlockRpcOp::kRead)));
+  EXPECT_THAT(ValueInitializedBytes<BlockWriteRequest>(),
+              t::ElementsAreArray(
+                  OpcodeAndZeros<BlockWriteRequest>(BlockRpcOp::kWrite)));
+  EXPECT_THAT(ValueInitializedBytes<BlockFlushRequest>(),
+              t::ElementsAreArray(
+                  OpcodeAndZeros<BlockFlushRequest>(BlockRpcOp::kFlush)));
+  EXPECT_THAT(ValueInitializedBytes<BlockDeviceInfo>(), t::Each(t::Eq(0)));
   EXPECT_THAT(ValueInitializedBytes<IpcReceivedMessage>(), t::Each(t::Eq(0)));
 }
 
@@ -500,11 +632,17 @@ TEST(SyscallAbiTest, UserProgramNameEqualsMatchesExactLengthStrings) {
   EXPECT_TRUE(UserProgramNameEquals("init", 4, "init"));
   EXPECT_TRUE(UserProgramNameEquals("usertest", 8, "usertest"));
   EXPECT_TRUE(UserProgramNameEquals("ramfs", 5, "ramfs"));
+  EXPECT_TRUE(UserProgramNameEquals("usbkbd", 6, "usbkbd"));
+  EXPECT_TRUE(UserProgramNameEquals("ps2kbd", 6, "ps2kbd"));
+  EXPECT_TRUE(UserProgramNameEquals("nvme", 4, "nvme"));
   // Substring of longer buffer with exact length matches.
   EXPECT_TRUE(UserProgramNameEquals("sh_extra", 2, "sh"));
+  EXPECT_TRUE(UserProgramNameEquals("nvme_extra", 4, "nvme"));
   // Mismatched lengths, embedded NULs, or null pointers do not match.
   EXPECT_FALSE(UserProgramNameEquals("sh", 1, "sh"));
+  EXPECT_FALSE(UserProgramNameEquals("nvme", 3, "nvme"));
   EXPECT_FALSE(UserProgramNameEquals("sh\0x", 4, "sh"));
+  EXPECT_FALSE(UserProgramNameEquals("nvme\0x", 6, "nvme"));
   EXPECT_FALSE(UserProgramNameEquals("sh", 0, "sh"));
   EXPECT_FALSE(UserProgramNameEquals(nullptr, 2, "sh"));
   EXPECT_FALSE(UserProgramNameEquals("unknown", 7, "sh"));
@@ -1987,6 +2125,2383 @@ TEST(SyscallAbiTest, UserSegmentRangeAllowedRejectsReservedWindows) {
   EXPECT_FALSE(UserSegmentRangeAllowed(kUserStackRegionBase, 1));
   EXPECT_FALSE(UserSegmentRangeAllowed(kUserStackTop - kPageSize, 1));
   EXPECT_FALSE(UserSegmentRangeAllowed(kUserStackTop, 1));
+}
+
+TEST(ShellLibTest, RunDispatchesNvmeThroughEmbeddedProgramBranch) {
+  struct NvmeSpawnShellHarness : RamfsShellHarness {
+    NvmeSpawnShellHarness() { env.spawn = SpawnWithNvme; }
+
+    static int64_t SpawnWithNvme(void* const ctx,         //
+                                 const char* const name,  //
+                                 const int64_t name_len,  //
+                                 const uint64_t arg) {
+      FakeShellState* const s = static_cast<FakeShellState*>(ctx);
+      const std::string prog(name, static_cast<size_t>(name_len));
+      if (prog == "nvme") {
+        s->spawns.push_back(SpawnCall{prog, arg, {}});
+        return static_cast<int64_t>(s->spawns.size());
+      }
+      return FakeShellState::Spawn(ctx, name, name_len, arg);
+    }
+  };
+
+  NvmeSpawnShellHarness h;
+  h.MakeDir("/bin");
+  h.WriteFile("/bin/nvme", std::string("\x7F"
+                                       "ELFbinary",
+                                       10));
+
+  // `run nvme` uses the embedded-program branch (`env.spawn`) rather than
+  // `/bin/nvme`, and validates its optional integer argument.
+  EXPECT_THAT(h.Run("run nvme"), t::Eq("sh: nvme exited with status 0\n"));
+  ASSERT_FALSE(h.spawns.empty());
+  EXPECT_THAT(h.spawns.back().name, t::Eq("nvme"));
+  EXPECT_THAT(h.spawns.back().arg, t::Eq(0ULL));
+  EXPECT_TRUE(h.spawns.back().argv.empty());
+
+  EXPECT_THAT(h.Run("run nvme 1"), t::Eq("sh: nvme exited with status 1\n"));
+  EXPECT_THAT(h.spawns.back().name, t::Eq("nvme"));
+  EXPECT_THAT(h.spawns.back().arg, t::Eq(1ULL));
+
+  const size_t spawns_before_bad = h.spawns.size();
+  EXPECT_THAT(h.Run("run nvme badarg"),
+              t::Eq("sh: invalid argument: badarg\n"));
+  EXPECT_THAT(h.Run("run nvme 1 2"), t::Eq("sh: too many arguments\n"));
+  EXPECT_THAT(h.spawns.size(), t::Eq(spawns_before_bad));
+
+  // Bare `nvme` is not listed in `IsKnownUserProgram`, so when `/bin/nvme`
+  // exists it runs `/bin/nvme` via `env.spawn_file`.
+  EXPECT_THAT(h.Run("nvme"), t::Eq("sh: nvme exited with status 0\n"));
+  EXPECT_THAT(h.spawns.back().name, t::Eq("/bin/nvme"));
+
+  // Without embedded `"nvme"` spawn support (or without `/bin/nvme`), standard
+  // `FakeShellState` reports `unknown program` / `unknown command`.
+  FakeShellState plain;
+  EXPECT_THAT(plain.Run("run nvme"), t::Eq("sh: unknown program: nvme\n"));
+  EXPECT_THAT(plain.Run("nvme"), t::Eq("sh: unknown command: nvme\n"));
+  h.ExpectNoOpenFiles();
+}
+
+struct FakeBlockClient {
+  int calls = 0;
+  int64_t last_port = -1;
+  std::vector<uint8_t> last_req;
+  void* last_reply_buf = nullptr;
+  int64_t last_reply_cap = -1;
+  int64_t next_rc = 0;
+  std::vector<uint8_t> next_reply;
+  std::optional<int64_t> override_reply_size;
+
+  user::BlockClientEnv Env() {
+    return user::BlockClientEnv{
+        .ctx = this,
+        .ipc_call = &IpcCall,
+    };
+  }
+
+  static int64_t IpcCall(void* const ctx,            //
+                         const int64_t port,         //
+                         const void* const req_buf,  //
+                         const int64_t req_size,     //
+                         void* const reply_buf,      //
+                         const int64_t reply_cap,    //
+                         int64_t* const out_reply_size) {
+    FakeBlockClient* const self = static_cast<FakeBlockClient*>(ctx);
+    ++self->calls;
+    self->last_port = port;
+    self->last_reply_buf = reply_buf;
+    self->last_reply_cap = reply_cap;
+    self->last_req.resize(static_cast<size_t>(req_size));
+    if (req_size > 0 && req_buf != nullptr) {
+      __builtin_memcpy(self->last_req.data(),  //
+                       req_buf,                //
+                       static_cast<size_t>(req_size));
+    }
+    const int64_t reported_size =
+        self->override_reply_size.has_value()
+            ? *self->override_reply_size
+            : static_cast<int64_t>(self->next_reply.size());
+    if (self->next_rc >= 0 && reply_buf != nullptr && reply_cap > 0 &&
+        !self->next_reply.empty()) {
+      const int64_t to_copy =
+          (static_cast<int64_t>(self->next_reply.size()) < reply_cap)
+              ? static_cast<int64_t>(self->next_reply.size())
+              : reply_cap;
+      __builtin_memcpy(reply_buf,                //
+                       self->next_reply.data(),  //
+                       static_cast<size_t>(to_copy));
+    }
+    if (out_reply_size != nullptr) {
+      *out_reply_size = reported_size;
+    }
+    return self->next_rc;
+  }
+};
+
+static BlockDeviceInfo MakeValidBlockInfo(const int32_t block_size = 512,
+                                          const int32_t max_transfer_blocks = 8,
+                                          const uint64_t block_count = 1024,
+                                          const uint8_t read_only = 0) {
+  BlockDeviceInfo info{};
+  info.block_count = block_count;
+  info.block_size = block_size;
+  info.max_transfer_blocks = max_transfer_blocks;
+  info.bus = 0;
+  info.device = 3;
+  info.function = 1;
+  info.read_only = read_only;
+  info.nsid = 1;
+  __builtin_memcpy(info.model, "PROTOS NVMe", 11);
+  __builtin_memcpy(info.serial, "PROTOS-DISK-0", 13);
+  return info;
+}
+
+template <typename T>
+static std::vector<uint8_t> ToBytes(const T& value) {
+  const uint8_t* const p = reinterpret_cast<const uint8_t*>(&value);
+  return std::vector<uint8_t>(p, p + sizeof(value));
+}
+
+TEST(SyscallAbiTest, BlockProtocolHelpersValidateGeometryAndStrings) {
+  EXPECT_THAT(user::kBlockWriteScratchBytes, t::Eq(4120));
+
+  EXPECT_TRUE(user::IsValidBlockSize(512));
+  EXPECT_TRUE(user::IsValidBlockSize(1024));
+  EXPECT_TRUE(user::IsValidBlockSize(2048));
+  EXPECT_TRUE(user::IsValidBlockSize(4096));
+  EXPECT_FALSE(user::IsValidBlockSize(INT32_MIN));
+  EXPECT_FALSE(user::IsValidBlockSize(-512));
+  EXPECT_FALSE(user::IsValidBlockSize(0));
+  EXPECT_FALSE(user::IsValidBlockSize(256));
+  EXPECT_FALSE(user::IsValidBlockSize(511));
+  EXPECT_FALSE(user::IsValidBlockSize(513));
+  EXPECT_FALSE(user::IsValidBlockSize(1536));
+  EXPECT_FALSE(user::IsValidBlockSize(4097));
+  EXPECT_FALSE(user::IsValidBlockSize(8192));
+  EXPECT_FALSE(user::IsValidBlockSize(INT32_MAX));
+
+  EXPECT_FALSE(user::IsNulTerminated(nullptr, 4));
+  EXPECT_FALSE(user::IsNulTerminated(nullptr, 1));
+  EXPECT_FALSE(user::IsNulTerminated("", 0));
+  EXPECT_FALSE(user::IsNulTerminated("", -1));
+  const char empty[4] = {};
+  EXPECT_TRUE(user::IsNulTerminated(empty, 4));
+  EXPECT_TRUE(user::IsNulTerminated("", 1));
+  EXPECT_FALSE(user::IsNulTerminated("A", 1));
+  const char early[4] = {'\0', 'A', 'B', 'C'};
+  EXPECT_TRUE(user::IsNulTerminated(early, 4));
+  // Inspect exact 7 bytes so `buf[cap - 1] == 'Z' != '\0'`.
+  const char early_tail[7] = {'a', 'b', 'c', '\0', 'X', 'Y', 'Z'};
+  EXPECT_TRUE(user::IsNulTerminated(early_tail, 7));
+  char full_model[kBlockModelCapacity];
+  __builtin_memset(full_model, 'M', sizeof(full_model));
+  EXPECT_FALSE(user::IsNulTerminated(full_model, kBlockModelCapacity));
+  full_model[kBlockModelCapacity - 1] = '\0';
+  EXPECT_TRUE(user::IsNulTerminated(full_model, kBlockModelCapacity));
+  char full_serial[kBlockSerialCapacity];
+  __builtin_memset(full_serial, 'S', sizeof(full_serial));
+  EXPECT_FALSE(user::IsNulTerminated(full_serial, kBlockSerialCapacity));
+  full_serial[kBlockSerialCapacity - 1] = '\0';
+  EXPECT_TRUE(user::IsNulTerminated(full_serial, kBlockSerialCapacity));
+  char high_bytes[4];
+  __builtin_memset(high_bytes, 0x80, sizeof(high_bytes));
+  high_bytes[1] = static_cast<char>(0x81);
+  high_bytes[2] = static_cast<char>(0xFE);
+  high_bytes[3] = static_cast<char>(0xFF);
+  EXPECT_FALSE(user::IsNulTerminated(high_bytes, 4));
+  high_bytes[2] = '\0';
+  EXPECT_TRUE(user::IsNulTerminated(high_bytes, 4));
+
+  EXPECT_TRUE(user::IsValidBlockDeviceInfo(MakeValidBlockInfo(512, 8, 1, 0)));
+  EXPECT_TRUE(user::IsValidBlockDeviceInfo(MakeValidBlockInfo(1024, 4, 1, 0)));
+  EXPECT_TRUE(user::IsValidBlockDeviceInfo(MakeValidBlockInfo(2048, 2, 1, 1)));
+  EXPECT_TRUE(
+      user::IsValidBlockDeviceInfo(MakeValidBlockInfo(4096, 1, UINT64_MAX, 1)));
+  EXPECT_TRUE(user::IsValidBlockDeviceInfo(
+      MakeValidBlockInfo(512, 8, uint64_t{1} << 32, 0)));
+  {
+    BlockDeviceInfo early_nul = MakeValidBlockInfo();
+    __builtin_memset(early_nul.model, 'X', sizeof(early_nul.model));
+    early_nul.model[0] = '\0';
+    __builtin_memset(early_nul.serial, 'Y', sizeof(early_nul.serial));
+    early_nul.serial[3] = '\0';
+    EXPECT_TRUE(user::IsValidBlockDeviceInfo(early_nul));
+
+    __builtin_memset(early_nul.model, 'X', sizeof(early_nul.model));
+    early_nul.model[3] = '\0';
+    __builtin_memset(early_nul.serial, 'Y', sizeof(early_nul.serial));
+    early_nul.serial[0] = '\0';
+    EXPECT_TRUE(user::IsValidBlockDeviceInfo(early_nul));
+  }
+
+  EXPECT_FALSE(user::IsValidBlockDeviceInfo(BlockDeviceInfo{}));
+  {
+    BlockDeviceInfo bad = MakeValidBlockInfo();
+    bad.block_count = 0;
+    EXPECT_FALSE(user::IsValidBlockDeviceInfo(bad));
+  }
+  {
+    BlockDeviceInfo bad = MakeValidBlockInfo();
+    bad.block_size = 0;
+    EXPECT_FALSE(user::IsValidBlockDeviceInfo(bad));
+    bad.block_size = 256;
+    EXPECT_FALSE(user::IsValidBlockDeviceInfo(bad));
+  }
+  {
+    BlockDeviceInfo bad = MakeValidBlockInfo();
+    bad.max_transfer_blocks = 0;
+    EXPECT_FALSE(user::IsValidBlockDeviceInfo(bad));
+    bad.max_transfer_blocks = -1;
+    EXPECT_FALSE(user::IsValidBlockDeviceInfo(bad));
+    bad.max_transfer_blocks = 9;
+    EXPECT_FALSE(user::IsValidBlockDeviceInfo(bad));
+    bad.max_transfer_blocks = INT32_MAX;
+    EXPECT_FALSE(user::IsValidBlockDeviceInfo(bad));
+    bad = MakeValidBlockInfo(1024, 5);
+    EXPECT_FALSE(user::IsValidBlockDeviceInfo(bad));
+    bad = MakeValidBlockInfo(2048, 3);
+    EXPECT_FALSE(user::IsValidBlockDeviceInfo(bad));
+    bad = MakeValidBlockInfo(4096, 2);
+    EXPECT_FALSE(user::IsValidBlockDeviceInfo(bad));
+    bad = MakeValidBlockInfo();
+    bad.block_size = -512;
+    bad.max_transfer_blocks = -1;
+    EXPECT_FALSE(user::IsValidBlockDeviceInfo(bad));
+  }
+  {
+    BlockDeviceInfo bad = MakeValidBlockInfo();
+    bad.read_only = 2;
+    EXPECT_FALSE(user::IsValidBlockDeviceInfo(bad));
+    bad.read_only = 255;
+    EXPECT_FALSE(user::IsValidBlockDeviceInfo(bad));
+  }
+  {
+    BlockDeviceInfo bad = MakeValidBlockInfo();
+    __builtin_memset(bad.model, 'A', sizeof(bad.model));
+    EXPECT_FALSE(user::IsValidBlockDeviceInfo(bad));
+    __builtin_memset(bad.model, 0x80, sizeof(bad.model));
+    EXPECT_FALSE(user::IsValidBlockDeviceInfo(bad));
+  }
+  {
+    BlockDeviceInfo bad = MakeValidBlockInfo();
+    __builtin_memset(bad.serial, 'B', sizeof(bad.serial));
+    EXPECT_FALSE(user::IsValidBlockDeviceInfo(bad));
+    __builtin_memset(bad.serial, 0xFF, sizeof(bad.serial));
+    EXPECT_FALSE(user::IsValidBlockDeviceInfo(bad));
+  }
+}
+
+TEST(SyscallAbiTest, BlockClientGetDeviceInfoValidatesServerReplies) {
+  {
+    const user::BlockClientEnv null_env{};
+    int64_t disk_count = 123;
+    const StatusOr<BlockDeviceInfo> res =
+        user::GetBlockDeviceInfo(null_env, 0, &disk_count);
+    EXPECT_EQ(res.status(), kSyscallErrorInvalid);
+    EXPECT_EQ(disk_count, 123);
+  }
+
+  // Valid query returns metadata and populates `*out_disk_count`.
+  {
+    FakeBlockClient mock;
+    BlockDeviceInfo expected = MakeValidBlockInfo(4096, 1, 2048, 1);
+    __builtin_memset(expected.model, 'X', kBlockModelCapacity - 1);
+    expected.model[kBlockModelCapacity - 1] = '\0';
+    __builtin_memset(expected.serial, 'Y', kBlockSerialCapacity - 1);
+    expected.serial[kBlockSerialCapacity - 1] = '\0';
+    mock.next_rc = 2;
+    mock.next_reply = ToBytes(expected);
+
+    int64_t disk_count = -1;
+    const StatusOr<BlockDeviceInfo> res =
+        user::GetBlockDeviceInfo(mock.Env(), 1, &disk_count);
+    ASSERT_TRUE(res.ok());
+    EXPECT_EQ(disk_count, 2);
+    EXPECT_EQ(mock.calls, 1);
+    EXPECT_EQ(mock.last_port, kIpcPortBlock);
+    EXPECT_EQ(mock.last_reply_cap,
+              static_cast<int64_t>(sizeof(BlockDeviceInfo)));
+    const BlockGetInfoRequest expected_req{.op = BlockRpcOp::kGetInfo,
+                                           .disk_index = 1};
+    EXPECT_THAT(mock.last_req, t::ElementsAreArray(ToBytes(expected_req)));
+    EXPECT_THAT(ToBytes(*res), t::ElementsAreArray(ToBytes(expected)));
+  }
+
+  // Boundary `max_transfer_blocks` values across all valid sector sizes pass
+  // through `GetBlockDeviceInfo()`.
+  {
+    struct ValidBound {
+      int32_t bs;
+      int32_t max_blocks;
+    };
+    static constexpr ValidBound kValidBounds[] = {{1024, 4}, {2048, 2}};
+    for (const ValidBound& bound : kValidBounds) {
+      FakeBlockClient mock;
+      const BlockDeviceInfo info =
+          MakeValidBlockInfo(bound.bs, bound.max_blocks);
+      mock.next_rc = 1;
+      mock.next_reply = ToBytes(info);
+      EXPECT_TRUE(user::GetBlockDeviceInfo(mock.Env(), 0).ok());
+    }
+  }
+
+  // Early NUL with non-NUL trailing bytes in `model` and `serial` succeeds.
+  {
+    FakeBlockClient mock;
+    BlockDeviceInfo expected = MakeValidBlockInfo();
+    __builtin_memset(expected.model, 'X', sizeof(expected.model));
+    expected.model[0] = '\0';
+    __builtin_memset(expected.serial, 'Y', sizeof(expected.serial));
+    expected.serial[3] = '\0';
+    mock.next_rc = 1;
+    mock.next_reply = ToBytes(expected);
+
+    const StatusOr<BlockDeviceInfo> res =
+        user::GetBlockDeviceInfo(mock.Env(), 0);
+    ASSERT_TRUE(res.ok());
+    EXPECT_THAT(ToBytes(*res), t::ElementsAreArray(ToBytes(expected)));
+
+    __builtin_memset(expected.model, 'X', sizeof(expected.model));
+    expected.model[3] = '\0';
+    __builtin_memset(expected.serial, 'Y', sizeof(expected.serial));
+    expected.serial[0] = '\0';
+    mock.next_reply = ToBytes(expected);
+    const StatusOr<BlockDeviceInfo> swapped =
+        user::GetBlockDeviceInfo(mock.Env(), 0);
+    ASSERT_TRUE(swapped.ok());
+    EXPECT_THAT(ToBytes(*swapped), t::ElementsAreArray(ToBytes(expected)));
+  }
+
+  // Negative server errors propagate without touching `*out_disk_count`.
+  {
+    FakeBlockClient mock;
+    mock.next_rc = kSyscallErrorNoDevice;
+    int64_t disk_count = 77;
+    const StatusOr<BlockDeviceInfo> res =
+        user::GetBlockDeviceInfo(mock.Env(), 0, &disk_count);
+    EXPECT_EQ(res.status(), kSyscallErrorNoDevice);
+    EXPECT_EQ(disk_count, 77);
+
+    mock.next_rc = kSyscallErrorPermission;
+    mock.next_reply = ToBytes(MakeValidBlockInfo());
+    const StatusOr<BlockDeviceInfo> perm_res =
+        user::GetBlockDeviceInfo(mock.Env(), 0, &disk_count);
+    EXPECT_EQ(perm_res.status(), kSyscallErrorPermission);
+    EXPECT_EQ(disk_count, 77);
+  }
+
+  // Malformed status / index / reply_size / payload all fail with Io.
+  const BlockDeviceInfo valid = MakeValidBlockInfo();
+  {
+    FakeBlockClient mock;
+    mock.next_rc = 0;
+    mock.next_reply = ToBytes(valid);
+    int64_t disk_count = 55;
+    EXPECT_EQ(user::GetBlockDeviceInfo(mock.Env(), 0, &disk_count).status(),
+              kSyscallErrorIo);
+    EXPECT_EQ(disk_count, 55);
+  }
+  {
+    FakeBlockClient mock;
+    mock.next_rc = 1;
+    mock.next_reply = ToBytes(valid);
+    int64_t disk_count = 44;
+    EXPECT_EQ(user::GetBlockDeviceInfo(mock.Env(), 1, &disk_count).status(),
+              kSyscallErrorIo);
+    EXPECT_EQ(disk_count, 44);
+    EXPECT_EQ(user::GetBlockDeviceInfo(mock.Env(), UINT32_MAX).status(),
+              kSyscallErrorIo);
+
+    mock.next_rc = 2;
+    EXPECT_EQ(user::GetBlockDeviceInfo(mock.Env(), 2, &disk_count).status(),
+              kSyscallErrorIo);
+    EXPECT_EQ(user::GetBlockDeviceInfo(mock.Env(), 256u, &disk_count).status(),
+              kSyscallErrorIo);
+    EXPECT_EQ(
+        user::GetBlockDeviceInfo(mock.Env(), 65536u, &disk_count).status(),
+        kSyscallErrorIo);
+    EXPECT_EQ(disk_count, 44);
+  }
+  {
+    // 0x100000000LL must not truncate to 0 in uint32_t comparison or
+    // `*out_disk_count`, and 64-bit `block_count` / 32-bit `disk_index`
+    // must not truncate.
+    FakeBlockClient mock;
+    const BlockDeviceInfo large_disk =
+        MakeValidBlockInfo(512, 8, uint64_t{1} << 32, 0);
+    mock.next_rc = int64_t{1} << 32;
+    mock.next_reply = ToBytes(large_disk);
+    int64_t disk_count = 0;
+    const StatusOr<BlockDeviceInfo> first =
+        user::GetBlockDeviceInfo(mock.Env(), 0, &disk_count);
+    ASSERT_TRUE(first.ok());
+    EXPECT_EQ(first->block_count, uint64_t{1} << 32);
+    EXPECT_EQ(disk_count, int64_t{1} << 32);
+
+    const uint32_t wide_disk_index = 0x12345678u;
+    EXPECT_TRUE(user::GetBlockDeviceInfo(mock.Env(), wide_disk_index).ok());
+    const BlockGetInfoRequest expected_req{.op = BlockRpcOp::kGetInfo,
+                                           .disk_index = wide_disk_index};
+    EXPECT_THAT(mock.last_req, t::ElementsAreArray(ToBytes(expected_req)));
+    EXPECT_TRUE(user::GetBlockDeviceInfo(mock.Env(), UINT32_MAX).ok());
+
+    mock.next_rc = int64_t{1} << 31;
+    disk_count = 0;
+    const StatusOr<BlockDeviceInfo> bit31 =
+        user::GetBlockDeviceInfo(mock.Env(), 0, &disk_count);
+    ASSERT_TRUE(bit31.ok());
+    EXPECT_EQ(bit31->block_count, uint64_t{1} << 32);
+    EXPECT_EQ(disk_count, int64_t{1} << 31);
+  }
+  {
+    FakeBlockClient mock;
+    mock.next_rc = 1;
+    mock.next_reply = ToBytes(valid);
+    mock.override_reply_size = 0;
+    EXPECT_EQ(user::GetBlockDeviceInfo(mock.Env(), 0).status(),
+              kSyscallErrorIo);
+    mock.override_reply_size =
+        static_cast<int64_t>(sizeof(BlockDeviceInfo)) - 1;
+    EXPECT_EQ(user::GetBlockDeviceInfo(mock.Env(), 0).status(),
+              kSyscallErrorIo);
+    mock.override_reply_size =
+        static_cast<int64_t>(sizeof(BlockDeviceInfo)) + 1;
+    EXPECT_EQ(user::GetBlockDeviceInfo(mock.Env(), 0).status(),
+              kSyscallErrorIo);
+    mock.override_reply_size = -1;
+    int64_t disk_count = 33;
+    EXPECT_EQ(user::GetBlockDeviceInfo(mock.Env(), 0, &disk_count).status(),
+              kSyscallErrorIo);
+    EXPECT_EQ(disk_count, 33);
+    mock.override_reply_size =
+        (int64_t{1} << 32) + static_cast<int64_t>(sizeof(BlockDeviceInfo));
+    EXPECT_EQ(user::GetBlockDeviceInfo(mock.Env(), 0, &disk_count).status(),
+              kSyscallErrorIo);
+    EXPECT_EQ(disk_count, 33);
+    mock.override_reply_size =
+        -(int64_t{1} << 32) + static_cast<int64_t>(sizeof(BlockDeviceInfo));
+    EXPECT_EQ(user::GetBlockDeviceInfo(mock.Env(), 0, &disk_count).status(),
+              kSyscallErrorIo);
+    EXPECT_EQ(disk_count, 33);
+    mock.override_reply_size.reset();
+  }
+
+  const auto expect_invalid_payload = [](const BlockDeviceInfo& bad) {
+    FakeBlockClient mock;
+    mock.next_rc = 1;
+    mock.next_reply = ToBytes(bad);
+    int64_t disk_count = 99;
+    EXPECT_EQ(user::GetBlockDeviceInfo(mock.Env(), 0, &disk_count).status(),
+              kSyscallErrorIo);
+    EXPECT_EQ(disk_count, 99);
+  };
+  expect_invalid_payload(BlockDeviceInfo{});
+  {
+    BlockDeviceInfo bad = valid;
+    bad.block_count = 0;
+    expect_invalid_payload(bad);
+  }
+  {
+    BlockDeviceInfo bad = valid;
+    bad.block_size = 0;
+    expect_invalid_payload(bad);
+    bad.block_size = 513;
+    expect_invalid_payload(bad);
+  }
+  {
+    BlockDeviceInfo bad = valid;
+    bad.max_transfer_blocks = 9;
+    expect_invalid_payload(bad);
+  }
+  expect_invalid_payload(MakeValidBlockInfo(1024, 5));
+  expect_invalid_payload(MakeValidBlockInfo(2048, 3));
+  expect_invalid_payload(MakeValidBlockInfo(4096, 2));
+  {
+    BlockDeviceInfo bad = valid;
+    bad.block_size = -512;
+    bad.max_transfer_blocks = -1;
+    expect_invalid_payload(bad);
+  }
+  {
+    BlockDeviceInfo bad = valid;
+    bad.read_only = 2;
+    expect_invalid_payload(bad);
+    bad.read_only = 255;
+    expect_invalid_payload(bad);
+  }
+  {
+    BlockDeviceInfo bad = valid;
+    __builtin_memset(bad.model, 'Z', sizeof(bad.model));
+    expect_invalid_payload(bad);
+    __builtin_memset(bad.model, 0x80, sizeof(bad.model));
+    expect_invalid_payload(bad);
+  }
+  {
+    BlockDeviceInfo bad = valid;
+    __builtin_memset(bad.serial, 'W', sizeof(bad.serial));
+    expect_invalid_payload(bad);
+    __builtin_memset(bad.serial, 0xFF, sizeof(bad.serial));
+    expect_invalid_payload(bad);
+  }
+}
+
+TEST(SyscallAbiTest, BlockClientReadBlocksValidatesArgsZeroBlockAndReplies) {
+  uint8_t buf[kBlockMaxIoBytes] = {};
+  {
+    const user::BlockClientEnv null_env{};
+    EXPECT_EQ(user::ReadBlocks(null_env, 0, 0, 1, buf, 512),
+              kSyscallErrorInvalid);
+  }
+  {
+    FakeBlockClient mock;
+    EXPECT_EQ(user::ReadBlocks(mock.Env(), 0, 0, -1, buf, 512),
+              kSyscallErrorInvalid);
+    EXPECT_EQ(user::ReadBlocks(mock.Env(), 0, 0, 1, buf, -1),
+              kSyscallErrorInvalid);
+    EXPECT_EQ(user::ReadBlocks(mock.Env(), 0, 0, 1, buf, kBlockMaxIoBytes + 1),
+              kSyscallErrorInvalid);
+    EXPECT_EQ(user::ReadBlocks(mock.Env(), 0, 0, 1, buf, 0),
+              kSyscallErrorInvalid);
+    EXPECT_EQ(user::ReadBlocks(mock.Env(), 0, 0, 1, nullptr, 512),
+              kSyscallErrorInvalid);
+    EXPECT_EQ(user::ReadBlocks(mock.Env(), 0, 0, 0, nullptr, 512),
+              kSyscallErrorInvalid);
+    EXPECT_EQ(user::ReadBlocks(mock.Env(), 0, 0, 1, nullptr, 1),
+              kSyscallErrorInvalid);
+    EXPECT_EQ(user::ReadBlocks(mock.Env(), 0, 0, 0, nullptr, 1),
+              kSyscallErrorInvalid);
+    EXPECT_EQ(user::ReadBlocks(mock.Env(), 0, 0, 0, nullptr, -1),
+              kSyscallErrorInvalid);
+    EXPECT_EQ(user::ReadBlocks(mock.Env(), 0, 0, 0, buf, kBlockMaxIoBytes + 1),
+              kSyscallErrorInvalid);
+    EXPECT_EQ(
+        user::ReadBlocks(mock.Env(), 0, 0, 1, buf, (int64_t{1} << 32) + 512),
+        kSyscallErrorInvalid);
+    EXPECT_EQ(
+        user::ReadBlocks(mock.Env(), 0, 0, 0, buf, (int64_t{1} << 32) + 512),
+        kSyscallErrorInvalid);
+    EXPECT_EQ(
+        user::ReadBlocks(mock.Env(), 0, 0, 1, buf, -(int64_t{1} << 32) + 512),
+        kSyscallErrorInvalid);
+    EXPECT_EQ(
+        user::ReadBlocks(mock.Env(), 0, 0, 0, buf, -(int64_t{1} << 32) + 512),
+        kSyscallErrorInvalid);
+    EXPECT_EQ(mock.calls, 0);
+  }
+
+  // Zero-block read passes reply_buf=nullptr, reply_cap=0 even with a valid
+  // buffer so a server cannot overwrite caller memory.
+  {
+    FakeBlockClient mock;
+    uint8_t sentinel[512];
+    __builtin_memset(sentinel, 0xA5, sizeof(sentinel));
+    mock.next_rc = 0;
+    EXPECT_EQ(user::ReadBlocks(mock.Env(), 0, 4, 0, nullptr, 0), 0);
+    EXPECT_EQ(mock.last_port, kIpcPortBlock);
+    EXPECT_EQ(mock.last_reply_buf, nullptr);
+    EXPECT_EQ(mock.last_reply_cap, 0);
+    const BlockReadRequest expected_req{.op = BlockRpcOp::kRead,
+                                        .disk_index = 0,
+                                        .lba = 4,
+                                        .block_count = 0,
+                                        .reserved = 0};
+    EXPECT_THAT(mock.last_req, t::ElementsAreArray(ToBytes(expected_req)));
+
+    mock.next_reply.assign(64, 0x11);
+    mock.override_reply_size = 0;
+    EXPECT_EQ(user::ReadBlocks(mock.Env(), 0, 4, 0, sentinel, 0), 0);
+    EXPECT_EQ(mock.last_port, kIpcPortBlock);
+    EXPECT_EQ(mock.last_reply_buf, nullptr);
+    EXPECT_EQ(mock.last_reply_cap, 0);
+    EXPECT_THAT(mock.last_req, t::ElementsAreArray(ToBytes(expected_req)));
+    EXPECT_THAT(sentinel, t::Each(t::Eq(0xA5)));
+    mock.override_reply_size.reset();
+
+    mock.next_reply.assign(64, 0x11);
+    mock.override_reply_size = 0;
+    EXPECT_EQ(user::ReadBlocks(mock.Env(), 0, 4, 0, sentinel, sizeof(sentinel)),
+              0);
+    EXPECT_EQ(mock.last_port, kIpcPortBlock);
+    EXPECT_EQ(mock.last_reply_buf, nullptr);
+    EXPECT_EQ(mock.last_reply_cap, 0);
+    EXPECT_THAT(mock.last_req, t::ElementsAreArray(ToBytes(expected_req)));
+    EXPECT_THAT(sentinel, t::Each(t::Eq(0xA5)));
+
+    const uint32_t wide_disk_index = 0x12345678u;
+    const uint64_t wide_lba = 0x123456789ABCDEF0ULL;
+    EXPECT_EQ(user::ReadBlocks(mock.Env(),       //
+                               wide_disk_index,  //
+                               wide_lba,         //
+                               0,                //
+                               sentinel,         //
+                               sizeof(sentinel)),
+              0);
+    EXPECT_EQ(mock.last_port, kIpcPortBlock);
+    EXPECT_EQ(mock.last_reply_buf, nullptr);
+    EXPECT_EQ(mock.last_reply_cap, 0);
+    const BlockReadRequest wide_req{.op = BlockRpcOp::kRead,
+                                    .disk_index = wide_disk_index,
+                                    .lba = wide_lba,
+                                    .block_count = 0,
+                                    .reserved = 0};
+    EXPECT_THAT(mock.last_req, t::ElementsAreArray(ToBytes(wide_req)));
+    EXPECT_THAT(sentinel, t::Each(t::Eq(0xA5)));
+
+    const uint64_t high_lba = uint64_t{1} << 63;
+    EXPECT_EQ(user::ReadBlocks(mock.Env(),       //
+                               wide_disk_index,  //
+                               high_lba,         //
+                               0,                //
+                               sentinel,         //
+                               sizeof(sentinel)),
+              0);
+    const BlockReadRequest high_req{.op = BlockRpcOp::kRead,
+                                    .disk_index = wide_disk_index,
+                                    .lba = high_lba,
+                                    .block_count = 0,
+                                    .reserved = 0};
+    EXPECT_THAT(mock.last_req, t::ElementsAreArray(ToBytes(high_req)));
+    EXPECT_THAT(sentinel, t::Each(t::Eq(0xA5)));
+
+    mock.override_reply_size = 16;
+    EXPECT_EQ(user::ReadBlocks(mock.Env(), 0, 4, 0, sentinel, sizeof(sentinel)),
+              kSyscallErrorIo);
+    mock.override_reply_size = 1;
+    EXPECT_EQ(user::ReadBlocks(mock.Env(), 0, 4, 0, sentinel, sizeof(sentinel)),
+              kSyscallErrorIo);
+    mock.override_reply_size = -1;
+    EXPECT_EQ(user::ReadBlocks(mock.Env(), 0, 4, 0, sentinel, sizeof(sentinel)),
+              kSyscallErrorIo);
+    mock.override_reply_size = int64_t{1} << 32;
+    EXPECT_EQ(user::ReadBlocks(mock.Env(), 0, 4, 0, sentinel, sizeof(sentinel)),
+              kSyscallErrorIo);
+    mock.override_reply_size = -(int64_t{1} << 32);
+    EXPECT_EQ(user::ReadBlocks(mock.Env(), 0, 4, 0, sentinel, sizeof(sentinel)),
+              kSyscallErrorIo);
+    mock.override_reply_size = 0;
+    mock.next_rc = 1;
+    EXPECT_EQ(user::ReadBlocks(mock.Env(), 0, 4, 0, sentinel, sizeof(sentinel)),
+              kSyscallErrorIo);
+    mock.next_rc = int64_t{1} << 32;
+    EXPECT_EQ(user::ReadBlocks(mock.Env(), 0, 4, 0, sentinel, sizeof(sentinel)),
+              kSyscallErrorIo);
+    mock.override_reply_size.reset();
+    mock.next_rc = kSyscallErrorPermission;
+    EXPECT_EQ(user::ReadBlocks(mock.Env(), 0, 4, 0, sentinel, sizeof(sentinel)),
+              kSyscallErrorPermission);
+    mock.next_rc = kSyscallErrorIo;
+    EXPECT_EQ(user::ReadBlocks(mock.Env(), 0, 4, 0, sentinel, sizeof(sentinel)),
+              kSyscallErrorIo);
+    EXPECT_THAT(sentinel, t::Each(t::Eq(0xA5)));
+  }
+
+  // Valid reads across valid sector sizes (even when byte_cap is larger).
+  for (const int32_t bs : {512, 1024, 2048, 4096}) {
+    FakeBlockClient mock;
+    mock.next_rc = 1;
+    mock.next_reply.assign(static_cast<size_t>(bs), 0x3C);
+    __builtin_memset(buf, 0, sizeof(buf));
+    EXPECT_EQ(user::ReadBlocks(mock.Env(), 0, 7, 1, buf, sizeof(buf)), 1);
+    EXPECT_EQ(mock.last_port, kIpcPortBlock);
+    EXPECT_EQ(mock.last_reply_buf, buf);
+    EXPECT_EQ(mock.last_reply_cap, static_cast<int64_t>(sizeof(buf)));
+    const BlockReadRequest expected_req{.op = BlockRpcOp::kRead,
+                                        .disk_index = 0,
+                                        .lba = 7,
+                                        .block_count = 1,
+                                        .reserved = 0};
+    EXPECT_THAT(mock.last_req, t::ElementsAreArray(ToBytes(expected_req)));
+    EXPECT_EQ(buf[0], 0x3C);
+    EXPECT_EQ(buf[bs - 1], 0x3C);
+  }
+
+  // `reply_cap` passed to IPC must match caller `byte_cap` (`512`, `1024`),
+  // never `kBlockMaxIoBytes`.
+  for (const int64_t cap : {int64_t{512}, int64_t{1024}}) {
+    FakeBlockClient mock;
+    mock.next_rc = 1;
+    mock.next_reply.assign(512, 0x3C);
+    __builtin_memset(buf, 0xA5, sizeof(buf));
+    EXPECT_EQ(user::ReadBlocks(mock.Env(), 0, 7, 1, buf, cap), 1);
+    EXPECT_EQ(mock.last_port, kIpcPortBlock);
+    EXPECT_EQ(mock.last_reply_buf, buf);
+    EXPECT_EQ(mock.last_reply_cap, cap);
+    EXPECT_EQ(buf[0], 0x3C);
+    EXPECT_EQ(buf[511], 0x3C);
+    EXPECT_EQ(buf[512], 0xA5);
+  }
+
+  // Multi-block read: 3 x 512 B = 1536 B exercises `reply_size / block_count`
+  // (1536 itself is not a valid block size), and 4 x 1024 B = 4096 B checks
+  // full-buffer transfer.
+  {
+    FakeBlockClient mock;
+    mock.next_rc = 3;
+    mock.next_reply.resize(1536);
+    for (int i = 0; i < 1536; ++i) {
+      mock.next_reply[static_cast<size_t>(i)] =
+          static_cast<uint8_t>((i * 19 + 3) & 0xFF);
+    }
+    __builtin_memset(buf, 0, sizeof(buf));
+    EXPECT_EQ(user::ReadBlocks(mock.Env(), 1, 12, 3, buf, sizeof(buf)), 3);
+    EXPECT_EQ(mock.last_port, kIpcPortBlock);
+    const BlockReadRequest expected_req{.op = BlockRpcOp::kRead,
+                                        .disk_index = 1,
+                                        .lba = 12,
+                                        .block_count = 3,
+                                        .reserved = 0};
+    EXPECT_THAT(mock.last_req, t::ElementsAreArray(ToBytes(expected_req)));
+    EXPECT_EQ(__builtin_memcmp(buf, mock.next_reply.data(), 1536), 0);
+  }
+  {
+    FakeBlockClient mock;
+    mock.next_rc = 4;
+    mock.next_reply.assign(4096, 0x6B);
+    __builtin_memset(buf, 0, sizeof(buf));
+    const uint32_t disk_index = 0x12345678u;
+    const uint64_t lba = 0x123456789ABCDEF0ULL;
+    EXPECT_EQ(user::ReadBlocks(mock.Env(), disk_index, lba, 4, buf, 4096), 4);
+    EXPECT_EQ(mock.last_port, kIpcPortBlock);
+    EXPECT_EQ(mock.last_reply_buf, buf);
+    EXPECT_EQ(mock.last_reply_cap, 4096);
+    const BlockReadRequest expected_req{.op = BlockRpcOp::kRead,
+                                        .disk_index = disk_index,
+                                        .lba = lba,
+                                        .block_count = 4,
+                                        .reserved = 0};
+    EXPECT_THAT(mock.last_req, t::ElementsAreArray(ToBytes(expected_req)));
+    EXPECT_EQ(__builtin_memcmp(buf, mock.next_reply.data(), 4096), 0);
+  }
+  {
+    FakeBlockClient mock;
+    mock.next_rc = 1;
+    mock.next_reply.assign(512, 0x7E);
+    __builtin_memset(buf, 0, sizeof(buf));
+    const uint32_t msb_disk = 0x80000001u;
+    const uint64_t high_lba = 0xFEDCBA9876543210ULL;
+    EXPECT_EQ(user::ReadBlocks(mock.Env(), msb_disk, high_lba, 1, buf, 512), 1);
+    const BlockReadRequest expected_req{.op = BlockRpcOp::kRead,
+                                        .disk_index = msb_disk,
+                                        .lba = high_lba,
+                                        .block_count = 1,
+                                        .reserved = 0};
+    EXPECT_THAT(mock.last_req, t::ElementsAreArray(ToBytes(expected_req)));
+    EXPECT_EQ(buf[0], 0x7E);
+    EXPECT_EQ(buf[511], 0x7E);
+  }
+
+  // Sub-sector byte_cap and >8 block_count still reach the server so
+  // server-side rejection tests keep working, while malformed positive replies
+  // are caught.
+  {
+    FakeBlockClient mock;
+    uint8_t sentinel[512];
+    __builtin_memset(sentinel, 0xA5, sizeof(sentinel));
+    mock.next_rc = kSyscallErrorInvalid;
+    EXPECT_EQ(user::ReadBlocks(mock.Env(), 0, 0, 1, sentinel, 511),
+              kSyscallErrorInvalid);
+    EXPECT_EQ(user::ReadBlocks(mock.Env(), 0, 0, 9, buf, kBlockMaxIoBytes),
+              kSyscallErrorInvalid);
+    EXPECT_EQ(user::ReadBlocks(mock.Env(),  //
+                               0,           //
+                               0,           //
+                               0x1020304,   //
+                               sentinel,    //
+                               sizeof(sentinel)),
+              kSyscallErrorInvalid);
+    const BlockReadRequest expected_wide_cnt_req{.op = BlockRpcOp::kRead,
+                                                 .disk_index = 0,
+                                                 .lba = 0,
+                                                 .block_count = 0x1020304,
+                                                 .reserved = 0};
+    EXPECT_THAT(mock.last_req,
+                t::ElementsAreArray(ToBytes(expected_wide_cnt_req)));
+    mock.next_rc = kSyscallErrorNoDevice;
+    EXPECT_EQ(user::ReadBlocks(mock.Env(), 0, 0, 1, sentinel, sizeof(sentinel)),
+              kSyscallErrorNoDevice);
+    EXPECT_EQ(user::ReadBlocks(mock.Env(), 0, 0, 0, nullptr, 0),
+              kSyscallErrorNoDevice);
+    mock.next_rc = kSyscallErrorIo;
+    EXPECT_EQ(user::ReadBlocks(mock.Env(), 0, 0, 1, sentinel, sizeof(sentinel)),
+              kSyscallErrorIo);
+    EXPECT_EQ(user::ReadBlocks(mock.Env(), 0, 0, 0, nullptr, 0),
+              kSyscallErrorIo);
+    mock.next_reply.assign(sizeof(sentinel), 0x11);
+    mock.next_rc = kSyscallErrorPermission;
+    EXPECT_EQ(user::ReadBlocks(mock.Env(), 0, 0, 1, sentinel, sizeof(sentinel)),
+              kSyscallErrorPermission);
+    EXPECT_EQ(user::ReadBlocks(mock.Env(), 0, 0, 0, nullptr, 0),
+              kSyscallErrorPermission);
+    EXPECT_EQ(mock.calls, 9);
+    EXPECT_THAT(sentinel, t::Each(t::Eq(0xA5)));
+  }
+  {
+    FakeBlockClient mock;
+    mock.next_rc = 2;  // mismatch with block_count=1
+    mock.next_reply.assign(512, 0x11);
+    EXPECT_EQ(user::ReadBlocks(mock.Env(), 0, 0, 1, buf, 4096),
+              kSyscallErrorIo);
+    mock.next_rc = 0;  // mismatch (< block_count)
+    EXPECT_EQ(user::ReadBlocks(mock.Env(), 0, 0, 1, buf, 4096),
+              kSyscallErrorIo);
+    mock.next_rc = (int64_t{1} << 32) + 1;
+    EXPECT_EQ(user::ReadBlocks(mock.Env(), 0, 0, 1, buf, 4096),
+              kSyscallErrorIo);
+    mock.next_rc = int64_t{1} << 31;
+    EXPECT_EQ(user::ReadBlocks(mock.Env(), 0, 0, 1, buf, 512), kSyscallErrorIo);
+
+    mock.next_rc = 1;
+    mock.next_reply.clear();
+    __builtin_memset(buf, 0xA5, sizeof(buf));
+    mock.override_reply_size = 0;
+    EXPECT_EQ(user::ReadBlocks(mock.Env(), 0, 0, 1, buf, 4096),
+              kSyscallErrorIo);
+    EXPECT_THAT(buf, t::Each(t::Eq(0xA5)));
+    mock.override_reply_size = 513;
+    EXPECT_EQ(user::ReadBlocks(mock.Env(), 0, 0, 1, buf, 512), kSyscallErrorIo);
+    EXPECT_EQ(user::ReadBlocks(mock.Env(), 0, 0, 1, buf, 4096),
+              kSyscallErrorIo);
+    mock.override_reply_size = 511;
+    EXPECT_EQ(user::ReadBlocks(mock.Env(), 0, 0, 1, buf, 4096),
+              kSyscallErrorIo);
+    {
+      uint8_t cap_sentinel[511];
+      __builtin_memset(cap_sentinel, 0xA5, sizeof(cap_sentinel));
+      mock.next_rc = 1;
+      mock.next_reply.clear();
+      mock.override_reply_size = 512;
+      EXPECT_EQ(user::ReadBlocks(mock.Env(),    //
+                                 0,             //
+                                 0,             //
+                                 1,             //
+                                 cap_sentinel,  //
+                                 sizeof(cap_sentinel)),
+                kSyscallErrorIo);
+      EXPECT_THAT(cap_sentinel, t::Each(t::Eq(0xA5)));
+    }
+    mock.override_reply_size = 256;
+    EXPECT_EQ(user::ReadBlocks(mock.Env(), 0, 0, 1, buf, 4096),
+              kSyscallErrorIo);
+    mock.override_reply_size = 1536;
+    EXPECT_EQ(user::ReadBlocks(mock.Env(), 0, 0, 1, buf, 4096),
+              kSyscallErrorIo);
+    EXPECT_THAT(buf, t::Each(t::Eq(0xA5)));
+
+    // Valid sector size (1024) exceeding caller `byte_cap` (512) must fail
+    // solely on `reply_size > byte_cap` (`COV-02`).
+    mock.override_reply_size = 1024;
+    EXPECT_EQ(user::ReadBlocks(mock.Env(), 0, 0, 1, buf, 512), kSyscallErrorIo);
+    mock.next_rc = 2;
+    EXPECT_EQ(user::ReadBlocks(mock.Env(), 0, 0, 2, buf, 512), kSyscallErrorIo);
+
+    // Negative `reply_size` must fail with `kSyscallErrorIo`, including values
+    // whose lower 32 bits match a valid sector size.
+    mock.next_rc = 1;
+    mock.override_reply_size = -1;
+    EXPECT_EQ(user::ReadBlocks(mock.Env(), 0, 0, 1, buf, 512), kSyscallErrorIo);
+    mock.override_reply_size = -512;
+    EXPECT_EQ(user::ReadBlocks(mock.Env(), 0, 0, 1, buf, 512), kSyscallErrorIo);
+    mock.override_reply_size = -(int64_t{1} << 32) + 512;
+    EXPECT_EQ(user::ReadBlocks(mock.Env(), 0, 0, 1, buf, 512), kSyscallErrorIo);
+    mock.override_reply_size = (int64_t{1} << 32) + 512;
+    EXPECT_EQ(user::ReadBlocks(mock.Env(), 0, 0, 1, buf, 512), kSyscallErrorIo);
+    mock.next_rc = 1 << 20;
+    mock.override_reply_size = int64_t{1} << 32;
+    EXPECT_EQ(user::ReadBlocks(mock.Env(), 0, 0, 1 << 20, buf, 512),
+              kSyscallErrorIo);
+    EXPECT_THAT(buf, t::Each(t::Eq(0xA5)));
+
+    // Non-divisible total and block_count=9 with 4096 reply fail post-reply,
+    // including totals whose floored quotient equals a valid sector size.
+    mock.next_rc = 3;
+    mock.override_reply_size = 1024;
+    EXPECT_EQ(user::ReadBlocks(mock.Env(), 0, 0, 3, buf, 4096),
+              kSyscallErrorIo);
+    mock.override_reply_size = 1537;
+    EXPECT_EQ(user::ReadBlocks(mock.Env(), 0, 0, 3, buf, 4096),
+              kSyscallErrorIo);
+    mock.override_reply_size = 3073;
+    EXPECT_EQ(user::ReadBlocks(mock.Env(), 0, 0, 3, buf, 4096),
+              kSyscallErrorIo);
+    mock.next_rc = 2;
+    mock.override_reply_size = 1025;
+    EXPECT_EQ(user::ReadBlocks(mock.Env(), 0, 0, 2, buf, 4096),
+              kSyscallErrorIo);
+    mock.next_rc = 9;
+    mock.override_reply_size = 4096;
+    EXPECT_EQ(user::ReadBlocks(mock.Env(), 0, 0, 9, buf, 4096),
+              kSyscallErrorIo);
+    EXPECT_THAT(buf, t::Each(t::Eq(0xA5)));
+
+    // 2 blocks returning 3072 total bytes yields invalid non-pow2 1536 B/block,
+    // and 2 blocks returning 512 total bytes yields invalid 256 B/block.
+    mock.next_rc = 2;
+    mock.override_reply_size = 3072;
+    EXPECT_EQ(user::ReadBlocks(mock.Env(), 0, 0, 2, buf, 4096),
+              kSyscallErrorIo);
+    EXPECT_THAT(buf, t::Each(t::Eq(0xA5)));
+    mock.override_reply_size.reset();
+    mock.next_reply.assign(512, 0x22);
+    EXPECT_EQ(user::ReadBlocks(mock.Env(), 0, 0, 2, buf, 4096),
+              kSyscallErrorIo);
+  }
+}
+
+TEST(SyscallAbiTest, BlockClientReadBlocksCheckedEnforcesExpectedBlockSize) {
+  uint8_t buf[kBlockMaxIoBytes] = {};
+  {
+    const user::BlockClientEnv null_env{};
+    EXPECT_EQ(user::ReadBlocksChecked(null_env, 0, 0, 1, 512, buf, 512),
+              kSyscallErrorInvalid);
+  }
+  {
+    FakeBlockClient mock;
+    EXPECT_EQ(user::ReadBlocksChecked(mock.Env(), 0, 0, 0, 256, nullptr, 0),
+              kSyscallErrorInvalid);
+    EXPECT_EQ(user::ReadBlocksChecked(mock.Env(), 0, 0, 0, 513, nullptr, 0),
+              kSyscallErrorInvalid);
+    EXPECT_EQ(user::ReadBlocksChecked(mock.Env(), 0, 0, 1, 1536, buf, 4096),
+              kSyscallErrorInvalid);
+    EXPECT_EQ(user::ReadBlocksChecked(mock.Env(), 0, 0, 0, 1536, nullptr, 0),
+              kSyscallErrorInvalid);
+    EXPECT_EQ(user::ReadBlocksChecked(mock.Env(), 0, 0, 0, 8192, nullptr, 0),
+              kSyscallErrorInvalid);
+    EXPECT_EQ(user::ReadBlocksChecked(mock.Env(), 0, 0, -1, 512, buf, 512),
+              kSyscallErrorInvalid);
+    EXPECT_EQ(user::ReadBlocksChecked(mock.Env(), 0, 0, 0, 512, nullptr, -1),
+              kSyscallErrorInvalid);
+    EXPECT_EQ(user::ReadBlocksChecked(mock.Env(), 0, 0, 1, 512, buf, -1),
+              kSyscallErrorInvalid);
+    EXPECT_EQ(user::ReadBlocksChecked(mock.Env(), 0, 0, 0, 512, nullptr, 512),
+              kSyscallErrorInvalid);
+    EXPECT_EQ(user::ReadBlocksChecked(mock.Env(), 0, 0, 1, 512, buf, 0),
+              kSyscallErrorInvalid);
+    EXPECT_EQ(user::ReadBlocksChecked(mock.Env(), 0, 0, 1, 4096, buf, 512),
+              kSyscallErrorInvalid);
+    EXPECT_EQ(user::ReadBlocksChecked(mock.Env(), 0, 0, 2, 4096, buf, 4096),
+              kSyscallErrorInvalid);
+    EXPECT_EQ(user::ReadBlocksChecked(mock.Env(), 0, 0, 1, 512, buf, 511),
+              kSyscallErrorInvalid);
+    EXPECT_EQ(user::ReadBlocksChecked(mock.Env(), 0, 0, 0, 512, nullptr, 1),
+              kSyscallErrorInvalid);
+    EXPECT_EQ(user::ReadBlocksChecked(mock.Env(),  //
+                                      0,           //
+                                      0,           //
+                                      1 << 20,     //
+                                      4096,        //
+                                      buf,         //
+                                      kBlockMaxIoBytes),
+              kSyscallErrorInvalid);
+    EXPECT_EQ(user::ReadBlocksChecked(mock.Env(),  //
+                                      0,           //
+                                      0,           //
+                                      INT32_MAX,   //
+                                      4096,        //
+                                      buf,         //
+                                      kBlockMaxIoBytes),
+              kSyscallErrorInvalid);
+    EXPECT_EQ(user::ReadBlocksChecked(mock.Env(), 0, 0, 1, 512, nullptr, 512),
+              kSyscallErrorInvalid);
+    EXPECT_EQ(user::ReadBlocksChecked(mock.Env(),  //
+                                      0,           //
+                                      0,           //
+                                      1,           //
+                                      512,         //
+                                      buf,         //
+                                      kBlockMaxIoBytes + 1),
+              kSyscallErrorInvalid);
+    EXPECT_EQ(user::ReadBlocksChecked(mock.Env(),  //
+                                      0,           //
+                                      0,           //
+                                      0,           //
+                                      512,         //
+                                      buf,         //
+                                      kBlockMaxIoBytes + 1),
+              kSyscallErrorInvalid);
+    EXPECT_EQ(user::ReadBlocksChecked(mock.Env(),  //
+                                      0,           //
+                                      0,           //
+                                      1,           //
+                                      512,         //
+                                      buf,         //
+                                      (int64_t{1} << 32) + 512),
+              kSyscallErrorInvalid);
+    EXPECT_EQ(user::ReadBlocksChecked(mock.Env(),  //
+                                      0,           //
+                                      0,           //
+                                      0,           //
+                                      512,         //
+                                      buf,         //
+                                      (int64_t{1} << 32) + 512),
+              kSyscallErrorInvalid);
+    EXPECT_EQ(user::ReadBlocksChecked(mock.Env(),  //
+                                      0,           //
+                                      0,           //
+                                      1,           //
+                                      512,         //
+                                      buf,         //
+                                      -(int64_t{1} << 32) + 512),
+              kSyscallErrorInvalid);
+    EXPECT_EQ(user::ReadBlocksChecked(mock.Env(),  //
+                                      0,           //
+                                      0,           //
+                                      0,           //
+                                      512,         //
+                                      buf,         //
+                                      -(int64_t{1} << 32) + 512),
+              kSyscallErrorInvalid);
+    EXPECT_EQ(mock.calls, 0);
+  }
+  {
+    FakeBlockClient mock;
+    uint8_t sentinel[512];
+    __builtin_memset(sentinel, 0xA5, sizeof(sentinel));
+    mock.next_rc = 0;
+    EXPECT_EQ(user::ReadBlocksChecked(mock.Env(), 0, 1, 0, 4096, nullptr, 0),
+              0);
+    EXPECT_EQ(mock.last_port, kIpcPortBlock);
+    EXPECT_EQ(mock.last_reply_buf, nullptr);
+    EXPECT_EQ(mock.last_reply_cap, 0);
+    const BlockReadRequest expected_req{.op = BlockRpcOp::kRead,
+                                        .disk_index = 0,
+                                        .lba = 1,
+                                        .block_count = 0,
+                                        .reserved = 0};
+    EXPECT_THAT(mock.last_req, t::ElementsAreArray(ToBytes(expected_req)));
+
+    mock.next_reply.assign(sizeof(sentinel), 0x11);
+    mock.override_reply_size = 0;
+    EXPECT_EQ(user::ReadBlocksChecked(mock.Env(), 0, 1, 0, 4096, sentinel, 0),
+              0);
+    EXPECT_EQ(mock.last_port, kIpcPortBlock);
+    EXPECT_EQ(mock.last_reply_buf, nullptr);
+    EXPECT_EQ(mock.last_reply_cap, 0);
+    EXPECT_THAT(mock.last_req, t::ElementsAreArray(ToBytes(expected_req)));
+    EXPECT_THAT(sentinel, t::Each(t::Eq(0xA5)));
+    mock.override_reply_size.reset();
+
+    // Non-null buffer on a 0-block read still masks `reply_buf`/`reply_cap`
+    // so server replies cannot touch caller memory.
+    mock.next_reply.assign(sizeof(sentinel), 0x11);
+    mock.override_reply_size = 0;
+    EXPECT_EQ(user::ReadBlocksChecked(mock.Env(),  //
+                                      0,           //
+                                      1,           //
+                                      0,           //
+                                      4096,        //
+                                      sentinel,    //
+                                      sizeof(sentinel)),
+              0);
+    EXPECT_EQ(mock.last_reply_buf, nullptr);
+    EXPECT_EQ(mock.last_reply_cap, 0);
+    EXPECT_THAT(mock.last_req, t::ElementsAreArray(ToBytes(expected_req)));
+    EXPECT_THAT(sentinel, t::Each(t::Eq(0xA5)));
+
+    const uint32_t wide_disk_index = 0x12345678u;
+    const uint64_t wide_lba = 0x123456789ABCDEF0ULL;
+    EXPECT_EQ(user::ReadBlocksChecked(mock.Env(),       //
+                                      wide_disk_index,  //
+                                      wide_lba,         //
+                                      0,                //
+                                      4096,             //
+                                      sentinel,         //
+                                      sizeof(sentinel)),
+              0);
+    EXPECT_EQ(mock.last_port, kIpcPortBlock);
+    EXPECT_EQ(mock.last_reply_buf, nullptr);
+    EXPECT_EQ(mock.last_reply_cap, 0);
+    const BlockReadRequest wide_req{.op = BlockRpcOp::kRead,
+                                    .disk_index = wide_disk_index,
+                                    .lba = wide_lba,
+                                    .block_count = 0,
+                                    .reserved = 0};
+    EXPECT_THAT(mock.last_req, t::ElementsAreArray(ToBytes(wide_req)));
+    EXPECT_THAT(sentinel, t::Each(t::Eq(0xA5)));
+
+    const uint64_t high_lba = uint64_t{1} << 63;
+    EXPECT_EQ(user::ReadBlocksChecked(mock.Env(),       //
+                                      wide_disk_index,  //
+                                      high_lba,         //
+                                      0,                //
+                                      4096,             //
+                                      sentinel,         //
+                                      sizeof(sentinel)),
+              0);
+    const BlockReadRequest high_req{.op = BlockRpcOp::kRead,
+                                    .disk_index = wide_disk_index,
+                                    .lba = high_lba,
+                                    .block_count = 0,
+                                    .reserved = 0};
+    EXPECT_THAT(mock.last_req, t::ElementsAreArray(ToBytes(high_req)));
+    EXPECT_THAT(sentinel, t::Each(t::Eq(0xA5)));
+
+    mock.override_reply_size = 512;
+    EXPECT_EQ(user::ReadBlocksChecked(mock.Env(),  //
+                                      0,           //
+                                      1,           //
+                                      0,           //
+                                      4096,        //
+                                      sentinel,    //
+                                      sizeof(sentinel)),
+              kSyscallErrorIo);
+    mock.override_reply_size = 1;
+    EXPECT_EQ(user::ReadBlocksChecked(mock.Env(),  //
+                                      0,           //
+                                      1,           //
+                                      0,           //
+                                      4096,        //
+                                      sentinel,    //
+                                      sizeof(sentinel)),
+              kSyscallErrorIo);
+    mock.override_reply_size = -1;
+    EXPECT_EQ(user::ReadBlocksChecked(mock.Env(),  //
+                                      0,           //
+                                      1,           //
+                                      0,           //
+                                      4096,        //
+                                      sentinel,    //
+                                      sizeof(sentinel)),
+              kSyscallErrorIo);
+    mock.override_reply_size = int64_t{1} << 32;
+    EXPECT_EQ(user::ReadBlocksChecked(mock.Env(),  //
+                                      0,           //
+                                      1,           //
+                                      0,           //
+                                      4096,        //
+                                      sentinel,    //
+                                      sizeof(sentinel)),
+              kSyscallErrorIo);
+    mock.override_reply_size = -(int64_t{1} << 32);
+    EXPECT_EQ(user::ReadBlocksChecked(mock.Env(),  //
+                                      0,           //
+                                      1,           //
+                                      0,           //
+                                      4096,        //
+                                      sentinel,    //
+                                      sizeof(sentinel)),
+              kSyscallErrorIo);
+    mock.override_reply_size = 0;
+    mock.next_rc = 1;
+    EXPECT_EQ(user::ReadBlocksChecked(mock.Env(),  //
+                                      0,           //
+                                      1,           //
+                                      0,           //
+                                      4096,        //
+                                      sentinel,    //
+                                      sizeof(sentinel)),
+              kSyscallErrorIo);
+    mock.next_rc = int64_t{1} << 32;
+    EXPECT_EQ(user::ReadBlocksChecked(mock.Env(),  //
+                                      0,           //
+                                      1,           //
+                                      0,           //
+                                      4096,        //
+                                      sentinel,    //
+                                      sizeof(sentinel)),
+              kSyscallErrorIo);
+    mock.override_reply_size.reset();
+    mock.next_rc = kSyscallErrorPermission;
+    EXPECT_EQ(user::ReadBlocksChecked(mock.Env(),  //
+                                      0,           //
+                                      1,           //
+                                      0,           //
+                                      4096,        //
+                                      sentinel,    //
+                                      sizeof(sentinel)),
+              kSyscallErrorPermission);
+    mock.next_rc = kSyscallErrorIo;
+    EXPECT_EQ(user::ReadBlocksChecked(mock.Env(),  //
+                                      0,           //
+                                      1,           //
+                                      0,           //
+                                      4096,        //
+                                      sentinel,    //
+                                      sizeof(sentinel)),
+              kSyscallErrorIo);
+    EXPECT_THAT(sentinel, t::Each(t::Eq(0xA5)));
+  }
+  {
+    FakeBlockClient mock;
+    mock.next_rc = 1;
+    mock.next_reply.assign(4096, 0x5A);
+    EXPECT_EQ(user::ReadBlocksChecked(mock.Env(), 0, 2, 1, 4096, buf, 4096), 1);
+    EXPECT_EQ(mock.last_port, kIpcPortBlock);
+    EXPECT_EQ(mock.last_reply_buf, buf);
+    EXPECT_EQ(mock.last_reply_cap, 4096);
+
+    mock.next_reply.assign(2048, 0x5A);
+    __builtin_memset(buf, 0xA5, sizeof(buf));
+    EXPECT_EQ(user::ReadBlocksChecked(mock.Env(), 0, 2, 1, 2048, buf, 4096), 1);
+    EXPECT_EQ(mock.last_port, kIpcPortBlock);
+    EXPECT_EQ(mock.last_reply_buf, buf);
+    EXPECT_EQ(mock.last_reply_cap, 4096);
+    EXPECT_EQ(buf[0], 0x5A);
+    EXPECT_EQ(buf[2047], 0x5A);
+    EXPECT_EQ(buf[2048], 0xA5);
+
+    // `reply_cap` must match caller `byte_cap` (`512`, `1024`, `4096`), never
+    // hardcoded `kBlockMaxIoBytes` or `expected_bytes` (`512`).
+    mock.next_reply.assign(512, 0x5A);
+    __builtin_memset(buf, 0xA5, sizeof(buf));
+    EXPECT_EQ(user::ReadBlocksChecked(mock.Env(), 0, 2, 1, 512, buf, 512), 1);
+    EXPECT_EQ(mock.last_reply_buf, buf);
+    EXPECT_EQ(mock.last_reply_cap, 512);
+    EXPECT_EQ(buf[0], 0x5A);
+    EXPECT_EQ(buf[511], 0x5A);
+    EXPECT_EQ(buf[512], 0xA5);
+
+    EXPECT_EQ(user::ReadBlocksChecked(mock.Env(), 0, 2, 1, 512, buf, 1024), 1);
+    EXPECT_EQ(mock.last_reply_buf, buf);
+    EXPECT_EQ(mock.last_reply_cap, 1024);
+
+    EXPECT_EQ(user::ReadBlocksChecked(mock.Env(), 0, 2, 1, 512, buf, 4096), 1);
+    EXPECT_EQ(mock.last_reply_buf, buf);
+    EXPECT_EQ(mock.last_reply_cap, 4096);
+
+    // Multi-block > 512 B happy path (4 x 1024 B = 4096 B) with framing & byte
+    // verification.
+    mock.next_rc = 4;
+    mock.next_reply.resize(4096);
+    for (int i = 0; i < 4096; ++i) {
+      mock.next_reply[static_cast<size_t>(i)] =
+          static_cast<uint8_t>((i * 17 + 5) & 0xFF);
+    }
+    __builtin_memset(buf, 0, sizeof(buf));
+    const uint32_t disk_index = 0x12345678u;
+    const uint64_t lba = 0x123456789ABCDEF0ULL;
+    EXPECT_EQ(user::ReadBlocksChecked(mock.Env(),  //
+                                      disk_index,  //
+                                      lba,         //
+                                      4,           //
+                                      1024,        //
+                                      buf,         //
+                                      4096),
+              4);
+    EXPECT_EQ(mock.last_port, kIpcPortBlock);
+    EXPECT_EQ(mock.last_reply_buf, buf);
+    EXPECT_EQ(mock.last_reply_cap, 4096);
+    const BlockReadRequest expected_req{.op = BlockRpcOp::kRead,
+                                        .disk_index = disk_index,
+                                        .lba = lba,
+                                        .block_count = 4,
+                                        .reserved = 0};
+    EXPECT_THAT(mock.last_req, t::ElementsAreArray(ToBytes(expected_req)));
+    EXPECT_EQ(__builtin_memcmp(buf, mock.next_reply.data(), 4096), 0);
+
+    mock.next_rc = 1;
+    mock.next_reply.assign(512, 0x7E);
+    __builtin_memset(buf, 0, sizeof(buf));
+    const uint32_t msb_disk = 0x80000001u;
+    const uint64_t high_lba = 0xFEDCBA9876543210ULL;
+    EXPECT_EQ(user::ReadBlocksChecked(mock.Env(),  //
+                                      msb_disk,    //
+                                      high_lba,    //
+                                      1,           //
+                                      512,         //
+                                      buf,         //
+                                      512),
+              1);
+    const BlockReadRequest high_req{.op = BlockRpcOp::kRead,
+                                    .disk_index = msb_disk,
+                                    .lba = high_lba,
+                                    .block_count = 1,
+                                    .reserved = 0};
+    EXPECT_THAT(mock.last_req, t::ElementsAreArray(ToBytes(high_req)));
+    EXPECT_EQ(buf[0], 0x7E);
+    EXPECT_EQ(buf[511], 0x7E);
+
+    // Catches 512 B short-read when caller expected 4096 B, and 4096 B
+    // over-read when caller expected 512 B.
+    mock.next_rc = 1;
+    mock.next_reply.assign(512, 0x5A);
+    EXPECT_EQ(user::ReadBlocksChecked(mock.Env(), 0, 2, 1, 4096, buf, 4096),
+              kSyscallErrorIo);
+    mock.next_reply.assign(4096, 0x5A);
+    EXPECT_EQ(user::ReadBlocksChecked(mock.Env(), 0, 2, 1, 512, buf, 4096),
+              kSyscallErrorIo);
+
+    // `rc != block_count` must fail even when `reply_size == expected_bytes`.
+    mock.next_reply.assign(512, 0x5A);
+    mock.next_rc = 2;
+    EXPECT_EQ(user::ReadBlocksChecked(mock.Env(), 0, 2, 1, 512, buf, 512),
+              kSyscallErrorIo);
+    mock.next_rc = 0;
+    EXPECT_EQ(user::ReadBlocksChecked(mock.Env(), 0, 2, 1, 512, buf, 512),
+              kSyscallErrorIo);
+    mock.next_reply.assign(2048, 0x5A);
+    mock.next_rc = 1;
+    EXPECT_EQ(user::ReadBlocksChecked(mock.Env(), 0, 2, 2, 1024, buf, 2048),
+              kSyscallErrorIo);
+    mock.next_reply.assign(512, 0x5A);
+    mock.next_rc = (int64_t{1} << 32) + 1;
+    EXPECT_EQ(user::ReadBlocksChecked(mock.Env(), 0, 2, 1, 512, buf, 512),
+              kSyscallErrorIo);
+    mock.next_rc = int64_t{1} << 31;
+    EXPECT_EQ(user::ReadBlocksChecked(mock.Env(), 0, 2, 1, 512, buf, 512),
+              kSyscallErrorIo);
+
+    // Negative, 64-bit aliased, and empty (`reply_size == 0`) replies must be
+    // rejected with `kSyscallErrorIo` without touching caller memory.
+    mock.next_rc = 1;
+    mock.override_reply_size = -1;
+    EXPECT_EQ(user::ReadBlocksChecked(mock.Env(), 0, 2, 1, 512, buf, 512),
+              kSyscallErrorIo);
+    mock.override_reply_size = -512;
+    EXPECT_EQ(user::ReadBlocksChecked(mock.Env(), 0, 2, 1, 512, buf, 512),
+              kSyscallErrorIo);
+    {
+      uint8_t sentinel[512];
+      __builtin_memset(sentinel, 0xA5, sizeof(sentinel));
+      mock.next_reply.clear();
+      mock.override_reply_size = (int64_t{1} << 32) + 512;
+      EXPECT_EQ(user::ReadBlocksChecked(mock.Env(),  //
+                                        0,           //
+                                        2,           //
+                                        1,           //
+                                        512,         //
+                                        sentinel,    //
+                                        sizeof(sentinel)),
+                kSyscallErrorIo);
+      mock.override_reply_size = -(int64_t{1} << 32) + 512;
+      EXPECT_EQ(user::ReadBlocksChecked(mock.Env(),  //
+                                        0,           //
+                                        2,           //
+                                        1,           //
+                                        512,         //
+                                        sentinel,    //
+                                        sizeof(sentinel)),
+                kSyscallErrorIo);
+      EXPECT_THAT(sentinel, t::Each(t::Eq(0xA5)));
+      mock.override_reply_size = 0;
+      EXPECT_EQ(user::ReadBlocksChecked(mock.Env(),  //
+                                        0,           //
+                                        2,           //
+                                        1,           //
+                                        512,         //
+                                        sentinel,    //
+                                        sizeof(sentinel)),
+                kSyscallErrorIo);
+      mock.override_reply_size.reset();
+      EXPECT_THAT(sentinel, t::Each(t::Eq(0xA5)));
+    }
+    // Multi-block short reply matching `expected_block_size` (512 != 1024)
+    // must fail with `kSyscallErrorIo` without touching caller memory.
+    {
+      uint8_t sentinel[1024];
+      __builtin_memset(sentinel, 0xA5, sizeof(sentinel));
+      mock.next_rc = 2;
+      mock.next_reply.clear();
+      mock.override_reply_size = 512;
+      EXPECT_EQ(user::ReadBlocksChecked(mock.Env(),  //
+                                        0,           //
+                                        2,           //
+                                        2,           //
+                                        512,         //
+                                        sentinel,    //
+                                        sizeof(sentinel)),
+                kSyscallErrorIo);
+      mock.override_reply_size.reset();
+      EXPECT_THAT(sentinel, t::Each(t::Eq(0xA5)));
+    }
+    // Exact +/-1 reply-size boundary around `expected_bytes` (511/513 and
+    // 1023/1025) must fail with `kSyscallErrorIo` without touching memory.
+    {
+      uint8_t sentinel[1024];
+      __builtin_memset(sentinel, 0xA5, sizeof(sentinel));
+      mock.next_reply.clear();
+      mock.next_rc = 1;
+      for (const int64_t bad_sz : {int64_t{511}, int64_t{513}}) {
+        mock.override_reply_size = bad_sz;
+        EXPECT_EQ(user::ReadBlocksChecked(mock.Env(),  //
+                                          0,           //
+                                          2,           //
+                                          1,           //
+                                          512,         //
+                                          sentinel,    //
+                                          sizeof(sentinel)),
+                  kSyscallErrorIo);
+      }
+      mock.next_rc = 2;
+      for (const int64_t bad_sz : {int64_t{1023}, int64_t{1025}}) {
+        mock.override_reply_size = bad_sz;
+        EXPECT_EQ(user::ReadBlocksChecked(mock.Env(),  //
+                                          0,           //
+                                          2,           //
+                                          2,           //
+                                          512,         //
+                                          sentinel,    //
+                                          sizeof(sentinel)),
+                  kSyscallErrorIo);
+      }
+      mock.override_reply_size.reset();
+      EXPECT_THAT(sentinel, t::Each(t::Eq(0xA5)));
+    }
+  }
+  {
+    FakeBlockClient mock;
+    uint8_t sentinel[512];
+    __builtin_memset(sentinel, 0xA5, sizeof(sentinel));
+    mock.next_rc = kSyscallErrorIo;
+    EXPECT_EQ(user::ReadBlocksChecked(mock.Env(),  //
+                                      0,           //
+                                      0,           //
+                                      1,           //
+                                      512,         //
+                                      sentinel,    //
+                                      sizeof(sentinel)),
+              kSyscallErrorIo);
+    EXPECT_EQ(user::ReadBlocksChecked(mock.Env(), 0, 0, 0, 512, nullptr, 0),
+              kSyscallErrorIo);
+    EXPECT_THAT(sentinel, t::Each(t::Eq(0xA5)));
+    mock.next_rc = kSyscallErrorNoDevice;
+    EXPECT_EQ(user::ReadBlocksChecked(mock.Env(),  //
+                                      0,           //
+                                      0,           //
+                                      1,           //
+                                      512,         //
+                                      sentinel,    //
+                                      sizeof(sentinel)),
+              kSyscallErrorNoDevice);
+    EXPECT_EQ(user::ReadBlocksChecked(mock.Env(), 0, 0, 0, 512, nullptr, 0),
+              kSyscallErrorNoDevice);
+    EXPECT_THAT(sentinel, t::Each(t::Eq(0xA5)));
+    mock.next_rc = kSyscallErrorInvalid;
+    EXPECT_EQ(user::ReadBlocksChecked(mock.Env(),  //
+                                      0,           //
+                                      0,           //
+                                      1,           //
+                                      512,         //
+                                      sentinel,    //
+                                      sizeof(sentinel)),
+              kSyscallErrorInvalid);
+    EXPECT_EQ(user::ReadBlocksChecked(mock.Env(), 0, 0, 0, 512, nullptr, 0),
+              kSyscallErrorInvalid);
+    EXPECT_EQ(mock.calls, 6);
+    EXPECT_THAT(sentinel, t::Each(t::Eq(0xA5)));
+    mock.next_reply.assign(sizeof(sentinel), 0x11);
+    mock.next_rc = kSyscallErrorPermission;
+    EXPECT_EQ(user::ReadBlocksChecked(mock.Env(),  //
+                                      0,           //
+                                      0,           //
+                                      1,           //
+                                      512,         //
+                                      sentinel,    //
+                                      sizeof(sentinel)),
+              kSyscallErrorPermission);
+    EXPECT_EQ(user::ReadBlocksChecked(mock.Env(), 0, 0, 0, 512, nullptr, 0),
+              kSyscallErrorPermission);
+    EXPECT_EQ(mock.calls, 8);
+    EXPECT_THAT(sentinel, t::Each(t::Eq(0xA5)));
+  }
+}
+
+TEST(SyscallAbiTest,
+     BlockClientWriteBlocksAndWithScratchValidateArgsPayloadAndReplies) {
+  uint8_t payload[kBlockMaxIoBytes] = {};
+  uint8_t scratch[user::kBlockWriteScratchBytes] = {};
+  {
+    const user::BlockClientEnv null_env{};
+    EXPECT_EQ(user::WriteBlocks(null_env, 0, 0, 1, payload, 512),
+              kSyscallErrorInvalid);
+    EXPECT_EQ(user::WriteBlocksWithScratch(null_env,  //
+                                           0,         //
+                                           0,         //
+                                           1,         //
+                                           payload,   //
+                                           512,       //
+                                           scratch,   //
+                                           sizeof(scratch)),
+              kSyscallErrorInvalid);
+  }
+  {
+    FakeBlockClient mock;
+    uint8_t big_scratch[user::kBlockWriteScratchBytes + 1] = {};
+    const auto expect_no_ipc = [&](const int64_t rc) {
+      EXPECT_EQ(rc, kSyscallErrorInvalid);
+      EXPECT_EQ(mock.calls, 0);
+    };
+
+    // Direct `WriteBlocks` invalid-argument checks.
+    expect_no_ipc(user::WriteBlocks(mock.Env(), 0, 0, -1, payload, 0));
+    expect_no_ipc(user::WriteBlocks(mock.Env(), 0, 0, 0, payload, -1));
+    expect_no_ipc(user::WriteBlocks(mock.Env(), 0, 0, 1, payload, -1));
+    expect_no_ipc(user::WriteBlocks(mock.Env(),  //
+                                    0,           //
+                                    0,           //
+                                    1,           //
+                                    payload,     //
+                                    -(int64_t{1} << 32) + 512));
+    expect_no_ipc(
+        user::WriteBlocks(mock.Env(), 0, 0, 1, payload, kBlockMaxIoBytes + 1));
+    expect_no_ipc(user::WriteBlocks(mock.Env(),  //
+                                    0,           //
+                                    0,           //
+                                    1,           //
+                                    payload,     //
+                                    (int64_t{1} << 32) + 512));
+    expect_no_ipc(user::WriteBlocks(mock.Env(), 0, 0, 0, payload, 512));
+    expect_no_ipc(user::WriteBlocks(mock.Env(), 0, 0, 0, payload, 1));
+    expect_no_ipc(user::WriteBlocks(mock.Env(), 0, 0, 1, payload, 0));
+    expect_no_ipc(user::WriteBlocks(mock.Env(), 0, 0, 1, nullptr, 512));
+    expect_no_ipc(user::WriteBlocks(mock.Env(), 0, 0, 1, nullptr, 1));
+
+    // Direct `WriteBlocksWithScratch` invalid-argument checks (`COV-01`),
+    // including `(1, -1)` so `byte_count < 0` is isolated from
+    // `block_count == 0` and `4121`-byte `big_scratch` so
+    // `byte_count > kBlockMaxIoBytes` is isolated from `scratch_cap <
+    // msg_size`.
+    expect_no_ipc(user::WriteBlocksWithScratch(mock.Env(),  //
+                                               0,           //
+                                               0,           //
+                                               -1,          //
+                                               payload,     //
+                                               0,           //
+                                               scratch,     //
+                                               sizeof(scratch)));
+    expect_no_ipc(user::WriteBlocksWithScratch(mock.Env(),  //
+                                               0,           //
+                                               0,           //
+                                               0,           //
+                                               payload,     //
+                                               -1,          //
+                                               scratch,     //
+                                               sizeof(scratch)));
+    expect_no_ipc(user::WriteBlocksWithScratch(mock.Env(),  //
+                                               0,           //
+                                               0,           //
+                                               1,           //
+                                               payload,     //
+                                               -1,          //
+                                               scratch,     //
+                                               sizeof(scratch)));
+    expect_no_ipc(user::WriteBlocksWithScratch(mock.Env(),                 //
+                                               0,                          //
+                                               0,                          //
+                                               1,                          //
+                                               payload,                    //
+                                               -(int64_t{1} << 32) + 512,  //
+                                               scratch,                    //
+                                               sizeof(scratch)));
+    expect_no_ipc(user::WriteBlocksWithScratch(mock.Env(),            //
+                                               0,                     //
+                                               0,                     //
+                                               1,                     //
+                                               payload,               //
+                                               kBlockMaxIoBytes + 1,  //
+                                               big_scratch,           //
+                                               sizeof(big_scratch)));
+    expect_no_ipc(user::WriteBlocksWithScratch(
+        mock.Env(),                //
+        0,                         //
+        0,                         //
+        1,                         //
+        payload,                   //
+        (int64_t{1} << 32) + 512,  //
+        scratch,                   //
+        static_cast<int64_t>(sizeof(BlockWriteRequest)) + (int64_t{1} << 32) +
+            512));
+    expect_no_ipc(user::WriteBlocksWithScratch(mock.Env(),  //
+                                               0,           //
+                                               0,           //
+                                               0,           //
+                                               payload,     //
+                                               512,         //
+                                               scratch,     //
+                                               sizeof(scratch)));
+    expect_no_ipc(user::WriteBlocksWithScratch(mock.Env(),  //
+                                               0,           //
+                                               0,           //
+                                               0,           //
+                                               payload,     //
+                                               1,           //
+                                               scratch,     //
+                                               sizeof(scratch)));
+    expect_no_ipc(user::WriteBlocksWithScratch(mock.Env(),  //
+                                               0,           //
+                                               0,           //
+                                               1,           //
+                                               payload,     //
+                                               0,           //
+                                               scratch,     //
+                                               sizeof(scratch)));
+    expect_no_ipc(user::WriteBlocksWithScratch(mock.Env(),  //
+                                               0,           //
+                                               0,           //
+                                               1,           //
+                                               nullptr,     //
+                                               512,         //
+                                               scratch,     //
+                                               sizeof(scratch)));
+    expect_no_ipc(user::WriteBlocksWithScratch(mock.Env(),  //
+                                               0,           //
+                                               0,           //
+                                               1,           //
+                                               nullptr,     //
+                                               1,           //
+                                               scratch,     //
+                                               sizeof(scratch)));
+    expect_no_ipc(user::WriteBlocksWithScratch(mock.Env(),  //
+                                               0,           //
+                                               0,           //
+                                               0,           //
+                                               nullptr,     //
+                                               0,           //
+                                               nullptr,     //
+                                               sizeof(scratch)));
+    expect_no_ipc(user::WriteBlocksWithScratch(mock.Env(),  //
+                                               0,           //
+                                               0,           //
+                                               1,           //
+                                               payload,     //
+                                               512,         //
+                                               nullptr,     //
+                                               sizeof(scratch)));
+    expect_no_ipc(user::WriteBlocksWithScratch(mock.Env(),  //
+                                               0,           //
+                                               0,           //
+                                               0,           //
+                                               nullptr,     //
+                                               0,           //
+                                               scratch,     //
+                                               -1));
+    expect_no_ipc(user::WriteBlocksWithScratch(mock.Env(),  //
+                                               0,           //
+                                               0,           //
+                                               0,           //
+                                               nullptr,     //
+                                               0,           //
+                                               scratch,     //
+                                               0));
+    expect_no_ipc(user::WriteBlocksWithScratch(mock.Env(),  //
+                                               0,           //
+                                               0,           //
+                                               0,           //
+                                               nullptr,     //
+                                               0,           //
+                                               scratch,     //
+                                               sizeof(BlockWriteRequest) - 1));
+    expect_no_ipc(user::WriteBlocksWithScratch(mock.Env(),  //
+                                               0,           //
+                                               0,           //
+                                               8,           //
+                                               payload,     //
+                                               4096,        //
+                                               scratch,     //
+                                               4096));
+    expect_no_ipc(
+        user::WriteBlocksWithScratch(mock.Env(),  //
+                                     0,           //
+                                     0,           //
+                                     8,           //
+                                     payload,     //
+                                     4096,        //
+                                     scratch,     //
+                                     user::kBlockWriteScratchBytes - 1));
+    expect_no_ipc(user::WriteBlocksWithScratch(
+        mock.Env(),  //
+        0,           //
+        0,           //
+        1,           //
+        payload,     //
+        512,         //
+        scratch,     //
+        static_cast<int64_t>(sizeof(BlockWriteRequest)) + 512 - 1));
+    expect_no_ipc(user::WriteBlocksWithScratch(
+        mock.Env(),  //
+        0,           //
+        0,           //
+        1,           //
+        payload,     //
+        512,         //
+        scratch,     //
+        -(int64_t{1} << 32) + static_cast<int64_t>(sizeof(BlockWriteRequest)) +
+            512));
+  }
+
+  // Valid 0-block writes send 24-byte header only (with full 64-bit LBA and
+  // 32-bit disk_index), including when `data` is non-null with `byte_count=0`.
+  {
+    FakeBlockClient mock;
+    mock.next_rc = 0;
+    const uint32_t disk_index = 0x12345678u;
+    const uint64_t lba = 0x123456789ABCDEF0ULL;
+    EXPECT_EQ(user::WriteBlocks(mock.Env(), disk_index, lba, 0, nullptr, 0), 0);
+    const BlockWriteRequest expected_req{.op = BlockRpcOp::kWrite,
+                                         .disk_index = disk_index,
+                                         .lba = lba,
+                                         .block_count = 0,
+                                         .reserved = 0};
+    EXPECT_THAT(mock.last_req, t::ElementsAreArray(ToBytes(expected_req)));
+    EXPECT_EQ(mock.last_reply_buf, nullptr);
+    EXPECT_EQ(mock.last_reply_cap, 0);
+
+    EXPECT_EQ(user::WriteBlocks(mock.Env(), disk_index, lba, 0, payload, 0), 0);
+    EXPECT_THAT(mock.last_req, t::ElementsAreArray(ToBytes(expected_req)));
+    EXPECT_EQ(mock.last_reply_buf, nullptr);
+    EXPECT_EQ(mock.last_reply_cap, 0);
+
+    const uint64_t high_lba = uint64_t{1} << 63;
+    EXPECT_EQ(
+        user::WriteBlocks(mock.Env(), disk_index, high_lba, 0, nullptr, 0), 0);
+    const BlockWriteRequest high_req{.op = BlockRpcOp::kWrite,
+                                     .disk_index = disk_index,
+                                     .lba = high_lba,
+                                     .block_count = 0,
+                                     .reserved = 0};
+    EXPECT_THAT(mock.last_req, t::ElementsAreArray(ToBytes(high_req)));
+  }
+  {
+    FakeBlockClient mock;
+    uint8_t min_scratch[sizeof(BlockWriteRequest)] = {};
+    mock.next_rc = 0;
+    const uint32_t disk_index = 0x12345678u;
+    const uint64_t lba = 0x123456789ABCDEF0ULL;
+    EXPECT_EQ(user::WriteBlocksWithScratch(mock.Env(),   //
+                                           disk_index,   //
+                                           lba,          //
+                                           0,            //
+                                           nullptr,      //
+                                           0,            //
+                                           min_scratch,  //
+                                           sizeof(min_scratch)),
+              0);
+    EXPECT_EQ(mock.last_port, kIpcPortBlock);
+    const BlockWriteRequest expected_req{.op = BlockRpcOp::kWrite,
+                                         .disk_index = disk_index,
+                                         .lba = lba,
+                                         .block_count = 0,
+                                         .reserved = 0};
+    EXPECT_THAT(mock.last_req, t::ElementsAreArray(ToBytes(expected_req)));
+    EXPECT_EQ(mock.last_reply_buf, nullptr);
+    EXPECT_EQ(mock.last_reply_cap, 0);
+
+    EXPECT_EQ(user::WriteBlocksWithScratch(mock.Env(),   //
+                                           disk_index,   //
+                                           lba,          //
+                                           0,            //
+                                           payload,      //
+                                           0,            //
+                                           min_scratch,  //
+                                           sizeof(min_scratch)),
+              0);
+    EXPECT_THAT(mock.last_req, t::ElementsAreArray(ToBytes(expected_req)));
+    EXPECT_EQ(mock.last_reply_buf, nullptr);
+    EXPECT_EQ(mock.last_reply_cap, 0);
+
+    const uint64_t high_lba = uint64_t{1} << 63;
+    EXPECT_EQ(user::WriteBlocksWithScratch(mock.Env(),   //
+                                           disk_index,   //
+                                           high_lba,     //
+                                           0,            //
+                                           nullptr,      //
+                                           0,            //
+                                           min_scratch,  //
+                                           sizeof(min_scratch)),
+              0);
+    const BlockWriteRequest high_req{.op = BlockRpcOp::kWrite,
+                                     .disk_index = disk_index,
+                                     .lba = high_lba,
+                                     .block_count = 0,
+                                     .reserved = 0};
+    EXPECT_THAT(mock.last_req, t::ElementsAreArray(ToBytes(high_req)));
+  }
+
+  for (int i = 0; i < kBlockMaxIoBytes; ++i) {
+    payload[i] = static_cast<uint8_t>((i * 29 + 7) & 0xFF);
+  }
+
+  // `WriteBlocks(block_count > 0)` 1-block and max 4096 B stack-buffer paths.
+  {
+    FakeBlockClient mock;
+    mock.next_rc = 1;
+    EXPECT_EQ(user::WriteBlocks(mock.Env(), 2, 17, 1, payload, 512), 1);
+    EXPECT_EQ(mock.calls, 1);
+    EXPECT_EQ(mock.last_port, kIpcPortBlock);
+    EXPECT_EQ(mock.last_reply_buf, nullptr);
+    EXPECT_EQ(mock.last_reply_cap, 0);
+    ASSERT_EQ(mock.last_req.size(), sizeof(BlockWriteRequest) + 512);
+    const BlockWriteRequest expected_req{.op = BlockRpcOp::kWrite,
+                                         .disk_index = 2,
+                                         .lba = 17,
+                                         .block_count = 1,
+                                         .reserved = 0};
+    EXPECT_EQ(__builtin_memcmp(mock.last_req.data(),  //
+                               &expected_req,         //
+                               sizeof(expected_req)),
+              0);
+    EXPECT_EQ(
+        __builtin_memcmp(mock.last_req.data() + sizeof(BlockWriteRequest),  //
+                         payload,                                           //
+                         512),
+        0);
+  }
+  {
+    FakeBlockClient mock;
+    mock.next_rc = 8;
+    const uint32_t disk_index = 0x12345678u;
+    const uint64_t lba = 0x123456789ABCDEF0ULL;
+    EXPECT_EQ(user::WriteBlocks(mock.Env(),  //
+                                disk_index,  //
+                                lba,         //
+                                8,           //
+                                payload,     //
+                                kBlockMaxIoBytes),
+              8);
+    EXPECT_EQ(mock.calls, 1);
+    EXPECT_EQ(mock.last_port, kIpcPortBlock);
+    EXPECT_EQ(mock.last_reply_buf, nullptr);
+    EXPECT_EQ(mock.last_reply_cap, 0);
+    ASSERT_EQ(mock.last_req.size(),
+              static_cast<size_t>(user::kBlockWriteScratchBytes));
+    const BlockWriteRequest expected_req{.op = BlockRpcOp::kWrite,
+                                         .disk_index = disk_index,
+                                         .lba = lba,
+                                         .block_count = 8,
+                                         .reserved = 0};
+    EXPECT_EQ(__builtin_memcmp(mock.last_req.data(),  //
+                               &expected_req,         //
+                               sizeof(expected_req)),
+              0);
+    EXPECT_EQ(
+        __builtin_memcmp(mock.last_req.data() + sizeof(BlockWriteRequest),  //
+                         payload,                                           //
+                         kBlockMaxIoBytes),
+        0);
+
+    mock.next_rc = 1;
+    const uint32_t msb_disk = 0x80000001u;
+    const uint64_t high_lba = 0xFEDCBA9876543210ULL;
+    EXPECT_EQ(
+        user::WriteBlocks(mock.Env(), msb_disk, high_lba, 1, payload, 512), 1);
+    const BlockWriteRequest high_req{.op = BlockRpcOp::kWrite,
+                                     .disk_index = msb_disk,
+                                     .lba = high_lba,
+                                     .block_count = 1,
+                                     .reserved = 0};
+    std::vector<uint8_t> expected_msg = ToBytes(high_req);
+    expected_msg.insert(expected_msg.end(), payload, payload + 512);
+    EXPECT_THAT(mock.last_req, t::ElementsAreArray(expected_msg));
+  }
+
+  // Disjoint, zero-copy (scratch + 24), and overlapping staging.
+  {
+    FakeBlockClient mock;
+    mock.next_rc = 1;
+    const uint32_t disk_index = 0x12345678u;
+    EXPECT_EQ(user::WriteBlocksWithScratch(mock.Env(),        //
+                                           disk_index,        //
+                                           5,                 //
+                                           1,                 //
+                                           payload,           //
+                                           kBlockMaxIoBytes,  //
+                                           scratch,           //
+                                           sizeof(scratch)),
+              1);
+    ASSERT_EQ(mock.last_req.size(),
+              static_cast<size_t>(user::kBlockWriteScratchBytes));
+    const BlockWriteRequest expected_req{.op = BlockRpcOp::kWrite,
+                                         .disk_index = disk_index,
+                                         .lba = 5,
+                                         .block_count = 1,
+                                         .reserved = 0};
+    EXPECT_EQ(__builtin_memcmp(mock.last_req.data(),  //
+                               &expected_req,         //
+                               sizeof(expected_req)),
+              0);
+    EXPECT_EQ(
+        __builtin_memcmp(mock.last_req.data() + sizeof(BlockWriteRequest),  //
+                         payload,                                           //
+                         kBlockMaxIoBytes),
+        0);
+
+    const uint32_t msb_disk = 0x80000001u;
+    const uint64_t high_lba = 0xFEDCBA9876543210ULL;
+    EXPECT_EQ(user::WriteBlocksWithScratch(mock.Env(),  //
+                                           msb_disk,    //
+                                           high_lba,    //
+                                           1,           //
+                                           payload,     //
+                                           512,         //
+                                           scratch,     //
+                                           sizeof(scratch)),
+              1);
+    const BlockWriteRequest high_req{.op = BlockRpcOp::kWrite,
+                                     .disk_index = msb_disk,
+                                     .lba = high_lba,
+                                     .block_count = 1,
+                                     .reserved = 0};
+    std::vector<uint8_t> expected_msg = ToBytes(high_req);
+    expected_msg.insert(expected_msg.end(), payload, payload + 512);
+    EXPECT_THAT(mock.last_req, t::ElementsAreArray(expected_msg));
+  }
+  {
+    FakeBlockClient mock;
+    mock.next_rc = 2;
+    __builtin_memcpy(scratch + sizeof(BlockWriteRequest), payload, 1024);
+    EXPECT_EQ(
+        user::WriteBlocksWithScratch(mock.Env(),                           //
+                                     0,                                    //
+                                     10,                                   //
+                                     2,                                    //
+                                     scratch + sizeof(BlockWriteRequest),  //
+                                     1024,                                 //
+                                     scratch,                              //
+                                     sizeof(scratch)),
+        2);
+    ASSERT_EQ(mock.last_req.size(), sizeof(BlockWriteRequest) + 1024);
+    const BlockWriteRequest expected_req{.op = BlockRpcOp::kWrite,
+                                         .disk_index = 0,
+                                         .lba = 10,
+                                         .block_count = 2,
+                                         .reserved = 0};
+    EXPECT_EQ(__builtin_memcmp(mock.last_req.data(),  //
+                               &expected_req,         //
+                               sizeof(expected_req)),
+              0);
+    EXPECT_EQ(
+        __builtin_memcmp(mock.last_req.data() + sizeof(BlockWriteRequest),  //
+                         payload,                                           //
+                         1024),
+        0);
+  }
+  {
+    FakeBlockClient mock;
+    mock.next_rc = 1;
+    __builtin_memcpy(scratch, payload, 512);
+    EXPECT_EQ(user::WriteBlocksWithScratch(mock.Env(),  //
+                                           0,           //
+                                           11,          //
+                                           1,           //
+                                           scratch,     //
+                                           512,         //
+                                           scratch,     //
+                                           sizeof(scratch)),
+              1);
+    ASSERT_EQ(mock.last_req.size(), sizeof(BlockWriteRequest) + 512);
+    const BlockWriteRequest expected_req{.op = BlockRpcOp::kWrite,
+                                         .disk_index = 0,
+                                         .lba = 11,
+                                         .block_count = 1,
+                                         .reserved = 0};
+    EXPECT_EQ(__builtin_memcmp(mock.last_req.data(),  //
+                               &expected_req,         //
+                               sizeof(expected_req)),
+              0);
+    EXPECT_EQ(
+        __builtin_memcmp(mock.last_req.data() + sizeof(BlockWriteRequest),  //
+                         payload,                                           //
+                         512),
+        0);
+  }
+
+  // Rightward overlaps (`d < s`: `scratch + 40`, `scratch + 25`) and partial
+  // header-straddling overlap (`scratch + 12`).
+  for (const int offset : {40, 25, 12}) {
+    FakeBlockClient mock;
+    mock.next_rc = 1;
+    __builtin_memcpy(scratch + offset, payload, 512);
+    const uint64_t lba = static_cast<uint64_t>(offset);
+    EXPECT_EQ(user::WriteBlocksWithScratch(mock.Env(),        //
+                                           0,                 //
+                                           lba,               //
+                                           1,                 //
+                                           scratch + offset,  //
+                                           512,               //
+                                           scratch,           //
+                                           sizeof(scratch)),
+              1)
+        << "offset=" << offset;
+    ASSERT_EQ(mock.last_req.size(), sizeof(BlockWriteRequest) + 512);
+    const BlockWriteRequest expected_req{.op = BlockRpcOp::kWrite,
+                                         .disk_index = 0,
+                                         .lba = lba,
+                                         .block_count = 1,
+                                         .reserved = 0};
+    EXPECT_EQ(__builtin_memcmp(mock.last_req.data(),  //
+                               &expected_req,         //
+                               sizeof(expected_req)),
+              0);
+    EXPECT_EQ(
+        __builtin_memcmp(mock.last_req.data() + sizeof(BlockWriteRequest),  //
+                         payload,                                           //
+                         512),
+        0);
+  }
+
+  // Exact-fit small scratch buffer (`sizeof(BlockWriteRequest) + 512 == 536`
+  // bytes < `kBlockWriteScratchBytes`) and 64-bit `scratch_cap` succeed, while
+  // `535` fails before IPC.
+  {
+    FakeBlockClient mock;
+    uint8_t small_scratch[sizeof(BlockWriteRequest) + 512] = {};
+    const int64_t exact_cap = static_cast<int64_t>(sizeof(small_scratch));
+    mock.next_rc = 1;
+    EXPECT_EQ(user::WriteBlocksWithScratch(mock.Env(),     //
+                                           0,              //
+                                           13,             //
+                                           1,              //
+                                           payload,        //
+                                           512,            //
+                                           small_scratch,  //
+                                           exact_cap - 1),
+              kSyscallErrorInvalid);
+    EXPECT_EQ(mock.calls, 0);
+    EXPECT_EQ(user::WriteBlocksWithScratch(mock.Env(),     //
+                                           0,              //
+                                           13,             //
+                                           1,              //
+                                           payload,        //
+                                           512,            //
+                                           small_scratch,  //
+                                           exact_cap),
+              1);
+    EXPECT_EQ(mock.calls, 1);
+    EXPECT_EQ(mock.last_port, kIpcPortBlock);
+    const BlockWriteRequest expected_req{.op = BlockRpcOp::kWrite,
+                                         .disk_index = 0,
+                                         .lba = 13,
+                                         .block_count = 1,
+                                         .reserved = 0};
+    std::vector<uint8_t> expected_msg = ToBytes(expected_req);
+    expected_msg.insert(expected_msg.end(), payload, payload + 512);
+    EXPECT_THAT(mock.last_req, t::ElementsAreArray(expected_msg));
+
+    EXPECT_EQ(user::WriteBlocksWithScratch(mock.Env(),  //
+                                           0,           //
+                                           13,          //
+                                           1,           //
+                                           payload,     //
+                                           512,         //
+                                           scratch,     //
+                                           int64_t{1} << 32),
+              1);
+    EXPECT_EQ(mock.calls, 2);
+  }
+
+  // Non-sector-multiple `byte_count` (511 B) passes through to the server so
+  // server-side rejection tests keep working.
+  {
+    FakeBlockClient mock;
+    mock.next_rc = kSyscallErrorInvalid;
+    EXPECT_EQ(user::WriteBlocks(mock.Env(), 0, 0, 1, payload, 511),
+              kSyscallErrorInvalid);
+    EXPECT_EQ(mock.calls, 1);
+    EXPECT_EQ(mock.last_req.size(), sizeof(BlockWriteRequest) + 511);
+    EXPECT_EQ(user::WriteBlocksWithScratch(mock.Env(),  //
+                                           0,           //
+                                           0,           //
+                                           1,           //
+                                           payload,     //
+                                           511,         //
+                                           scratch,     //
+                                           sizeof(scratch)),
+              kSyscallErrorInvalid);
+    EXPECT_EQ(mock.calls, 2);
+    EXPECT_EQ(mock.last_req.size(), sizeof(BlockWriteRequest) + 511);
+
+    const BlockWriteRequest expected_wide_cnt_req{.op = BlockRpcOp::kWrite,
+                                                  .disk_index = 0,
+                                                  .lba = 0,
+                                                  .block_count = 0x1020304,
+                                                  .reserved = 0};
+    std::vector<uint8_t> expected_msg = ToBytes(expected_wide_cnt_req);
+    expected_msg.insert(expected_msg.end(), payload, payload + 512);
+    EXPECT_EQ(user::WriteBlocks(mock.Env(), 0, 0, 0x1020304, payload, 512),
+              kSyscallErrorInvalid);
+    EXPECT_EQ(mock.calls, 3);
+    EXPECT_THAT(mock.last_req, t::ElementsAreArray(expected_msg));
+    EXPECT_EQ(user::WriteBlocksWithScratch(mock.Env(),  //
+                                           0,           //
+                                           0,           //
+                                           0x1020304,   //
+                                           payload,     //
+                                           512,         //
+                                           scratch,     //
+                                           sizeof(scratch)),
+              kSyscallErrorInvalid);
+    EXPECT_EQ(mock.calls, 4);
+    EXPECT_THAT(mock.last_req, t::ElementsAreArray(expected_msg));
+  }
+
+  // Server mismatch/non-empty reply fail with Io, while negative errors pass.
+  {
+    FakeBlockClient mock;
+    mock.next_rc = 2;
+    EXPECT_EQ(user::WriteBlocks(mock.Env(), 0, 0, 1, payload, 512),
+              kSyscallErrorIo);
+    mock.next_rc = (int64_t{1} << 32) + 1;
+    EXPECT_EQ(user::WriteBlocks(mock.Env(), 0, 0, 1, payload, 512),
+              kSyscallErrorIo);
+    mock.next_rc = int64_t{1} << 31;
+    EXPECT_EQ(user::WriteBlocks(mock.Env(), 0, 0, 1, payload, 512),
+              kSyscallErrorIo);
+    mock.next_rc = 1;
+    mock.override_reply_size = 4;
+    EXPECT_EQ(user::WriteBlocks(mock.Env(), 0, 0, 1, payload, 512),
+              kSyscallErrorIo);
+    mock.override_reply_size = 1;
+    EXPECT_EQ(user::WriteBlocks(mock.Env(), 0, 0, 1, payload, 512),
+              kSyscallErrorIo);
+    mock.override_reply_size = -1;
+    EXPECT_EQ(user::WriteBlocks(mock.Env(), 0, 0, 1, payload, 512),
+              kSyscallErrorIo);
+    mock.override_reply_size = int64_t{1} << 32;
+    EXPECT_EQ(user::WriteBlocks(mock.Env(), 0, 0, 1, payload, 512),
+              kSyscallErrorIo);
+    mock.override_reply_size = -(int64_t{1} << 32);
+    EXPECT_EQ(user::WriteBlocks(mock.Env(), 0, 0, 1, payload, 512),
+              kSyscallErrorIo);
+    mock.override_reply_size.reset();
+    mock.next_rc = kSyscallErrorPermission;
+    EXPECT_EQ(user::WriteBlocks(mock.Env(), 0, 0, 1, payload, 512),
+              kSyscallErrorPermission);
+    mock.next_rc = kSyscallErrorNoDevice;
+    EXPECT_EQ(user::WriteBlocks(mock.Env(), 0, 0, 0, nullptr, 0),
+              kSyscallErrorNoDevice);
+
+    // Direct `WriteBlocksWithScratch` reply checks (status mismatch, non-zero
+    // and negative `reply_size`, 0-block errors, negative error propagation).
+    mock.next_rc = 2;
+    EXPECT_EQ(user::WriteBlocksWithScratch(mock.Env(),  //
+                                           0,           //
+                                           0,           //
+                                           1,           //
+                                           payload,     //
+                                           512,         //
+                                           scratch,     //
+                                           sizeof(scratch)),
+              kSyscallErrorIo);
+    mock.next_rc = 0;
+    EXPECT_EQ(user::WriteBlocksWithScratch(mock.Env(),  //
+                                           0,           //
+                                           0,           //
+                                           1,           //
+                                           payload,     //
+                                           512,         //
+                                           scratch,     //
+                                           sizeof(scratch)),
+              kSyscallErrorIo);
+    mock.next_rc = (int64_t{1} << 32) + 1;
+    EXPECT_EQ(user::WriteBlocksWithScratch(mock.Env(),  //
+                                           0,           //
+                                           0,           //
+                                           1,           //
+                                           payload,     //
+                                           512,         //
+                                           scratch,     //
+                                           sizeof(scratch)),
+              kSyscallErrorIo);
+    mock.next_rc = int64_t{1} << 31;
+    EXPECT_EQ(user::WriteBlocksWithScratch(mock.Env(),  //
+                                           0,           //
+                                           0,           //
+                                           1,           //
+                                           payload,     //
+                                           512,         //
+                                           scratch,     //
+                                           sizeof(scratch)),
+              kSyscallErrorIo);
+    mock.next_rc = 1;
+    mock.override_reply_size = 4;
+    EXPECT_EQ(user::WriteBlocksWithScratch(mock.Env(),  //
+                                           0,           //
+                                           0,           //
+                                           1,           //
+                                           payload,     //
+                                           512,         //
+                                           scratch,     //
+                                           sizeof(scratch)),
+              kSyscallErrorIo);
+    mock.override_reply_size = 1;
+    EXPECT_EQ(user::WriteBlocksWithScratch(mock.Env(),  //
+                                           0,           //
+                                           0,           //
+                                           1,           //
+                                           payload,     //
+                                           512,         //
+                                           scratch,     //
+                                           sizeof(scratch)),
+              kSyscallErrorIo);
+    mock.override_reply_size = -1;
+    EXPECT_EQ(user::WriteBlocksWithScratch(mock.Env(),  //
+                                           0,           //
+                                           0,           //
+                                           1,           //
+                                           payload,     //
+                                           512,         //
+                                           scratch,     //
+                                           sizeof(scratch)),
+              kSyscallErrorIo);
+    mock.override_reply_size = int64_t{1} << 32;
+    EXPECT_EQ(user::WriteBlocksWithScratch(mock.Env(),  //
+                                           0,           //
+                                           0,           //
+                                           1,           //
+                                           payload,     //
+                                           512,         //
+                                           scratch,     //
+                                           sizeof(scratch)),
+              kSyscallErrorIo);
+    mock.override_reply_size = -(int64_t{1} << 32);
+    EXPECT_EQ(user::WriteBlocksWithScratch(mock.Env(),  //
+                                           0,           //
+                                           0,           //
+                                           1,           //
+                                           payload,     //
+                                           512,         //
+                                           scratch,     //
+                                           sizeof(scratch)),
+              kSyscallErrorIo);
+    mock.override_reply_size.reset();
+    mock.next_rc = 1;
+    EXPECT_EQ(user::WriteBlocksWithScratch(mock.Env(),  //
+                                           0,           //
+                                           0,           //
+                                           0,           //
+                                           nullptr,     //
+                                           0,           //
+                                           scratch,     //
+                                           sizeof(scratch)),
+              kSyscallErrorIo);
+    mock.next_rc = int64_t{1} << 32;
+    EXPECT_EQ(user::WriteBlocksWithScratch(mock.Env(),  //
+                                           0,           //
+                                           0,           //
+                                           0,           //
+                                           nullptr,     //
+                                           0,           //
+                                           scratch,     //
+                                           sizeof(scratch)),
+              kSyscallErrorIo);
+    mock.next_rc = 0;
+    mock.override_reply_size = 4;
+    EXPECT_EQ(user::WriteBlocksWithScratch(mock.Env(),  //
+                                           0,           //
+                                           0,           //
+                                           0,           //
+                                           nullptr,     //
+                                           0,           //
+                                           scratch,     //
+                                           sizeof(scratch)),
+              kSyscallErrorIo);
+    mock.override_reply_size = 1;
+    EXPECT_EQ(user::WriteBlocksWithScratch(mock.Env(),  //
+                                           0,           //
+                                           0,           //
+                                           0,           //
+                                           nullptr,     //
+                                           0,           //
+                                           scratch,     //
+                                           sizeof(scratch)),
+              kSyscallErrorIo);
+    mock.override_reply_size = -1;
+    EXPECT_EQ(user::WriteBlocksWithScratch(mock.Env(),  //
+                                           0,           //
+                                           0,           //
+                                           0,           //
+                                           nullptr,     //
+                                           0,           //
+                                           scratch,     //
+                                           sizeof(scratch)),
+              kSyscallErrorIo);
+    mock.override_reply_size = int64_t{1} << 32;
+    EXPECT_EQ(user::WriteBlocksWithScratch(mock.Env(),  //
+                                           0,           //
+                                           0,           //
+                                           0,           //
+                                           nullptr,     //
+                                           0,           //
+                                           scratch,     //
+                                           sizeof(scratch)),
+              kSyscallErrorIo);
+    mock.override_reply_size = -(int64_t{1} << 32);
+    EXPECT_EQ(user::WriteBlocksWithScratch(mock.Env(),  //
+                                           0,           //
+                                           0,           //
+                                           0,           //
+                                           nullptr,     //
+                                           0,           //
+                                           scratch,     //
+                                           sizeof(scratch)),
+              kSyscallErrorIo);
+    mock.override_reply_size.reset();
+    mock.next_rc = kSyscallErrorPermission;
+    EXPECT_EQ(user::WriteBlocksWithScratch(mock.Env(),  //
+                                           0,           //
+                                           0,           //
+                                           1,           //
+                                           payload,     //
+                                           512,         //
+                                           scratch,     //
+                                           sizeof(scratch)),
+              kSyscallErrorPermission);
+    mock.next_rc = kSyscallErrorNoDevice;
+    EXPECT_EQ(user::WriteBlocksWithScratch(mock.Env(),  //
+                                           0,           //
+                                           0,           //
+                                           0,           //
+                                           nullptr,     //
+                                           0,           //
+                                           scratch,     //
+                                           sizeof(scratch)),
+              kSyscallErrorNoDevice);
+  }
+}
+
+TEST(SyscallAbiTest, BlockClientFlushDiskNormalizesPositiveAndNonEmptyReplies) {
+  {
+    const user::BlockClientEnv null_env{};
+    EXPECT_EQ(user::FlushDisk(null_env, 0), kSyscallErrorInvalid);
+  }
+  {
+    FakeBlockClient mock;
+    mock.next_rc = 0;
+    EXPECT_EQ(user::FlushDisk(mock.Env(), 2), 0);
+    EXPECT_EQ(mock.last_port, kIpcPortBlock);
+    const BlockFlushRequest expected_req{.op = BlockRpcOp::kFlush,
+                                         .disk_index = 2};
+    EXPECT_THAT(mock.last_req, t::ElementsAreArray(ToBytes(expected_req)));
+    EXPECT_EQ(mock.last_reply_buf, nullptr);
+    EXPECT_EQ(mock.last_reply_cap, 0);
+
+    const uint32_t wide_disk_index = 0x12345678u;
+    EXPECT_EQ(user::FlushDisk(mock.Env(), wide_disk_index), 0);
+    const BlockFlushRequest wide_req{.op = BlockRpcOp::kFlush,
+                                     .disk_index = wide_disk_index};
+    EXPECT_THAT(mock.last_req, t::ElementsAreArray(ToBytes(wide_req)));
+    const uint32_t msb_disk = 0x80000001u;
+    EXPECT_EQ(user::FlushDisk(mock.Env(), msb_disk), 0);
+    const BlockFlushRequest msb_req{.op = BlockRpcOp::kFlush,
+                                    .disk_index = msb_disk};
+    EXPECT_THAT(mock.last_req, t::ElementsAreArray(ToBytes(msb_req)));
+
+    mock.next_rc = kSyscallErrorNoDevice;
+    EXPECT_EQ(user::FlushDisk(mock.Env(), 2), kSyscallErrorNoDevice);
+    mock.next_rc = kSyscallErrorPermission;
+    EXPECT_EQ(user::FlushDisk(mock.Env(), 2), kSyscallErrorPermission);
+
+    mock.next_rc = 1;
+    EXPECT_EQ(user::FlushDisk(mock.Env(), 2), kSyscallErrorIo);
+    mock.next_rc = 42;
+    EXPECT_EQ(user::FlushDisk(mock.Env(), 2), kSyscallErrorIo);
+    mock.next_rc = int64_t{1} << 32;
+    EXPECT_EQ(user::FlushDisk(mock.Env(), 2), kSyscallErrorIo);
+    mock.next_rc = int64_t{1} << 31;
+    EXPECT_EQ(user::FlushDisk(mock.Env(), 2), kSyscallErrorIo);
+
+    mock.next_rc = 0;
+    mock.override_reply_size = 8;
+    EXPECT_EQ(user::FlushDisk(mock.Env(), 2), kSyscallErrorIo);
+    mock.override_reply_size = 1;
+    EXPECT_EQ(user::FlushDisk(mock.Env(), 2), kSyscallErrorIo);
+    mock.override_reply_size = -1;
+    EXPECT_EQ(user::FlushDisk(mock.Env(), 2), kSyscallErrorIo);
+    mock.override_reply_size = int64_t{1} << 32;
+    EXPECT_EQ(user::FlushDisk(mock.Env(), 2), kSyscallErrorIo);
+    mock.override_reply_size = -(int64_t{1} << 32);
+    EXPECT_EQ(user::FlushDisk(mock.Env(), 2), kSyscallErrorIo);
+    mock.override_reply_size.reset();
+  }
 }
 
 }  // namespace

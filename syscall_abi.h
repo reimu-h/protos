@@ -35,9 +35,9 @@ enum class UserProgramOutcome : uint8_t {
   kLoadFailed = 3,
 };
 
-// How a user program ended, as Wait() writes it to user memory. It has no
-// implicit padding, which would carry stale kernel bytes to user space: the
-// gaps are reserved fields, which are always zero (see the static_asserts
+// How a user program ended, as Wait() and TryWait() write it to user memory. It
+// has no implicit padding, which would carry stale kernel bytes to user space:
+// the gaps are reserved fields, which are always zero (see the static_asserts
 // below).
 struct UserProgramResult {
   UserProgramOutcome outcome = UserProgramOutcome::kLoadFailed;
@@ -153,14 +153,15 @@ enum class IpcMessageKind : uint32_t {
   kCall = 1,
   // Notification that client process `client_id` ended after the server had
   // received one of its calls (on `kIpcPortFs`: while it may have had files
-  // open), so that the server can drop what it keeps for the client. `token`,
-  // `size` and `reply_cap` are 0, and the server doesn't reply. It comes before
-  // the calls that are queued when it is posted. A process makes one call at a
-  // time, and if it ends in the middle of one, the kernel cancels the call
-  // before it posts the notification. So a call of `client_id` that the server
-  // has received and not answered yet when the notification comes was
-  // canceled: `IpcReply()` drops its reply, and a server that answers calls
-  // out of order should drop what it keeps for that call too.
+  // open; and on `kIpcPortBlock` or user ports), so that the server can drop
+  // what it keeps for the client. `token`, `size` and `reply_cap` are 0, and
+  // the server doesn't reply. It comes before the calls that are queued when it
+  // is posted. A process makes one call at a time, and if it ends in the middle
+  // of one, the kernel cancels the call before it posts the notification. So a
+  // call of `client_id` that the server has received and not answered yet when
+  // the notification comes was canceled: `IpcReply()` drops its reply, and a
+  // server that answers calls out of order should drop what it keeps for that
+  // call too.
   kClientDisconnect = 2,
 };
 
@@ -410,10 +411,11 @@ constexpr int64_t kSyscallIsaIrqAlloc = 19;
 // then receives the port's calls with IpcRecv() and answers them with
 // IpcReply() until it ends, and returns 0 (also if the caller already owns
 // `port`). Fails with `kSyscallErrorInvalid` unless
-// `0 <= port < kIpcPortCount`, with `kSyscallErrorPermission` if `port` is
-// `kIpcPortFs` and the caller lacks `kUserCapDriver`, with `kSyscallErrorBusy`
-// if another process owns `port`, and with `kSyscallErrorNoMemory` if the
-// kernel can't allocate the caller's receive buffer.
+// `0 <= port < kIpcPortCount`, with `kSyscallErrorPermission` if `port`
+// requires `kUserCapDriver` (`IpcPortRequiresDriverCap(port)`: `kIpcPortFs` or
+// `kIpcPortBlock`) and the caller lacks it, with `kSyscallErrorBusy` if another
+// process owns `port`, and with `kSyscallErrorNoMemory` if the kernel can't
+// allocate the caller's receive buffer.
 constexpr int64_t kSyscallIpcListen = 20;
 // IpcRecv(port, buf, buf_cap, out_msg, timeout_ticks): receives the next
 // message on port `port` (rdi), which the caller owns: a pending client
@@ -625,9 +627,19 @@ constexpr int64_t kSyscallBootModuleRead = 36;
 // user-space ELF executable (elf.h, user_mode.h) or ends before its segments
 // do; and with `kSyscallErrorNoMemory` if memory or tasks run out.
 constexpr int64_t kSyscallSpawnFile = 37;
+// TryWait(pid, result): non-blocking poll of child process `pid` (rdi) of the
+// calling process. If `pid` has ended, writes its `UserProgramResult` to
+// `result` (rsi), reclaims the child slot, and returns 1. If `pid` is still
+// running, leaves `result` and the child slot untouched and returns 0. Fails
+// with `kSyscallErrorInvalid` unless `1 <= pid <= kMaxUserChildProcesses` and
+// `pid` names an active child of the calling process, and with
+// `kSyscallErrorFault` (before inspecting child state, without reclaiming the
+// child slot) if user code may not write `sizeof(UserProgramResult)` bytes at
+// `result`.
+constexpr int64_t kSyscallTryWait = 38;
 
 // Total number of defined system calls (`0 .. kSyscallCount - 1`).
-constexpr int64_t kSyscallCount = 38;
+constexpr int64_t kSyscallCount = 39;
 
 // The most bytes that one Write() writes.
 constexpr int64_t kSyscallWriteMaxSize = 4096;
@@ -673,10 +685,17 @@ constexpr int64_t kSyscallPortIoWrite8 = 1;
 // IPC ports and limits (`IpcListen()`, `IpcRecv()`, `IpcReply()`,
 // `IpcCall()`). Port `kIpcPortFs` belongs to the filesystem server: only
 // `kUserCapDriver` processes may claim it, and only the kernel's filesystem
-// system calls call it. Any process may claim and call the other ports.
+// system calls call it. Port `kIpcPortBlock` belongs to the block storage
+// driver (such as `nvme`): only `kUserCapDriver` processes may claim it, while
+// any process may call it (block_protocol.h). Any process may claim and call
+// the other ports (`kIpcFirstUserPort .. kIpcPortCount - 1`).
 constexpr int kIpcPortFs = 0;
-constexpr int kIpcFirstUserPort = 1;
+constexpr int kIpcPortBlock = 1;
+constexpr int kIpcFirstUserPort = 2;
 constexpr int kIpcPortCount = 16;
+static_assert(kIpcPortFs >= 0 && kIpcPortFs < kIpcFirstUserPort);
+static_assert(kIpcPortBlock >= 0 && kIpcPortBlock < kIpcFirstUserPort);
+static_assert(kIpcFirstUserPort <= kIpcPortCount);
 // The longest request or reply: room for the longest filesystem request, an
 // `FsWriteRequest` followed by `kSyscallFsMaxIoSize` data bytes
 // (fs_protocol.h), and some to spare.
@@ -757,8 +776,8 @@ constexpr uint64_t kUserCapSpawnDrivers = 1ULL << 1;
 
 // Bit flags in `init`'s `arg` (`rdi` at entry):
 // - `kInitArgStartDrivers`: spawn user-space hardware drivers (`usbkbd`,
-//   `ps2kbd`) AND the user-space filesystem server (`ramfs`) via `SpawnDriver`
-//   before starting the shell.
+//   `ps2kbd`, `nvme`) AND the user-space filesystem server (`ramfs`) via
+//   `SpawnDriver` before starting the shell.
 // - `kInitArgStartFs`: spawn `ramfs` via `SpawnDriver` before starting the
 //   shell even when hardware drivers are omitted (for isolated tests).
 // - `kInitArgEmptyFs`: start `ramfs` with `kRamfsArgEmpty`, so that the
@@ -819,6 +838,22 @@ constexpr bool MayMakeSyscall(const uint64_t capabilities,
     return (capabilities & kUserCapSpawnDrivers) != 0;
   }
   if (SyscallIsDriverOnly(number)) {
+    return (capabilities & kUserCapDriver) != 0;
+  }
+  return true;
+}
+
+// True if IPC port `port` requires `kUserCapDriver` to claim via
+// `IpcListen()` (`kIpcPortFs` or `kIpcPortBlock`).
+constexpr bool IpcPortRequiresDriverCap(const int64_t port) {
+  return port == kIpcPortFs || port == kIpcPortBlock;
+}
+
+// True if a process with `capabilities` may claim IPC port `port` via
+// `IpcListen()` (before per-port range validation).
+constexpr bool MayListenOnIpcPort(const uint64_t capabilities,
+                                  const int64_t port) {
+  if (IpcPortRequiresDriverCap(port)) {
     return (capabilities & kUserCapDriver) != 0;
   }
   return true;

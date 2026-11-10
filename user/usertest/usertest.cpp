@@ -6,7 +6,10 @@
 #include <cstddef>
 #include <cstdint>
 
+#include "block_protocol.h"
 #include "syscall_abi.h"
+#include "user/block.h"
+#include "user/nvme/nvme_regs.h"
 #include "user/ramfs/boot_module_source.h"
 #include "user/ramfs/tar.h"
 #include "user/syscall.h"
@@ -802,6 +805,15 @@ static int64_t RunSyscallChecks() {
       Wait(-1).status() != kSyscallErrorInvalid ||
       Wait(kMaxUserChildProcesses + 1).status() != kSyscallErrorInvalid ||
       Wait(1).status() != kSyscallErrorInvalid) {
+    return check;
+  }
+  ++check;
+  UserProgramResult try_wait_res{};
+  if (TryWait(0, &try_wait_res) != kSyscallErrorInvalid ||
+      TryWait(-1, &try_wait_res) != kSyscallErrorInvalid ||
+      TryWait(kMaxUserChildProcesses + 1, &try_wait_res) !=
+          kSyscallErrorInvalid ||
+      TryWait(1, &try_wait_res) != kSyscallErrorInvalid) {
     return check;
   }
   ++check;
@@ -1776,10 +1788,16 @@ static int64_t RunSpawnAndWait(const usertest::SpawnTestSubmode submode) {
     return check;
   }
   ++check;
+  UserProgramResult try_wait_res{};
   if (Wait(0).status() != kSyscallErrorInvalid ||
       Wait(-1).status() != kSyscallErrorInvalid ||
       Wait(kMaxUserChildProcesses + 1).status() != kSyscallErrorInvalid ||
-      Wait(1).status() != kSyscallErrorInvalid) {
+      Wait(1).status() != kSyscallErrorInvalid ||
+      TryWait(0, &try_wait_res) != kSyscallErrorInvalid ||
+      TryWait(-1, &try_wait_res) != kSyscallErrorInvalid ||
+      TryWait(kMaxUserChildProcesses + 1, &try_wait_res) !=
+          kSyscallErrorInvalid ||
+      TryWait(1, &try_wait_res) != kSyscallErrorInvalid) {
     return check;
   }
   ++check;
@@ -1864,6 +1882,150 @@ static int64_t RunSpawnAndWait(const usertest::SpawnTestSubmode submode) {
       return check;
     }
   }
+  ++check;
+  // COV-07 Points 3-7: live ring-3 TryWait matrix (running Fault without reap,
+  // running -> 0 with sentinel untouched + slot held, ended -> 1 + slot freed,
+  // already-reaped -> Invalid, ended Fault pre-check without reap -> 1).
+  const int64_t spin_pid =
+      Spawn("usertest", usertest::KernelSpinArg(100, 1, 0x42));
+  if (spin_pid < 1 || spin_pid > kMaxUserChildProcesses) {
+    return check;
+  }
+  ++check;
+  const uint64_t spin_pid_u = static_cast<uint64_t>(spin_pid);
+  const uintptr_t ro_addr = reinterpret_cast<uintptr_t>(&kReadOnlyWord);
+  const uintptr_t text_addr =
+      reinterpret_cast<uintptr_t>(&SyscallChangedRegisterBits);
+  if (Syscall(kSyscallTryWait, spin_pid_u, 0) != kSyscallErrorFault ||
+      Syscall(kSyscallTryWait, spin_pid_u, usertest::kKernelAddress) !=
+          kSyscallErrorFault ||
+      Syscall(kSyscallTryWait, spin_pid_u, kNonCanonicalAddress) !=
+          kSyscallErrorFault ||
+      Syscall(kSyscallTryWait, spin_pid_u, kUnmappedUserAddress) !=
+          kSyscallErrorFault ||
+      Syscall(kSyscallTryWait, spin_pid_u, ro_addr) != kSyscallErrorFault ||
+      Syscall(kSyscallTryWait, spin_pid_u, text_addr) != kSyscallErrorFault ||
+      Syscall(kSyscallTryWait, spin_pid_u, kStackGuardPage) !=
+          kSyscallErrorFault ||
+      Syscall(kSyscallTryWait, spin_pid_u, usertest::kStackTop - 4) !=
+          kSyscallErrorFault) {
+    return check;
+  }
+  ++check;
+  UserProgramResult tw_res{};
+  uint8_t* const tw_bytes = reinterpret_cast<uint8_t*>(&tw_res);
+  constexpr int kResultBytes = static_cast<int>(sizeof(tw_res));
+  for (int i = 0; i < kResultBytes; ++i) {
+    tw_bytes[i] = 0xA5;
+  }
+  if (TryWait(spin_pid, &tw_res) != 0) {
+    return check;
+  }
+  for (int i = 0; i < kResultBytes; ++i) {
+    if (tw_bytes[i] != 0xA5) {
+      return check;
+    }
+  }
+  ++check;
+  // Remaining kMaxUserChildProcesses - 1 slots prove spin_pid still occupies
+  // its child slot.
+  int64_t extra_pids[kMaxUserChildProcesses - 1] = {};
+  for (int i = 0; i < kMaxUserChildProcesses - 1; ++i) {
+    extra_pids[i] = Spawn("usertest", usertest::Arg(Mode::kExit));
+    if (extra_pids[i] < 1 || extra_pids[i] > kMaxUserChildProcesses) {
+      return check;
+    }
+  }
+  if (Spawn("usertest", usertest::Arg(Mode::kExit)) != kSyscallErrorInvalid) {
+    return check;
+  }
+  for (int i = 0; i < kMaxUserChildProcesses - 1; ++i) {
+    const StatusOr<UserProgramResult> r = Wait(extra_pids[i]);
+    if (!r.ok() || r->outcome != UserProgramOutcome::kExited ||
+        r->exit_status != usertest::kExitStatus) {
+      return check;
+    }
+  }
+  ++check;
+  int64_t tw_rc = 0;
+  for (int poll = 0; poll < 5000; ++poll) {
+    tw_rc = TryWait(spin_pid, &tw_res);
+    if (tw_rc != 0) {
+      break;
+    }
+    (void)SpinOnBuffer(nullptr, 0, 1);
+  }
+  if (tw_rc != 1 || tw_res.outcome != UserProgramOutcome::kExited ||
+      tw_res.exit_status != 0) {
+    return check;
+  }
+  if (TryWait(spin_pid, &tw_res) != kSyscallErrorInvalid) {
+    return check;
+  }
+  ++check;
+  const int64_t ud_tw_pid =
+      Spawn("usertest", usertest::Arg(Mode::kInvalidOpcode));
+  if (ud_tw_pid < 1 || ud_tw_pid > kMaxUserChildProcesses) {
+    return check;
+  }
+  tw_rc = 0;
+  for (int poll = 0; poll < 5000; ++poll) {
+    tw_rc = TryWait(ud_tw_pid, &tw_res);
+    if (tw_rc != 0) {
+      break;
+    }
+    (void)SpinOnBuffer(nullptr, 0, 1);
+  }
+  if (tw_rc != 1 || tw_res.outcome != UserProgramOutcome::kFaulted ||
+      tw_res.fault_vector != 6 ||
+      TryWait(ud_tw_pid, &tw_res) != kSyscallErrorInvalid) {
+    return check;
+  }
+  ++check;
+  // Re-allocate all kMaxUserChildProcesses slots to verify spin_pid and
+  // ud_tw_pid freed their slots cleanly.
+  for (int i = 0; i < kMaxUserChildProcesses; ++i) {
+    pids[i] = Spawn("usertest", usertest::Arg(Mode::kExit));
+    if (pids[i] < 1 || pids[i] > kMaxUserChildProcesses) {
+      return check;
+    }
+  }
+  for (int i = 0; i < kMaxUserChildProcesses; ++i) {
+    if (!Wait(pids[i]).ok()) {
+      return check;
+    }
+  }
+  ++check;
+  // Point 7: non-writable out_result on an ALREADY-ENDED child must fail with
+  // kSyscallErrorFault before HasEnded()/ReapChild() and leave the child
+  // reapable afterward.
+  const int64_t ended_pid = Spawn("usertest", usertest::Arg(Mode::kExit));
+  if (ended_pid < 1 || ended_pid > kMaxUserChildProcesses) {
+    return check;
+  }
+  (void)SpinOnBuffer(nullptr, 0, 25);
+  const uint64_t ended_pid_u = static_cast<uint64_t>(ended_pid);
+  if (Syscall(kSyscallTryWait, ended_pid_u, 0) != kSyscallErrorFault ||
+      Syscall(kSyscallTryWait, ended_pid_u, usertest::kKernelAddress) !=
+          kSyscallErrorFault ||
+      Syscall(kSyscallTryWait, ended_pid_u, kUnmappedUserAddress) !=
+          kSyscallErrorFault ||
+      Syscall(kSyscallTryWait, ended_pid_u, ro_addr) != kSyscallErrorFault) {
+    return check;
+  }
+  tw_rc = 0;
+  for (int poll = 0; poll < 5000; ++poll) {
+    tw_rc = TryWait(ended_pid, &tw_res);
+    if (tw_rc != 0) {
+      break;
+    }
+    (void)SpinOnBuffer(nullptr, 0, 1);
+  }
+  if (tw_rc != 1 || tw_res.outcome != UserProgramOutcome::kExited ||
+      tw_res.exit_status != usertest::kExitStatus ||
+      TryWait(ended_pid, &tw_res) != kSyscallErrorInvalid) {
+    return check;
+  }
   return 0;
 }
 
@@ -1911,6 +2073,9 @@ static int64_t RunDriverDenied() {
   if (IpcListen(kIpcPortFs) != kSyscallErrorPermission) {
     return 16;
   }
+  if (IpcListen(kIpcPortBlock) != kSyscallErrorPermission) {
+    return 19;
+  }
   if (GetBootModuleCount() != kSyscallErrorPermission) {
     return 17;
   }
@@ -1954,6 +2119,11 @@ static int64_t RunDriverCapProbe(const uint64_t arg) {
     if (GetBootModuleCount() < 0) {
       return 7;
     }
+    if (IpcListen(kIpcPortBlock) != 0 || IpcListen(kIpcPortBlock) != 0 ||
+        IpcCall(kIpcPortBlock, nullptr, 0, nullptr, 0) !=
+            kSyscallErrorDeadlock) {
+      return 8;
+    }
     const int64_t child_pid =
         Spawn("usertest", usertest::Arg(Mode::kDriverDenied));
     if (child_pid < 1) {
@@ -1981,6 +2151,7 @@ static int64_t RunDriverCapProbe(const uint64_t arg) {
       IsaPortIo(kSyscallPortIoRead8, 0x60, 0) != kSyscallErrorPermission ||
       IsaIrqAlloc(kIsaDeviceI8042) != kSyscallErrorPermission ||
       IpcListen(kIpcPortFs) != kSyscallErrorPermission ||
+      IpcListen(kIpcPortBlock) != kSyscallErrorPermission ||
       GetBootModuleCount() != kSyscallErrorPermission ||
       ReadBootModule(0, 0, nullptr, 0) != kSyscallErrorPermission ||
       GetTicks() < 0) {
@@ -2748,6 +2919,58 @@ static int64_t RunDriverXhciReset(const uint64_t arg) {
   return HaltAndResetXhci(mmio, *caps);
 }
 
+static int64_t RunDriverNvmeReset(const uint64_t arg) {
+  constexpr uint8_t kPciClassMassStorage = 0x01;
+  constexpr uint8_t kPciSubclassNvm = 0x08;
+  constexpr uint8_t kPciProgIfNvme = 0x02;
+  constexpr uint32_t kNvmeMmioAllOnes = 0xFFFFFFFFu;
+  const int dev_idx = usertest::DriverDeviceIndex(arg);
+  if (PciClaim(dev_idx) != 0) {
+    return usertest::kNvmeResetNotNvmeStatus;
+  }
+  const StatusOr<PciDeviceInfo> info = GetPciInfo(dev_idx);
+  if (!info.ok() || info->class_code != kPciClassMassStorage ||
+      info->subclass != kPciSubclassNvm || info->prog_if != kPciProgIfNvme ||
+      !IsMemoryBar(info->bars[0]) || info->bars[0].size < 2 * 4096) {
+    return usertest::kNvmeResetNotNvmeStatus;
+  }
+  PagedMmioWindow mmio(info->bars[0].phys_base, info->bars[0].size);
+  const uint32_t cap_lo = mmio.Read32(nvme::kRegCap);
+  const uint32_t cap_hi = mmio.Read32(nvme::kRegCap + 4);
+  if (cap_lo == kNvmeMmioAllOnes || cap_hi == kNvmeMmioAllOnes) {
+    return usertest::kNvmeResetNotDecodingStatus;
+  }
+  const uint64_t cap = (uint64_t{cap_hi} << 32) | cap_lo;
+  if ((cap & nvme::kCapCssNvm) == 0 || nvme::CapMpsMin(cap) != 0 ||
+      nvme::CapMpsMax(cap) < nvme::CapMpsMin(cap) || nvme::CapMqes(cap) < 2) {
+    return usertest::kNvmeResetBadCapabilitiesStatus;
+  }
+  const uint32_t cc = mmio.Read32(nvme::kRegCc);
+  const uint32_t csts = mmio.Read32(nvme::kRegCsts);
+  if (cc == kNvmeMmioAllOnes || csts == kNvmeMmioAllOnes) {
+    return usertest::kNvmeResetNotDecodingStatus;
+  }
+  const bool was_running =
+      ((cc & nvme::kCcEn) != 0) || ((csts & nvme::kCstsRdy) != 0);
+  if (cc != 0) {
+    mmio.Write32(nvme::kRegCc, 0);
+  }
+  int64_t timeout_ms = nvme::CapToMs(cap);
+  if (timeout_ms < 2000) {
+    timeout_ms = 2000;
+  }
+  const int64_t timeout_ticks = TicksForMs(timeout_ms);
+  const PollResult reset =
+      PollRegister(mmio, nvme::kRegCsts, nvme::kCstsRdy, 0, timeout_ticks);
+  if (reset == PollResult::kNotDecoding) {
+    return usertest::kNvmeResetNotDecodingStatus;
+  }
+  if (reset != PollResult::kMatched) {
+    return usertest::kNvmeResetTimeoutStatus;
+  }
+  return was_running ? usertest::kNvmeResetWasRunningStatus : 0;
+}
+
 // The buffers of `Mode::kIpcChecks` and `Mode::kFsChecks`, which are too big
 // for the 16 KiB stack: requests and data to write go in `g_ipc_buf_a`,
 // replies and data read in `g_ipc_buf_b`. Each process has its own copy.
@@ -2857,12 +3080,13 @@ static int64_t RunIpcEndToEnd(const int port) {
     p1[i] = static_cast<uint8_t>(i & 0xFF);
   }
 
-  // Bad ports, `kIpcPortFs` without driver capability, a port that no process
-  // owns, and one that the caller doesn't.
+  // Bad ports, `kIpcPortFs`/`kIpcPortBlock` without driver capability, a port
+  // that no process owns, and one that the caller doesn't.
   IpcReceivedMessage msg{};
   if (IpcListen(-1) != kSyscallErrorInvalid ||
       IpcListen(kIpcPortCount) != kSyscallErrorInvalid ||
       IpcListen(kIpcPortFs) != kSyscallErrorPermission ||
+      IpcListen(kIpcPortBlock) != kSyscallErrorPermission ||
       IpcRecv(port, g_ipc_buf_a, kIpcMaxMessageSize, &msg, 0) !=
           kSyscallErrorAccess ||
       IpcCall(port, "x", 1, nullptr, 0) != kSyscallErrorNoDevice) {
@@ -4047,8 +4271,8 @@ g_fs_test_prog_start:
     pause
     jmp 2b
 3:
-    // Verify initial stack pointer alignment (8 mod 16) and zero return
-    // address, plus `argc >= 0`, `argv != nullptr`, and `argv[argc] == nullptr`.
+    // Verify initial stack pointer alignment (8 mod 16), zero return address,
+    // plus `argc >= 0`, `argv != nullptr`, and `argv[argc] == nullptr`.
     mov rax, r15
     and eax, 0xF
     cmp eax, 8
@@ -4769,6 +4993,654 @@ static int64_t RunFsChecks(const uint64_t arg) {
   return usertest::kBadSubmodeStatus;
 }
 
+static void FillBlockPattern(uint8_t* const dst,  //
+                             const int64_t len,   //
+                             const uint64_t seed) {
+  for (int64_t i = 0; i < len; ++i) {
+    dst[i] = static_cast<uint8_t>(
+        (seed * 131ULL + static_cast<uint64_t>(i) * 17ULL + 0x5AULL) & 0xFFULL);
+  }
+}
+
+static bool VerifyBlockPattern(const uint8_t* const buf,  //
+                               const int64_t len,         //
+                               const uint64_t seed) {
+  for (int64_t i = 0; i < len; ++i) {
+    const uint8_t expected = static_cast<uint8_t>(
+        (seed * 131ULL + static_cast<uint64_t>(i) * 17ULL + 0x5AULL) & 0xFFULL);
+    if (buf[i] != expected) {
+      return false;
+    }
+  }
+  return true;
+}
+
+static bool BufferIsAllZero(const uint8_t* const buf, const int64_t len) {
+  for (int64_t i = 0; i < len; ++i) {
+    if (buf[i] != 0) {
+      return false;
+    }
+  }
+  return true;
+}
+
+static bool RunDiskCli(const int argc,                 //
+                       const char* const* const argv,  //
+                       const int64_t expected_status) {
+  const int64_t pid = SpawnFile("/bin/disk", argc, argv);
+  if (pid < 1) {
+    return false;
+  }
+  const StatusOr<UserProgramResult> res = Wait(pid);
+  return res.ok() && res->outcome == UserProgramOutcome::kExited &&
+         res->exit_status == expected_status;
+}
+
+alignas(8) uint8_t g_block_scratch[kBlockWriteScratchBytes];
+
+static void FormatU64Dec(const uint64_t val, char (&out)[21]) {
+  char digits[20] = {};
+  int n = 0;
+  uint64_t v = val;
+  do {
+    digits[n++] = static_cast<char>('0' + (v % 10));
+    v /= 10;
+  } while (v != 0);
+  int pos = 0;
+  while (n > 0) {
+    out[pos++] = digits[--n];
+  }
+  out[pos] = '\0';
+}
+
+static int64_t RunBlockNoServer(const uint32_t disk_index) {
+  if (GetBlockDeviceInfo(disk_index).status() != kSyscallErrorNoDevice) {
+    return 1;
+  }
+  if (ReadBlocksChecked(disk_index, 0, 1, 512, g_ipc_buf_a, 512) !=
+      kSyscallErrorNoDevice) {
+    return 2;
+  }
+  if (WriteBlocksWithScratch(disk_index,       //
+                             0,                //
+                             1,                //
+                             g_ipc_buf_a,      //
+                             512,              //
+                             g_block_scratch,  //
+                             sizeof(g_block_scratch)) !=
+      kSyscallErrorNoDevice) {
+    return 3;
+  }
+  if (FlushDisk(disk_index) != kSyscallErrorNoDevice) {
+    return 4;
+  }
+  return 0;
+}
+
+static int64_t RunBlockWriteReadVerify(const uint32_t disk_index) {
+  static_assert(sizeof(g_ipc_buf_a) >= kBlockMaxIoBytes);
+  static_assert(sizeof(g_ipc_buf_b) >= kBlockMaxIoBytes);
+  static_assert(sizeof(g_block_scratch) >= kBlockWriteScratchBytes);
+
+  if (IpcListen(kIpcPortBlock) != kSyscallErrorPermission) {
+    return 1;
+  }
+
+  // Raw malformed IPC validation against live server.
+  {
+    const uint32_t bad_op = 99;
+    const BlockGetInfoRequest truncated_info{};
+    BlockReadRequest bad_reserved{};
+    bad_reserved.op = BlockRpcOp::kRead;
+    bad_reserved.disk_index = disk_index;
+    bad_reserved.reserved = 1;
+    if (IpcCall(kIpcPortBlock, nullptr, 0, nullptr, 0) !=
+            kSyscallErrorInvalid ||
+        IpcCall(kIpcPortBlock, &bad_op, sizeof(bad_op), nullptr, 0) !=
+            kSyscallErrorInvalid ||
+        IpcCall(kIpcPortBlock,    //
+                &truncated_info,  //
+                4,                //
+                g_ipc_buf_a,      //
+                sizeof(BlockDeviceInfo)) != kSyscallErrorInvalid ||
+        IpcCall(kIpcPortBlock,         //
+                &bad_reserved,         //
+                sizeof(bad_reserved),  //
+                g_ipc_buf_a,           //
+                kBlockMaxIoBytes) != kSyscallErrorInvalid) {
+      return 2;
+    }
+  }
+
+  int64_t disk_count = 0;
+  const StatusOr<BlockDeviceInfo> info =
+      GetBlockDeviceInfo(disk_index, &disk_count);
+  if (!info.ok() || disk_count < 1 ||
+      disk_index >= static_cast<uint32_t>(disk_count)) {
+    return 3;
+  }
+  const int32_t bs = info->block_size;
+  if (!IsValidBlockDeviceInfo(*info) || info->block_count < 16 ||
+      info->nsid < 1 ||
+      info->block_count <=
+          static_cast<uint64_t>(4 + info->max_transfer_blocks)) {
+    return 4;
+  }
+  if (GetBlockDeviceInfo(static_cast<uint32_t>(disk_count)).status() !=
+          kSyscallErrorNoDevice ||
+      GetBlockDeviceInfo(UINT32_MAX).status() != kSyscallErrorNoDevice) {
+    return 5;
+  }
+  const int32_t over_blocks = info->max_transfer_blocks + 1;
+  const BlockReadRequest over_read{
+      .op = BlockRpcOp::kRead,
+      .disk_index = disk_index,
+      .lba = 0,
+      .block_count = over_blocks,
+      .reserved = 0,
+  };
+  const BlockWriteRequest over_write{
+      .op = BlockRpcOp::kWrite,
+      .disk_index = disk_index,
+      .lba = 0,
+      .block_count = over_blocks,
+      .reserved = 0,
+  };
+  constexpr int64_t kScratchCap = static_cast<int64_t>(sizeof(g_block_scratch));
+  if (ReadBlocksChecked(disk_index,         //
+                        info->block_count,  //
+                        1,                  //
+                        bs,                 //
+                        g_ipc_buf_a,        //
+                        bs) != kSyscallErrorInvalid ||
+      ReadBlocksChecked(disk_index, UINT64_MAX, 1, bs, g_ipc_buf_a, bs) !=
+          kSyscallErrorInvalid ||
+      ReadBlocks(disk_index, 0, 1, g_ipc_buf_a, bs - 1) !=
+          kSyscallErrorInvalid ||
+      ReadBlocksChecked(disk_index, 0, 1, bs, g_ipc_buf_a, bs - 1) !=
+          kSyscallErrorInvalid ||
+      ReadBlocksChecked(disk_index, 0, 1, 256, g_ipc_buf_a, 512) !=
+          kSyscallErrorInvalid ||
+      ReadBlocksChecked(disk_index, 0, -1, bs, g_ipc_buf_a, bs) !=
+          kSyscallErrorInvalid ||
+      ReadBlocksChecked(disk_index,   //
+                        0,            //
+                        over_blocks,  //
+                        bs,           //
+                        g_ipc_buf_a,  //
+                        kBlockMaxIoBytes) != kSyscallErrorInvalid ||
+      IpcCall(kIpcPortBlock,      //
+              &over_read,         //
+              sizeof(over_read),  //
+              g_ipc_buf_a,        //
+              kBlockMaxIoBytes) != kSyscallErrorInvalid ||
+      IpcCall(kIpcPortBlock, &over_write, sizeof(over_write), nullptr, 0) !=
+          kSyscallErrorInvalid ||
+      (info->max_transfer_blocks >= 2 &&
+       (ReadBlocksChecked(disk_index,             //
+                          info->block_count - 1,  //
+                          2,                      //
+                          bs,                     //
+                          g_ipc_buf_a,            //
+                          2 * int64_t{bs}) != kSyscallErrorInvalid ||
+        ReadBlocksChecked(disk_index,      //
+                          UINT64_MAX - 1,  //
+                          2,               //
+                          bs,              //
+                          g_ipc_buf_a,     //
+                          2 * int64_t{bs}) != kSyscallErrorInvalid)) ||
+      WriteBlocksWithScratch(disk_index,       //
+                             0,                //
+                             1,                //
+                             g_ipc_buf_a,      //
+                             bs - 1,           //
+                             g_block_scratch,  //
+                             kScratchCap) != kSyscallErrorInvalid ||
+      WriteBlocksWithScratch(disk_index,         //
+                             info->block_count,  //
+                             1,                  //
+                             g_ipc_buf_a,        //
+                             bs,                 //
+                             g_block_scratch,    //
+                             kScratchCap) != kSyscallErrorInvalid) {
+    return 6;
+  }
+  const uint32_t bad_disk = static_cast<uint32_t>(disk_count);
+  if (ReadBlocksChecked(bad_disk, 0, 1, bs, g_ipc_buf_a, bs) !=
+          kSyscallErrorNoDevice ||
+      WriteBlocksWithScratch(bad_disk,         //
+                             0,                //
+                             1,                //
+                             g_ipc_buf_a,      //
+                             bs,               //
+                             g_block_scratch,  //
+                             kScratchCap) != kSyscallErrorNoDevice ||
+      FlushDisk(bad_disk) != kSyscallErrorNoDevice) {
+    return 7;
+  }
+
+  // Non-destructive read of LBA 0 and zero-block I/O always succeed.
+  if (ReadBlocksChecked(disk_index, 0, 1, bs, g_ipc_buf_a, bs) != 1 ||
+      ReadBlocksChecked(disk_index, 0, 0, bs, nullptr, 0) != 0) {
+    return 8;
+  }
+  if (!IsBlockTestDiskSerial(info->serial)) {
+    return 0;
+  }
+  if (info->read_only != 0) {
+    const int32_t multi = info->max_transfer_blocks;
+    const int64_t multi_bytes = static_cast<int64_t>(multi) * bs;
+    const uint64_t last_lba = info->block_count - 1;
+    if (WriteBlocksWithScratch(disk_index,       //
+                               0,                //
+                               1,                //
+                               g_ipc_buf_a,      //
+                               bs,               //
+                               g_block_scratch,  //
+                               kScratchCap) != kSyscallErrorPermission ||
+        WriteBlocks(disk_index, 0, 1, g_ipc_buf_a, bs) !=
+            kSyscallErrorPermission ||
+        WriteBlocksWithScratch(disk_index,       //
+                               0,                //
+                               0,                //
+                               nullptr,          //
+                               0,                //
+                               g_block_scratch,  //
+                               kScratchCap) != 0 ||
+        FlushDisk(disk_index) > 0 ||
+        ReadBlocks(disk_index, 0, 0, nullptr, 0) != 0 ||
+        ReadBlocks(disk_index, 0, 1, g_ipc_buf_b, bs) != 1 ||
+        ReadBlocksChecked(disk_index, 4, multi, bs, g_ipc_buf_b, multi_bytes) !=
+            multi ||
+        ReadBlocksChecked(disk_index, last_lba, 1, bs, g_ipc_buf_b, bs) != 1) {
+      return 15;
+    }
+    return 0;
+  }
+
+  // Single block LBA 0 (exercising zero-copy staging at g_block_scratch +
+  // sizeof(BlockWriteRequest)).
+  uint8_t* const zero_copy_buf = g_block_scratch + sizeof(BlockWriteRequest);
+  FillBlockPattern(zero_copy_buf, bs, 0xA100);
+  if (WriteBlocksWithScratch(disk_index,       //
+                             0,                //
+                             1,                //
+                             zero_copy_buf,    //
+                             bs,               //
+                             g_block_scratch,  //
+                             kScratchCap) != 1 ||
+      FlushDisk(disk_index) != 0) {
+    return 9;
+  }
+  if (ReadBlocksChecked(disk_index, 0, 1, bs, g_ipc_buf_b, bs) != 1 ||
+      !VerifyBlockPattern(g_ipc_buf_b, bs, 0xA100) ||
+      ReadBlocks(disk_index, 0, 0, nullptr, 0) != 0 ||
+      ReadBlocks(disk_index, 0, 1, g_ipc_buf_b, bs) != 1 ||
+      !VerifyBlockPattern(g_ipc_buf_b, bs, 0xA100)) {
+    return 10;
+  }
+
+  // Exercise 0-block write no-ops and the 5-arg stack-staging `WriteBlocks`
+  // wrapper in ring 3 under `-fstack-clash-protection`, restoring pattern
+  // `0xA100` on LBA 0 for `RunBlockVerifyPersisted`.
+  if (WriteBlocksWithScratch(disk_index,       //
+                             0,                //
+                             0,                //
+                             nullptr,          //
+                             0,                //
+                             g_block_scratch,  //
+                             kScratchCap) != 0 ||
+      WriteBlocks(disk_index, 0, 0, nullptr, 0) != 0) {
+    return 16;
+  }
+  FillBlockPattern(g_ipc_buf_a, bs, 0xD400);
+  if (WriteBlocks(disk_index, 0, 1, g_ipc_buf_a, bs) != 1 ||
+      FlushDisk(disk_index) != 0 ||
+      ReadBlocks(disk_index, 0, 1, g_ipc_buf_b, bs) != 1 ||
+      !VerifyBlockPattern(g_ipc_buf_b, bs, 0xD400)) {
+    return 17;
+  }
+  FillBlockPattern(g_ipc_buf_a, bs, 0xA100);
+  if (WriteBlocks(disk_index, 0, 1, g_ipc_buf_a, bs) != 1 ||
+      FlushDisk(disk_index) != 0 ||
+      ReadBlocksChecked(disk_index, 0, 1, bs, g_ipc_buf_b, bs) != 1 ||
+      !VerifyBlockPattern(g_ipc_buf_b, bs, 0xA100)) {
+    return 18;
+  }
+
+  // Multi-block range LBA 4..4+multi-1 across full max_transfer_blocks.
+  const int32_t multi = info->max_transfer_blocks;
+  const int64_t multi_bytes = static_cast<int64_t>(multi) * bs;
+  FillBlockPattern(g_ipc_buf_a, multi_bytes, 0xB204);
+  if (WriteBlocksWithScratch(disk_index,       //
+                             4,                //
+                             multi,            //
+                             g_ipc_buf_a,      //
+                             multi_bytes,      //
+                             g_block_scratch,  //
+                             kScratchCap) != multi ||
+      FlushDisk(disk_index) != 0) {
+    return 11;
+  }
+  if (ReadBlocksChecked(disk_index, 4, multi, bs, g_ipc_buf_b, multi_bytes) !=
+          multi ||
+      !VerifyBlockPattern(g_ipc_buf_b, multi_bytes, 0xB204)) {
+    return 12;
+  }
+
+  // Last block on the namespace.
+  const uint64_t last_lba = info->block_count - 1;
+  FillBlockPattern(g_ipc_buf_a, bs, 0xC3FF);
+  if (WriteBlocksWithScratch(disk_index,       //
+                             last_lba,         //
+                             1,                //
+                             g_ipc_buf_a,      //
+                             bs,               //
+                             g_block_scratch,  //
+                             kScratchCap) != 1 ||
+      FlushDisk(disk_index) != 0) {
+    return 13;
+  }
+  if (ReadBlocksChecked(disk_index, last_lba, 1, bs, g_ipc_buf_b, bs) != 1 ||
+      !VerifyBlockPattern(g_ipc_buf_b, bs, 0xC3FF)) {
+    return 14;
+  }
+  return 0;
+}
+
+static int64_t RunBlockVerifyPersisted(const uint32_t disk_index) {
+  const StatusOr<BlockDeviceInfo> info = GetBlockDeviceInfo(disk_index);
+  if (!info.ok() || !IsValidBlockDeviceInfo(*info) || info->block_count < 16 ||
+      info->block_count <=
+          static_cast<uint64_t>(4 + info->max_transfer_blocks)) {
+    return 1;
+  }
+  if (!IsBlockTestDiskSerial(info->serial) || info->read_only != 0) {
+    return 0;
+  }
+  const int32_t bs = info->block_size;
+  const int32_t multi = info->max_transfer_blocks;
+  const int64_t multi_bytes = static_cast<int64_t>(multi) * bs;
+  const uint64_t last_lba = info->block_count - 1;
+
+  if (ReadBlocksChecked(disk_index, 0, 1, bs, g_ipc_buf_b, bs) != 1 ||
+      !VerifyBlockPattern(g_ipc_buf_b, bs, 0xA100)) {
+    return 2;
+  }
+  if (ReadBlocksChecked(disk_index, 4, multi, bs, g_ipc_buf_b, multi_bytes) !=
+          multi ||
+      !VerifyBlockPattern(g_ipc_buf_b, multi_bytes, 0xB204)) {
+    return 3;
+  }
+  if (ReadBlocksChecked(disk_index, last_lba, 1, bs, g_ipc_buf_b, bs) != 1 ||
+      !VerifyBlockPattern(g_ipc_buf_b, bs, 0xC3FF)) {
+    return 4;
+  }
+
+  for (int64_t i = 0; i < multi_bytes; ++i) {
+    g_ipc_buf_a[i] = 0;
+  }
+  constexpr int64_t kScratchCap = static_cast<int64_t>(sizeof(g_block_scratch));
+  if (WriteBlocksWithScratch(disk_index,       //
+                             0,                //
+                             1,                //
+                             g_ipc_buf_a,      //
+                             bs,               //
+                             g_block_scratch,  //
+                             kScratchCap) != 1 ||
+      WriteBlocksWithScratch(disk_index,       //
+                             4,                //
+                             multi,            //
+                             g_ipc_buf_a,      //
+                             multi_bytes,      //
+                             g_block_scratch,  //
+                             kScratchCap) != multi ||
+      WriteBlocksWithScratch(disk_index,       //
+                             last_lba,         //
+                             1,                //
+                             g_ipc_buf_a,      //
+                             bs,               //
+                             g_block_scratch,  //
+                             kScratchCap) != 1) {
+    return 5;
+  }
+  if (FlushDisk(disk_index) != 0) {
+    return 6;
+  }
+  if (ReadBlocksChecked(disk_index, 0, 1, bs, g_ipc_buf_b, bs) != 1 ||
+      !BufferIsAllZero(g_ipc_buf_b, bs) ||
+      ReadBlocksChecked(disk_index, 4, multi, bs, g_ipc_buf_b, multi_bytes) !=
+          multi ||
+      !BufferIsAllZero(g_ipc_buf_b, multi_bytes)) {
+    return 7;
+  }
+  if (ReadBlocksChecked(disk_index, last_lba, 1, bs, g_ipc_buf_b, bs) != 1 ||
+      !BufferIsAllZero(g_ipc_buf_b, bs)) {
+    return 8;
+  }
+  return 0;
+}
+
+static int64_t RunBlockCliDiskChecks(const uint32_t disk_index) {
+  const StatusOr<BlockDeviceInfo> info = GetBlockDeviceInfo(disk_index);
+  if (!info.ok() || !IsValidBlockDeviceInfo(*info)) {
+    return 3;
+  }
+  char disk_str[21] = {};
+  char oob_lba[21] = {};
+  FormatU64Dec(disk_index, disk_str);
+  FormatU64Dec(info->block_count, oob_lba);
+
+  if (disk_index == 0) {
+    const char* const argv_default[] = {"/bin/disk"};
+    const char* const argv_info[] = {"/bin/disk", "info"};
+    const char* const argv_d_info[] = {"/bin/disk", "-d", "0", "info"};
+    if (!RunDiskCli(1, argv_default, 0) || !RunDiskCli(2, argv_info, 0) ||
+        !RunDiskCli(4, argv_d_info, 0)) {
+      return 1;
+    }
+    const char* const bad1[] = {"/bin/disk", "badcmd"};
+    const char* const bad2[] = {"/bin/disk", "read"};
+    const char* const bad3[] = {"/bin/disk", "read", "abc"};
+    const char* const bad4[] = {"/bin/disk", "read", "0", "99"};
+    const char* const bad5[] = {"/bin/disk", "write", "2"};
+    const char* const bad6[] = {"/bin/disk", "read", oob_lba};
+    const char* const bad7[] = {"/bin/disk", "read", "18446744073709551615"};
+    const char* const bad8[] = {"/bin/disk", "info", "extra"};
+    const char* const bad9[] = {"/bin/disk", "read", "0", "0"};
+    const char* const bad10[] = {"/bin/disk", "-d"};
+    const char* const bad11[] = {"/bin/disk", "-d", "4294967296"};
+    if (!RunDiskCli(2, bad1, 1) || !RunDiskCli(2, bad2, 1) ||
+        !RunDiskCli(3, bad3, 1) || !RunDiskCli(4, bad4, 1) ||
+        !RunDiskCli(3, bad5, 1) || !RunDiskCli(3, bad6, 1) ||
+        !RunDiskCli(3, bad7, 1) || !RunDiskCli(3, bad8, 1) ||
+        !RunDiskCli(4, bad9, 1) || !RunDiskCli(2, bad10, 1) ||
+        !RunDiskCli(3, bad11, 1)) {
+      return 2;
+    }
+  } else {
+    const char* const argv_d_info[] = {"/bin/disk", "-d", disk_str, "info"};
+    const char* const bad6[] = {"/bin/disk", "-d", disk_str, "read", oob_lba};
+    const char* const bad7[] = {"/bin/disk", "-d", disk_str, "read",
+                                "18446744073709551615"};
+    if (!RunDiskCli(4, argv_d_info, 0)) {
+      return 1;
+    }
+    if (!RunDiskCli(5, bad6, 1) || !RunDiskCli(5, bad7, 1)) {
+      return 2;
+    }
+  }
+
+  if (!IsBlockTestDiskSerial(info->serial)) {
+    return 0;
+  }
+  if (info->read_only != 0) {
+    const char* const write_cmd[] = {"/bin/disk", "-d",    disk_str, "write",
+                                     "2",         "hello", "from",   "nvme"};
+    const char* const zero_cmd[] = {"/bin/disk", "-d", disk_str, "zero", "2"};
+    const char* const read_cmd[] = {"/bin/disk", "-d", disk_str, "read", "2"};
+    if (!RunDiskCli(8, write_cmd, 1) || !RunDiskCli(5, zero_cmd, 1) ||
+        !RunDiskCli(5, read_cmd, 0)) {
+      return 4;
+    }
+    return 0;
+  }
+  const int32_t bs = info->block_size;
+  const char* const write_cmd[] = {"/bin/disk", "-d",    disk_str, "write",
+                                   "2",         "hello", "from",   "nvme"};
+  if (!RunDiskCli(8, write_cmd, 0)) {
+    return 4;
+  }
+  if (ReadBlocksChecked(disk_index, 2, 1, bs, g_ipc_buf_a, bs) != 1) {
+    return 5;
+  }
+  constexpr char kExpectedLine[] = "hello from nvme\n";
+  constexpr int64_t kExpectedLen =
+      static_cast<int64_t>(sizeof(kExpectedLine)) - 1;
+  for (int64_t i = 0; i < kExpectedLen; ++i) {
+    if (g_ipc_buf_a[i] != static_cast<uint8_t>(kExpectedLine[i])) {
+      return 5;
+    }
+  }
+  if (!BufferIsAllZero(g_ipc_buf_a + kExpectedLen, bs - kExpectedLen)) {
+    return 5;
+  }
+  const char* const read_cmd[] = {"/bin/disk", "-d", disk_str, "read", "2"};
+  if (!RunDiskCli(5, read_cmd, 0)) {
+    return 6;
+  }
+  const char* const zero_cmd[] = {"/bin/disk", "-d", disk_str, "zero", "2"};
+  if (!RunDiskCli(5, zero_cmd, 0)) {
+    return 7;
+  }
+  if (ReadBlocksChecked(disk_index, 2, 1, bs, g_ipc_buf_a, bs) != 1 ||
+      !BufferIsAllZero(g_ipc_buf_a, bs)) {
+    return 8;
+  }
+  return 0;
+}
+
+static int64_t RunBlockMockMalformedReplies() {
+  constexpr int64_t kScratchCap = static_cast<int64_t>(sizeof(g_block_scratch));
+  // 10 bad GetBlockDeviceInfo replies -> all must return kSyscallErrorIo.
+  for (int i = 0; i < 10; ++i) {
+    if (GetBlockDeviceInfo(0).status() != kSyscallErrorIo) {
+      return 1 + i;
+    }
+  }
+  // ReadBlocks: rc != block_count and unaligned reply_size -> kSyscallErrorIo.
+  if (ReadBlocks(0, 0, 1, g_ipc_buf_a, 512) != kSyscallErrorIo ||
+      ReadBlocks(0, 0, 1, g_ipc_buf_a, 1024) != kSyscallErrorIo) {
+    return 11;
+  }
+  // ReadBlocksChecked: reply_size (1024) != expected_bytes (512).
+  if (ReadBlocksChecked(0, 0, 1, 512, g_ipc_buf_a, 1024) != kSyscallErrorIo) {
+    return 12;
+  }
+  // WriteBlocksWithScratch: rc != block_count -> kSyscallErrorIo.
+  if (WriteBlocksWithScratch(0,                //
+                             0,                //
+                             1,                //
+                             g_ipc_buf_a,      //
+                             512,              //
+                             g_block_scratch,  //
+                             kScratchCap) != kSyscallErrorIo) {
+    return 13;
+  }
+  // FlushDisk: rc != 0 -> kSyscallErrorIo.
+  if (FlushDisk(0) != kSyscallErrorIo) {
+    return 14;
+  }
+  // Client-side invalid arguments.
+  constexpr int64_t kTooSmallCap =
+      static_cast<int64_t>(sizeof(BlockWriteRequest)) + 511;
+  if (WriteBlocksWithScratch(0, 0, 1, g_ipc_buf_a, 512, nullptr, 0) !=
+          kSyscallErrorInvalid ||
+      WriteBlocksWithScratch(0,                //
+                             0,                //
+                             1,                //
+                             g_ipc_buf_a,      //
+                             512,              //
+                             g_block_scratch,  //
+                             kTooSmallCap) != kSyscallErrorInvalid ||
+      ReadBlocksChecked(0, 0, 1, 256, g_ipc_buf_a, 512) !=
+          kSyscallErrorInvalid ||
+      ReadBlocksChecked(0, 0, 1, 512, g_ipc_buf_a, 511) !=
+          kSyscallErrorInvalid) {
+    return 15;
+  }
+  return 0;
+}
+
+static int64_t RunBlockMockClientGetInfoOnly() {
+  return GetBlockDeviceInfo(0).ok() ? 0 : 1;
+}
+
+static int64_t RunBlockMockClientCallWait() {
+  const StatusOr<BlockDeviceInfo> info = GetBlockDeviceInfo(0);
+  return info.ok() ? 0 : -info.status();
+}
+
+static int64_t RunBlockMockServerHoldCall() {
+  if (IpcListen(kIpcPortBlock) != 0 || IpcListen(kIpcFirstUserPort) != 0) {
+    return 1;
+  }
+  IpcReceivedMessage msg{};
+  if (!ReceiveCall(kIpcPortBlock, &msg)) {
+    return 2;
+  }
+  // Hold `msg` unanswered and park in syscalls == 4 until killed.
+  (void)IpcRecv(kIpcFirstUserPort, g_ipc_buf_b, kIpcMaxMessageSize, &msg, -1);
+  return 3;
+}
+
+static int64_t RunBlockMockDeadlock() {
+  if (IpcListen(kIpcPortBlock) != 0) {
+    return 1;
+  }
+  constexpr int64_t kScratchCap = static_cast<int64_t>(sizeof(g_block_scratch));
+  if (GetBlockDeviceInfo(0).status() != kSyscallErrorDeadlock ||
+      ReadBlocksChecked(0, 0, 1, 512, g_ipc_buf_a, 512) !=
+          kSyscallErrorDeadlock ||
+      WriteBlocksWithScratch(0,                //
+                             0,                //
+                             1,                //
+                             g_ipc_buf_a,      //
+                             512,              //
+                             g_block_scratch,  //
+                             kScratchCap) != kSyscallErrorDeadlock ||
+      FlushDisk(0) != kSyscallErrorDeadlock) {
+    return 2;
+  }
+  return 0;
+}
+
+static int64_t RunBlockChecks(const uint64_t arg) {
+  using usertest::BlockTestSubmode;
+  const uint32_t disk_index = usertest::BlockDiskIndex(arg);
+  switch (static_cast<BlockTestSubmode>(usertest::DriverSubmode(arg))) {
+    case BlockTestSubmode::kWriteReadVerify:
+      return RunBlockWriteReadVerify(disk_index);
+    case BlockTestSubmode::kVerifyPersisted:
+      return RunBlockVerifyPersisted(disk_index);
+    case BlockTestSubmode::kNoServer:
+      return RunBlockNoServer(disk_index);
+    case BlockTestSubmode::kCliDiskChecks:
+      return RunBlockCliDiskChecks(disk_index);
+    case BlockTestSubmode::kMockMalformedReplies:
+      return RunBlockMockMalformedReplies();
+    case BlockTestSubmode::kMockClientGetInfoOnly:
+      return RunBlockMockClientGetInfoOnly();
+    case BlockTestSubmode::kMockClientCallWait:
+      return RunBlockMockClientCallWait();
+    case BlockTestSubmode::kMockServerHoldCall:
+      return RunBlockMockServerHoldCall();
+    case BlockTestSubmode::kMockDeadlock:
+      return RunBlockMockDeadlock();
+  }
+  return usertest::kBadSubmodeStatus;
+}
+
 }  // namespace
 
 int64_t Main(const uint64_t arg) {
@@ -4851,6 +5723,10 @@ int64_t Main(const uint64_t arg) {
       return RunDriverIrqWait(arg);
     case Mode::kDriverXhciReset:
       return RunDriverXhciReset(arg);
+    case Mode::kDriverNvmeReset:
+      return RunDriverNvmeReset(arg);
+    case Mode::kBlockChecks:
+      return RunBlockChecks(arg);
     case Mode::kIpcChecks:
       return RunIpcChecks(arg);
     case Mode::kFsChecks:

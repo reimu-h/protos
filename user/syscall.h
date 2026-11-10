@@ -237,6 +237,17 @@ inline StatusOr<UserProgramResult> Wait(const int64_t pid) {
   return result;
 }
 
+// Polls whether child process `pid` has ended without blocking. Returns 1 and
+// writes the child's result to `*out_result` (and reclaims the child slot) if
+// `pid` has ended, 0 (leaving `out_result` untouched and the child active) if
+// it is still running, or a negative `kSyscallError*` error (`< 0`, such as
+// `kSyscallErrorInvalid` or `kSyscallErrorFault`).
+inline int64_t TryWait(const int64_t pid, UserProgramResult* const out_result) {
+  return Syscall(kSyscallTryWait,             //
+                 static_cast<uint64_t>(pid),  //
+                 reinterpret_cast<uintptr_t>(out_result));
+}
+
 constexpr bool IsError(const int64_t result) { return SyscallIsError(result); }
 
 // Starts the embedded user program whose name is the `name_len` bytes at

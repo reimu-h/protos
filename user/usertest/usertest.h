@@ -221,6 +221,55 @@ enum class Mode : uint8_t {
   // against a running `ramfs` as `DriverSubmode(arg)` (`FsTestSubmode`) says
   // (`FsChecksArg()`).
   kFsChecks,
+  // Claims the NVMe controller `DriverDeviceIndex(arg)` and clears `CC.EN`
+  // until `CSTS.RDY == 0` without touching Bus Master, so whatever firmware or
+  // a killed driver left in it is stopped before another test uses it. Exits
+  // with 0 if already disabled, `kNvmeResetWasRunningStatus` if it was
+  // enabled/ready and was reset, or another `kNvmeReset*Status` on failure.
+  kDriverNvmeReset,
+  // Exercises `kIpcPortBlock` (`block_protocol.h` / `user/block.h`) and
+  // `/bin/disk` according to `DriverSubmode(arg)` (`BlockTestSubmode`) on disk
+  // `DriverDeviceIndex(arg)` (`BlockChecksArg()`).
+  kBlockChecks,
+};
+
+// The submodes of `Mode::kBlockChecks`.
+enum class BlockTestSubmode : uint8_t {
+  // Verifies `IpcListen(kIpcPortBlock)` permission denial, malformed block RPC
+  // handling and `kSyscallErrorNoDevice` checks, and reads LBA 0. When
+  // `serial` starts with "protos" (a disposable test image), also writes
+  // deterministic patterns to LBA 0, a multi-block range and the last LBA,
+  // flushes, reads them back immediately, and leaves them for
+  // `kVerifyPersisted`. Exits with 0 or 1-18 on failure.
+  kWriteReadVerify = 0,
+  // Reads back the patterns written by `kWriteReadVerify` after a `nvme`
+  // driver restart to verify persistence across controller reset, then zeros
+  // those test LBAs and flushes so the disk is left clean. Exits with 0 or 1-8
+  // on failure.
+  kVerifyPersisted = 1,
+  // Verifies block helpers fail with `kSyscallErrorNoDevice` when no driver
+  // owns `kIpcPortBlock`. Exits with 0 or 1-4 on failure.
+  kNoServer = 2,
+  // Exercises `/bin/disk` via `SpawnFile()` against live `ramfs` and `nvme`.
+  // Exits with 0 or 1-8 on failure.
+  kCliDiskChecks = 3,
+  // Exercises client validation of malformed `kIpcPortBlock` server replies
+  // (`kSyscallErrorIo`) and invalid arguments (`kSyscallErrorInvalid`) against
+  // a mock kernel IPC server. Exits with 0 or 1-16 on failure.
+  kMockMalformedReplies = 4,
+  // Issues a single `GetBlockDeviceInfo(0)` and exits 0 (used to verify
+  // `kClientDisconnect` and replacement-server scoping on `kIpcPortBlock`).
+  kMockClientGetInfoOnly = 5,
+  // Calls `GetBlockDeviceInfo(0)` and exits 0 on success or `-status` on
+  // failure (used for kill-mid-RPC and server-kill tests on `kIpcPortBlock`).
+  kMockClientCallWait = 6,
+  // Claims `kIpcPortBlock`, receives one call (leaving it unanswered), and
+  // blocks in `IpcRecv()` until killed (`kBlockMockHoldCallParkedSyscall`).
+  kMockServerHoldCall = 7,
+  // Claims `kIpcPortBlock` and verifies `GetBlockDeviceInfo`,
+  // `ReadBlocksChecked`, `WriteBlocksWithScratch`, and `FlushDisk` all return
+  // `kSyscallErrorDeadlock`.
+  kMockDeadlock = 8,
 };
 
 // The submodes of `Mode::kIpcChecks`. Each but `kMemMapGuardFault` uses IPC
@@ -432,6 +481,17 @@ constexpr int64_t kXhciResetNotDecodingStatus = 3;
 constexpr int64_t kXhciResetBadCapabilitiesStatus = 4;
 constexpr int64_t kXhciResetHaltTimeoutStatus = 5;
 constexpr int64_t kXhciResetTimeoutStatus = 6;
+
+// The exit statuses of `Mode::kDriverNvmeReset`: the controller had `CC.EN` or
+// `CSTS.RDY` set and was disabled; the device can't be claimed or is not an
+// NVMe controller with a usable BAR 0; its registers read all-ones; its CAP
+// register does not support NVM / 4 KiB pages; or `CSTS.RDY` did not clear
+// before the reset timeout.
+constexpr int64_t kNvmeResetWasRunningStatus = 1;
+constexpr int64_t kNvmeResetNotNvmeStatus = 2;
+constexpr int64_t kNvmeResetNotDecodingStatus = 3;
+constexpr int64_t kNvmeResetBadCapabilitiesStatus = 4;
+constexpr int64_t kNvmeResetTimeoutStatus = 5;
 
 // The exit statuses of `Mode::kIpcChecks` and `Mode::kFsChecks` besides those
 // that each submode lists: an unknown submode or an IPC port that the submode
@@ -663,6 +723,26 @@ constexpr uint64_t IpcChecksArg(const IpcTestSubmode submode, const int port) {
 constexpr uint64_t FsChecksArg(const FsTestSubmode submode) {
   return DriverArg(Mode::kFsChecks, static_cast<uint8_t>(submode));
 }
+constexpr int64_t kBlockMockHoldCallParkedSyscall = 4;
+
+constexpr uint64_t BlockChecksArg(const BlockTestSubmode submode,
+                                  const uint32_t disk_index = 0) {
+  return Arg(Mode::kBlockChecks) |
+         (static_cast<uint64_t>(static_cast<uint8_t>(submode)) << 8) |
+         (static_cast<uint64_t>(disk_index) << 16);
+}
+
+constexpr uint32_t BlockDiskIndex(const uint64_t arg) {
+  return static_cast<uint32_t>((arg >> 16) & 0xFFFFFFFFULL);
+}
+
+static_assert(BlockDiskIndex(BlockChecksArg(BlockTestSubmode::kWriteReadVerify,
+                                            0x12345678U)) == 0x12345678U);
+static_assert(DriverSubmode(BlockChecksArg(BlockTestSubmode::kCliDiskChecks,
+                                           0x80000001U)) ==
+              static_cast<uint8_t>(BlockTestSubmode::kCliDiskChecks));
+static_assert(BlockDiskIndex(BlockChecksArg(BlockTestSubmode::kCliDiskChecks,
+                                            0x80000001U)) == 0x80000001U);
 
 }  // namespace protos::usertest
 

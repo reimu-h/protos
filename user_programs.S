@@ -47,5 +47,12 @@ g_ramfs_elf_start:
     .incbin "user/ramfs.elf"
 g_ramfs_elf_end:
 
+.balign 16
+.global g_nvme_elf_start
+.global g_nvme_elf_end
+g_nvme_elf_start:
+    .incbin "user/nvme.elf"
+g_nvme_elf_end:
+
 .section .note.GNU-stack,"",@progbits
 

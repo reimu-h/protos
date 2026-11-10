@@ -1187,7 +1187,8 @@ inline StatusOr<int64_t> ExecuteLine(const ShellEnv& env,     //
   };
   const auto is_embedded_program = [](const ShellToken& token) {
     return IsKnownUserProgram(token) || TokenEquals(token, "usbkbd") ||
-           TokenEquals(token, "ps2kbd") || TokenEquals(token, "ramfs");
+           TokenEquals(token, "ps2kbd") || TokenEquals(token, "ramfs") ||
+           TokenEquals(token, "nvme");
   };
   const auto is_missing_bin_error = [](const int64_t rc) {
     return rc == kSyscallErrorNoEntry || rc == kSyscallErrorNoDevice ||

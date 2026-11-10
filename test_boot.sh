@@ -382,6 +382,8 @@ REQUIRED_MARKERS=(
   "[TEST] ramfs_driver_lifecycle: PASS"
   "[TEST] filesystem_end_to_end: PASS"
   "[TEST] rootfs_boot_module: PASS"
+  "[TEST] nvme_driver_lifecycle: PASS"
+  "[TEST] nvme_block_io: PASS"
   "[TEST] user_mode_kill_edge_cases: PASS"
   "[TEST] user_mode_syscall_buffer_checks: PASS"
   "[TEST] user_mode_fpu_lifecycle: PASS"
@@ -432,6 +434,8 @@ USB_REQUIRED_MARKERS=(
   "[USBKBD] controller "
   "[USBKBD] keyboard attached: "
   "[PS2KBD] controller i8042 ready (irq1)"
+  "[NVME] controller "
+  "[NVME] ready"
   "[TEST] driver_session_cleanup: PASS"
 )
 
@@ -810,6 +814,105 @@ verify_init_ramfs() {
     echo "FAIL: init's ramfs did not load the boot filesystem cleanly (expected 'skipped=0 errors=0' and no damage): '${rootfs}'." >&2
     return 1
   fi
+}
+
+# Checks init's nvme startup in the serial log $1 when interactive USB session
+# did not already run ($2 is 0): verifies [NVME] controller ... ready and
+# [NVME] ready precede the first sh> prompt, and matches the controller BDF
+# against QMP query-pci ($3, class 0x0108).
+verify_init_nvme() {
+  local log="$1" interactive="$2" qmp_sock="$3"
+  if [[ "${interactive}" == "1" ]]; then
+    return 0
+  fi
+  local hello exited session=""
+  hello="$(grep -an -m1 -F -- "${INIT_HELLO_MARKER}" "${log}" | cut -d: -f1 || true)"
+  exited="$(grep -an -m1 -F -- "${INIT_EXITED_MARKER}" "${log}" | cut -d: -f1 || true)"
+  if [[ -n "${hello}" && -n "${exited}" ]] && ((hello <= exited)); then
+    session="$(sed -n "${hello},${exited}p" "${log}" | tr -d '\r')"
+  fi
+  if [[ -z "${session}" ]]; then
+    echo "FAIL: Missing init session between '${INIT_HELLO_MARKER}' and '${INIT_EXITED_MARKER}'." >&2
+    return 1
+  fi
+  SESSION_LOG="${session}" python3 - "${qmp_sock}" <<'PY'
+import json, os, re, socket, sys
+
+qmp_path = sys.argv[1]
+session = os.environ["SESSION_LOG"]
+
+if "[NVME] no NVMe controllers found" in session or "[NVME] no usable namespaces" in session:
+    sys.stderr.write("FAIL: init's nvme reported no NVMe disks in serial output.\n")
+    sys.exit(1)
+
+ctrl_re = re.compile(r"\[NVME\] controller ([0-9a-f]{2}:[0-9a-f]{2}\.[0-7]) ready \((msix|msi)\), disks=([0-9]+)$", re.M)
+ctrls = list(ctrl_re.finditer(session))
+ready_matches = [m for m in re.finditer(r"^\[NVME\] ready$", session, re.M)]
+prompt_pos = session.find("sh> ")
+if len(ctrls) != 1 or len(ready_matches) != 1 or prompt_pos < 0:
+    sys.stderr.write(
+        "FAIL: Missing '[NVME]' readiness markers before 'sh> ' in init session "
+        "(ctrls=%d, ready=%d, prompt_pos=%d).\n" % (len(ctrls), len(ready_matches), prompt_pos)
+    )
+    sys.exit(1)
+
+ctrl = ctrls[0]
+if ctrl.group(2) != "msix" or int(ctrl.group(3)) < 1:
+    sys.stderr.write("FAIL: Unexpected [NVME] controller line: %r\n" % ctrl.group(0))
+    sys.exit(1)
+
+if not (ctrl.start() < ready_matches[0].start() < prompt_pos):
+    sys.stderr.write("FAIL: [NVME] readiness markers appeared after 'sh> ' (task-221 serial race).\n")
+    sys.exit(1)
+
+sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+sock.settimeout(10.0)
+sock.connect(qmp_path)
+buf = b""
+
+def recv_obj():
+    global buf
+    while b"\n" not in buf:
+        data = sock.recv(65536)
+        if not data:
+            raise RuntimeError("QMP closed")
+        buf += data
+    line, buf = buf.split(b"\n", 1)
+    return json.loads(line.decode("utf-8"))
+
+def execute(cmd):
+    sock.sendall((json.dumps({"execute": cmd}) + "\r\n").encode("utf-8"))
+    while True:
+        obj = recv_obj()
+        if "return" in obj:
+            return obj["return"]
+        if "error" in obj:
+            raise RuntimeError(obj["error"])
+
+try:
+    recv_obj()
+    execute("qmp_capabilities")
+    pci = execute("query-pci")
+finally:
+    sock.close()
+
+nvme_bdfs = []
+def walk(devs):
+    for d in devs:
+        if ((d.get("class_info") or {}).get("class") == 0x0108):
+            nvme_bdfs.append("%02x:%02x.%x" % (d["bus"], d["slot"], d["function"]))
+        walk((d.get("pci_bridge") or {}).get("devices") or [])
+
+for bus in pci or []:
+    walk(bus.get("devices") or [])
+
+if len(nvme_bdfs) != 1 or ctrl.group(1) != nvme_bdfs[0]:
+    sys.stderr.write(
+        "FAIL: [NVME] controller BDF %r does not match QEMU query-pci %r.\n"
+        % (ctrl.group(1), nvme_bdfs)
+    )
+    sys.exit(1)
+PY
 }
 
 # Checks that the serial log $1 contains none of the markers $2...: lines that
@@ -1328,6 +1431,8 @@ CLEANUP_PASS = "[TEST] driver_session_cleanup: PASS"
 NO_CONTROLLERS = "[USBKBD] no xHCI controllers found"
 PS2_READY = "[PS2KBD] controller i8042 ready (irq1)"
 NO_PS2 = "[PS2KBD] no i8042 controller found"
+NVME_READY = "[NVME] ready"
+NO_NVME = "[NVME] no NVMe controllers found"
 RAMFS_READY = "[RAMFS] ready"
 RAMFS_NOT_READY = "[INIT] ramfs not ready"
 ROOTFS = "[RAMFS] rootfs: files="
@@ -1351,6 +1456,9 @@ ATTACHED_RE = re.compile(r"\[USBKBD\] keyboard attached: (%s) port (%s) "
 DETACHED_RE = re.compile(r"\[USBKBD\] keyboard detached: (%s) port (%s)$" %
                          (BDF, PORT_PATH))
 PS2_READY_RE = re.compile(re.escape(PS2_READY) + r"$")
+NVME_CTRL_RE = re.compile(
+    r"\[NVME\] controller (%s) ready \((msix|msi)\), disks=([0-9]+)$" % BDF)
+NVME_READY_RE = re.compile(re.escape(NVME_READY) + r"$")
 RAMFS_READY_RE = re.compile(re.escape(RAMFS_READY) + r"$")
 # ramfs's report of the boot filesystem that it loaded, and that report for a
 # load with no member skipped, no error and no damage (ROOTFS_CLEAN_RE in
@@ -1364,8 +1472,8 @@ LOG_LINE_RE = re.compile(r"\[[A-Z][A-Za-z0-9_]*\][^\n]*\n")
 # read as failures, test results, tags, seeds, CPU reports or the greeting,
 # and the harness's own sync words.
 FORBIDDEN_RE = re.compile(
-    r"FAIL|FATAL|PASS|TEST|BOOT|INIT|STRESS|USBKBD|PS2KBD|RAMFS|Hello|XSAVE|"
-    r"SMEP|SMAP|smep|smap|seed=|sh>|ser_|boot_sh_ok|\[[A-Za-z_]")
+    r"FAIL|FATAL|PASS|TEST|BOOT|INIT|STRESS|USBKBD|PS2KBD|NVME|RAMFS|Hello|"
+    r"XSAVE|SMEP|SMAP|smep|smap|seed=|sh>|ser_|boot_sh_ok|\[[A-Za-z_]")
 
 LETTERS = "abcdefghijklmnopqrstuvwxyz"
 DIGITS = "0123456789"
@@ -1761,6 +1869,9 @@ class Session:
             if t.find(NO_PS2, start) >= 0:
                 raise Failure("usb_ready", "ps2kbd reported that it "
                               "found no i8042 controller")
+            if t.find(NO_NVME, start) >= 0:
+                raise Failure("usb_ready", "nvme reported that it "
+                              "found no NVMe controller")
             if t.find(RAMFS_NOT_READY, start) >= 0:
                 raise Failure("usb_ready", "init reported that ramfs did not "
                               "get ready")
@@ -1804,7 +1915,9 @@ class Session:
         if (READY_RE.search(s) or ATTACHED_RE.search(s) or
                 DETACHED_RE.search(s) or NO_CONTROLLERS in s or
                 PS2_READY_RE.search(s) or NO_PS2 in s or
-                ROOTFS_RE.search(s) or RAMFS_READY_RE.search(s)):
+                NVME_CTRL_RE.search(s) or NVME_READY_RE.search(s) or
+                NO_NVME in s or ROOTFS_RE.search(s) or
+                RAMFS_READY_RE.search(s)):
             raise Failure(self.scenario, "unexpected driver marker in the "
                           "serial log", ["line: %r" % s])
         say("USB note: log line during the session: %r" % s)
@@ -2206,20 +2319,26 @@ class Session:
             ready = [m for m in map(READY_RE.search, lines) if m]
             ps2_ready = [m.group(0) for m in map(PS2_READY_RE.search, lines)
                          if m]
+            nvme_ctrl = [m for m in map(NVME_CTRL_RE.search, lines) if m]
+            nvme_ready = [m.group(0) for m in map(NVME_READY_RE.search, lines)
+                          if m]
             # ramfs reports the boot filesystem before it reports ready.
             rootfs = [m.group(0) for m in map(ROOTFS_RE.search, lines) if m]
             ramfs_ready = [m.group(0) for m in map(RAMFS_READY_RE.search, lines)
                            if m]
             attached = [m for m in map(ATTACHED_RE.search, lines) if m]
             if (len(ready) >= ready_count and len(ps2_ready) >= 1 and
+                    len(nvme_ctrl) >= 1 and len(nvme_ready) >= 1 and
                     len(ramfs_ready) >= 1 and len(attached) >= kbd_count):
-                return ready, ps2_ready, rootfs, ramfs_ready, attached
+                return (ready, ps2_ready, nvme_ctrl, nvme_ready, rootfs,
+                        ramfs_ready, attached)
             return None
 
-        ready, ps2_ready, rootfs, ramfs_ready, attached = self.wait_for(
-            "the drivers' 'controller ... ready' and 'keyboard attached' "
-            "markers and '%s' in the init session" % RAMFS_READY,
-            SESSION_READY_TIMEOUT, markers)
+        (ready, ps2_ready, nvme_ctrl, nvme_ready, rootfs, ramfs_ready,
+         attached) = self.wait_for(
+             "the drivers' 'controller ... ready' and 'keyboard attached' "
+             "markers and '%s' in the init session" % RAMFS_READY,
+             SESSION_READY_TIMEOUT, markers)
         if not rootfs:
             raise Failure("usb_ready", "init's ramfs reported ready without "
                           "'%s' (it did not load the boot filesystem)" % ROOTFS)
@@ -2238,15 +2357,19 @@ class Session:
             raise Failure("usb_ready", "could not query the PCI devices "
                           "through QMP", [str(e)])
 
+        nvme_bdfs = []
+
         def walk(devices):
             for d in devices:
+                bdf = "%02x:%02x.%x" % (d["bus"], d["slot"], d["function"])
                 if d.get("qdev_id"):
-                    self.bdf[d["qdev_id"]] = "%02x:%02x.%x" % (
-                        d["bus"], d["slot"], d["function"])
-                walk((d.get("pci_bridge") or {}).get("devices", []))
+                    self.bdf[d["qdev_id"]] = bdf
+                if (d.get("class_info") or {}).get("class") == 0x0108:
+                    nvme_bdfs.append(bdf)
+                walk((d.get("pci_bridge") or {}).get("devices") or [])
 
-        for bus in pci:
-            walk(bus.get("devices", []))
+        for bus in pci or []:
+            walk(bus.get("devices") or [])
         controllers = ["xhci0", "xhci1"] if MULTI else ["xhci0"]
         if any(c not in self.bdf for c in controllers):
             raise Failure("usb_ready", "QEMU's query-pci does not list the "
@@ -2255,7 +2378,25 @@ class Session:
         got_ready = sorted(m.groups() for m in ready)
         got_attached = [m.groups() for m in attached]
         ok = (len(got_ready) == ready_count and len(ps2_ready) == 1 and
-              len(ramfs_ready) == 1 and len(got_attached) == kbd_count)
+              len(nvme_bdfs) == 1 and len(nvme_ctrl) == 1 and
+              nvme_ctrl[0].group(1) == nvme_bdfs[0] and
+              nvme_ctrl[0].group(2) == "msix" and
+              int(nvme_ctrl[0].group(3)) >= 1 and
+              len(nvme_ready) == 1 and len(ramfs_ready) == 1 and
+              len(got_attached) == kbd_count)
+        if ok:
+            ctrl_pos = self.log.find(nvme_ctrl[0].group(0), self.s0)
+            ready_pos = self.log.find(NVME_READY, self.s0)
+            prompt_pos = self.log.find(PROMPT, self.s0)
+            if not (0 <= ctrl_pos < ready_pos < prompt_pos):
+                raise Failure(
+                    "usb_ready",
+                    "NVMe readiness markers did not precede the first shell "
+                    "prompt",
+                    ["ctrl_pos=%r ready_pos=%r prompt_pos=%r" % (
+                        ctrl_pos, ready_pos, prompt_pos)],
+                )
+            self.nvme_bdf = nvme_bdfs[0]
         if ok:
             bdf0 = self.bdf["xhci0"]
             r0 = [g for g in got_ready if g[0] == bdf0]
@@ -2290,12 +2431,17 @@ class Session:
                           "controllers and keyboards of the pass", [
                               "controllers (query-pci): %r" % {
                                   c: self.bdf[c] for c in controllers},
+                              "nvme (query-pci): %r" % nvme_bdfs,
                               "ready markers: %r" % [m.group(0) for m in ready],
                               "ps2 ready markers: %r" % ps2_ready,
+                              "nvme controller markers: %r" % [
+                                  m.group(0) for m in nvme_ctrl],
+                              "nvme ready markers: %r" % nvme_ready,
                               "ramfs ready markers: %r" % ramfs_ready,
                               "attached markers: %r" % [m.group(0)
                                                         for m in attached]])
         self.initial_markers = ([m.group(0) for m in ready] + ps2_ready +
+                                [m.group(0) for m in nvme_ctrl] + nvme_ready +
                                 rootfs + ramfs_ready +
                                 [m.group(0) for m in attached])
         say("USB session: %s." % "; ".join(self.initial_markers))
@@ -2340,6 +2486,7 @@ class Session:
         markers = []
         for line in complete_lines(self.log[:end_of_session], self.s0):
             match = (READY_RE.search(line) or PS2_READY_RE.search(line) or
+                     NVME_CTRL_RE.search(line) or NVME_READY_RE.search(line) or
                      ROOTFS_RE.search(line) or RAMFS_READY_RE.search(line) or
                      ATTACHED_RE.search(line) or DETACHED_RE.search(line))
             if match:
@@ -2516,7 +2663,7 @@ class Session:
 
     def commands(self, scenario):
         """Realistic session steps typed over USB: help, an unknown command,
-        and a user program (usertest 0) like in the scripted commands."""
+        a user program (usertest 0), and /bin/disk info/write/read/zero."""
         self.scenario = scenario
         self.command("help", "\r\n".join(HELP_LINES), "help")
         for _ in range(200):
@@ -2526,9 +2673,57 @@ class Session:
         self.command(unknown, "sh: unknown command: " + unknown,
                      "an unknown command")
         self.command("usertest 0", self.usertest_line, "usertest 0")
+
+        kbd, shell = KeyboardModel(self.active_kbd()), ShellModel(self.shell)
+        plan = Plan(keys("disk info") + ENTER, kbd, shell)
+        self.type_plan(plan, "disk info")
+        self.set_active_kbd(kbd)
+        self.shell = shell
+        start = self.cursor
+        info_end = "sh: disk exited with status 0\r\n" + PROMPT
+        end = self.wait_for(
+            "the output of 'disk info' and the next prompt", OUTPUT_TIMEOUT,
+            lambda t: (t.find(info_end, start) + len(info_end)
+                       if t.find(info_end, start) >= 0 else None))
+        info_text = self.log[start:end]
+        self.cursor = end
+        self.lines_typed += 1
+        info_re = re.compile(
+            r"disk 0: [^\r\n]+ \(serial=protos0, nsid=1, pci=%s, ro=0\)\r\n"
+            r"  8192 blocks x 512 B = 4 MiB \(max 8 blocks/call\)\r\n" %
+            re.escape(self.nvme_bdf))
+        if not info_re.search(info_text):
+            raise Failure("usb_commands", "'disk info' output mismatch",
+                          ["captured: %r" % info_text,
+                           "expected bdf: %r" % self.nvme_bdf])
+
+        for _ in range(200):
+            tok = rand(6, LETTERS)
+            if acceptable(tok) and tok not in self.text():
+                break
+        else:
+            raise RuntimeError("could not pick unique /bin/disk token")
+        self.command(
+            "disk write 0 " + tok,
+            "wrote 1 block(s) at lba 0\r\nsh: disk exited with status 0",
+            "disk write 0")
+        hex16 = " ".join(["%02x" % ord(c) for c in tok] + ["0a"] + ["00"] * 9)
+        self.command(
+            "disk read 0",
+            "0000: %s |%s|\r\n...\r\nsh: disk exited with status 0" % (
+                hex16, tok + "." * 10),
+            "disk read 0")
+        self.command(
+            "disk zero 0",
+            "zeroed 1 block(s) at lba 0\r\nsh: disk exited with status 0",
+            "disk zero 0")
+        self.command(
+            "disk read 0",
+            "...\r\n(zero through 512 B)\r\nsh: disk exited with status 0",
+            "disk read 0 after zero")
         target = self.keyboards[-1] if self.keyboards else "ps2/i8042"
-        say("USB %s: help, %r and usertest 0 typed over %s; outputs OK." % (
-            scenario, unknown, target))
+        say("USB %s: help, %r, usertest 0 and disk info/write/read/zero typed "
+            "over %s; outputs OK." % (scenario, unknown, target))
 
     # -- Scenarios -----------------------------------------------------------
 
@@ -2806,8 +3001,18 @@ run_bios_pass() {
     label="${label} + USB keyboard"
     deadline=$((SECONDS + BIOS_TIMEOUT_SECS + USB_SESSION_TIMEOUT_SECS))
   fi
+  local disk_args=()
+  if [[ "${name}" == "bios" ]]; then
+    local nvme_img="${RUN_DIR}/nvme_${name}.img"
+    dd if=/dev/zero of="${nvme_img}" bs=1048576 count=4 >/dev/null 2>&1 || return 1
+    disk_args=(
+      -drive "file=${nvme_img},format=raw,if=none,id=nvme0"
+      -device "nvme,drive=nvme0,serial=protos0"
+    )
+  fi
   echo "Running ${label} boot verification..."
-  start_qemu "${name}" "${cpu_args[@]}" -cdrom "${iso}" ${usb_args[@]+"${usb_args[@]}"}
+  start_qemu "${name}" "${cpu_args[@]}" -cdrom "${iso}" \
+    ${usb_args[@]+"${usb_args[@]}"} ${disk_args[@]+"${disk_args[@]}"}
   if [[ "${USB_SESSION}" == "1" ]]; then
     if ! run_usb_pass_session "${name}" "${label}" "${log}" single "${deadline}"; then
       return 1
@@ -2821,8 +3026,13 @@ run_bios_pass() {
     report_failure "${label}" "${log}" "${name}"
     return 1
   fi
+  local nvme_verify=0
+  if [[ "${name}" == "bios" ]]; then
+    nvme_verify=1
+  fi
   if ! verify_serial_log "${log}" "${QEMU_PID}" "$@" ${usb_markers[@]+"${usb_markers[@]}"} ||
      ! verify_init_ramfs "${log}" "${USB_SESSION}" ||
+     { [[ "${nvme_verify}" -eq 1 ]] && ! verify_init_nvme "${log}" "${USB_SESSION}" "${RUN_DIR}/qemu_${name}_qmp.sock"; } ||
      ! verify_pass_absent_markers "${name}" "${log}" ||
      ! verify_x87_pointer_reset "${log}" "${RUN_DIR}/qemu_${name}_qmp.sock" ||
      ! verify_vga_text "${RUN_DIR}/qemu_${name}_monitor.sock" "${RUN_DIR}/vga_${name}_dump.bin" ||
@@ -2872,9 +3082,15 @@ run_uefi_pass() {
     label="${label} + USB keyboards on 2 xHCI controllers"
     deadline=$((SECONDS + UEFI_TIMEOUT_SECS + USB_SESSION_TIMEOUT_SECS))
   fi
+  local nvme_img="${RUN_DIR}/nvme_${name}.img"
+  dd if=/dev/zero of="${nvme_img}" bs=1048576 count=4 >/dev/null 2>&1 || return 1
+  local disk_args=(
+    -drive "file=${nvme_img},format=raw,if=none,id=nvme0"
+    -device "nvme,drive=nvme0,serial=protos0"
+  )
   echo "Running ${label} boot verification..."
   start_qemu "${name}" "${OVMF_ARGS[@]}" "${cpu_args[@]}" -m 4G -cdrom "${iso}" \
-    ${usb_args[@]+"${usb_args[@]}"}
+    ${usb_args[@]+"${usb_args[@]}"} ${disk_args[@]+"${disk_args[@]}"}
   if [[ "${USB_SESSION}" == "1" ]]; then
     if ! run_usb_pass_session "${name}" "${label}" "${log}" multi "${deadline}"; then
       return 1
@@ -2892,6 +3108,7 @@ run_uefi_pass() {
          "[PMM] mmap entry: base=0x100000000" "[PMM] Framebuffer: addr=" \
          "${QEMU64_MARKERS[@]}" ${usb_markers[@]+"${usb_markers[@]}"} ||
      ! verify_init_ramfs "${log}" "${USB_SESSION}" ||
+     ! verify_init_nvme "${log}" "${USB_SESSION}" "${RUN_DIR}/qemu_${name}_qmp.sock" ||
      ! verify_pass_absent_markers "${name}" "${log}" ||
      ! verify_x87_pointer_reset "${log}" "${RUN_DIR}/qemu_${name}_qmp.sock" ||
      ! verify_framebuffer "${log}" "${RUN_DIR}/qemu_${name}_monitor.sock" "${RUN_DIR}/vga_${name}_dump.bin" ||
@@ -2928,6 +3145,616 @@ run_smep_pass() {
     return 0
   fi
   run_bios_pass smep "${iso}" "${label}" "${cpu}" "${SMEP_MARKERS[@]}"
+}
+
+# Checks a 0-namespace NVMe controller (controller attached, no attached drives)
+# in an isolated QEMU pass after the main batch passes when --passes was not
+# set.
+run_nvme_0ns_check() {
+  local iso="${ISO_FILE}"
+  local name="nvme_0ns" label="BIOS/Multiboot2 (0-NS NVMe controller)"
+  local log="${RUN_DIR}/serial_${name}_output.log"
+  local QEMU_PID=""
+  local USB_SESSION=0
+  trap kill_qemu RETURN
+
+  local cpu_args=(-cpu qemu64)
+  if [[ "${KVM}" == "1" ]]; then
+    cpu_args=(-enable-kvm -cpu host)
+  fi
+  local disk_args=(-device "nvme,serial=protos0")
+  echo "Running ${label} verification..."
+  start_qemu "${name}" "${cpu_args[@]}" -cdrom "${iso}" "${disk_args[@]}"
+  if ! wait_for_boot "${log}" "${QEMU_PID}" "${BIOS_TIMEOUT_SECS}"; then
+    report_failure "${label}" "${log}" "${name}"
+    return 1
+  fi
+  if ! verify_serial_log "${log}" "${QEMU_PID}" "${QEMU64_MARKERS[@]}" ||
+     ! verify_init_ramfs "${log}" 0 ||
+     ! verify_pass_absent_markers bios "${log}" ||
+     ! stop_qemu_and_recheck_log "${log}"; then
+    print_qemu_stderr "${name}"
+    cat "${log}" >&2
+    return 1
+  fi
+  QEMU_PID=""
+  local hello exited session=""
+  hello="$(grep -an -m1 -F -- "${INIT_HELLO_MARKER}" "${log}" | cut -d: -f1 || true)"
+  exited="$(grep -an -m1 -F -- "${INIT_EXITED_MARKER}" "${log}" | cut -d: -f1 || true)"
+  if [[ -n "${hello}" && -n "${exited}" ]] && ((hello <= exited)); then
+    session="$(sed -n "${hello},${exited}p" "${log}" | tr -d '\r')"
+  fi
+  if [[ -z "${session}" ]]; then
+    echo "FAIL: ${label}: missing init session between '${INIT_HELLO_MARKER}' and '${INIT_EXITED_MARKER}'." >&2
+    cat "${log}" >&2
+    return 1
+  fi
+  if ! SESSION_LOG="${session}" python3 - <<'PY'
+import os, re, sys
+
+session = os.environ["SESSION_LOG"]
+if re.search(r"^\[NVME\] ready$", session, re.M):
+    sys.stderr.write("FAIL: 0-NS init session unexpectedly printed '[NVME] ready'.\n")
+    sys.exit(1)
+ctrl = re.search(
+    r"^\[NVME\] controller [0-9a-f]{2}:[0-9a-f]{2}\.[0-7] ready \((msix|msi)\), disks=0$",
+    session,
+    re.M,
+)
+no_ns = re.search(r"^\[NVME\] no usable namespaces$", session, re.M)
+prompt_pos = session.find("sh> ")
+if not ctrl or not no_ns or prompt_pos < 0 or not (ctrl.start() < no_ns.start() < prompt_pos):
+    sys.stderr.write("FAIL: 0-NS NVMe markers missing or out of order before 'sh> '.\n")
+    sys.exit(1)
+PY
+  then
+    cat "${log}" >&2
+    return 1
+  fi
+  if ! grep -aFq -- "[TEST] nvme_block_io: skipped (no usable NVMe namespaces)" "${log}"; then
+    echo "FAIL: ${label}: missing expected 0-NS NVMe skip marker." >&2
+    cat "${log}" >&2
+    return 1
+  fi
+  echo "Verified ${label}."
+}
+
+# Checks a 4 KiB-sector NVMe namespace in an isolated QEMU pass after the main
+# batch passes when --passes was not set.
+run_nvme_4k_check() {
+  local iso="${ISO_FILE}"
+  local name="nvme_4k" label="BIOS/Multiboot2 (4 KiB NVMe namespace)"
+  local log="${RUN_DIR}/serial_${name}_output.log"
+  local QEMU_PID=""
+  local USB_SESSION=0
+  trap kill_qemu RETURN
+
+  local cpu_args=(-cpu qemu64)
+  if [[ "${KVM}" == "1" ]]; then
+    cpu_args=(-enable-kvm -cpu host)
+  fi
+  local nvme_img="${RUN_DIR}/nvme_4k.img"
+  dd if=/dev/zero of="${nvme_img}" bs=1048576 count=4 >/dev/null 2>&1 || return 1
+  local disk_args=(
+    -device "nvme,id=nvme0,serial=protos0"
+    -drive "file=${nvme_img},format=raw,if=none,id=nvme0_blk"
+    -device "nvme-ns,drive=nvme0_blk,bus=nvme0,nsid=1,logical_block_size=4096,physical_block_size=4096"
+  )
+  echo "Running ${label} verification..."
+  start_qemu "${name}" "${cpu_args[@]}" -cdrom "${iso}" "${disk_args[@]}"
+  if ! wait_for_boot "${log}" "${QEMU_PID}" "${BIOS_TIMEOUT_SECS}"; then
+    report_failure "${label}" "${log}" "${name}"
+    return 1
+  fi
+  if ! verify_serial_log "${log}" "${QEMU_PID}" "${QEMU64_MARKERS[@]}" ||
+     ! verify_init_ramfs "${log}" 0 ||
+     ! verify_init_nvme "${log}" 0 "${RUN_DIR}/qemu_${name}_qmp.sock" ||
+     ! verify_pass_absent_markers bios "${log}" ||
+     ! stop_qemu_and_recheck_log "${log}"; then
+    print_qemu_stderr "${name}"
+    cat "${log}" >&2
+    return 1
+  fi
+  QEMU_PID=""
+  if ! grep -aFq -- "1024 blocks x 4096 B = 4 MiB (max 1 blocks/call)" "${log}"; then
+    echo "FAIL: ${label}: missing expected 4 KiB /bin/disk info geometry output." >&2
+    cat "${log}" >&2
+    return 1
+  fi
+  echo "Verified ${label}."
+}
+
+# Drives one interactive-session serial check for multi-disk NVMe topologies
+# ($4 = expected controller count, $5 = mode "multidisk", $6 = token for
+# write/read, $7 = timeout seconds, $8 = QEMU PID).
+nvme_interactive_serial_step() {
+  local log="$1" qmp_sock="$2" ser_sock="$3" expected_ctrls="$4" mode="$5" token="$6" timeout="$7" qemu_pid="${8:-0}"
+  python3 - "${log}" "${qmp_sock}" "${ser_sock}" "${expected_ctrls}" "${mode}" "${token}" "${timeout}" "${qemu_pid}" <<'PY'
+import json, os, re, socket, sys, time
+
+log_path, qmp_path, ser_path, expected_ctrls, mode, token, timeout, qemu_pid = (
+    sys.argv[1], sys.argv[2], sys.argv[3], int(sys.argv[4]), sys.argv[5],
+    sys.argv[6], float(sys.argv[7]), int(sys.argv[8])
+)
+deadline = time.monotonic() + timeout
+
+def qemu_alive():
+    if qemu_pid <= 0:
+        return True
+    try:
+        with open("/proc/%d/stat" % qemu_pid) as f:
+            return f.read().rsplit(")", 1)[1].split()[0] != "Z"
+    except OSError:
+        pass
+    try:
+        os.kill(qemu_pid, 0)
+        return True
+    except OSError:
+        return False
+
+def read_log():
+    try:
+        return open(log_path, "rb").read().decode("latin-1")
+    except OSError:
+        return ""
+
+while True:
+    t = read_log()
+    if "FAIL" in t or "[FATAL]" in t:
+        sys.stderr.write("FAIL: failure line while waiting for NVMe %s session.\n" % mode)
+        sys.exit(1)
+    done = t.find("[TEST] ALL BOOT SELF-TESTS PASSED")
+    if done >= 0:
+        s0 = t.find("\n", done)
+        if s0 >= 0:
+            break
+    if not qemu_alive():
+        sys.stderr.write("FAIL: QEMU exited unexpectedly before boot self-tests completed in %s check.\n" % mode)
+        sys.exit(1)
+    if time.monotonic() >= deadline:
+        sys.stderr.write("FAIL: timed out waiting for boot self-tests in %s check.\n" % mode)
+        sys.exit(1)
+    time.sleep(0.05)
+
+s0 += 1
+ctrl_re = re.compile(r"\[NVME\] controller ([0-9a-f]{2}:[0-9a-f]{2}\.[0-7]) ready \((msix|msi)\), disks=([0-9]+)$", re.M)
+while True:
+    t = read_log()[s0:].replace("\r", "")
+    if "FAIL" in t or "[FATAL]" in t or "[NVME] no " in t or "[INIT] exited with status" in t:
+        sys.stderr.write("FAIL: unexpected error before shell prompt in %s check.\n" % mode)
+        sys.exit(1)
+    ctrls = list(ctrl_re.finditer(t))
+    ready = list(re.finditer(r"^\[NVME\] ready$", t, re.M))
+    prompt_pos = t.find("sh> ")
+    if ("[INIT] hello from ring 3" in t and "[RAMFS] ready" in t and
+            len(ctrls) == expected_ctrls and len(ready) == 1 and prompt_pos >= 0):
+        if not (max(c.start() for c in ctrls) < ready[0].start() < prompt_pos):
+            sys.stderr.write("FAIL: [NVME] readiness markers appeared after 'sh> ' in %s check.\n" % mode)
+            sys.exit(1)
+        break
+    if not qemu_alive():
+        sys.stderr.write("FAIL: QEMU exited unexpectedly before init/nvme/prompt in %s check.\n" % mode)
+        sys.exit(1)
+    if time.monotonic() >= deadline:
+        sys.stderr.write("FAIL: timed out waiting for init/nvme/prompt in %s check.\n" % mode)
+        sys.exit(1)
+    time.sleep(0.05)
+
+qsock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+qsock.settimeout(10.0)
+qsock.connect(qmp_path)
+qbuf = b""
+
+def qrecv():
+    global qbuf
+    while b"\n" not in qbuf:
+        data = qsock.recv(65536)
+        if not data:
+            raise RuntimeError("QMP closed")
+        qbuf += data
+    line, qbuf = qbuf.split(b"\n", 1)
+    return json.loads(line.decode("utf-8"))
+
+def qexec(cmd):
+    qsock.sendall((json.dumps({"execute": cmd}) + "\r\n").encode("utf-8"))
+    while True:
+        obj = qrecv()
+        if "return" in obj:
+            return obj["return"]
+        if "error" in obj:
+            raise RuntimeError(obj["error"])
+
+try:
+    qrecv()
+    qexec("qmp_capabilities")
+    pci = qexec("query-pci")
+finally:
+    qsock.close()
+
+nvme_bdfs = []
+def walk(devs):
+    for d in devs:
+        if ((d.get("class_info") or {}).get("class") == 0x0108):
+            nvme_bdfs.append("%02x:%02x.%x" % (d["bus"], d["slot"], d["function"]))
+        walk((d.get("pci_bridge") or {}).get("devices") or [])
+for bus in pci or []:
+    walk(bus.get("devices") or [])
+ctrl_bdfs = [c.group(1) for c in ctrls]
+if len(nvme_bdfs) != expected_ctrls or ctrl_bdfs != nvme_bdfs:
+    sys.stderr.write("FAIL: NVMe BDF mismatch %r vs %r in %s check.\n" % (ctrl_bdfs, nvme_bdfs, mode))
+    sys.exit(1)
+
+ssock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+ssock.settimeout(10.0)
+ssock.connect(ser_path)
+
+def drain_serial_sock():
+    ssock.settimeout(0.0)
+    try:
+        while ssock.recv(65536):
+            pass
+    except OSError:
+        pass
+    finally:
+        ssock.settimeout(10.0)
+
+def send_line(text):
+    raw = (text + "\r").encode("latin-1")
+    for i in range(0, len(raw), 8):
+        drain_serial_sock()
+        ssock.sendall(raw[i:i + 8])
+        time.sleep(0.02)
+
+def wait_for_substr(cursor, needle, what):
+    while True:
+        drain_serial_sock()
+        cur_text = read_log()[s0:]
+        if "FAIL" in cur_text[cursor:] or "[FATAL]" in cur_text[cursor:]:
+            sys.stderr.write("FAIL: kernel failure while waiting for %s.\n" % what)
+            sys.exit(1)
+        idx = cur_text.find(needle, cursor)
+        if idx >= 0:
+            return idx + len(needle)
+        if not qemu_alive():
+            sys.stderr.write("FAIL: QEMU exited unexpectedly while waiting for %s.\n" % what)
+            sys.exit(1)
+        if time.monotonic() >= deadline:
+            sys.stderr.write("FAIL: timed out waiting for %s.\n" % what)
+            sys.exit(1)
+        time.sleep(0.05)
+
+try:
+    cursor = len(read_log()[s0:])
+    if mode == "multidisk":
+        send_line("disk info")
+        next_cursor = wait_for_substr(
+            cursor, "sh: disk exited with status 0\r\nsh> ", "multidisk info"
+        )
+        info_out = read_log()[s0 + cursor:s0 + next_cursor]
+        d0_re = re.compile(
+            r"disk 0: [^\r\n]+ \(serial=protos0, nsid=1, pci=%s, ro=0\)\r\n"
+            r"  8192 blocks x 512 B = 4 MiB \(max 8 blocks/call\)\r\n"
+            % re.escape(nvme_bdfs[0])
+        )
+        d1_re = re.compile(
+            r"disk 1: [^\r\n]+ \(serial=protos1, nsid=1, pci=%s, ro=0\)\r\n"
+            r"  1024 blocks x 4096 B = 4 MiB \(max 1 blocks/call\)\r\n"
+            % re.escape(nvme_bdfs[1])
+        )
+        if not d0_re.search(info_out) or not d1_re.search(info_out):
+            sys.stderr.write("FAIL: unexpected multidisk 'disk info' output: %r\n" % info_out)
+            sys.exit(1)
+        cursor = next_cursor
+        send_line("disk -d 1 write 0 " + token)
+        cursor = wait_for_substr(
+            cursor,
+            "wrote 1 block(s) at lba 0\r\nsh: disk exited with status 0\r\nsh> ",
+            "disk -d 1 write 0",
+        )
+        hex16 = " ".join(["%02x" % ord(c) for c in token] + ["0a"] + ["00"] * 9)
+        send_line("disk -d 1 read 0")
+        cursor = wait_for_substr(
+            cursor,
+            "0000: %s |%s|\r\n...\r\nsh: disk exited with status 0\r\nsh> "
+            % (hex16, token + "." * 10),
+            "disk -d 1 read 0",
+        )
+        send_line("disk -d 1 zero 0")
+        cursor = wait_for_substr(
+            cursor,
+            "zeroed 1 block(s) at lba 0\r\nsh: disk exited with status 0\r\nsh> ",
+            "disk -d 1 zero 0",
+        )
+        send_line("disk -d 1 read 0")
+        cursor = wait_for_substr(
+            cursor,
+            "...\r\n(zero through 4096 B)\r\nsh: disk exited with status 0\r\nsh> ",
+            "disk -d 1 read 0 after zero",
+        )
+    else:
+        raise ValueError("unknown mode: %r" % mode)
+    send_line("exit 0")
+    wait_for_substr(cursor, "[INIT] exited with status 0", "init exit")
+    wait_for_substr(cursor, "[TEST] driver_session_cleanup: PASS", "cleanup pass")
+finally:
+    ssock.close()
+PY
+}
+
+# Checks two NVMe controllers (512 B + 4096 B) and `/bin/disk -d 1` in an
+# isolated QEMU pass when --passes was not set.
+run_nvme_multidisk_check() {
+  local iso="${ISO_FILE}"
+  local name="nvme_multidisk" label="BIOS/Multiboot2 (multi-disk NVMe)"
+  local log="${RUN_DIR}/serial_${name}_output.log"
+  local QEMU_PID=""
+  local USB_SESSION=1
+  trap kill_qemu RETURN
+
+  local cpu_args=(-cpu qemu64)
+  if [[ "${KVM}" == "1" ]]; then
+    cpu_args=(-enable-kvm -cpu host)
+  fi
+  local img0="${RUN_DIR}/nvme_md0.img"
+  local img1="${RUN_DIR}/nvme_md1.img"
+  dd if=/dev/zero of="${img0}" bs=1048576 count=4 >/dev/null 2>&1 || return 1
+  dd if=/dev/zero of="${img1}" bs=1048576 count=4 >/dev/null 2>&1 || return 1
+  local disk_args=(
+    -drive "file=${img0},format=raw,if=none,id=nvme0"
+    -device "nvme,drive=nvme0,serial=protos0"
+    -device "nvme,id=nvme1,serial=protos1"
+    -drive "file=${img1},format=raw,if=none,id=nvme1_blk"
+    -device "nvme-ns,drive=nvme1_blk,bus=nvme1,nsid=1,logical_block_size=4096,physical_block_size=4096"
+  )
+  local token
+  token="md$(python3 -c 'import secrets; print("".join(secrets.choice("abcdefghijklmnopqrstuvwxyz") for _ in range(4)))')"
+  local step_timeout=$((BIOS_TIMEOUT_SECS + USB_SESSION_TIMEOUT_SECS))
+  echo "Running ${label} verification..."
+  start_qemu "${name}" "${cpu_args[@]}" -cdrom "${iso}" "${USB_FW_CFG_ARGS[@]}" "${disk_args[@]}"
+  if ! nvme_interactive_serial_step "${log}" "${RUN_DIR}/qemu_${name}_qmp.sock" \
+         "${RUN_DIR}/qemu_${name}_serial.sock" 2 multidisk "${token}" "${step_timeout}" "${QEMU_PID}" ||
+     ! wait_for_boot "${log}" "${QEMU_PID}" "${step_timeout}" ||
+     ! verify_serial_log "${log}" "${QEMU_PID}" "${QEMU64_MARKERS[@]}" \
+         "[NVME] controller " "[NVME] ready" \
+         "[TEST] nvme_driver_lifecycle: controllers=2 " \
+         "[TEST] nvme_block_io: controllers=2 status=ok" \
+         "[TEST] driver_session_cleanup: PASS" ||
+     ! verify_pass_absent_markers bios "${log}" ||
+     ! stop_qemu_and_recheck_log "${log}"; then
+    print_qemu_stderr "${name}"
+    cat "${log}" >&2
+    return 1
+  fi
+  QEMU_PID=""
+  echo "Verified ${label} (2 controllers: 512 B + 4096 B, disk -d 1 token='${token}')."
+}
+
+# Drives one interactive-session serial check for NVMe persistence (mode "write"
+# or "read" on LBA 1 with token $4).
+nvme_persist_serial_step() {
+  local log="$1" qmp_sock="$2" ser_sock="$3" mode="$4" token="$5" timeout="$6" qemu_pid="${7:-0}"
+  python3 - "${log}" "${qmp_sock}" "${ser_sock}" "${mode}" "${token}" "${timeout}" "${qemu_pid}" <<'PY'
+import json, os, re, socket, sys, time
+
+log_path, qmp_path, ser_path, mode, token, timeout, qemu_pid = (
+    sys.argv[1], sys.argv[2], sys.argv[3], sys.argv[4], sys.argv[5], float(sys.argv[6]), int(sys.argv[7])
+)
+deadline = time.monotonic() + timeout
+
+def qemu_alive():
+    if qemu_pid <= 0:
+        return True
+    try:
+        with open("/proc/%d/stat" % qemu_pid) as f:
+            return f.read().rsplit(")", 1)[1].split()[0] != "Z"
+    except OSError:
+        pass
+    try:
+        os.kill(qemu_pid, 0)
+        return True
+    except OSError:
+        return False
+
+def read_log():
+    try:
+        return open(log_path, "rb").read().decode("latin-1")
+    except OSError:
+        return ""
+
+while True:
+    t = read_log()
+    if "FAIL" in t or "[FATAL]" in t:
+        sys.stderr.write("FAIL: failure line while waiting for NVMe persistence session.\n")
+        sys.exit(1)
+    done = t.find("[TEST] ALL BOOT SELF-TESTS PASSED")
+    if done >= 0:
+        s0 = t.find("\n", done)
+        if s0 >= 0:
+            break
+    if not qemu_alive():
+        sys.stderr.write("FAIL: QEMU exited unexpectedly before boot self-tests completed in persistence check.\n")
+        sys.exit(1)
+    if time.monotonic() >= deadline:
+        sys.stderr.write("FAIL: timed out waiting for boot self-tests in persistence check.\n")
+        sys.exit(1)
+    time.sleep(0.05)
+
+s0 += 1
+ctrl_re = re.compile(r"\[NVME\] controller ([0-9a-f]{2}:[0-9a-f]{2}\.[0-7]) ready \((msix|msi)\), disks=([0-9]+)$", re.M)
+while True:
+    t = read_log()[s0:].replace("\r", "")
+    if "FAIL" in t or "[FATAL]" in t or "[NVME] no " in t or "[INIT] exited with status" in t:
+        sys.stderr.write("FAIL: unexpected error before shell prompt in persistence check.\n")
+        sys.exit(1)
+    ctrls = list(ctrl_re.finditer(t))
+    ready = list(re.finditer(r"^\[NVME\] ready$", t, re.M))
+    prompt_pos = t.find("sh> ")
+    if "[INIT] hello from ring 3" in t and "[RAMFS] ready" in t and ctrls and ready and prompt_pos >= 0:
+        if not (0 <= ctrls[0].start() < ready[0].start() < prompt_pos):
+            sys.stderr.write("FAIL: [NVME] readiness markers appeared after 'sh> ' in persistence check.\n")
+            sys.exit(1)
+        break
+    if not qemu_alive():
+        sys.stderr.write("FAIL: QEMU exited unexpectedly before init/nvme/prompt in persistence check.\n")
+        sys.exit(1)
+    if time.monotonic() >= deadline:
+        sys.stderr.write("FAIL: timed out waiting for init/nvme/prompt in persistence check.\n")
+        sys.exit(1)
+    time.sleep(0.05)
+
+qsock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+qsock.settimeout(10.0)
+qsock.connect(qmp_path)
+qbuf = b""
+
+def qrecv():
+    global qbuf
+    while b"\n" not in qbuf:
+        data = qsock.recv(65536)
+        if not data:
+            raise RuntimeError("QMP closed")
+        qbuf += data
+    line, qbuf = qbuf.split(b"\n", 1)
+    return json.loads(line.decode("utf-8"))
+
+def qexec(cmd):
+    qsock.sendall((json.dumps({"execute": cmd}) + "\r\n").encode("utf-8"))
+    while True:
+        obj = qrecv()
+        if "return" in obj:
+            return obj["return"]
+        if "error" in obj:
+            raise RuntimeError(obj["error"])
+
+try:
+    qrecv()
+    qexec("qmp_capabilities")
+    pci = qexec("query-pci")
+finally:
+    qsock.close()
+
+nvme_bdfs = []
+def walk(devs):
+    for d in devs:
+        if ((d.get("class_info") or {}).get("class") == 0x0108):
+            nvme_bdfs.append("%02x:%02x.%x" % (d["bus"], d["slot"], d["function"]))
+        walk((d.get("pci_bridge") or {}).get("devices") or [])
+for bus in pci or []:
+    walk(bus.get("devices") or [])
+if len(nvme_bdfs) != 1 or ctrls[0].group(1) != nvme_bdfs[0]:
+    sys.stderr.write("FAIL: NVMe BDF mismatch %r vs %r.\n" % (ctrls[0].group(1), nvme_bdfs))
+    sys.exit(1)
+
+ssock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+ssock.settimeout(10.0)
+ssock.connect(ser_path)
+
+def drain_serial_sock():
+    ssock.settimeout(0.0)
+    try:
+        while ssock.recv(65536):
+            pass
+    except OSError:
+        pass
+    finally:
+        ssock.settimeout(10.0)
+
+def send_line(text):
+    raw = (text + "\r").encode("latin-1")
+    for i in range(0, len(raw), 8):
+        drain_serial_sock()
+        ssock.sendall(raw[i:i + 8])
+        time.sleep(0.02)
+
+def wait_for_substr(cursor, needle, what):
+    while True:
+        drain_serial_sock()
+        cur_text = read_log()[s0:]
+        if "FAIL" in cur_text[cursor:] or "[FATAL]" in cur_text[cursor:]:
+            sys.stderr.write("FAIL: kernel failure while waiting for %s.\n" % what)
+            sys.exit(1)
+        idx = cur_text.find(needle, cursor)
+        if idx >= 0:
+            return idx + len(needle)
+        if not qemu_alive():
+            sys.stderr.write("FAIL: QEMU exited unexpectedly while waiting for %s.\n" % what)
+            sys.exit(1)
+        if time.monotonic() >= deadline:
+            sys.stderr.write("FAIL: timed out waiting for %s.\n" % what)
+            sys.exit(1)
+        time.sleep(0.05)
+
+try:
+    cursor = len(read_log()[s0:])
+    if mode == "write":
+        send_line("disk write 1 " + token)
+        cursor = wait_for_substr(
+            cursor,
+            "wrote 1 block(s) at lba 1\r\nsh: disk exited with status 0\r\nsh> ",
+            "disk write 1",
+        )
+    else:
+        hex16 = " ".join(["%02x" % ord(c) for c in token] + ["0a"] + ["00"] * 9)
+        expected = (
+            "0000: %s |%s|\r\n...\r\nsh: disk exited with status 0\r\nsh> "
+            % (hex16, token + "." * 10)
+        )
+        send_line("disk read 1")
+        cursor = wait_for_substr(cursor, expected, "disk read 1 persistence")
+    send_line("exit 0")
+    wait_for_substr(cursor, "[INIT] exited with status 0", "init exit")
+    wait_for_substr(cursor, "[TEST] driver_session_cleanup: PASS", "cleanup pass")
+finally:
+    ssock.close()
+PY
+}
+
+# Checks NVMe disk persistence across two separate QEMU boots sharing one image.
+run_nvme_persistence_check() {
+  local iso="${ISO_FILE}"
+  local nvme_img="${RUN_DIR}/nvme_persist.img"
+  local QEMU_PID=""
+  trap kill_qemu RETURN
+
+  dd if=/dev/zero of="${nvme_img}" bs=1048576 count=4 >/dev/null 2>&1 || return 1
+  local cpu_args=(-cpu qemu64)
+  if [[ "${KVM}" == "1" ]]; then
+    cpu_args=(-enable-kvm -cpu host)
+  fi
+  local disk_args=(
+    -drive "file=${nvme_img},format=raw,if=none,id=nvme0"
+    -device "nvme,drive=nvme0,serial=protos0"
+  )
+  local token
+  token="nv$(python3 -c 'import secrets; print("".join(secrets.choice("abcdefghijklmnopqrstuvwxyz") for _ in range(4)))')"
+
+  local persist_timeout=$((BIOS_TIMEOUT_SECS + USB_SESSION_TIMEOUT_SECS))
+  local step mode name log
+  for step in 1 2; do
+    if [[ "${step}" -eq 1 ]]; then
+      mode="write"
+    else
+      mode="read"
+    fi
+    name="nvme_persist${step}"
+    log="${RUN_DIR}/serial_${name}_output.log"
+    local USB_SESSION=1
+    echo "Running BIOS/Multiboot2 (NVMe persistence boot ${step}/2: ${mode})..."
+    start_qemu "${name}" "${cpu_args[@]}" -cdrom "${iso}" "${USB_FW_CFG_ARGS[@]}" "${disk_args[@]}"
+    if ! nvme_persist_serial_step "${log}" "${RUN_DIR}/qemu_${name}_qmp.sock" \
+           "${RUN_DIR}/qemu_${name}_serial.sock" "${mode}" "${token}" "${persist_timeout}" "${QEMU_PID}" ||
+       ! wait_for_boot "${log}" "${QEMU_PID}" "${persist_timeout}" ||
+       ! verify_serial_log "${log}" "${QEMU_PID}" "${QEMU64_MARKERS[@]}" \
+           "[NVME] controller " "[NVME] ready" "[TEST] driver_session_cleanup: PASS" ||
+       ! verify_pass_absent_markers bios "${log}" ||
+       ! stop_qemu_and_recheck_log "${log}"; then
+      print_qemu_stderr "${name}"
+      cat "${log}" >&2
+      return 1
+    fi
+    QEMU_PID=""
+  done
+  echo "Verified NVMe persistence across two QEMU boots (lba 1 token='${token}')."
 }
 
 run_pass() {
@@ -2997,6 +3824,13 @@ PASSES_STARTED=0
 if [[ "${overall_rc}" -ne 0 ]]; then
   echo "FAILURE: boot verification failed (${summary[*]})." >&2
   exit 1
+fi
+if [[ "${PASSES_SET}" -eq 0 ]]; then
+  if ! ( run_nvme_0ns_check ) || ! ( run_nvme_4k_check ) ||
+     ! ( run_nvme_multidisk_check ) || ! ( run_nvme_persistence_check ); then
+    echo "FAILURE: extra NVMe verification failed." >&2
+    exit 1
+  fi
 fi
 usb_summary=""
 if [[ "${#usb_passed[@]}" -gt 0 ]]; then

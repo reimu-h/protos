@@ -19,6 +19,8 @@ extern "C" const uint8_t g_ps2kbd_elf_start[];
 extern "C" const uint8_t g_ps2kbd_elf_end[];
 extern "C" const uint8_t g_ramfs_elf_start[];
 extern "C" const uint8_t g_ramfs_elf_end[];
+extern "C" const uint8_t g_nvme_elf_start[];
+extern "C" const uint8_t g_nvme_elf_end[];
 
 namespace protos {
 
@@ -62,6 +64,11 @@ inline UserProgram RamfsProgram() {
   return UserProgram{g_ramfs_elf_start, g_ramfs_elf_end - g_ramfs_elf_start};
 }
 
+// user/nvme/nvme.cpp: the ring-3 NVMe block storage driver.
+inline UserProgram NvmeProgram() {
+  return UserProgram{g_nvme_elf_start, g_nvme_elf_end - g_nvme_elf_start};
+}
+
 // Returns true if `[name, name + name_len)` equals the null-terminated string
 // `literal`.
 constexpr bool UserProgramNameEquals(const char* const name,  //
@@ -101,6 +108,9 @@ inline StatusOr<UserProgram> FindUserProgram(const char* const name,
   }
   if (UserProgramNameEquals(name, name_len, "ramfs")) {
     return RamfsProgram();
+  }
+  if (UserProgramNameEquals(name, name_len, "nvme")) {
+    return NvmeProgram();
   }
   return kStatusError;
 }

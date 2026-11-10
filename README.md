@@ -9,7 +9,8 @@ protos is a small x86-64 SMP kernel in freestanding C++20. It has:
   legacy ISA device/IRQ ownership, an in-memory filesystem server (`ramfs`) with
   POSIX-like file and directory operations that starts with the files of
   `rootfs/`, a shell (`sh`), a USB keyboard driver (`usbkbd`: xHCI, with hubs),
-  and an `i8042` PS/2 keyboard driver (`ps2kbd`).
+  an `i8042` PS/2 keyboard driver (`ps2kbd`), and a PCIe NVMe block driver
+  (`nvme`, with the `/bin/disk` shell utility).
 
 ## Build and run
 
@@ -21,11 +22,23 @@ Debian packages, and when a tool is missing, `make` builds in that Docker image
 instead.
 
 ```sh
-make                  # build/kernel.iso (Multiboot 2) and build/kernel-mb1.iso
-make run SELFTEST=0   # boot into the shell in QEMU (Ctrl-A X quits)
-make run              # boot with the self-tests, then a stress test loop
-make test             # unit tests, then QEMU boot tests
+make                          # build/kernel.iso (Multiboot 2) and build/kernel-mb1.iso
+make run SELFTEST=0           # boot into the shell in QEMU (Ctrl-A X quits)
+make run                      # boot with the self-tests, then a stress test loop
+make unit-test USE_DOCKER=1   # run C++ GoogleTest + deflake unit tests in Docker
+make test                     # unit tests, then QEMU boot tests (add REQUIRE_UEFI=1 for UEFI)
 ```
+
+`make run` attaches a raw NVMe disk image (`QEMU_DISK_IMAGE`, defaulting to
+`build/nvme.img` when `SELFTEST=0` and `build/nvme-selftest.img` when
+`SELFTEST=1`) with PCI serial `protos0` so `/bin/disk` writes persist across
+`make run SELFTEST=0` restarts. Self-tests (`SELFTEST=1`) overwrite test LBAs on
+any attached `serial=protos*` image, and `make clean` removes `build/`
+(including default disk images); pass `QEMU_DISK_IMAGE=/path/to/disk.img` to
+keep an image outside `build/`. A serial that starts with `protos` marks a disk
+as a disposable test image: the self-tests write only to such disks, and
+`/bin/disk` refuses `write` and `zero` on any other disk, such as a real one
+when the kernel boots on a real machine, unless it gets `-f`.
 
 CI checks that the C++ sources follow `.clang-format` with clang-format 21.1.8,
 since other versions format some code differently; to format with it, run

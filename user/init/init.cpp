@@ -1,12 +1,13 @@
 // init: the first user process, which the kernel starts once it has booted
 // (kernel.cpp). It greets from user mode, starts the user-space hardware
-// drivers (`usbkbd` and `ps2kbd`) if `kInitArgStartDrivers` is set in `arg`,
-// and the `ramfs` filesystem server if `kInitArgStartDrivers` or
+// drivers (`usbkbd`, `ps2kbd`, and `nvme`) if `kInitArgStartDrivers` is set in
+// `arg`, and the `ramfs` filesystem server if `kInitArgStartDrivers` or
 // `kInitArgStartFs` is set (with `kRamfsArgEmpty` if `kInitArgEmptyFs` is set,
 // so that the filesystem starts empty instead of with the boot filesystem),
-// waiting until ramfs serves requests. It then spawns the interactive shell
-// (sh), waits for the shell to finish, and exits with 0 if the shell exited
-// with 0. Otherwise it exits with:
+// waiting until ramfs serves requests and until nvme either serves block
+// requests or exits (up to `kNvmeReadyTimeoutTicks`). It then spawns the
+// interactive shell (sh), waits for the shell to finish, and exits with 0 if
+// the shell exited with 0. Otherwise it exits with:
 //   1 if it does not run in ring 3;
 //   2 if it can't print;
 //   3 if it can't spawn sh;
@@ -14,14 +15,17 @@
 //   5 if sh faulted, was killed, or failed to load;
 //   6 if sh exited with a status other than 0;
 //   7 if it can't spawn usbkbd (for the handoff or as the driver);
-//   8 if it can't spawn ps2kbd.
+//   8 if it can't spawn ps2kbd;
+//   9 if it can't spawn nvme.
 // If ramfs can't be spawned or doesn't serve requests within
 // `kRamfsReadyTimeoutTicks`, init says so and why, and starts the shell anyway
 // (its filesystem commands fail while no ramfs runs).
 
 #include <cstdint>
 
+#include "block_protocol.h"
 #include "syscall_abi.h"
+#include "user/block.h"
 #include "user/syscall.h"
 
 namespace protos::user {
@@ -30,6 +34,13 @@ namespace protos::user {
 // takes to start, yet short enough that a boot whose ramfs doesn't come up
 // still reaches the shell soon.
 constexpr int64_t kRamfsReadyTimeoutTicks = 2 * kSyscallTicksPerSecond;
+
+// How long init waits for nvme to claim its port before it starts `sh` without
+// it. Once nvme has claimed the port, init waits until nvme has finished
+// probing its controllers and entered its request loop (or exited), however
+// long that takes, so `[NVME]` startup messages do not interleave with
+// scripted shell output (see WaitForNvmeReady()).
+constexpr int64_t kNvmeReadyTimeoutTicks = 2 * kSyscallTicksPerSecond;
 
 // StartRamfs()'s result when ramfs doesn't serve requests in time.
 constexpr int64_t kRamfsTimedOut = 1;
@@ -64,6 +75,35 @@ static int64_t StartRamfs(const uint64_t mode) {
     (void)SpinOnBuffer(nullptr, 0, 1);
   }
   return 0;
+}
+
+// Waits until `nvme` (`nvme_pid`) either answers `GetBlockDeviceInfo(0)` (after
+// printing its `[NVME]` readiness lines) or exits. Gives up after
+// `kNvmeReadyTimeoutTicks` only while nvme has not claimed its port: nvme
+// claims it before it brings its controllers up, and a GetBlockDeviceInfo()
+// that reaches the port waits for nvme's answer (it has no timeout, like
+// StartRamfs()'s Stat()). nvme answers once it has brought every controller
+// up or given up on it, which its own timeouts bound: a controller's CAP.TO
+// (at least 2 s) for each reset and enable, and 5 s for each command.
+static void WaitForNvmeReady(const int64_t nvme_pid) {
+  const int64_t deadline = GetTicks() + kNvmeReadyTimeoutTicks;
+  for (;;) {
+    UserProgramResult nvme_result{};
+    if (TryWait(nvme_pid, &nvme_result) != 0) {
+      return;
+    }
+    int64_t disk_count = 0;
+    if (GetBlockDeviceInfo(0, &disk_count).ok()) {
+      return;
+    }
+    if (GetTicks() >= deadline) {
+      if (TryWait(nvme_pid, &nvme_result) == 0) {
+        (void)Print("[INIT] nvme not ready (timed out); continuing\n");
+      }
+      return;
+    }
+    (void)SpinOnBuffer(nullptr, 0, 1);
+  }
 }
 
 // Says why init continues without ramfs, for StartRamfs()'s result `rc`, in
@@ -104,6 +144,7 @@ int64_t Main(const uint64_t arg) {
   if (Print("[INIT] hello from ring 3\n") < 0) {
     return 2;
   }
+  int64_t nvme_pid = -1;
   if ((arg & kInitArgStartDrivers) != 0) {
     // Release any xHCI SMM USB Legacy Support (including Port 60h/64h
     // emulation SMIs) and halt firmware-running xHCI controllers before
@@ -126,6 +167,10 @@ int64_t Main(const uint64_t arg) {
     if (SpawnDriver("ps2kbd", kDriverArgNormal) < 0) {
       return 8;
     }
+    nvme_pid = SpawnDriver("nvme", kDriverArgNormal);
+    if (nvme_pid < 0) {
+      return 9;
+    }
   }
   // Like a keyboard, the filesystem is optional: without it, the shell still
   // runs its other commands.
@@ -136,6 +181,9 @@ int64_t Main(const uint64_t arg) {
     if (ramfs_rc != 0) {
       ReportRamfsNotReady(ramfs_rc);
     }
+  }
+  if (nvme_pid >= 0) {
+    WaitForNvmeReady(nvme_pid);
   }
   const int64_t sh_pid = Spawn(
       "sh", arg & ~(kInitArgStartDrivers | kInitArgStartFs | kInitArgEmptyFs));

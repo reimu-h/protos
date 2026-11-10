@@ -254,7 +254,13 @@ def xhci_port(port_spec):
     return ".".join(parts)
 
 
-controllers, cold, hubs, slot = {}, [], {}, 4
+drives = {}
+for spec in values("-drive"):
+    o = dict(p.split("=", 1) for p in spec.split(",") if "=" in p)
+    if "id" in o:
+        drives[o["id"]] = o.get("file")
+
+controllers, cold, hubs, nvme_devs, nvme_by_id, slot = {}, [], {}, [], {}, 4
 for spec in values("-device"):
     driver, o = opts(spec)
     if driver in ("qemu-xhci", "nec-usb-xhci"):
@@ -265,6 +271,18 @@ for spec in values("-device"):
         controllers[o["id"]] = (bdf, "msi" if o.get("msix") == "off" else "msix")
     elif driver == "pci-bridge":
         controllers[o["id"]], slot = ("00:%02x.0" % slot, None), slot + 1
+    elif driver == "nvme":
+        bdf, slot = "00:%02x.0" % slot, slot + 1
+        info = {"bdf": bdf, "mode": "msix", "drive": o.get("drive"),
+                "serial": o.get("serial", "protos0"), "bs": 512}
+        nvme_devs.append(info)
+        if "id" in o:
+            nvme_by_id[o["id"]] = info
+    elif driver == "nvme-ns":
+        bus = o.get("bus", "")
+        if bus in nvme_by_id:
+            nvme_by_id[bus]["drive"] = o.get("drive", nvme_by_id[bus]["drive"])
+            nvme_by_id[bus]["bs"] = int(o.get("logical_block_size", 512))
     elif driver == "usb-hub":
         hubs[o["id"]] = {"id": o["id"], "ctrl": o["bus"].split(".")[0],
                          "port": str(o["port"])}
@@ -376,6 +394,62 @@ def shell():
                     "path\n")
             elif words == ["usertest", "0"]:
                 log("sh: usertest exited with status -1250999896491\n")
+            elif words[:1] == ["disk"] and nvme_devs:
+                nv = nvme_devs[0]
+                bs = nv["bs"]
+                nblocks = (4 * 1024 * 1024) // bs
+                max_b = 4096 // bs
+                dpath = drives.get(nv["drive"])
+                sub = words[1] if len(words) > 1 else ""
+                if sub == "info" and len(words) == 2:
+                    log("disk 0: QEMU NVMe Ctrl (serial=%s, nsid=1, pci=%s, ro=0)\n"
+                        "  %d blocks x %d B = 4 MiB (max %d blocks/call)\n" % (
+                            nv["serial"], nv["bdf"], nblocks, bs, max_b))
+                    log("sh: disk exited with status 0\n")
+                elif sub == "write" and len(words) >= 4:
+                    lba = int(words[2], 0)
+                    payload = (" ".join(words[3:]) + "\n").encode("latin-1")
+                    blk = (payload + b"\x00" * bs)[:bs]
+                    if dpath and os.path.exists(dpath):
+                        with open(dpath, "r+b") as df:
+                            df.seek(lba * bs)
+                            df.write(blk)
+                    log("wrote 1 block(s) at lba %d\n" % lba)
+                    log("sh: disk exited with status 0\n")
+                elif sub == "zero" and len(words) == 3:
+                    lba = int(words[2], 0)
+                    if dpath and os.path.exists(dpath):
+                        with open(dpath, "r+b") as df:
+                            df.seek(lba * bs)
+                            df.write(b"\x00" * bs)
+                    log("zeroed 1 block(s) at lba %d\n" % lba)
+                    log("sh: disk exited with status 0\n")
+                elif sub == "read" and len(words) == 3:
+                    lba = int(words[2], 0)
+                    blk = b"\x00" * bs
+                    if dpath and os.path.exists(dpath):
+                        with open(dpath, "rb") as df:
+                            df.seek(lba * bs)
+                            blk = df.read(bs) or blk
+                    skipping = False
+                    any_nz = False
+                    for off in range(0, bs, 16):
+                        chunk = blk[off:off + 16]
+                        if all(b == 0 for b in chunk):
+                            if not skipping:
+                                log("...\n")
+                                skipping = True
+                            continue
+                        skipping = False
+                        any_nz = True
+                        hexs = "".join("%02x " % b for b in chunk)
+                        asc = "".join(chr(b) if 0x20 <= b <= 0x7E else "." for b in chunk)
+                        log("%04x: %s|%s|\n" % (off, hexs, asc))
+                    if not any_nz:
+                        log("(zero through %d B)\n" % bs)
+                    log("sh: disk exited with status 0\n")
+                else:
+                    log("disk: error\nsh: disk exited with status 1\n")
             elif words[:1] == ["exit"]:
                 return
             elif words:
@@ -447,22 +521,58 @@ def boot():
                  "[INIT] ramfs not ready (spawn error -1); continuing without a "
                  "filesystem\n"
                  "sh> ls\nsh: ls: /: filesystem unavailable\nsh> exit 0\n")
+    nvme_selftest = ""
+    if nvme_devs:
+        nv0 = nvme_devs[0]
+        bs0 = nv0["bs"]
+        nvme_selftest = (
+            "disk 0: QEMU NVMe Ctrl (serial=%s, nsid=1, pci=%s, ro=0)\n"
+            "  %d blocks x %d B = 4 MiB (max %d blocks/call)\n" % (
+                nv0["serial"], nv0["bdf"], (4 * 1024 * 1024) // bs0, bs0,
+                4096 // bs0))
     if not interactive:
         log("[INIT] hello from ring 3\n" + ramfs)
+        if nvme_devs and BUG != "nvme_after_prompt":
+            if BUG == "no_nvme":
+                log("[NVME] no NVMe controllers found\n")
+            elif BUG == "nvme_bad_bdf":
+                log("[NVME] controller 00:7f.0 ready (msix), disks=1\n"
+                    "[NVME] ready\n")
+            else:
+                for nv in nvme_devs:
+                    log("[NVME] controller %s ready (%s), disks=1\n" % (
+                        nv["bdf"], nv["mode"]))
+                log("[NVME] ready\n")
         for ch in script + "exit 0\n":
             shell_input.put(ch)
         shell()
-        log("[INIT] exited with status 0\n" + selftests +
+        if nvme_devs and BUG == "nvme_after_prompt":
+            for nv in nvme_devs:
+                log("[NVME] controller %s ready (%s), disks=1\n" % (
+                    nv["bdf"], nv["mode"]))
+            log("[NVME] ready\n")
+        log("[INIT] exited with status 0\n" + selftests + nvme_selftest +
             "[TEST] ALL BOOT SELF-TESTS PASSED\n")
         log(stress)
         return
-    log(selftests + "[TEST] ALL BOOT SELF-TESTS PASSED\n"
+    log(selftests + nvme_selftest + "[TEST] ALL BOOT SELF-TESTS PASSED\n"
         "[INIT] hello from ring 3\n")
     for ch in script:
         shell_input.put(ch)
     for bdf, mode in controllers.values():
         if mode:
             log("[USBKBD] controller %s ready (%s)\n" % (bdf, mode))
+    if nvme_devs and BUG != "nvme_after_prompt":
+        if BUG == "no_nvme":
+            log("[NVME] no NVMe controllers found\n")
+        elif BUG == "nvme_bad_bdf":
+            log("[NVME] controller 00:7f.0 ready (msix), disks=1\n"
+                "[NVME] ready\n")
+        else:
+            for nv in nvme_devs:
+                log("[NVME] controller %s ready (%s), disks=1\n" % (
+                    nv["bdf"], nv["mode"]))
+            log("[NVME] ready\n")
     log(ramfs)
     if BUG == "ps2_prefixed":
         log("sh> [PS2KBD] controller i8042 ready (irq1)\n")
@@ -473,6 +583,14 @@ def boot():
             kb = new_keyboard(spec)
             keyboards.append(kb)
             threading.Thread(target=attach, args=(kb,), daemon=True).start()
+    if nvme_devs and BUG == "nvme_after_prompt":
+        def late_nvme():
+            time.sleep(0.05)
+            for nv in nvme_devs:
+                log("[NVME] controller %s ready (%s), disks=1\n" % (
+                    nv["bdf"], nv["mode"]))
+            log("[NVME] ready\n")
+        threading.Thread(target=late_nvme, daemon=True).start()
     shell()
     log("[INIT] exited with status 0\n[TEST] driver_session_cleanup: PASS\n")
     log(stress)
@@ -492,6 +610,10 @@ def pci_devices():
             devices.append(device)
         else:
             bridge["pci_bridge"]["devices"].append(device)
+    for nv in nvme_devs:
+        bus, rest = nv["bdf"].split(":")
+        devices.append({"bus": int(bus, 16), "slot": int(rest[:2], 16),
+                        "function": 0, "class_info": {"class": 0x0108}})
     return [{"bus": 0, "devices": devices}]
 
 
@@ -1265,6 +1387,42 @@ class ConfigsAndCliTest(unittest.TestCase):
     self.assertEqual(cfgs_custom[0].name, "custom1")
     self.assertEqual(cfgs_custom[0].timeout_s, 180.0)
 
+  def test_custom_commands_valueless_options_and_program_paths(self) -> None:
+    # An option that takes no argument doesn't take the word after it.
+    argv, iso = deflake.parse_qemu_command(
+        "qemu-system-x86_64 -s -S -usb -no-user-config -cdrom x.iso"
+        " -serial stdio"
+    )
+    self.assertEqual(iso, Path("x.iso"))
+    self.assertEqual(
+        argv,
+        ("qemu-system-x86_64", "-s", "-S", "-usb", "-no-user-config",
+         "-cdrom", deflake.ISO_PLACEHOLDER, "-serial", "stdio", "-display",
+         "none"),
+    )
+    self.assertEqual(
+        deflake.tokenize_qemu_options(["-usb", "-smp", "4", "-s"]),
+        [("-usb", ()), ("-smp", ("4",)), ("-s", ())],
+    )
+    # After `--`, a command names the QEMU program with or without a path, as
+    # --qemu-cmd takes it, and anything else is options on top of kvm24.
+    for program in ("qemu-system-x86_64", "/opt/qemu/bin/qemu-system-x86_64"):
+      out = io.StringIO()
+      with contextlib.redirect_stdout(out):
+        rc = deflake.main([
+            "--list-configs", "--", program, "-cdrom", "x.iso", "-serial",
+            "stdio",
+        ])
+      self.assertEqual(rc, 0)
+      self.assertIn(
+          f"cmd: {program} -cdrom x.iso -serial stdio", out.getvalue()
+      )
+    out = io.StringIO()
+    with contextlib.redirect_stdout(out):
+      rc = deflake.main(["--list-configs", "--", "-smp", "12"])
+    self.assertEqual(rc, 0)
+    self.assertIn("kvm24 + -smp 12", out.getvalue())
+
   def test_parse_duration(self) -> None:
     self.assertEqual(deflake.parse_duration("90s"), 90.0)
     self.assertEqual(deflake.parse_duration("30m"), 1800.0)
@@ -1387,6 +1545,15 @@ class LockAndRunnersTest(unittest.TestCase):
       with self.assertRaises(OSError):
         with deflake.HostLock(sym_dir / "host.lock"):
           pass
+
+  def test_stop_process_group_survives_a_docker_kill_that_hangs(self) -> None:
+    proc = subprocess.Popen([sys.executable, "-c", "pass"])
+    proc.wait()
+    hung = subprocess.TimeoutExpired(cmd=["docker", "kill", "c"], timeout=10)
+    with mock.patch.object(deflake.subprocess, "run", side_effect=hung) as run:
+      deflake.stop_process_group(proc, docker_name="c", docker_bin="docker")
+    run.assert_called_once()
+    self.assertEqual(run.call_args.args[0], ["docker", "kill", "c"])
 
   def test_vcs_provenance_git_fallback_and_toolchain_detection(self) -> None:
     if shutil.which("git") is None:
@@ -1840,7 +2007,12 @@ class LockAndRunnersTest(unittest.TestCase):
                 "-monitor", f"unix:{run_dir}/qemu_{p}_monitor.sock,server,nowait",
                 "-qmp", f"unix:{run_dir}/qemu_{p}_qmp.sock,server,nowait",
                 "-no-reboot",
-            ] + rest + ["-cdrom", str(tmp_path / "kernel.iso"), ""],
+            ] + rest + [
+                "-cdrom", str(tmp_path / "kernel.iso"),
+                "-drive", f"file={run_dir}/nvme_{p}.img,format=raw,if=none,id=nvme0",
+                "-device", "nvme,drive=nvme0,serial=protos0",
+                "",
+            ],
         )
         output_txt = (art_off / p / "output.log").read_text(encoding="utf-8")
         self.assertNotIn("USB", output_txt)
@@ -2294,11 +2466,14 @@ class LockAndRunnersTest(unittest.TestCase):
     self.assertEqual(reproduced.custom_iso, Path(rec.iso_snapshot))
     self.assertEqual(reproduced.qemu_argv, cfg.qemu_argv)
 
-    # rerun.sh of a test_boot.sh USB pass recreates the run's directory and
+    # rerun.sh of a test_boot.sh USB pass recreates the run's directory,
+    # recreates and zeroes any writable NVMe disk image under qemu_run_dir, and
     # leaves out the interactive boot session, which would wait forever
     # without the harness.
+    drive_spec = "file=build/test_boot.abc123/nvme_bios.img,format=raw,if=none,id=nvme0"
     qemu_argv = ("qemu-system-x86_64", "-serial",
                  "file:build/test_boot.abc123/serial_bios_output.log",
+                 "-drive", drive_spec, "-device", "nvme,drive=nvme0,serial=protos0",
                  *deflake.INTERACTIVE_SESSION_ARGS, "-cdrom", rec.iso_snapshot)
     rec = make_run_record(qemu_argv=qemu_argv, qemu_run_dir="build/test_boot.abc123",
                           harness_argv=("./test_boot.sh", "--passes=bios"))
@@ -2306,6 +2481,12 @@ class LockAndRunnersTest(unittest.TestCase):
         rec, deflake._make_builtin_config("host:bios"), repo)
     lines = script.splitlines()
     self.assertIn("mkdir -p build/test_boot.abc123", lines)
+    self.assertIn(
+        "rm -f -- build/test_boot.abc123/nvme_bios.img && "
+        "dd if=/dev/zero of=build/test_boot.abc123/nvme_bios.img "
+        "bs=1048576 count=4 >/dev/null 2>&1 || exit 1",
+        lines,
+    )
     self.assertEqual(shlex.split(lines[-1])[1:],
                      [a for a in qemu_argv if a not in
                       deflake.INTERACTIVE_SESSION_ARGS])
@@ -2323,6 +2504,12 @@ class LockAndRunnersTest(unittest.TestCase):
         docker_image_id="sha256:1234")
     lines = script.splitlines()
     self.assertIn("mkdir -p /repo/build/test_boot.abc123", lines)
+    self.assertIn(
+        "rm -f -- /repo/build/test_boot.abc123/nvme_bios.img && "
+        "dd if=/dev/zero of=/repo/build/test_boot.abc123/nvme_bios.img "
+        "bs=1048576 count=4 >/dev/null 2>&1 || exit 1",
+        lines,
+    )
     words = shlex.split(lines[-1])
     self.assertEqual(words[words.index("--user") + 1], "0:0")
     self.assertIn("/repo:/workspace:z", words)
@@ -2330,6 +2517,162 @@ class LockAndRunnersTest(unittest.TestCase):
     self.assertEqual(words[words.index("sha256:1234") + 1:],
                      [a for a in qemu_argv if a not in
                       deflake.INTERACTIVE_SESSION_ARGS])
+
+    # Running a rendered host rerun.sh twice consecutively re-creates a fresh
+    # zeroed 4 MiB image before each QEMU launch even if run 1 dirties it.
+    with tempfile.TemporaryDirectory() as tmp:
+      tmp_repo = Path(tmp)
+      fake_bin = tmp_repo / "bin"
+      fake_bin.mkdir()
+      disk_rel = "build/test_boot.abc123/nvme_bios.img"
+      fake_qemu = fake_bin / "qemu-system-x86_64"
+      fake_qemu.write_text(
+          textwrap.dedent(f"""\
+          #!/usr/bin/env python3
+          import pathlib
+          p = pathlib.Path({disk_rel!r})
+          data = p.read_bytes()
+          assert len(data) == 4 * 1024 * 1024, len(data)
+          assert data == b"\\x00" * (4 * 1024 * 1024), "disk not freshly zeroed"
+          with p.open("r+b") as f:
+              f.write(b"DIRTY-FROM-PREVIOUS-RUN")
+          """),
+          encoding="utf-8",
+      )
+      fake_qemu.chmod(0o755)
+      iso_snap = tmp_repo / "snap.iso"
+      iso_snap.write_bytes(b"iso")
+      host_rec = make_run_record(
+          config="host:bios",
+          iso_snapshot=str(iso_snap),
+          qemu_argv=("qemu-system-x86_64", "-drive",
+                     f"file={disk_rel},format=raw,if=none,id=nvme0",
+                     "-cdrom", str(iso_snap)),
+          qemu_cwd=str(tmp_repo),
+          qemu_run_dir="build/test_boot.abc123",
+          harness_argv=("./test_boot.sh", "--passes=bios"),
+      )
+      rerun_sh = tmp_repo / "rerun.sh"
+      rerun_sh.write_text(
+          deflake.render_rerun_script(
+              host_rec, deflake._make_builtin_config("host:bios"), tmp_repo),
+          encoding="utf-8",
+      )
+      rerun_sh.chmod(0o755)
+      env = os.environ.copy()
+      env["PATH"] = f"{fake_bin}:{env.get('PATH', '')}"
+      for _ in range(2):
+        r = subprocess.run(["sh", str(rerun_sh)], env=env, capture_output=True,
+                           text=True, check=False)
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+
+  def test_rerun_script_drive_cleanup_edge_cases(self) -> None:
+    repo = Path("/repo")
+    # 1. Empty or None qemu_run_dir must NEVER fall back to "build" for drive
+    # cleanup, so persistent images like build/nvme.img are never deleted.
+    argv_build = (
+        "qemu-system-x86_64", "-drive", "file=build/nvme.img,format=raw",
+        "-cdrom", "/store/abc.iso",
+    )
+    for empty_run_dir in (None, ""):
+      for cfg_name in ("host:bios", "docker:bios"):
+        harness = (
+            ("./test_boot.sh", "--passes=bios")
+            if cfg_name.startswith("host:")
+            else deflake.build_docker_test_boot_argv(
+                repo, "bios", "art", "k.iso", "mb1.iso")
+        )
+        rec = make_run_record(
+            config=cfg_name,
+            qemu_argv=argv_build,
+            qemu_run_dir=empty_run_dir,
+            harness_argv=harness,
+        )
+        script = deflake.render_rerun_script(
+            rec, deflake._make_builtin_config(cfg_name), repo)
+        self.assertNotIn("rm -f", script, (empty_run_dir, cfg_name))
+        self.assertNotIn("dd if=/dev/zero", script, (empty_run_dir, cfg_name))
+    self.assertEqual(deflake._writable_run_drive_paths(argv_build, ""), [])
+
+    # 2. readonly=true/yes and snapshot=true/yes (case-insensitive) are skipped.
+    run_dir = "build/test_boot.abc123"
+    argv_ro = (
+        "qemu-system-x86_64",
+        "-drive", f"file={run_dir}/ro1.img,readonly=true",
+        "-drive", f"file={run_dir}/ro2.img,readonly=yes",
+        "-drive", f"file={run_dir}/snap1.img,snapshot=true",
+        "-drive", f"file={run_dir}/snap2.img,snapshot=yes",
+        "-drive", f"file={run_dir}/ro3.img,READONLY=YES",
+        "-drive", f"file={run_dir}/rw.img,format=raw",
+    )
+    self.assertEqual(
+        deflake._writable_run_drive_paths(argv_ro, run_dir),
+        [f"{run_dir}/rw.img"],
+    )
+
+    # 3. qemu_run_dir="/" or "//" with "//etc/passwd" must return no drives.
+    argv_root = (
+        "qemu-system-x86_64",
+        "-drive", "file=//etc/passwd,format=raw",
+        "-drive", "file=/etc/passwd,format=raw",
+    )
+    for bad_dir in ("/", "//", ".", ".."):
+      self.assertEqual(
+          deflake._writable_run_drive_paths(argv_root, bad_dir), [], bad_dir
+      )
+      rec_root = make_run_record(
+          config="host:bios",
+          qemu_argv=argv_root,
+          qemu_run_dir=bad_dir,
+          harness_argv=("./test_boot.sh", "--passes=bios"),
+      )
+      script_root = deflake.render_rerun_script(
+          rec_root, deflake._make_builtin_config("host:bios"), repo)
+      self.assertNotIn("rm -f", script_root, bad_dir)
+      self.assertNotIn("dd if=/dev/zero", script_root, bad_dir)
+
+    # 4. Nested drive path under qemu_run_dir gets mkdir -p for its parent.
+    nested_dp = f"{run_dir}/sub/nvme.img"
+    rec_nested = make_run_record(
+        config="host:bios",
+        qemu_argv=("qemu-system-x86_64", "-drive", f"file={nested_dp},format=raw"),
+        qemu_run_dir=run_dir,
+        harness_argv=("./test_boot.sh", "--passes=bios"),
+    )
+    nested_lines = deflake.render_rerun_script(
+        rec_nested, deflake._make_builtin_config("host:bios"), repo
+    ).splitlines()
+    self.assertIn(f"mkdir -p {run_dir}/sub", nested_lines)
+    self.assertIn(
+        f"rm -f -- {nested_dp} && dd if=/dev/zero of={nested_dp} "
+        "bs=1048576 count=4 >/dev/null 2>&1 || exit 1",
+        nested_lines,
+    )
+
+    # 5. Docker mode maps /workspace/... paths to host `repo / ...` for host
+    # mkdir/rm/dd while keeping /workspace/... inside the container qemu argv.
+    ws_run_dir = "/workspace/build/test_boot.abc123"
+    ws_dp = f"{ws_run_dir}/sub/nvme_bios.img"
+    rec_ws = make_run_record(
+        config="docker:bios",
+        qemu_argv=("qemu-system-x86_64", "-drive", f"file={ws_dp},format=raw"),
+        qemu_run_dir=ws_run_dir,
+        harness_argv=deflake.build_docker_test_boot_argv(
+            repo, "bios", "art", "k.iso", "mb1.iso"),
+    )
+    ws_lines = deflake.render_rerun_script(
+        rec_ws, deflake._make_builtin_config("docker:bios"), repo,
+        docker_image_id="sha256:1234",
+    ).splitlines()
+    self.assertIn("mkdir -p /repo/build/test_boot.abc123", ws_lines)
+    self.assertIn("mkdir -p /repo/build/test_boot.abc123/sub", ws_lines)
+    self.assertIn(
+        "rm -f -- /repo/build/test_boot.abc123/sub/nvme_bios.img && "
+        "dd if=/dev/zero of=/repo/build/test_boot.abc123/sub/nvme_bios.img "
+        "bs=1048576 count=4 >/dev/null 2>&1 || exit 1",
+        ws_lines,
+    )
+    self.assertIn(f"file={ws_dp},format=raw", shlex.split(ws_lines[-1]))
 
   def test_sources_parse_as_python_3_8(self) -> None:
     for name in ("deflake.py", "deflake_test.py"):
@@ -2387,7 +2730,7 @@ class LockAndRunnersTest(unittest.TestCase):
           f"{shlex.quote(str(fake_qemu))} -smp 4 -m 256M -serial mon:stdio"
           f" -cdrom {shlex.quote(str(iso_path))}"
       )
-      rc = deflake.main([
+      session_argv = [
           "--qemu-cmd",
           cmd_str,
           "--runs",
@@ -2397,7 +2740,8 @@ class LockAndRunnersTest(unittest.TestCase):
           "--out",
           str(out_dir),
           "--quiet",
-      ])
+      ]
+      rc = deflake.main(session_argv)
       # Session returns 1 when any run fails.
       self.assertEqual(rc, 1)
       summary = json.loads(
@@ -2423,6 +2767,18 @@ class LockAndRunnersTest(unittest.TestCase):
         self.assertTrue((run_dir / fname).is_file(), f"missing {fname}")
       rerun_mode = (run_dir / "rerun.sh").stat().st_mode
       self.assertTrue(bool(rerun_mode & stat.S_IXUSR))
+
+      # The directory holds this session only: another session in it would
+      # number its run 0001 too, and replace these artifacts or (if the run
+      # passes) delete them.
+      runs_jsonl = (out_dir / "runs.jsonl").read_bytes()
+      stderr = io.StringIO()
+      with contextlib.redirect_stderr(stderr):
+        rc = deflake.main(session_argv)
+      self.assertEqual(rc, 2)
+      self.assertIn("already holds a session", stderr.getvalue())
+      self.assertEqual((out_dir / "runs.jsonl").read_bytes(), runs_jsonl)
+      self.assertTrue((run_dir / "serial.log").is_file())
 
   def test_run_test_boot_pass_and_docker_argv(self) -> None:
     docker_argv = deflake.build_docker_test_boot_argv(
@@ -2535,9 +2891,11 @@ class UsbHarnessTest(unittest.TestCase):
       extra_env: dict[str, str] | None = None,
   ) -> tuple[subprocess.CompletedProcess[str], Path, float]:
     art_dir = tmp_path / f"artifacts_{passes.replace(',', '_')}_{bug}"
+    # Without the caller's settings of the real boot test, which `make test
+    # MIN_STRESS_PASSES=4` exports to this test too: the fake guest behaves
+    # like a boot with the default settings.
     env = os.environ.copy()
-    for var in ("USE_DOCKER", "KVM", "BOOT_TEST_USB", "QEMU_USB_FLAGS",
-                "USB_SESSION_TIMEOUT_SECS"):
+    for var in (*deflake.BOOT_TEST_ENV_VARS, "USE_DOCKER", "KVM"):
       env.pop(var, None)
     env.update({
         "PATH": f"{tmp_path / 'fakebin'}:{env.get('PATH', '')}",
@@ -2558,6 +2916,25 @@ class UsbHarnessTest(unittest.TestCase):
         check=False,
     )
     return proc, art_dir, time.monotonic() - started
+
+  def test_run_test_boot_ignores_the_boot_test_settings_of_the_caller(
+      self) -> None:
+    # `make test MIN_STRESS_PASSES=4` exports the settings of the real boot
+    # test (BOOT_TEST_ENV_VARS) to this test too. The passes of the fake guest
+    # must not see them: it passes the stress test 3 times, for example.
+    settings = {var: "1" for var in deflake.BOOT_TEST_ENV_VARS}
+    settings.update({
+        "MIN_STRESS_PASSES": "4",
+        "OVMF_VARS": "/nonexistent/OVMF_VARS.fd",
+    })
+    with tempfile.TemporaryDirectory() as tmp, mock.patch.dict(
+        os.environ, settings
+    ):
+      tmp_path = Path(tmp)
+      self.setup_fake_guest(tmp_path)
+      proc, _, _ = self.run_test_boot(
+          tmp_path, "bios,uefi", extra_env={"BOOT_TEST_USB": "0"})
+      self.assertEqual(proc.returncode, 0, (proc.stdout + proc.stderr)[-3000:])
 
   def test_test_boot_sh_fails_on_failure_during_the_last_checks(self) -> None:
     with tempfile.TemporaryDirectory() as tmp:
@@ -2760,6 +3137,42 @@ class UsbHarnessTest(unittest.TestCase):
           "rootfs_skipped": bad_rootfs,
           "rootfs_errors": bad_rootfs,
           "rootfs_damaged": bad_rootfs,
+      }
+      for bug, failures in cases.items():
+        for extra_env, failure in zip(({"BOOT_TEST_USB": "0"}, {}), failures):
+          proc, art_dir, elapsed = self.run_test_boot(
+              tmp_path, "bios", bug, extra_env=extra_env)
+          self.assertEqual(proc.returncode, 1, (
+              bug, extra_env, (proc.stdout + proc.stderr)[-3000:]))
+          self.assertTrue(first_failure(art_dir).startswith(failure),
+                          (bug, extra_env, first_failure(art_dir)))
+          self.assertLess(elapsed, 30)
+
+  def test_test_boot_sh_requires_init_nvme(self) -> None:
+    with tempfile.TemporaryDirectory() as tmp:
+      tmp_path = Path(tmp)
+      self.setup_fake_guest(tmp_path)
+
+      def first_failure(art_dir: Path) -> str:
+        output = (art_dir / "bios" / "output.log").read_text(encoding="utf-8")
+        return deflake.first_harness_failure(output) or output[-2000:]
+
+      cases = {
+          "nvme_after_prompt": (
+              "FAIL: [NVME] readiness markers appeared after 'sh> '",
+              "FAIL: usb_ready: NVMe readiness markers did not precede the "
+              "first shell prompt",
+          ),
+          "no_nvme": (
+              "FAIL: init's nvme reported no NVMe disks in serial output.",
+              "FAIL: usb_ready: nvme reported that it found no NVMe controller",
+          ),
+          "nvme_bad_bdf": (
+              "FAIL: [NVME] controller BDF '00:7f.0' does not match QEMU "
+              "query-pci",
+              "FAIL: usb_ready: the drivers' markers do not match the "
+              "controllers and keyboards of the pass",
+          ),
       }
       for bug, failures in cases.items():
         for extra_env, failure in zip(({"BOOT_TEST_USB": "0"}, {}), failures):
